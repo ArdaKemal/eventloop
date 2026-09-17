@@ -12,7 +12,6 @@
 #include <dirent.h>
 
 std::string http_client::ROOT_PATH = {};
-file_cache http_client::FILE_CACHE = {};
 std::shared_ptr<route_manager> http_client::ROUTES = {};
 
 static const std::string_view BAD_REQUEST =
@@ -30,7 +29,6 @@ static const std::string_view NOT_IMPLEMENTED =
 auto http_client::set_root_path(const std::string &path) -> void
 {
     ROOT_PATH = path;
-    FILE_CACHE.build(path);
 }
 
 auto http_client::set_route_manager(std::shared_ptr<route_manager> routes)
@@ -45,27 +43,13 @@ auto http_client::start() -> void
         std::bind_front(&http_client::on_read, this));
 }
 
-auto http_client::serve_file(const file_info &info) -> void
+auto http_client::serve_file(const struct stat &info) -> void
 {
     static thread_local std::array<char, 128> time_buffer;
 
-    if ((ROOT_PATH.size() + request_->uri.size()) >= path_buffer_.size()) {
-        socket_.async_write(URI_TOO_LONG,
-            std::bind_front(&http_client::on_write, this));
-
-        return;
-    }
-
-    std::copy(ROOT_PATH.begin(), ROOT_PATH.end(), path_buffer_.begin());
-
-    std::copy(request_->uri.begin(),
-        request_->uri.end(), path_buffer_.begin() + ROOT_PATH.size());
-
-    path_buffer_.at(ROOT_PATH.size() + request_->uri.size()) = '\0';
-
     const std::size_t time_len = std::strftime(
         time_buffer.data(), time_buffer.size(),
-        "%a, %e %b %Y %T %Z", std::gmtime(&info.last_modified.tv_sec));
+        "%a, %e %b %Y %T %Z", std::gmtime(&info.st_mtime));
 
     const long buffer_size = std::snprintf(
         out_buffer_.data(), out_buffer_.size(),
@@ -75,7 +59,8 @@ auto http_client::serve_file(const file_info &info) -> void
         "Content-Length: %zu\r\n"
         "Content-Type: %s\r\n\r\n",
         static_cast<int>(time_len), time_buffer.data(),
-        *info.size, mime_type_from_path(request_->uri).data());
+        static_cast<std::size_t>(info.st_size),
+        mime_type_from_path(request_->uri).data());
 
     std::string_view buffer{
         out_buffer_.begin(), out_buffer_.begin() + buffer_size };
@@ -83,7 +68,8 @@ auto http_client::serve_file(const file_info &info) -> void
     socket_.async_write(buffer, true,
         std::bind_front(&http_client::on_write, this));
 
-    socket_.async_sendfile(path_buffer_.data(), *info.size,
+    socket_.async_sendfile(path_buffer_.data(),
+        static_cast<std::size_t>(info.st_size),
         std::bind_front(&http_client::on_write, this));
 }
 
@@ -173,32 +159,48 @@ auto http_client::handle_request(std::size_t bytes_received) -> void
         return;
     }
 
-    const auto info = FILE_CACHE.retrieve(request_->uri);
+    if ((ROOT_PATH.size() + request_->uri.size()) >= path_buffer_.size()) {
+        socket_.async_write(URI_TOO_LONG,
+            std::bind_front(&http_client::on_write, this));
+        return;
+    }
+
+    std::copy(ROOT_PATH.begin(), ROOT_PATH.end(), path_buffer_.begin());
+    std::copy(request_->uri.begin(), request_->uri.end(),
+        path_buffer_.begin() + ROOT_PATH.size());
+    path_buffer_.at(ROOT_PATH.size() + request_->uri.size()) = '\0';
+
+    struct stat info {};
+    const bool found = ::stat(path_buffer_.data(), &info) == 0;
 
     switch (request_->method) {
         case http_method_t::GET:
-            if (!info) {
+            if (!found) {
                 socket_.async_write(NOT_FOUND,
                     std::bind_front(&http_client::on_write, this));
 
                 break;
             }
 
-            if (info->type == file_type::regular) {
-                serve_file(*info);
+            if (S_ISREG(info.st_mode)) {
+                serve_file(info);
+            }
+            else if (S_ISDIR(info.st_mode)) {
+                serve_directory();
             }
             else {
-                serve_directory();
+                socket_.async_write(NOT_FOUND,
+                    std::bind_front(&http_client::on_write, this));
             }
 
             break;
         case http_method_t::HEAD:
-            if (info->type != file_type::regular) {
+            if (!found || !S_ISREG(info.st_mode)) {
                 socket_.async_write(NOT_FOUND,
                     std::bind_front(&http_client::on_write, this));
             }
             else {
-                serve_file_size(*info->size);
+                serve_file_size(static_cast<std::size_t>(info.st_size));
             }
 
             break;

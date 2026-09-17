@@ -3,11 +3,12 @@
 #include "http_parser.h"
 #include "route_manager.h"
 #include "../io/tcp_socket.h"
-#include "../util/file_cache.h"
 
 #include <array>
 #include <memory>
 #include <unordered_set>
+
+#include <sys/stat.h>
 
 class http_client
     : public std::enable_shared_from_this<http_client>
@@ -37,7 +38,7 @@ private:
 
     auto handle_request(std::size_t bytes_received) -> void;
 
-    auto serve_file(const file_info &info) -> void;
+    auto serve_file(const struct stat &info) -> void;
     auto serve_file_size(std::size_t size) -> void;
     auto serve_directory() -> void;
 
@@ -56,6 +57,5 @@ private:
     std::optional<http_request> request_;
 
     static std::string ROOT_PATH;
-    static file_cache FILE_CACHE;
     static std::shared_ptr<route_manager> ROUTES;
 };
