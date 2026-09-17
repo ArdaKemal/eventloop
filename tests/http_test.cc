@@ -1,0 +1,155 @@
+#include "eventloop/http/mime_types.h"
+#include "eventloop/http/request.h"
+#include "eventloop/http/session.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <new>
+#include <span>
+#include <string_view>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace {
+std::size_t allocations = 0;
+}
+
+auto operator new(std::size_t size) -> void*
+{
+    ++allocations;
+    if (void* memory = std::malloc(size)) return memory;
+    throw std::bad_alloc {};
+}
+
+auto operator new[](std::size_t size) -> void*
+{
+    ++allocations;
+    if (void* memory = std::malloc(size)) return memory;
+    throw std::bad_alloc {};
+}
+
+auto operator delete(void* memory) noexcept -> void { std::free(memory); }
+auto operator delete[](void* memory) noexcept -> void { std::free(memory); }
+auto operator delete(void* memory, std::size_t) noexcept -> void { std::free(memory); }
+auto operator delete[](void* memory, std::size_t) noexcept -> void { std::free(memory); }
+
+namespace {
+
+class fixed_stream final : public byte_stream {
+public:
+    auto write(std::span<const std::byte> data) -> void override
+    {
+        if (data.size() > output.size() - size) throw std::bad_alloc {};
+        std::memcpy(output.data() + size, data.data(), data.size());
+        size += data.size();
+    }
+
+    auto close() -> void override { open = false; }
+    [[nodiscard]] auto ready() const noexcept -> bool override { return open; }
+    [[nodiscard]] auto write_pending() const noexcept -> bool override { return false; }
+
+    std::array<char, 128 * 1024> output {};
+    std::size_t size {0};
+    bool open {true};
+
+private:
+    auto on_data(std::span<const std::byte>) -> void override {}
+};
+
+[[nodiscard]] auto contains(const fixed_stream& stream, std::string_view value) -> bool
+{
+    return std::string_view {stream.output.data(), stream.size}.find(value) !=
+           std::string_view::npos;
+}
+
+auto write_file(int directory, const char* name, std::string_view contents) -> bool
+{
+    const int descriptor = openat(directory, name, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (descriptor == -1) return false;
+    const auto written = ::write(descriptor, contents.data(), contents.size());
+    ::close(descriptor);
+    return written == static_cast<ssize_t>(contents.size());
+}
+
+auto parser_and_mime_tests() -> bool
+{
+    constexpr std::string_view raw =
+        "GET /assets/site.CSS?version=1 HTTP/1.1\r\n"
+        "host: localhost\r\nConnection: keep-alive\r\n\r\n";
+    http::request request;
+    const auto before = allocations;
+    const auto result = http::parse_request(raw, request);
+    const auto mime = http::mime_type_from_path(request.target);
+    const auto after = allocations;
+
+    if (result.status != http::parse_status::complete || request.target != "/assets/site.CSS?version=1" ||
+        mime != "text/css; charset=utf-8" || before != after) return false;
+    if (http::mime_type_from_path("/image.png") != "image/png") return false;
+    if (http::mime_type_from_path("/archive.bin") != "application/octet-stream") return false;
+
+    http::request incomplete;
+    if (http::parse_request("GET / HTTP/1.1\r\nHost: local", incomplete).status !=
+        http::parse_status::incomplete) return false;
+    http::request missing_host;
+    if (http::parse_request("GET / HTTP/1.1\r\n\r\n", missing_host).status !=
+        http::parse_status::bad_request) return false;
+    http::request chunked;
+    if (http::parse_request(
+            "POST / HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n",
+            chunked).status != http::parse_status::unsupported_transfer_encoding) return false;
+    return true;
+}
+
+auto session_tests() -> bool
+{
+    char directory_name[] = "/tmp/eventloop-http-XXXXXX";
+    if (mkdtemp(directory_name) == nullptr) return false;
+    const int directory = open(directory_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory == -1) return false;
+    if (!write_file(directory, "index.html", "<h1>home</h1>") ||
+        !write_file(directory, "site.css", "body{}")) {
+        ::close(directory);
+        return false;
+    }
+
+    fixed_stream stream;
+    http::session session(stream, directory);
+    constexpr std::string_view requests =
+        "GET /site.css HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        "HEAD /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    const auto split = requests.size() / 2;
+    const auto before = allocations;
+    session.receive(std::as_bytes(std::span {requests.data(), split}));
+    session.receive(std::as_bytes(std::span {
+        requests.data() + split, requests.size() - split}));
+    session.write_drained();
+    session.write_drained();
+    const auto after = allocations;
+
+    const bool valid = before == after &&
+        contains(stream, "Content-Type: text/css; charset=utf-8") &&
+        contains(stream, "body{}") &&
+        contains(stream, "Content-Type: text/html; charset=utf-8") &&
+        !stream.open;
+    unlinkat(directory, "index.html", 0);
+    unlinkat(directory, "site.css", 0);
+    ::close(directory);
+    unlinkat(AT_FDCWD, directory_name, AT_REMOVEDIR);
+    return valid;
+}
+
+} // namespace
+
+auto main() -> int
+{
+    if (!parser_and_mime_tests() || !session_tests()) {
+        std::cerr << "HTTP tests failed\n";
+        return 1;
+    }
+    return 0;
+}
