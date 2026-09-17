@@ -20,6 +20,7 @@ mkdir -p "$work_dir/www/files"
 printf 'secure static file' > "$work_dir/www/file.txt"
 printf '<h1>home</h1>' > "$work_dir/www/index.html"
 printf 'directory entry' > "$work_dir/www/files/a&b.txt"
+head -c 16384 /dev/zero | tr '\0' 'x' > "$work_dir/www/large.bin"
 
 "$openssl" req -x509 -newkey rsa:2048 -nodes -days 1 \
     -subj /CN=localhost \
@@ -58,6 +59,10 @@ fi
 [[ $(<"$work_dir/index.out") == '<h1>home</h1>' ]]
 
 "$curl" --silent --insecure --fail --http1.1 \
+    "https://localhost:$https_port/large.bin" > "$work_dir/large-tls.out"
+cmp "$work_dir/www/large.bin" "$work_dir/large-tls.out"
+
+"$curl" --silent --insecure --fail --http1.1 \
     "https://localhost:$https_port/files/" > "$work_dir/listing.out"
 grep -Fq 'href="a%26b.txt"' "$work_dir/listing.out"
 grep -Fq 'a&amp;b.txt' "$work_dir/listing.out"
@@ -67,3 +72,33 @@ grep -Fq 'a&amp;b.txt' "$work_dir/listing.out"
 grep -Fq 'HTTP/1.1 308 Permanent Redirect' "$work_dir/redirect.headers"
 grep -Fq "Location: https://localhost:$https_port/file.txt?download=1" \
     "$work_dir/redirect.headers"
+
+kill "$server_pid"
+wait "$server_pid" 2>/dev/null || true
+server_pid=''
+
+plain_port=$((http_port + 1))
+"$server" \
+    --root "$work_dir/www" \
+    --http-only \
+    --http-port "$plain_port" \
+    --directory-listing \
+    > "$work_dir/http-only.log" 2>&1 &
+server_pid=$!
+
+for _ in {1..100}; do
+    if "$curl" --silent --fail --http1.1 \
+        "http://localhost:$plain_port/file.txt" > "$work_dir/plain.out"; then
+        break
+    fi
+    sleep 0.05
+done
+
+if [[ $(<"$work_dir/plain.out") != 'secure static file' ]]; then
+    sed -n '1,120p' "$work_dir/http-only.log" >&2
+    exit 1
+fi
+
+"$curl" --silent --fail --http1.1 \
+    "http://localhost:$plain_port/large.bin" > "$work_dir/large-http.out"
+cmp "$work_dir/www/large.bin" "$work_dir/large-http.out"

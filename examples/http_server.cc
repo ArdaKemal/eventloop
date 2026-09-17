@@ -19,6 +19,7 @@ namespace {
     }
     return static_cast<std::uint16_t>(port);
 }
+
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
@@ -33,44 +34,63 @@ auto main(int argc, char* argv[]) -> int
         int http_port_value = 8080;
         int https_port_value = 8443;
         bool directory_listing = false;
+        bool http_only = false;
 
         std::array options {
             arg_parser::option {'r', "root", &root, true},
-            arg_parser::option {'c', "certificate", &certificate, true},
-            arg_parser::option {'k', "private-key", &private_key, true},
+            arg_parser::option {'c', "certificate", &certificate, false},
+            arg_parser::option {'k', "private-key", &private_key, false},
             arg_parser::option {'w', "key-password", &key_password, false},
             arg_parser::option {'a', "address", &address, false},
             arg_parser::option {'n', "hostname", &hostname, false},
             arg_parser::option {'p', "http-port", &http_port_value, false},
             arg_parser::option {'s', "https-port", &https_port_value, false},
             arg_parser::option {'d', "directory-listing", &directory_listing, false},
+            arg_parser::option {'o', "http-only", &http_only, false},
         };
         arg_parser arguments(options.data(), options.size());
         arguments.set_usage(
-            "usage: http_server --root <directory> --certificate <chain.pem> "
-            "--private-key <key.pem> [options]\n"
+            "usage: http_server --root <directory> [TLS options] [options]\n"
             "  -r, --root <directory>       document root (required)\n"
-            "  -c, --certificate <file>     TLS certificate chain (required)\n"
-            "  -k, --private-key <file>     TLS private key (required)\n"
+            "  -c, --certificate <file>     TLS certificate chain\n"
+            "  -k, --private-key <file>     TLS private key\n"
             "  -w, --key-password <value>   private-key password\n"
             "  -a, --address <address>      listen address (default 127.0.0.1)\n"
             "  -n, --hostname <name>        HTTPS redirect host (default localhost)\n"
-            "  -p, --http-port <port>       redirect listener (default 8080)\n"
+            "  -p, --http-port <port>       HTTP listener (default 8080)\n"
             "  -s, --https-port <port>      HTTPS listener (default 8443)\n"
             "  -d, --directory-listing      enable directory listings\n"
+            "  -o, --http-only              serve HTTP without TLS or redirect\n"
             "  -h, --help                   show this help\n");
         arguments.parse(argc, argv);
 
         const auto http_port = valid_port(http_port_value);
+        event_loop loop;
+
+        const auto server_options =
+            http::server_options {.directory_listing = directory_listing};
+        if (http_only) {
+            loop.add(std::make_unique<http::server>(
+                loop, http_port, root, address, server_options));
+            std::cout << "HTTP server listening on http://" << address << ':'
+                      << http_port << '\n';
+            loop.run();
+            return 0;
+        }
+
+        if (certificate.empty() || private_key.empty()) {
+            throw std::invalid_argument(
+                "--certificate and --private-key are required unless "
+                "--http-only is used");
+        }
+
         const auto https_port = valid_port(https_port_value);
         auto context = tls_context::make_server(
             certificate, private_key, key_password);
-        event_loop loop;
         loop.add(std::make_unique<http::redirect_server>(
             loop, http_port, hostname, https_port, address));
         loop.add(std::make_unique<http::https_server>(
-            loop, https_port, std::move(context), root, address,
-            http::server_options {.directory_listing = directory_listing}));
+            loop, https_port, std::move(context), root, address, server_options));
         std::cout << "HTTP redirect listening on http://" << address << ':'
                   << http_port << '\n'
                   << "HTTPS server listening on https://" << address << ':'

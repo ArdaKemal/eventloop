@@ -18,6 +18,8 @@ public:
 
     [[nodiscard]] auto descriptor() const noexcept -> int override;
     auto write(std::span<const std::byte> data) -> void override;
+    auto send_file(std::span<const std::byte> header, int descriptor,
+                   std::size_t size) -> void;
     auto close() -> void override;
     [[nodiscard]] auto ready() const noexcept -> bool override;
     [[nodiscard]] auto write_pending() const noexcept -> bool override;
@@ -34,6 +36,7 @@ private:
     auto on_write() -> void override;
     auto on_error() -> void override;
     auto flush() -> void;
+    auto close_file() noexcept -> void;
     auto watch_writes(bool enabled) -> void;
 
     event_loop& loop_;
@@ -41,6 +44,8 @@ private:
     std::array<std::byte, 64 * 1024> output_ {};
     std::size_t output_size_ {0};
     std::size_t written_ {0};
+    int file_descriptor_ {-1};
+    std::size_t file_remaining_ {0};
     bool watching_writes_ {false};
     bool peer_closed_ {false};
     bool closing_ {false};

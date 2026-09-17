@@ -10,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
 #include <fcntl.h>
@@ -25,11 +26,18 @@ public:
     serving_connection(int root_descriptor, server_options options,
                        Arguments&&... arguments)
         : Stream(std::forward<Arguments>(arguments)...),
-          session_(*this, root_descriptor, options.directory_listing)
+          session_(*this, root_descriptor, options.directory_listing,
+                   file_stream(this))
     {
     }
 
 private:
+    [[nodiscard]] static auto file_stream(Stream* stream) noexcept -> tcp_stream*
+    {
+        if constexpr (std::is_same_v<Stream, tcp_stream>) return stream;
+        return nullptr;
+    }
+
     auto on_data(std::span<const std::byte> data) -> void override
     {
         session_.receive(data);

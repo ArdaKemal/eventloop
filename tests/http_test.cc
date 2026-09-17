@@ -111,8 +111,12 @@ auto session_tests() -> bool
     if (mkdtemp(directory_name) == nullptr) return false;
     const int directory = open(directory_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory == -1) return false;
+    std::array<char, 70 * 1024> large_contents {};
+    large_contents.fill('x');
     if (!write_file(directory, "index.html", "<h1>home</h1>") ||
         !write_file(directory, "site.css", "body{}") ||
+        !write_file(directory, "large.bin",
+                    std::string_view {large_contents.data(), large_contents.size()}) ||
         mkdirat(directory, "listing", 0700) == -1 ||
         symlinkat("/etc", directory, "escape") == -1) {
         ::close(directory);
@@ -180,19 +184,32 @@ auto session_tests() -> bool
         contains(forbidden_stream, "403 Forbidden") &&
         contains(redirect_stream, "308 Permanent Redirect") &&
         contains(redirect_stream, "Location: /listing/") &&
-        contains(listing_stream, "Transfer-Encoding: chunked") &&
+        contains(listing_stream, "Content-Length:") &&
         contains(listing_stream, "href=\"a%26b.txt\"") &&
         contains(listing_stream, "a&amp;b.txt") && !listing_stream.open;
     const bool root_confined = contains(escape_stream, "404 Not Found");
+
+    fixed_stream large_stream;
+    http::session large_session(large_stream, directory);
+    constexpr std::string_view large_request =
+        "GET /large.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    large_session.receive(std::as_bytes(std::span {large_request}));
+    for (int index = 0; index < 8 && large_stream.open; ++index) {
+        large_session.write_drained();
+    }
+    const bool large_file_valid =
+        contains(large_stream, "Content-Length: 71680") &&
+        large_stream.size > large_contents.size() && !large_stream.open;
 
     unlinkat(directory, "escape", 0);
     unlinkat(directory, "listing/a&b.txt", 0);
     unlinkat(directory, "listing", AT_REMOVEDIR);
     unlinkat(directory, "index.html", 0);
     unlinkat(directory, "site.css", 0);
+    unlinkat(directory, "large.bin", 0);
     ::close(directory);
     unlinkat(AT_FDCWD, directory_name, AT_REMOVEDIR);
-    return valid && directories_valid && root_confined;
+    return valid && directories_valid && root_confined && large_file_valid;
 }
 
 } // namespace

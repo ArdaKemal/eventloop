@@ -1,12 +1,25 @@
 #include "eventloop/tcp_stream.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <stdexcept>
 
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+namespace {
+
+[[nodiscard]] auto sigpipe_ignored() noexcept -> bool
+{
+    static const bool ignored = std::signal(SIGPIPE, SIG_IGN) != SIG_ERR;
+    return ignored;
+}
+
+} // namespace
 
 tcp_stream::tcp_stream(event_loop& loop, int descriptor)
     : loop_(loop), descriptor_(descriptor)
@@ -15,6 +28,7 @@ tcp_stream::tcp_stream(event_loop& loop, int descriptor)
 
 tcp_stream::~tcp_stream()
 {
+    close_file();
     ::close(descriptor_);
 }
 
@@ -27,6 +41,9 @@ auto tcp_stream::write(std::span<const std::byte> data) -> void
 {
     if (closing_ || closed_) {
         throw std::logic_error("cannot write to a closing TCP stream");
+    }
+    if (file_descriptor_ != -1) {
+        throw std::logic_error("cannot write during a file transfer");
     }
     if (written_ != 0) {
         const auto remaining = output_size_ - written_;
@@ -42,13 +59,47 @@ auto tcp_stream::write(std::span<const std::byte> data) -> void
     flush();
 }
 
+auto tcp_stream::send_file(std::span<const std::byte> header, int descriptor,
+                           std::size_t size) -> void
+{
+    if (!sigpipe_ignored()) {
+        const int error = errno;
+        ::close(descriptor);
+        throw std::system_error(error, std::system_category(),
+                                "ignore SIGPIPE");
+    }
+    if (closing_ || closed_) {
+        ::close(descriptor);
+        throw std::logic_error("cannot start a file transfer while closing");
+    }
+    if (written_ < output_size_) {
+        ::close(descriptor);
+        throw std::logic_error("cannot start a file transfer with pending bytes");
+    }
+    if (file_descriptor_ != -1) {
+        ::close(descriptor);
+        throw std::logic_error("cannot start a concurrent file transfer");
+    }
+    if (header.size() > output_.size()) {
+        ::close(descriptor);
+        throw std::length_error("TCP write buffer capacity exceeded");
+    }
+
+    std::memcpy(output_.data(), header.data(), header.size());
+    output_size_ = header.size();
+    written_ = 0;
+    file_descriptor_ = descriptor;
+    file_remaining_ = size;
+    flush();
+}
+
 auto tcp_stream::close() -> void
 {
     if (closing_ || closed_) {
         return;
     }
     closing_ = true;
-    if (output_size_ == 0) {
+    if (!write_pending()) {
         abort();
     } else {
         watch_writes(true);
@@ -62,7 +113,7 @@ auto tcp_stream::ready() const noexcept -> bool
 
 auto tcp_stream::write_pending() const noexcept -> bool
 {
-    return written_ < output_size_;
+    return written_ < output_size_ || file_descriptor_ != -1;
 }
 
 auto tcp_stream::on_read() -> void
@@ -116,8 +167,10 @@ auto tcp_stream::flush() -> void
 {
     const bool had_output = write_pending();
     while (written_ < output_size_) {
+        const int flags = MSG_NOSIGNAL |
+            (file_descriptor_ != -1 && file_remaining_ != 0 ? MSG_MORE : 0);
         const auto size = send(descriptor_, output_.data() + written_,
-                               output_size_ - written_, MSG_NOSIGNAL);
+                               output_size_ - written_, flags);
         if (size > 0) {
             written_ += static_cast<std::size_t>(size);
             continue;
@@ -135,6 +188,28 @@ auto tcp_stream::flush() -> void
 
     output_size_ = 0;
     written_ = 0;
+
+    while (file_descriptor_ != -1 && file_remaining_ != 0) {
+        constexpr std::size_t maximum_send = 0x7ffff000;
+        const auto requested = std::min(file_remaining_, maximum_send);
+        const auto size = sendfile(descriptor_, file_descriptor_, nullptr, requested);
+        if (size > 0) {
+            file_remaining_ -= static_cast<std::size_t>(size);
+            continue;
+        }
+        if (size == -1 && errno == EINTR) {
+            continue;
+        }
+        if (size == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            watch_writes(true);
+            return;
+        }
+        const int error = size == 0 ? EIO : errno;
+        on_transport_error({error, std::system_category()});
+        return;
+    }
+    close_file();
+
     watch_writes(false);
     if (peer_closed_ || closing_) {
         abort();
@@ -176,7 +251,17 @@ auto tcp_stream::abort() -> void
     if (!closed_) {
         closed_ = true;
         closing_ = true;
+        close_file();
         loop_.remove(descriptor_);
+    }
+}
+
+auto tcp_stream::close_file() noexcept -> void
+{
+    if (file_descriptor_ != -1) {
+        ::close(file_descriptor_);
+        file_descriptor_ = -1;
+        file_remaining_ = 0;
     }
 }
 

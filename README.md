@@ -44,6 +44,13 @@ and uses `index.html` for directories. Pass `--directory-listing` to generate a
 listing when a directory has no index file. Run `http_server --help` for all
 options.
 
+To serve plain HTTP without TLS or a redirect listener, certificate files are
+not required:
+
+```sh
+./build/http_server --root ./public --http-only --http-port 8080
+```
+
 The HTTP parser and request/response path use fixed-capacity buffers. Requests
 larger than those limits receive an appropriate 4xx response instead of
 growing buffers dynamically.
@@ -77,6 +84,7 @@ Use `SERVER=eventloop`, `SERVER=nginx`, or `SERVER=lighttpd` to repeat one
 participant while diagnosing a result.
 
 This is a local HTTP/1.1 static-file benchmark, not a production tuning guide.
-In particular, nginx uses its normal `sendfile` path while the example server
-reads files into user space, so treat the comparison as end-to-end baseline
-data and record the command, CPU, and package versions with any result.
+Plain HTTP file responses use Linux `sendfile`; HTTPS responses pass through
+Botan in user space. Plain HTTP files smaller than 11 KiB use the buffered path;
+larger files use `sendfile`. Treat the comparison as end-to-end baseline data
+and record the command, CPU, and package versions with any result.

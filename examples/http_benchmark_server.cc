@@ -20,6 +20,7 @@ namespace {
     }
     return static_cast<std::uint16_t>(port);
 }
+
 } // namespace
 
 auto main(int argc, char* argv[]) -> int

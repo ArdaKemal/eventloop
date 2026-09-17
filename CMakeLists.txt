@@ -21,6 +21,7 @@ add_library(eventloop
     include/eventloop/util/arg_parser.h
     src/linux/epoll_loop.cc
     src/event_loop.cc
+    src/http/directory_listing.cc
     src/http/mime_types.cc
     src/http/request.cc
     src/http/server.cc

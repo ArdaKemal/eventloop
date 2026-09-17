@@ -9,7 +9,7 @@ namespace http {
 
 inline constexpr std::size_t max_headers = 32;
 inline constexpr std::size_t max_target_size = 2048;
-inline constexpr std::size_t max_message_size = 16 * 1024;
+inline constexpr std::size_t max_message_size = 4096;
 
 enum class method_type {
     get,
