@@ -13,6 +13,7 @@
 
 namespace {
 constexpr std::size_t max_read_per_event = 64 * 1024;
+constexpr std::size_t max_pending_output = 64 * 1024;
 
 [[nodiscard]] auto sigpipe_ignored() noexcept -> bool
 {
@@ -46,18 +47,43 @@ auto tcp_stream::write(std::span<const std::byte> data) -> void
     if (file_descriptor_ != -1) {
         throw std::logic_error("cannot write during a file transfer");
     }
-    if (written_ != 0) {
-        const auto remaining = output_size_ - written_;
-        std::memmove(output_.data(), output_.data() + written_, remaining);
-        output_size_ = remaining;
-        written_ = 0;
-    }
-    if (data.size() > output_.size() - output_size_) {
+    if (data.empty()) return;
+    if (data.size() > max_pending_output) {
         throw std::length_error("TCP write buffer capacity exceeded");
     }
-    std::memcpy(output_.data() + output_size_, data.data(), data.size());
-    output_size_ += data.size();
-    flush();
+
+    if (output_.empty()) {
+        std::size_t offset = 0;
+        while (offset < data.size()) {
+            const auto size = send(descriptor_, data.data() + offset,
+                                   data.size() - offset, MSG_NOSIGNAL);
+            if (size > 0) {
+                offset += static_cast<std::size_t>(size);
+                continue;
+            }
+            if (size == -1 && errno == EINTR) continue;
+            if (size == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            on_transport_error({errno, std::system_category()});
+            return;
+        }
+        if (offset == data.size()) {
+            notify_write_drained();
+            return;
+        }
+        data = data.subspan(offset);
+    }
+
+    if (written_ != 0) {
+        const auto remaining = output_.size() - written_;
+        std::memmove(output_.data(), output_.data() + written_, remaining);
+        output_.resize(remaining);
+        written_ = 0;
+    }
+    if (data.size() > max_pending_output - output_.size()) {
+        throw std::length_error("TCP write buffer capacity exceeded");
+    }
+    output_.insert(output_.end(), data.begin(), data.end());
+    watch_writes(true);
 }
 
 auto tcp_stream::send_file(std::span<const std::byte> header, int descriptor,
@@ -73,7 +99,7 @@ auto tcp_stream::send_file(std::span<const std::byte> header, int descriptor,
         ::close(descriptor);
         throw std::logic_error("cannot start a file transfer while closing");
     }
-    if (written_ < output_size_) {
+    if (written_ < output_.size()) {
         ::close(descriptor);
         throw std::logic_error("cannot start a file transfer with pending bytes");
     }
@@ -81,16 +107,40 @@ auto tcp_stream::send_file(std::span<const std::byte> header, int descriptor,
         ::close(descriptor);
         throw std::logic_error("cannot start a concurrent file transfer");
     }
-    if (header.size() > output_.size()) {
+    if (header.size() > max_pending_output) {
         ::close(descriptor);
         throw std::length_error("TCP write buffer capacity exceeded");
     }
 
-    std::memcpy(output_.data(), header.data(), header.size());
-    output_size_ = header.size();
-    written_ = 0;
     file_descriptor_ = descriptor;
     file_remaining_ = size;
+
+    std::size_t offset = 0;
+    while (offset < header.size()) {
+        const auto sent = send(descriptor_, header.data() + offset,
+                               header.size() - offset,
+                               MSG_NOSIGNAL | (size != 0 ? MSG_MORE : 0));
+        if (sent > 0) {
+            offset += static_cast<std::size_t>(sent);
+            continue;
+        }
+        if (sent == -1 && errno == EINTR) continue;
+        if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        on_transport_error({errno, std::system_category()});
+        return;
+    }
+    if (offset != header.size()) {
+        try {
+            output_.assign(header.begin() + static_cast<std::ptrdiff_t>(offset),
+                           header.end());
+        } catch (...) {
+            close_file();
+            throw;
+        }
+        written_ = 0;
+        watch_writes(true);
+        return;
+    }
     flush();
 }
 
@@ -114,7 +164,7 @@ auto tcp_stream::ready() const noexcept -> bool
 
 auto tcp_stream::write_pending() const noexcept -> bool
 {
-    return written_ < output_size_ || file_descriptor_ != -1;
+    return written_ < output_.size() || file_descriptor_ != -1;
 }
 
 auto tcp_stream::on_read() -> void
@@ -169,11 +219,11 @@ auto tcp_stream::on_error() -> void
 auto tcp_stream::flush() -> void
 {
     const bool had_output = write_pending();
-    while (written_ < output_size_) {
+    while (written_ < output_.size()) {
         const int flags = MSG_NOSIGNAL |
             (file_descriptor_ != -1 && file_remaining_ != 0 ? MSG_MORE : 0);
         const auto size = send(descriptor_, output_.data() + written_,
-                               output_size_ - written_, flags);
+                               output_.size() - written_, flags);
         if (size > 0) {
             written_ += static_cast<std::size_t>(size);
             continue;
@@ -189,7 +239,7 @@ auto tcp_stream::flush() -> void
         return;
     }
 
-    output_size_ = 0;
+    std::vector<std::byte> {}.swap(output_);
     written_ = 0;
 
     while (file_descriptor_ != -1 && file_remaining_ != 0) {
@@ -218,18 +268,21 @@ auto tcp_stream::flush() -> void
         abort();
         return;
     }
-    if (had_output && notifying_write_drained_) {
+    if (had_output) notify_write_drained();
+}
+
+auto tcp_stream::notify_write_drained() -> void
+{
+    if (notifying_write_drained_) {
         write_drained_deferred_ = true;
         return;
     }
-    if (had_output) {
-        do {
-            write_drained_deferred_ = false;
-            notifying_write_drained_ = true;
-            on_write_drained();
-            notifying_write_drained_ = false;
-        } while (write_drained_deferred_ && !write_pending() && !closing_ && !closed_);
-    }
+    do {
+        write_drained_deferred_ = false;
+        notifying_write_drained_ = true;
+        on_write_drained();
+        notifying_write_drained_ = false;
+    } while (write_drained_deferred_ && !write_pending() && !closing_ && !closed_);
 }
 
 auto tcp_stream::on_transport_data(std::span<const std::byte> data) -> void

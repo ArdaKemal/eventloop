@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <span>
 #include <system_error>
+#include <vector>
 
 class tcp_stream : public byte_stream, public notifiable {
 public:
@@ -36,13 +37,13 @@ private:
     auto on_write() -> void override;
     auto on_error() -> void override;
     auto flush() -> void;
+    auto notify_write_drained() -> void;
     auto close_file() noexcept -> void;
     auto watch_writes(bool enabled) -> void;
 
     event_loop& loop_;
     int descriptor_;
-    std::array<std::byte, 64 * 1024> output_ {};
-    std::size_t output_size_ {0};
+    std::vector<std::byte> output_;
     std::size_t written_ {0};
     int file_descriptor_ {-1};
     std::size_t file_remaining_ {0};
