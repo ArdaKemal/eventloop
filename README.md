@@ -27,11 +27,22 @@ For the TLS echo example, provide a PEM certificate chain and private key:
 ./build/tls_echo certificate.pem private-key.pem 7443
 ```
 
-Run the HTTP/1.1 static-file server with a document root:
+Run the HTTP/1.1 static-file server with a document root and TLS certificate:
 
 ```sh
-./build/http_server ./public 8080
+./build/http_server \
+    --root ./public \
+    --certificate certificate-chain.pem \
+    --private-key private-key.pem \
+    --hostname example.com \
+    --http-port 80 \
+    --https-port 443
 ```
+
+The HTTP listener redirects requests to HTTPS. The HTTPS listener serves files
+and uses `index.html` for directories. Pass `--directory-listing` to generate a
+listing when a directory has no index file. Run `http_server --help` for all
+options.
 
 The HTTP parser and request/response path use fixed-capacity buffers. Requests
 larger than those limits receive an appropriate 4xx response instead of

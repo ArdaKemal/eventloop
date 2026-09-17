@@ -20,10 +20,8 @@ for command in wrk nginx lighttpd curl taskset; do
     }
 done
 
-if [[ ! -x "$build_dir/http_server" ]]; then
-    cmake -S "$root" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release
-    cmake --build "$build_dir" --parallel
-fi
+cmake -S "$root" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$build_dir" --target http_benchmark_server --parallel
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/eventloop-http-benchmark.XXXXXX")
 server_pid=''
@@ -102,15 +100,15 @@ run_one() {
     server_pid=''
 }
 
-echo "Building/using: $build_dir/http_server"
+echo "Building/using: $build_dir/http_benchmark_server"
 echo "Pinned load generator and server to CPU $cpu; run on an otherwise idle machine."
 case "$server" in
     all)
-        run_one eventloop 18080 "$build_dir/http_server" "$work_dir/www" 18080
+        run_one eventloop 18080 "$build_dir/http_benchmark_server" "$work_dir/www" 18080
         run_one nginx 18081 nginx -c "$work_dir/nginx.conf" -g 'daemon off;'
         run_one lighttpd 18082 lighttpd -D -f "$work_dir/lighttpd.conf"
         ;;
-    eventloop) run_one eventloop 18080 "$build_dir/http_server" "$work_dir/www" 18080 ;;
+    eventloop) run_one eventloop 18080 "$build_dir/http_benchmark_server" "$work_dir/www" 18080 ;;
     nginx) run_one nginx 18081 nginx -c "$work_dir/nginx.conf" -g 'daemon off;' ;;
     lighttpd) run_one lighttpd 18082 lighttpd -D -f "$work_dir/lighttpd.conf" ;;
     *) echo "SERVER must be all, eventloop, nginx, or lighttpd" >&2; exit 2 ;;

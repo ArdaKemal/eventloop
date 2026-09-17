@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(event_loop LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 find_package(Botan 3 REQUIRED)
 include(CTest)
 
@@ -16,16 +18,18 @@ add_library(eventloop
     include/eventloop/tls_acceptor.h
     include/eventloop/tls_context.h
     include/eventloop/tls_stream.h
+    include/eventloop/util/arg_parser.h
     src/linux/epoll_loop.cc
     src/event_loop.cc
-    src/http11/mime_types.cc
-    src/http11/request.cc
-    src/http11/server.cc
-    src/http11/session.cc
+    src/http/mime_types.cc
+    src/http/request.cc
+    src/http/server.cc
+    src/http/session.cc
     src/tcp_acceptor.cc
     src/tcp_stream.cc
     src/tls_acceptor.cc
     src/tls_stream.cc
+    src/util/arg_parser.cc
 )
 
 add_library(eventloop::eventloop ALIAS eventloop)
@@ -50,8 +54,13 @@ add_executable(http_server examples/http_server.cc)
 target_link_libraries(http_server PRIVATE eventloop::eventloop)
 target_compile_options(http_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
+add_executable(http_benchmark_server examples/http_benchmark_server.cc)
+target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
+target_compile_options(http_benchmark_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
 if(BUILD_TESTING)
     find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
+    find_program(CURL_EXECUTABLE curl REQUIRED)
     add_executable(tls_loopback_test tests/tls_loopback.cc)
     target_link_libraries(tls_loopback_test PRIVATE eventloop::eventloop)
     target_compile_options(tls_loopback_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
@@ -66,4 +75,13 @@ if(BUILD_TESTING)
     target_link_libraries(http_test PRIVATE eventloop::eventloop)
     target_compile_options(http_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http COMMAND http_test)
+
+    add_test(
+        NAME http_server
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http_server.sh
+                     $<TARGET_FILE:http_server>
+                     ${OPENSSL_EXECUTABLE}
+                     ${CURL_EXECUTABLE}
+    )
+    set_tests_properties(http_server PROPERTIES TIMEOUT 15)
 endif()
