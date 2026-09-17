@@ -7,6 +7,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -74,6 +75,13 @@ auto tcp_acceptor::on_read() -> void
         const int client = accept4(
             descriptor_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client >= 0) {
+            const int enabled = 1;
+            if (setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &enabled,
+                           sizeof(enabled)) == -1) {
+                const auto error = system_error("setsockopt");
+                ::close(client);
+                throw error;
+            }
             on_accept(client);
             continue;
         }
