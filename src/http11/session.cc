@@ -35,6 +35,7 @@ constexpr std::string_view not_implemented =
     "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 constexpr std::string_view options_response =
     "HTTP/1.1 204 No Content\r\nAllow: GET, HEAD, OPTIONS\r\nContent-Length: 0\r\n\r\n";
+constexpr std::size_t response_header_capacity = 4096;
 
 [[nodiscard]] constexpr auto hex_value(char value) noexcept -> int
 {
@@ -196,7 +197,7 @@ auto session::serve_file(bool headers_only) -> void
     const auto modified_size = format_http_time(info.st_mtime, modified);
     const auto mime = mime_type_from_path(path_.data());
     const int response_size = std::snprintf(
-        response_.data(), response_.size(),
+        response_.data(), response_header_capacity,
         "HTTP/1.1 200 OK\r\n"
         "Date: %.*s\r\n"
         "Last-Modified: %.*s\r\n"
@@ -208,7 +209,8 @@ auto session::serve_file(bool headers_only) -> void
         static_cast<std::intmax_t>(info.st_size),
         static_cast<int>(mime.size()), mime.data(),
         close_after_response_ ? "close" : "keep-alive");
-    if (response_size < 0 || static_cast<std::size_t>(response_size) >= response_.size()) {
+    if (response_size < 0 ||
+        static_cast<std::size_t>(response_size) >= response_header_capacity) {
         ::close(file_descriptor_);
         file_descriptor_ = -1;
         send_error(parse_status::headers_too_large);
@@ -220,8 +222,26 @@ auto session::serve_file(bool headers_only) -> void
         file_descriptor_ = -1;
     }
     responding_ = true;
-    stream_.write(std::as_bytes(std::span {response_}.first(
-        static_cast<std::size_t>(response_size))));
+    const auto header_size = static_cast<std::size_t>(response_size);
+    while (file_descriptor_ != -1) {
+        const auto size = ::read(file_descriptor_, response_.data() + header_size,
+                                 response_.size() - header_size);
+        if (size > 0) {
+            stream_.write(std::as_bytes(std::span {response_}.first(
+                header_size + static_cast<std::size_t>(size))));
+            return;
+        }
+        if (size == -1 && errno == EINTR) {
+            continue;
+        }
+        ::close(file_descriptor_);
+        file_descriptor_ = -1;
+        if (size == -1) {
+            stream_.close();
+            return;
+        }
+    }
+    stream_.write(std::as_bytes(std::span {response_}.first(header_size)));
 }
 
 auto session::send_options() -> void
@@ -263,9 +283,10 @@ auto session::send_response(std::string_view response) -> void
 auto session::pump_file() -> void
 {
     while (file_descriptor_ != -1 && !stream_.write_pending()) {
-        const auto size = ::read(file_descriptor_, file_buffer_.data(), file_buffer_.size());
+        const auto size = ::read(file_descriptor_, response_.data(), response_.size());
         if (size > 0) {
-            stream_.write(std::span {file_buffer_}.first(static_cast<std::size_t>(size)));
+            stream_.write(std::as_bytes(
+                std::span {response_}.first(static_cast<std::size_t>(size))));
             continue;
         }
         if (size == -1 && errno == EINTR) {

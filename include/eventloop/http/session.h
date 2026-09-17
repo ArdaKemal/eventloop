@@ -41,9 +41,8 @@ private:
     int root_descriptor_;
     int file_descriptor_ {-1};
     std::array<char, max_message_size> input_ {};
-    std::array<char, 4096> response_ {};
+    std::array<char, 20 * 1024> response_ {};
     std::array<char, 4096> path_ {};
-    std::array<std::byte, 16 * 1024> file_buffer_ {};
     std::size_t input_size_ {0};
     request request_ {};
     bool responding_ {false};
