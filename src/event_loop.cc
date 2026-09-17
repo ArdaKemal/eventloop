@@ -34,25 +34,31 @@ auto event_loop::run() -> void
         const auto result = implementation_->poller.poll(events);
         implementation_->dispatching = true;
 
-        for (std::size_t index = 0; index < result.event_count; ++index) {
-            const auto event = events[index];
-            const auto found = implementation_->handlers.find(event.descriptor);
-            if (found == implementation_->handlers.end()) {
-                continue;
-            }
-            auto* const handler = found->second.get();
+        try {
+            for (std::size_t index = 0; index < result.event_count; ++index) {
+                const auto event = events[index];
+                const auto found = implementation_->handlers.find(event.descriptor);
+                if (found == implementation_->handlers.end()) {
+                    continue;
+                }
+                auto* const handler = found->second.get();
 
-            if (event.error) {
-                handler->on_error();
-                continue;
+                if (event.error) {
+                    handler->on_error();
+                    continue;
+                }
+                if (event.readable) {
+                    handler->on_read();
+                }
+                if (event.writable &&
+                    !implementation_->pending_removals.contains(event.descriptor)) {
+                    handler->on_write();
+                }
             }
-            if (event.readable) {
-                handler->on_read();
-            }
-            if (event.writable &&
-                !implementation_->pending_removals.contains(event.descriptor)) {
-                handler->on_write();
-            }
+        } catch (...) {
+            implementation_->dispatching = false;
+            implementation_->erase_pending();
+            throw;
         }
 
         implementation_->dispatching = false;

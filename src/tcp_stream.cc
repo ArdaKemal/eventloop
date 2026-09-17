@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 namespace {
+constexpr std::size_t max_read_per_event = 64 * 1024;
 
 [[nodiscard]] auto sigpipe_ignored() noexcept -> bool
 {
@@ -119,9 +120,11 @@ auto tcp_stream::write_pending() const noexcept -> bool
 auto tcp_stream::on_read() -> void
 {
     std::array<std::byte, 4096> buffer {};
-    for (;;) {
+    std::size_t received = 0;
+    while (received < max_read_per_event) {
         const auto size = recv(descriptor_, buffer.data(), buffer.size(), 0);
         if (size > 0) {
+            received += static_cast<std::size_t>(size);
             on_transport_data(std::span {buffer}.first(static_cast<std::size_t>(size)));
             if (closing_ || closed_) {
                 return;

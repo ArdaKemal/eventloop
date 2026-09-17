@@ -1,6 +1,7 @@
 #include "eventloop/tcp_acceptor.h"
 
 #include <cerrno>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -12,9 +13,29 @@
 #include <unistd.h>
 
 namespace {
+constexpr std::size_t max_accepts_per_event = 64;
+
 [[nodiscard]] auto system_error(const char* operation) -> std::system_error
 {
     return {errno, std::system_category(), operation};
+}
+
+[[nodiscard]] constexpr auto transient_accept_error(int error) noexcept -> bool
+{
+    switch (error) {
+    case ECONNABORTED:
+    case ENETDOWN:
+    case EPROTO:
+    case ENOPROTOOPT:
+    case EHOSTDOWN:
+    case ENONET:
+    case EHOSTUNREACH:
+    case EOPNOTSUPP:
+    case ENETUNREACH:
+        return true;
+    default:
+        return false;
+    }
 }
 } // namespace
 
@@ -71,16 +92,15 @@ auto tcp_acceptor::owner() noexcept -> event_loop&
 
 auto tcp_acceptor::on_read() -> void
 {
-    for (;;) {
+    for (std::size_t attempt = 0; attempt < max_accepts_per_event; ++attempt) {
         const int client = accept4(
             descriptor_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client >= 0) {
             const int enabled = 1;
             if (setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &enabled,
                            sizeof(enabled)) == -1) {
-                const auto error = system_error("setsockopt");
                 ::close(client);
-                throw error;
+                continue;
             }
             on_accept(client);
             continue;
@@ -89,6 +109,13 @@ auto tcp_acceptor::on_read() -> void
             continue;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+        if (transient_accept_error(errno)) {
+            continue;
+        }
+        if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+            errno == ENOMEM) {
             return;
         }
         throw system_error("accept4");

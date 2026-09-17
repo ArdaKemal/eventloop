@@ -72,6 +72,11 @@ if(BUILD_TESTING)
     )
     set_tests_properties(tls_loopback PROPERTIES TIMEOUT 10)
 
+    add_executable(event_loop_test tests/event_loop.cc)
+    target_link_libraries(event_loop_test PRIVATE eventloop::eventloop)
+    target_compile_options(event_loop_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME event_loop COMMAND event_loop_test)
+
     add_executable(http_test tests/http_test.cc)
     target_link_libraries(http_test PRIVATE eventloop::eventloop)
     target_compile_options(http_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
