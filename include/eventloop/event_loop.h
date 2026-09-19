@@ -43,7 +43,7 @@ public:
     // left intact on failure. The caller must stop posting before destroying
     // the loop; a posted task must not access loop-owned objects other than
     // through this loop's own thread.
-    [[nodiscard]] auto post(execution_task task) noexcept -> bool;
+    [[nodiscard]] auto post(execution_task&& task) noexcept -> bool;
 
     // Executor for independent background work. Work submitted here must not
     // access event-loop-owned objects; use post() to deliver results back.

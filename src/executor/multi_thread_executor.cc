@@ -16,9 +16,9 @@ namespace {
     return value != 0 && (value & (value - 1)) == 0;
 }
 
-// Counting semaphore with explicit waiter tracking. A release notifies only
-// when a worker is registered as waiting, and a worker re-checks the permit
-// count after registering, so no wakeup can be lost between the two.
+// libstdc++'s futex-backed counting_semaphore can miss a wake after the
+// counter changes away from and back to the value observed by a waiter. Keep
+// waiter registration separate and only wait while the permit count is zero.
 class wake_semaphore {
 public:
     wake_semaphore() = default;
@@ -56,6 +56,7 @@ public:
     }
 
 private:
+    // int is libstdc++'s Linux futex wait type, avoiding its waiter-pool path.
     std::atomic<int> permits_ {0};
     std::atomic<int> waiters_ {0};
 };

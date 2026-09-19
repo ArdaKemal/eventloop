@@ -29,7 +29,7 @@ public:
     auto remove_descriptor(int descriptor) -> void;
     auto set_write_interest(int descriptor, bool enabled) -> void;
     auto request_stop() -> void;
-    auto wake() -> void;
+    auto wake() noexcept -> void;
     [[nodiscard]] auto poll(std::span<ready_event> events) -> poll_result;
 
 private:

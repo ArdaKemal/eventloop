@@ -19,9 +19,9 @@
 
 namespace {
 
-[[nodiscard]] auto make_event() -> int
+[[nodiscard]] auto make_event(unsigned int initial_value = 1) -> int
 {
-    const int descriptor = eventfd(1, EFD_CLOEXEC | EFD_NONBLOCK);
+    const int descriptor = eventfd(initial_value, EFD_CLOEXEC | EFD_NONBLOCK);
     if (descriptor == -1) {
         throw std::system_error(errno, std::system_category(), "eventfd");
     }
@@ -77,6 +77,64 @@ private:
 
     event_loop& loop_;
     int descriptor_;
+};
+
+class fairness_handler final : public notifiable {
+public:
+    fairness_handler(event_loop& loop, int& post_count, int& observed_count)
+        : loop_(loop), post_count_(post_count), observed_count_(observed_count),
+          descriptor_(make_event(0))
+    {
+    }
+
+    ~fairness_handler() override { ::close(descriptor_); }
+
+    [[nodiscard]] auto descriptor() const noexcept -> int override
+    {
+        return descriptor_;
+    }
+
+private:
+    auto on_read() -> void override
+    {
+        std::uint64_t value;
+        (void)::read(descriptor_, &value, sizeof(value));
+        observed_count_ = post_count_;
+        loop_.stop();
+    }
+
+    auto on_write() -> void override {}
+    auto on_error() -> void override { loop_.stop(); }
+
+    event_loop& loop_;
+    int& post_count_;
+    int& observed_count_;
+    int descriptor_;
+};
+
+struct reposting_task {
+    static constexpr int limit = 512;
+
+    auto run() noexcept -> void
+    {
+        ++count;
+        if (count == 1) {
+            const std::uint64_t value = 1;
+            while (::write(descriptor, &value, sizeof(value)) == -1) {
+                if (errno == EINTR) continue;
+                loop.stop();
+                return;
+            }
+        }
+        if (count < limit &&
+            !loop.post(execution_task([this]() noexcept { run(); }))) {
+            loop.stop();
+        }
+    }
+
+    event_loop& loop;
+    int descriptor;
+    int& count;
 };
 
 class sending_stream final : public tcp_stream {
@@ -221,10 +279,31 @@ auto post_tests() -> bool
             ++count;
             loop.stop();
         }));
-        const bool third = loop.post(execution_task([&]() noexcept { ++count; }));
-        if (!first || !second || third) return false;
+        execution_task third([&]() noexcept { ++count; });
+        const bool third_accepted = loop.post(std::move(third));
+        if (!first || !second || third_accepted || !third) return false;
         loop.run();
         if (count != 2) return false;
+    }
+
+    {
+        event_loop loop;
+        int post_count = 0;
+        int observed_count = -1;
+        auto handler = std::make_unique<fairness_handler>(
+            loop, post_count, observed_count);
+        const int descriptor = handler->descriptor();
+        loop.add(std::move(handler));
+
+        reposting_task task {loop, descriptor, post_count};
+        if (!loop.post(execution_task([&task]() noexcept { task.run(); }))) {
+            return false;
+        }
+        loop.run();
+        if (observed_count <= 0 ||
+            observed_count >= reposting_task::limit) {
+            return false;
+        }
     }
 
     return true;

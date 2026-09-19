@@ -109,7 +109,7 @@ private:
     }
 
     alignas(executor_detail::task_storage_alignment)
-        std::byte storage_[executor_detail::task_storage_size] {};
+        std::byte storage_[executor_detail::task_storage_size];
     const operations* operations_ {nullptr};
 };
 

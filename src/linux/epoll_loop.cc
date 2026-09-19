@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
+#include <exception>
 #include <system_error>
 
 #include <sys/epoll.h>
@@ -112,11 +113,14 @@ auto epoll_loop::request_stop() -> void
     }
 }
 
-auto epoll_loop::wake() -> void
+auto epoll_loop::wake() noexcept -> void
 {
     const std::uint64_t value = 1;
-    if (write(wake_descriptor_, &value, sizeof(value)) == -1 && errno != EAGAIN) {
-        throw system_error("eventfd write");
+    for (;;) {
+        if (write(wake_descriptor_, &value, sizeof(value)) != -1) return;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN) return;
+        std::terminate();
     }
 }
 

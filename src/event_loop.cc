@@ -4,17 +4,14 @@
 #include "linux/epoll_loop.h"
 
 #include <array>
-#include <cerrno>
 #include <stdexcept>
-#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
-#include <sys/eventfd.h>
-#include <unistd.h>
-
 namespace {
+constexpr std::size_t max_posted_tasks_per_iteration = 64;
+
 [[nodiscard]] auto is_power_of_two(std::size_t value) noexcept -> bool
 {
     return value != 0 && (value & (value - 1)) == 0;
@@ -38,33 +35,18 @@ public:
                             ? make_single_thread_executor()
                             : make_multi_thread_executor(
                                   {.worker_count = options.worker_count}))
-    {
-        post_descriptor = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-        if (post_descriptor == -1) {
-            throw std::system_error(errno, std::system_category(), "eventfd");
-        }
-        try {
-            poller.add_descriptor(post_descriptor);
-        } catch (...) {
-            close(post_descriptor);
-            post_descriptor = -1;
-            throw;
-        }
-    }
+    {}
 
-    ~implementation()
-    {
-        if (post_descriptor != -1) {
-            close(post_descriptor);
-        }
-    }
-
-    auto drain_posted() -> void
+    [[nodiscard]] auto drain_posted() -> bool
     {
         execution_task task;
-        while (posted_tasks.try_pop(task)) {
+        std::size_t count = 0;
+        while (count < max_posted_tasks_per_iteration &&
+               posted_tasks.try_pop(task)) {
             task();
+            ++count;
         }
+        return count == max_posted_tasks_per_iteration;
     }
 
     auto erase_pending() -> void
@@ -78,7 +60,6 @@ public:
     epoll_loop poller;
     bounded_task_queue posted_tasks;
     std::unique_ptr<executor> task_executor;
-    int post_descriptor {-1};
     std::unordered_map<int, std::unique_ptr<notifiable>> handlers;
     std::unordered_set<int> pending_removals;
     bool dispatching {false};
@@ -131,7 +112,9 @@ auto event_loop::run() -> void
         implementation_->erase_pending();
 
         if (result.wake_requested) {
-            implementation_->drain_posted();
+            if (implementation_->drain_posted()) {
+                implementation_->poller.wake();
+            }
         }
         if (result.stop_requested) {
             return;
@@ -181,7 +164,7 @@ auto event_loop::set_write_interest(int descriptor, bool enabled) -> void
     }
 }
 
-auto event_loop::post(execution_task task) noexcept -> bool
+auto event_loop::post(execution_task&& task) noexcept -> bool
 {
     if (!implementation_->posted_tasks.try_push(std::move(task))) {
         return false;

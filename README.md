@@ -112,4 +112,3 @@ Both harnesses pin the server to `SERVER_CPUS` (default `0-7`) and `wrk` to
 contend for the same cores. They otherwise accept the same `DURATION`,
 `CONNECTIONS`, `WRK_THREADS`, and `FILE_SIZE` overrides as the throughput
 comparison.
-
