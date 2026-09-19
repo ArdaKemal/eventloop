@@ -30,6 +30,7 @@ public:
     auto write_drained() -> void;
     auto closed() -> void;
     auto failed(std::error_code) -> void;
+    auto shutdown() -> void;
 
 private:
     enum class path_result { valid, invalid, too_long };

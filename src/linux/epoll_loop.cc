@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <exception>
@@ -11,6 +12,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 namespace {
@@ -64,11 +66,25 @@ epoll_loop::epoll_loop()
         throw error;
     }
 
+    timer_descriptor_ = timerfd_create(
+        CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (timer_descriptor_ == -1) {
+        const auto error = system_error("timerfd_create");
+        close(wake_descriptor_);
+        close(stop_descriptor_);
+        close(epoll_descriptor_);
+        close(signal_descriptor_);
+        sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
+        throw error;
+    }
+
     try {
         update_descriptor(signal_descriptor_, false, EPOLL_CTL_ADD);
         update_descriptor(stop_descriptor_, false, EPOLL_CTL_ADD);
         update_descriptor(wake_descriptor_, false, EPOLL_CTL_ADD);
+        update_descriptor(timer_descriptor_, false, EPOLL_CTL_ADD);
     } catch (...) {
+        close(timer_descriptor_);
         close(wake_descriptor_);
         close(stop_descriptor_);
         close(epoll_descriptor_);
@@ -83,6 +99,7 @@ epoll_loop::~epoll_loop()
     close(signal_descriptor_);
     close(stop_descriptor_);
     close(wake_descriptor_);
+    close(timer_descriptor_);
     close(epoll_descriptor_);
     sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
 }
@@ -124,6 +141,26 @@ auto epoll_loop::wake() noexcept -> void
     }
 }
 
+auto epoll_loop::arm_timer(
+    std::optional<std::chrono::steady_clock::duration> delay) -> void
+{
+    itimerspec value {};
+    if (delay) {
+        auto nanoseconds = std::chrono::ceil<std::chrono::nanoseconds>(*delay);
+        if (nanoseconds <= std::chrono::nanoseconds::zero()) {
+            nanoseconds = std::chrono::nanoseconds {1};
+        }
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+            nanoseconds);
+        const auto remainder = nanoseconds - seconds;
+        value.it_value.tv_sec = static_cast<time_t>(seconds.count());
+        value.it_value.tv_nsec = static_cast<long>(remainder.count());
+    }
+    if (timerfd_settime(timer_descriptor_, 0, &value, nullptr) == -1) {
+        throw system_error("timerfd_settime");
+    }
+}
+
 auto epoll_loop::poll(std::span<ready_event> events) -> poll_result
 {
     std::array<epoll_event, 64> native_events {};
@@ -139,13 +176,15 @@ auto epoll_loop::poll(std::span<ready_event> events) -> poll_result
 
     std::size_t output_count = 0;
     bool stop_requested = false;
+    bool signal_requested = false;
     bool wake_requested = false;
+    bool timer_requested = false;
     for (int index = 0; index < count; ++index) {
         const auto& native = native_events[static_cast<std::size_t>(index)];
         if (native.data.fd == signal_descriptor_) {
             signalfd_siginfo info {};
             (void)read(signal_descriptor_, &info, sizeof(info));
-            stop_requested = true;
+            signal_requested = true;
             continue;
         }
         if (native.data.fd == stop_descriptor_) {
@@ -160,6 +199,12 @@ auto epoll_loop::poll(std::span<ready_event> events) -> poll_result
             wake_requested = true;
             continue;
         }
+        if (native.data.fd == timer_descriptor_) {
+            std::uint64_t value;
+            (void)read(timer_descriptor_, &value, sizeof(value));
+            timer_requested = true;
+            continue;
+        }
 
         events[output_count++] = {
             .descriptor = native.data.fd,
@@ -170,7 +215,9 @@ auto epoll_loop::poll(std::span<ready_event> events) -> poll_result
     }
     return {.event_count = output_count,
             .stop_requested = stop_requested,
-            .wake_requested = wake_requested};
+            .signal_requested = signal_requested,
+            .wake_requested = wake_requested,
+            .timer_requested = timer_requested};
 }
 
 auto epoll_loop::update_descriptor(int descriptor, bool write_enabled, int operation) -> void

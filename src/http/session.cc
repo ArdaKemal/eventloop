@@ -156,6 +156,14 @@ auto session::failed(std::error_code) -> void
     closed();
 }
 
+auto session::shutdown() -> void
+{
+    close_after_response_ = true;
+    if (!responding_) {
+        stream_.close();
+    }
+}
+
 auto session::process_requests() -> void
 {
     if (responding_ || input_size_ == 0) return;

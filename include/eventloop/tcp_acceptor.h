@@ -25,6 +25,7 @@ private:
     auto on_read() -> void override;
     auto on_write() -> void override {}
     auto on_error() -> void override;
+    auto on_shutdown() -> void override;
 
     event_loop& loop_;
     int descriptor_ {-1};

@@ -4,6 +4,8 @@
 #include "linux/epoll_loop.h"
 
 #include <array>
+#include <map>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -11,6 +13,7 @@
 
 namespace {
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
+constexpr std::size_t max_timers_per_iteration = 64;
 
 [[nodiscard]] auto is_power_of_two(std::size_t value) noexcept -> bool
 {
@@ -57,12 +60,78 @@ public:
         pending_removals.clear();
     }
 
+    auto arm_next_timer() -> void
+    {
+        if (timers.empty()) {
+            poller.arm_timer(std::nullopt);
+            return;
+        }
+        poller.arm_timer(timers.begin()->first.first - event_loop::clock::now());
+    }
+
+    [[nodiscard]] auto add_timer(event_loop::clock::time_point deadline,
+                                 execution_task&& task) -> event_loop::timer_id
+    {
+        if (!task) {
+            throw std::invalid_argument("timer task cannot be empty");
+        }
+
+        const auto id = next_timer++;
+        timers.emplace(timer_key {deadline, id}, std::move(task));
+        arm_next_timer();
+        return id;
+    }
+
+    auto cancel_timer(event_loop::timer_id id) noexcept -> bool
+    {
+        for (auto timer = timers.begin(); timer != timers.end(); ++timer) {
+            if (timer->first.second != id) continue;
+            timers.erase(timer);
+            try {
+                arm_next_timer();
+            } catch (...) {
+                std::terminate();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    auto run_due_timers() -> void
+    {
+        std::size_t count = 0;
+        while (!timers.empty() && count < max_timers_per_iteration &&
+               timers.begin()->first.first <= event_loop::clock::now()) {
+            auto task = std::move(timers.begin()->second);
+            timers.erase(timers.begin());
+            task();
+            ++count;
+        }
+        arm_next_timer();
+    }
+
+    auto force_shutdown() noexcept -> void
+    {
+        pending_removals.clear();
+        handlers.clear();
+    }
+
+    [[nodiscard]] auto shutdown_complete() const noexcept -> bool
+    {
+        return shutting_down && handlers.empty();
+    }
+
+    using timer_key = std::pair<event_loop::clock::time_point,
+                                event_loop::timer_id>;
     epoll_loop poller;
     bounded_task_queue posted_tasks;
     std::unique_ptr<executor> task_executor;
     std::unordered_map<int, std::unique_ptr<notifiable>> handlers;
     std::unordered_set<int> pending_removals;
+    std::map<timer_key, execution_task> timers;
+    event_loop::timer_id next_timer {1};
     bool dispatching {false};
+    bool shutting_down {false};
 };
 
 event_loop::event_loop() : event_loop(event_loop_options {}) {}
@@ -74,10 +143,13 @@ event_loop::event_loop(event_loop_options options)
 
 event_loop::~event_loop() = default;
 
-auto event_loop::run() -> void
+auto event_loop::run() -> event_loop_result
 {
     std::array<ready_event, 64> events {};
     for (;;) {
+        if (implementation_->shutdown_complete()) {
+            return event_loop_result::stopped;
+        }
         const auto result = implementation_->poller.poll(events);
         implementation_->dispatching = true;
 
@@ -116,8 +188,17 @@ auto event_loop::run() -> void
                 implementation_->poller.wake();
             }
         }
+        if (result.timer_requested) {
+            implementation_->run_due_timers();
+        }
+        if (implementation_->shutdown_complete()) {
+            return event_loop_result::stopped;
+        }
         if (result.stop_requested) {
-            return;
+            return event_loop_result::stopped;
+        }
+        if (result.signal_requested) {
+            return event_loop_result::interrupted;
         }
     }
 }
@@ -127,8 +208,52 @@ auto event_loop::stop() -> void
     implementation_->poller.request_stop();
 }
 
+auto event_loop::shutdown(clock::duration timeout) -> void
+{
+    if (implementation_->shutting_down) {
+        implementation_->force_shutdown();
+        implementation_->poller.wake();
+        return;
+    }
+
+    implementation_->shutting_down = true;
+    implementation_->dispatching = true;
+    try {
+        for (auto& [descriptor, handler] : implementation_->handlers) {
+            if (!implementation_->pending_removals.contains(descriptor)) {
+                handler->on_shutdown();
+            }
+        }
+    } catch (...) {
+        implementation_->dispatching = false;
+        implementation_->erase_pending();
+        throw;
+    }
+    implementation_->dispatching = false;
+    implementation_->erase_pending();
+
+    if (implementation_->handlers.empty()) {
+        implementation_->poller.wake();
+        return;
+    }
+    if (timeout <= clock::duration::zero()) {
+        implementation_->force_shutdown();
+        implementation_->poller.wake();
+        return;
+    }
+
+    auto* const state = implementation_.get();
+    (void)implementation_->add_timer(
+        clock::now() + timeout,
+        execution_task([state]() noexcept { state->force_shutdown(); }));
+    implementation_->poller.wake();
+}
+
 auto event_loop::add(std::unique_ptr<notifiable> handler) -> void
 {
+    if (implementation_->shutting_down) {
+        throw std::logic_error("cannot add a handler during shutdown");
+    }
     const int descriptor = handler->descriptor();
     if (implementation_->handlers.contains(descriptor)) {
         throw std::logic_error("descriptor is already registered");
@@ -171,6 +296,23 @@ auto event_loop::post(execution_task&& task) noexcept -> bool
     }
     implementation_->poller.wake();
     return true;
+}
+
+auto event_loop::schedule_at(clock::time_point deadline, execution_task&& task)
+    -> timer_id
+{
+    return implementation_->add_timer(deadline, std::move(task));
+}
+
+auto event_loop::schedule_after(clock::duration delay, execution_task&& task)
+    -> timer_id
+{
+    return schedule_at(clock::now() + delay, std::move(task));
+}
+
+auto event_loop::cancel(timer_id timer) noexcept -> bool
+{
+    return implementation_->cancel_timer(timer);
 }
 
 auto event_loop::task_executor() noexcept -> executor&

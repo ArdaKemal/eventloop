@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -76,6 +77,43 @@ private:
     auto on_error() -> void override {}
 
     event_loop& loop_;
+    int descriptor_;
+};
+
+class shutdown_handler final : public notifiable {
+public:
+    shutdown_handler(event_loop& loop, int& shutdowns, bool& destroyed,
+                     bool drain)
+        : loop_(loop), shutdowns_(shutdowns), destroyed_(destroyed),
+          drain_(drain), descriptor_(make_event(0))
+    {
+    }
+
+    ~shutdown_handler() override
+    {
+        destroyed_ = true;
+        ::close(descriptor_);
+    }
+
+    [[nodiscard]] auto descriptor() const noexcept -> int override
+    {
+        return descriptor_;
+    }
+
+private:
+    auto on_read() -> void override {}
+    auto on_write() -> void override {}
+    auto on_error() -> void override {}
+    auto on_shutdown() -> void override
+    {
+        ++shutdowns_;
+        if (drain_) loop_.remove(descriptor_);
+    }
+
+    event_loop& loop_;
+    int& shutdowns_;
+    bool& destroyed_;
+    bool drain_;
     int descriptor_;
 };
 
@@ -335,6 +373,76 @@ auto executor_integration_test() -> bool
            on_loop.load();
 }
 
+auto timer_tests() -> bool
+{
+    event_loop loop;
+    bool cancelled_ran = false;
+    bool first_ran = false;
+    bool second_ran = false;
+
+    const auto cancelled = loop.schedule_after(
+        std::chrono::milliseconds {1},
+        execution_task([&]() noexcept { cancelled_ran = true; }));
+    if (!loop.cancel(cancelled) || loop.cancel(cancelled)) return false;
+
+    const auto deadline = event_loop::clock::now() +
+                          std::chrono::milliseconds {5};
+    (void)loop.schedule_at(
+        deadline, execution_task([&]() noexcept { first_ran = true; }));
+    (void)loop.schedule_at(deadline, execution_task([&]() noexcept {
+        second_ran = true;
+        loop.stop();
+    }));
+
+    if (loop.run() != event_loop_result::stopped) return false;
+    return first_ran && second_ran && !cancelled_ran &&
+           event_loop::clock::now() >= deadline;
+}
+
+auto shutdown_tests() -> bool
+{
+    {
+        event_loop loop;
+        int shutdowns = 0;
+        bool destroyed = false;
+        loop.add(std::make_unique<shutdown_handler>(
+            loop, shutdowns, destroyed, true));
+        loop.shutdown(std::chrono::seconds {1});
+        if (loop.run() != event_loop_result::stopped || shutdowns != 1 ||
+            !destroyed) {
+            return false;
+        }
+    }
+
+    {
+        event_loop loop;
+        int shutdowns = 0;
+        bool destroyed = false;
+        loop.add(std::make_unique<shutdown_handler>(
+            loop, shutdowns, destroyed, false));
+        const auto started = event_loop::clock::now();
+        loop.shutdown(std::chrono::milliseconds {5});
+        if (loop.run() != event_loop_result::stopped || shutdowns != 1 ||
+            !destroyed ||
+            event_loop::clock::now() - started < std::chrono::milliseconds {5}) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto signal_test() -> bool
+{
+    event_loop loop;
+    std::thread interrupter([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds {5});
+        (void)::kill(::getpid(), SIGTERM);
+    });
+    const auto result = loop.run();
+    interrupter.join();
+    return result == event_loop_result::interrupted;
+}
+
 } // namespace
 
 auto main() -> int
@@ -358,5 +466,8 @@ auto main() -> int
     if (!backpressure_test()) return 1;
     if (!post_tests()) return 1;
     if (!executor_integration_test()) return 1;
+    if (!timer_tests()) return 1;
+    if (!shutdown_tests()) return 1;
+    if (!signal_test()) return 1;
     return 0;
 }

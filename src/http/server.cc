@@ -46,6 +46,7 @@ private:
     auto on_close() -> void override { session_.closed(); }
     auto on_error(std::error_code error) -> void override { session_.failed(error); }
     auto on_write_drained() -> void override { session_.write_drained(); }
+    auto on_shutdown() -> void override { session_.shutdown(); }
 
     session session_;
 };

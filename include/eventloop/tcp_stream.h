@@ -36,6 +36,7 @@ private:
     auto on_read() -> void override;
     auto on_write() -> void override;
     auto on_error() -> void override;
+    auto on_shutdown() -> void override;
     auto flush() -> void;
     auto notify_write_drained() -> void;
     auto close_file() noexcept -> void;

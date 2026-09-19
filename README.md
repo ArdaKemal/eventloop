@@ -42,7 +42,9 @@ Run the HTTP/1.1 static-file server with a document root and TLS certificate:
 The HTTP listener redirects requests to HTTPS. The HTTPS listener serves files
 and uses `index.html` for directories. Pass `--directory-listing` to generate a
 listing when a directory has no index file. Run `http_server --help` for all
-options.
+options. `SIGINT` and `SIGTERM` stop the listeners, close idle connections, and
+allow active responses up to five seconds to finish. Use `--shutdown-timeout`
+to change that deadline; a second signal closes remaining connections at once.
 
 To serve plain HTTP without TLS or a redirect listener, certificate files are
 not required:

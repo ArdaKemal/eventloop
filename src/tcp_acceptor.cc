@@ -131,3 +131,8 @@ auto tcp_acceptor::on_error() -> void
 {
     throw std::runtime_error("listening socket failed");
 }
+
+auto tcp_acceptor::on_shutdown() -> void
+{
+    loop_.remove(descriptor_);
+}

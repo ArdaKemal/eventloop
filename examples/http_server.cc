@@ -4,6 +4,7 @@
 #include "eventloop/util/arg_parser.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -20,6 +21,19 @@ namespace {
     return static_cast<std::uint16_t>(port);
 }
 
+auto run_server(event_loop& loop, int shutdown_timeout) -> void
+{
+    if (shutdown_timeout < 0) {
+        throw std::invalid_argument("shutdown timeout cannot be negative");
+    }
+    if (loop.run() == event_loop_result::stopped) return;
+
+    loop.shutdown(std::chrono::seconds {shutdown_timeout});
+    while (loop.run() == event_loop_result::interrupted) {
+        loop.shutdown(event_loop::clock::duration::zero());
+    }
+}
+
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
@@ -33,6 +47,7 @@ auto main(int argc, char* argv[]) -> int
         std::string hostname = "localhost";
         int http_port_value = 8080;
         int https_port_value = 8443;
+        int shutdown_timeout = 5;
         bool directory_listing = false;
         bool http_only = false;
 
@@ -47,6 +62,7 @@ auto main(int argc, char* argv[]) -> int
             arg_parser::option {'s', "https-port", &https_port_value, false},
             arg_parser::option {'d', "directory-listing", &directory_listing, false},
             arg_parser::option {'o', "http-only", &http_only, false},
+            arg_parser::option {'t', "shutdown-timeout", &shutdown_timeout, false},
         };
         arg_parser arguments(options.data(), options.size());
         arguments.set_usage(
@@ -61,6 +77,7 @@ auto main(int argc, char* argv[]) -> int
             "  -s, --https-port <port>      HTTPS listener (default 8443)\n"
             "  -d, --directory-listing      enable directory listings\n"
             "  -o, --http-only              serve HTTP without TLS or redirect\n"
+            "  -t, --shutdown-timeout <s>   graceful shutdown deadline (default 5)\n"
             "  -h, --help                   show this help\n");
         arguments.parse(argc, argv);
 
@@ -74,7 +91,7 @@ auto main(int argc, char* argv[]) -> int
                 loop, http_port, root, address, server_options));
             std::cout << "HTTP server listening on http://" << address << ':'
                       << http_port << '\n';
-            loop.run();
+            run_server(loop, shutdown_timeout);
             return 0;
         }
 
@@ -95,7 +112,7 @@ auto main(int argc, char* argv[]) -> int
                   << http_port << '\n'
                   << "HTTPS server listening on https://" << address << ':'
                   << https_port << '\n';
-        loop.run();
+        run_server(loop, shutdown_timeout);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;

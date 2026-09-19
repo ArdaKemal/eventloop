@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <csignal>
+#include <optional>
 #include <span>
 
 struct ready_event {
@@ -14,7 +16,9 @@ struct ready_event {
 struct poll_result {
     std::size_t event_count;
     bool stop_requested;
+    bool signal_requested;
     bool wake_requested;
+    bool timer_requested;
 };
 
 class epoll_loop {
@@ -30,6 +34,8 @@ public:
     auto set_write_interest(int descriptor, bool enabled) -> void;
     auto request_stop() -> void;
     auto wake() noexcept -> void;
+    auto arm_timer(std::optional<std::chrono::steady_clock::duration> delay)
+        -> void;
     [[nodiscard]] auto poll(std::span<ready_event> events) -> poll_result;
 
 private:
@@ -38,6 +44,7 @@ private:
     int signal_descriptor_ {-1};
     int stop_descriptor_ {-1};
     int wake_descriptor_ {-1};
+    int timer_descriptor_ {-1};
     int epoll_descriptor_ {-1};
     sigset_t original_signal_mask_ {};
 };

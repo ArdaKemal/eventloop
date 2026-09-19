@@ -216,6 +216,11 @@ auto tcp_stream::on_error() -> void
     on_transport_error({error, std::system_category()});
 }
 
+auto tcp_stream::on_shutdown() -> void
+{
+    close();
+}
+
 auto tcp_stream::flush() -> void
 {
     const bool had_output = write_pending();

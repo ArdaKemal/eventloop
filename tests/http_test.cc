@@ -201,6 +201,22 @@ auto session_tests() -> bool
         contains(large_stream, "Content-Length: 71680") &&
         large_stream.size > large_contents.size() && !large_stream.open;
 
+    fixed_stream draining_stream;
+    http::session draining_session(draining_stream, directory);
+    constexpr std::string_view draining_request =
+        "GET /site.css HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    draining_session.receive(std::as_bytes(std::span {draining_request}));
+    draining_session.shutdown();
+    const bool response_was_allowed_to_drain = draining_stream.open;
+    draining_session.write_drained();
+
+    fixed_stream idle_stream;
+    http::session idle_session(idle_stream, directory);
+    idle_session.shutdown();
+    const bool graceful_shutdown_valid = response_was_allowed_to_drain &&
+                                         !draining_stream.open &&
+                                         !idle_stream.open;
+
     unlinkat(directory, "escape", 0);
     unlinkat(directory, "listing/a&b.txt", 0);
     unlinkat(directory, "listing", AT_REMOVEDIR);
@@ -209,7 +225,8 @@ auto session_tests() -> bool
     unlinkat(directory, "large.bin", 0);
     ::close(directory);
     unlinkat(AT_FDCWD, directory_name, AT_REMOVEDIR);
-    return valid && directories_valid && root_confined && large_file_valid;
+    return valid && directories_valid && root_confined && large_file_valid &&
+           graceful_shutdown_valid;
 }
 
 } // namespace
