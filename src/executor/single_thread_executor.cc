@@ -1,0 +1,21 @@
+#include "eventloop/executor.h"
+
+#include <memory>
+
+namespace {
+
+class single_thread_executor final : public executor {
+public:
+    auto execute(execution_task&& task) noexcept -> bool override
+    {
+        task();
+        return true;
+    }
+};
+
+} // namespace
+
+auto make_single_thread_executor() -> std::unique_ptr<executor>
+{
+    return std::make_unique<single_thread_executor>();
+}

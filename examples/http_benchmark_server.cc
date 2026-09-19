@@ -2,11 +2,14 @@
 #include "eventloop/http/server.h"
 
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 namespace {
 [[nodiscard]] auto parse_port(std::string_view text) -> std::uint16_t
@@ -21,22 +24,59 @@ namespace {
     return static_cast<std::uint16_t>(port);
 }
 
+[[nodiscard]] auto parse_threads(std::string_view text) -> std::size_t
+{
+    std::size_t threads = 0;
+    const auto [end, error] = std::from_chars(
+        text.data(), text.data() + text.size(), threads);
+    if (error != std::errc {} || end != text.data() + text.size() ||
+        threads == 0) {
+        throw std::invalid_argument("threads must be a positive integer");
+    }
+    return threads;
+}
+
+auto serve(std::uint16_t port, const char* root, bool reuse_port) -> void
+{
+    event_loop loop;
+    loop.add(std::make_unique<http::server>(
+        loop, port, root, "127.0.0.1",
+        http::server_options {.reuse_port = reuse_port}));
+    loop.run();
+}
+
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
 {
-    if (argc != 3) {
-        std::cerr << "usage: http_benchmark_server <document-root> <port>\n";
+    if (argc < 3 || argc > 4) {
+        std::cerr << "usage: http_benchmark_server <document-root> <port> [threads]\n";
         return 1;
     }
 
     try {
         const auto port = parse_port(argv[2]);
-        event_loop loop;
-        loop.add(std::make_unique<http::server>(loop, port, argv[1]));
-        loop.run();
+        const auto threads =
+            argc == 4 ? parse_threads(argv[3]) : std::size_t {1};
+
+        if (threads == 1) {
+            serve(port, argv[1], false);
+            return 0;
+        }
+
+        std::vector<std::thread> workers;
+        workers.reserve(threads);
+        for (std::size_t index = 0; index < threads; ++index) {
+            workers.emplace_back([port, root = argv[1]] {
+                serve(port, root, true);
+            });
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;
     }
+    return 0;
 }

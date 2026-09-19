@@ -1,19 +1,71 @@
 #include "eventloop/event_loop.h"
 
+#include "executor/bounded_task_queue.h"
 #include "linux/epoll_loop.h"
 
 #include <array>
+#include <cerrno>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+namespace {
+[[nodiscard]] auto is_power_of_two(std::size_t value) noexcept -> bool
+{
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+[[nodiscard]] auto checked_options(event_loop_options options) -> event_loop_options
+{
+    if (options.post_capacity < 2 || !is_power_of_two(options.post_capacity)) {
+        throw std::invalid_argument(
+            "event loop post capacity must be a power of two and at least two");
+    }
+    return options;
+}
+} // namespace
+
 class event_loop::implementation {
 public:
-    epoll_loop poller;
-    std::unordered_map<int, std::unique_ptr<notifiable>> handlers;
-    std::unordered_set<int> pending_removals;
-    bool dispatching {false};
+    explicit implementation(event_loop_options options)
+        : posted_tasks(options.post_capacity),
+          task_executor(options.worker_count == 0
+                            ? make_single_thread_executor()
+                            : make_multi_thread_executor(
+                                  {.worker_count = options.worker_count}))
+    {
+        post_descriptor = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (post_descriptor == -1) {
+            throw std::system_error(errno, std::system_category(), "eventfd");
+        }
+        try {
+            poller.add_descriptor(post_descriptor);
+        } catch (...) {
+            close(post_descriptor);
+            post_descriptor = -1;
+            throw;
+        }
+    }
+
+    ~implementation()
+    {
+        if (post_descriptor != -1) {
+            close(post_descriptor);
+        }
+    }
+
+    auto drain_posted() -> void
+    {
+        execution_task task;
+        while (posted_tasks.try_pop(task)) {
+            task();
+        }
+    }
 
     auto erase_pending() -> void
     {
@@ -22,9 +74,23 @@ public:
         }
         pending_removals.clear();
     }
+
+    epoll_loop poller;
+    bounded_task_queue posted_tasks;
+    std::unique_ptr<executor> task_executor;
+    int post_descriptor {-1};
+    std::unordered_map<int, std::unique_ptr<notifiable>> handlers;
+    std::unordered_set<int> pending_removals;
+    bool dispatching {false};
 };
 
-event_loop::event_loop() : implementation_(std::make_unique<implementation>()) {}
+event_loop::event_loop() : event_loop(event_loop_options {}) {}
+
+event_loop::event_loop(event_loop_options options)
+    : implementation_(std::make_unique<implementation>(checked_options(options)))
+{
+}
+
 event_loop::~event_loop() = default;
 
 auto event_loop::run() -> void
@@ -63,6 +129,10 @@ auto event_loop::run() -> void
 
         implementation_->dispatching = false;
         implementation_->erase_pending();
+
+        if (result.wake_requested) {
+            implementation_->drain_posted();
+        }
         if (result.stop_requested) {
             return;
         }
@@ -109,4 +179,18 @@ auto event_loop::set_write_interest(int descriptor, bool enabled) -> void
     if (!implementation_->pending_removals.contains(descriptor)) {
         implementation_->poller.set_write_interest(descriptor, enabled);
     }
+}
+
+auto event_loop::post(execution_task task) noexcept -> bool
+{
+    if (!implementation_->posted_tasks.try_push(std::move(task))) {
+        return false;
+    }
+    implementation_->poller.wake();
+    return true;
+}
+
+auto event_loop::task_executor() noexcept -> executor&
+{
+    return *implementation_->task_executor;
 }

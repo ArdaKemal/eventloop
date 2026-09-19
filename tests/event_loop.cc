@@ -2,13 +2,16 @@
 #include "eventloop/tcp_stream.h"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -172,6 +175,87 @@ auto backpressure_test() -> bool
     return result->valid();
 }
 
+auto post_tests() -> bool
+{
+    {
+        event_loop loop;
+        bool ran = false;
+        std::thread::id observed;
+        const auto expected = std::this_thread::get_id();
+        if (!loop.post(execution_task([&]() noexcept {
+                ran = true;
+                observed = std::this_thread::get_id();
+                loop.stop();
+            }))) {
+            return false;
+        }
+        loop.run();
+        if (!ran || observed != expected) return false;
+    }
+
+    {
+        event_loop loop;
+        std::atomic<bool> ran {false};
+        std::atomic<bool> on_loop {false};
+        const auto expected = std::this_thread::get_id();
+        std::thread poster([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (!loop.post(execution_task([&]() noexcept {
+                    ran.store(true);
+                    on_loop.store(std::this_thread::get_id() == expected);
+                    loop.stop();
+                }))) {
+                loop.stop();
+            }
+        });
+        loop.run();
+        poster.join();
+        if (!ran.load() || !on_loop.load()) return false;
+    }
+
+    {
+        event_loop loop(event_loop_options {.post_capacity = 2});
+        int count = 0;
+        const bool first = loop.post(execution_task([&]() noexcept { ++count; }));
+        const bool second = loop.post(execution_task([&]() noexcept {
+            ++count;
+            loop.stop();
+        }));
+        const bool third = loop.post(execution_task([&]() noexcept { ++count; }));
+        if (!first || !second || third) return false;
+        loop.run();
+        if (count != 2) return false;
+    }
+
+    return true;
+}
+
+auto executor_integration_test() -> bool
+{
+    event_loop loop(event_loop_options {.worker_count = 2});
+    const auto loop_thread = std::this_thread::get_id();
+    std::atomic<bool> offloaded {false};
+    std::atomic<bool> on_worker {false};
+    std::atomic<bool> returned {false};
+    std::atomic<bool> on_loop {false};
+
+    loop.task_executor().execute(execution_task([&]() noexcept {
+        on_worker.store(std::this_thread::get_id() != loop_thread);
+        offloaded.store(true);
+        if (!loop.post(execution_task([&]() noexcept {
+                returned.store(true);
+                on_loop.store(std::this_thread::get_id() == loop_thread);
+                loop.stop();
+            }))) {
+            loop.stop();
+        }
+    }));
+
+    loop.run();
+    return offloaded.load() && on_worker.load() && returned.load() &&
+           on_loop.load();
+}
+
 } // namespace
 
 auto main() -> int
@@ -192,5 +276,8 @@ auto main() -> int
     loop.add(std::move(stopping));
     loop.run();
 
-    return backpressure_test() ? 0 : 1;
+    if (!backpressure_test()) return 1;
+    if (!post_tests()) return 1;
+    if (!executor_integration_test()) return 1;
+    return 0;
 }

@@ -14,6 +14,7 @@ struct ready_event {
 struct poll_result {
     std::size_t event_count;
     bool stop_requested;
+    bool wake_requested;
 };
 
 class epoll_loop {
@@ -28,6 +29,7 @@ public:
     auto remove_descriptor(int descriptor) -> void;
     auto set_write_interest(int descriptor, bool enabled) -> void;
     auto request_stop() -> void;
+    auto wake() -> void;
     [[nodiscard]] auto poll(std::span<ready_event> events) -> poll_result;
 
 private:
@@ -35,6 +37,7 @@ private:
 
     int signal_descriptor_ {-1};
     int stop_descriptor_ {-1};
+    int wake_descriptor_ {-1};
     int epoll_descriptor_ {-1};
     sigset_t original_signal_mask_ {};
 };

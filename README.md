@@ -88,3 +88,28 @@ Plain HTTP file responses use Linux `sendfile`; HTTPS responses pass through
 Botan in user space. Plain HTTP files smaller than 11 KiB use the buffered path;
 larger files use `sendfile`. Treat the comparison as end-to-end baseline data
 and record the command, CPU, and package versions with any result.
+
+### Listener-thread scaling
+
+`http_benchmark_server` accepts an optional thread count. Each listener thread
+runs its own event loop and binds the port with `SO_REUSEPORT`, so the kernel
+spreads accepted connections across the loops. To measure the bundled server as
+that count grows:
+
+```sh
+SERVER_THREADS="1 2 4 8" ./benchmark/http-scaling.sh
+```
+
+To compare the bundled server with nginx and lighttpd at several worker counts
+under the same workload:
+
+```sh
+WORKERS="1 8" ./benchmark/http-multicore.sh
+```
+
+Both harnesses pin the server to `SERVER_CPUS` (default `0-7`) and `wrk` to
+`CLIENT_CPUS` (default `8-15`) so the load generator and the server do not
+contend for the same cores. They otherwise accept the same `DURATION`,
+`CONNECTIONS`, `WRK_THREADS`, and `FILE_SIZE` overrides as the throughput
+comparison.
+

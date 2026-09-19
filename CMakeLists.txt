@@ -4,11 +4,13 @@ project(event_loop LANGUAGES CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(Botan 3 REQUIRED)
+find_package(Threads REQUIRED)
 include(CTest)
 
 add_library(eventloop
     include/eventloop/byte_stream.h
     include/eventloop/event_loop.h
+    include/eventloop/executor.h
     include/eventloop/http/mime_types.h
     include/eventloop/http/request.h
     include/eventloop/http/server.h
@@ -21,6 +23,8 @@ add_library(eventloop
     include/eventloop/util/arg_parser.h
     src/linux/epoll_loop.cc
     src/event_loop.cc
+    src/executor/single_thread_executor.cc
+    src/executor/multi_thread_executor.cc
     src/http/directory_listing.cc
     src/http/mime_types.cc
     src/http/request.cc
@@ -40,7 +44,7 @@ target_include_directories(eventloop
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 target_compile_features(eventloop PUBLIC cxx_std_23)
-target_link_libraries(eventloop PUBLIC botan::botan)
+target_link_libraries(eventloop PUBLIC botan::botan Threads::Threads)
 target_compile_options(eventloop PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(tcp_echo examples/tcp_echo.cc)
@@ -58,6 +62,10 @@ target_compile_options(http_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion
 add_executable(http_benchmark_server examples/http_benchmark_server.cc)
 target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
 target_compile_options(http_benchmark_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(executor_benchmark benchmark/executor_benchmark.cc)
+target_link_libraries(executor_benchmark PRIVATE eventloop::eventloop)
+target_compile_options(executor_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 if(BUILD_TESTING)
     find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
@@ -81,6 +89,13 @@ if(BUILD_TESTING)
     target_link_libraries(http_test PRIVATE eventloop::eventloop)
     target_compile_options(http_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http COMMAND http_test)
+
+    add_executable(executor_test tests/executor.cc)
+    target_include_directories(executor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(executor_test PRIVATE eventloop::eventloop)
+    target_compile_options(executor_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME executor COMMAND executor_test)
+    set_tests_properties(executor PROPERTIES TIMEOUT 30)
 
     add_test(
         NAME http_server

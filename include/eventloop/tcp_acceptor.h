@@ -8,7 +8,8 @@
 class tcp_acceptor : public notifiable {
 public:
     tcp_acceptor(event_loop& loop, std::uint16_t port,
-                 std::string_view address = "127.0.0.1");
+                 std::string_view address = "127.0.0.1",
+                 bool reuse_port = false);
     ~tcp_acceptor() override;
 
     tcp_acceptor(const tcp_acceptor&) = delete;

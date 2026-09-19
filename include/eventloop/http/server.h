@@ -12,6 +12,7 @@ namespace http {
 
 struct server_options {
     bool directory_listing {false};
+    bool reuse_port {false};
 };
 
 class server final : public tcp_acceptor {

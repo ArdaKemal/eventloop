@@ -157,7 +157,7 @@ auto validate_hostname(std::string_view hostname) -> void
 
 server::server(event_loop& loop, std::uint16_t port, std::string_view root,
                std::string_view address, server_options options)
-    : tcp_acceptor(loop, port, address), options_(options)
+    : tcp_acceptor(loop, port, address, options.reuse_port), options_(options)
 {
     root_descriptor_ = open_root(root);
 }

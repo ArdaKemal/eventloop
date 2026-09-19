@@ -40,7 +40,7 @@ constexpr std::size_t max_accepts_per_event = 64;
 } // namespace
 
 tcp_acceptor::tcp_acceptor(event_loop& loop, std::uint16_t port,
-                           std::string_view address)
+                           std::string_view address, bool reuse_port)
     : loop_(loop)
 {
     descriptor_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -53,6 +53,11 @@ tcp_acceptor::tcp_acceptor(event_loop& loop, std::uint16_t port,
         if (setsockopt(descriptor_, SOL_SOCKET, SO_REUSEADDR, &enabled,
                        sizeof(enabled)) == -1) {
             throw system_error("setsockopt");
+        }
+        if (reuse_port &&
+            setsockopt(descriptor_, SOL_SOCKET, SO_REUSEPORT, &enabled,
+                       sizeof(enabled)) == -1) {
+            throw system_error("setsockopt(SO_REUSEPORT)");
         }
 
         sockaddr_in endpoint {};
