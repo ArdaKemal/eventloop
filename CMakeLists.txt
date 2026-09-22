@@ -21,6 +21,7 @@ add_library(eventloop
     include/eventloop/tls_context.h
     include/eventloop/tls_stream.h
     include/eventloop/util/arg_parser.h
+    include/eventloop/ws/web_socket.h
     src/linux/epoll_loop.cc
     src/event_loop.cc
     src/executor/single_thread_executor.cc
@@ -35,6 +36,7 @@ add_library(eventloop
     src/tls_acceptor.cc
     src/tls_stream.cc
     src/util/arg_parser.cc
+    src/ws/web_socket.cpp
 )
 
 add_library(eventloop::eventloop ALIAS eventloop)
@@ -96,6 +98,11 @@ if(BUILD_TESTING)
     target_compile_options(executor_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME executor COMMAND executor_test)
     set_tests_properties(executor PROPERTIES TIMEOUT 30)
+
+    add_executable(web_socket_test tests/web_socket.cc)
+    target_link_libraries(web_socket_test PRIVATE eventloop::eventloop)
+    target_compile_options(web_socket_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME web_socket COMMAND web_socket_test)
 
     add_test(
         NAME http_server
