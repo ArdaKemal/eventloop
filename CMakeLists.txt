@@ -17,6 +17,7 @@ add_library(eventloop
     include/eventloop/http/session.h
     include/eventloop/tcp_acceptor.h
     include/eventloop/tcp_stream.h
+    include/eventloop/task.h
     include/eventloop/tls_acceptor.h
     include/eventloop/tls_context.h
     include/eventloop/tls_stream.h
@@ -69,6 +70,10 @@ add_executable(executor_benchmark benchmark/executor_benchmark.cc)
 target_link_libraries(executor_benchmark PRIVATE eventloop::eventloop)
 target_compile_options(executor_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
+add_executable(event_loop_benchmark benchmark/event_loop_benchmark.cc)
+target_link_libraries(event_loop_benchmark PRIVATE eventloop::eventloop)
+target_compile_options(event_loop_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
 if(BUILD_TESTING)
     find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
     find_program(CURL_EXECUTABLE curl REQUIRED)
@@ -103,6 +108,16 @@ if(BUILD_TESTING)
     target_link_libraries(web_socket_test PRIVATE eventloop::eventloop)
     target_compile_options(web_socket_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME web_socket COMMAND web_socket_test)
+
+    add_executable(task_test tests/task.cc)
+    target_link_libraries(task_test PRIVATE eventloop::eventloop)
+    target_compile_options(task_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        # GCC diagnoses the standard coroutine allocation/deallocation pair as
+        # mismatched when allocation receives coroutine function arguments.
+        target_compile_options(task_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME task COMMAND task_test)
 
     add_test(
         NAME http_server

@@ -2,8 +2,10 @@
 
 #include "eventloop/executor.h"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
+#include <coroutine>
 #include <cstdint>
 #include <memory>
 
@@ -17,7 +19,89 @@ public:
     virtual auto on_shutdown() -> void {}
 };
 
+class event_loop;
+template<typename T>
+class task;
+
+namespace eventloop_detail {
+
+enum class completion_reservation_result {
+    accepted,
+    capacity_exhausted,
+    shutting_down,
+};
+
+enum class blocking_submission_result {
+    accepted,
+    no_worker_threads,
+    queue_full,
+};
+
+struct coroutine_cancellation_node;
+
+struct coroutine_cancellation_state {
+    coroutine_cancellation_node* head {nullptr};
+    bool requested {false};
+};
+
+struct coroutine_cancellation_node {
+    coroutine_cancellation_node* previous {nullptr};
+    coroutine_cancellation_node* next {nullptr};
+    coroutine_cancellation_state* state {nullptr};
+    void* operation {nullptr};
+    void (*cancel)(coroutine_cancellation_node&) noexcept {nullptr};
+};
+
+struct coroutine_root_node {
+    coroutine_root_node* previous {nullptr};
+    coroutine_root_node* next {nullptr};
+    std::coroutine_handle<> handle {};
+    event_loop* owner {nullptr};
+    coroutine_cancellation_state cancellation;
+};
+
+struct coroutine_timer_node {
+    coroutine_timer_node* previous {nullptr};
+    coroutine_timer_node* next {nullptr};
+    std::chrono::steady_clock::time_point deadline;
+    std::coroutine_handle<> handle {};
+    event_loop* owner {nullptr};
+    coroutine_cancellation_node cancellation;
+};
+
+struct coroutine_frame_access {
+    [[nodiscard]] static auto allocate(event_loop& loop,
+                                       std::size_t size) noexcept -> void*;
+    static auto deallocate(void* pointer, std::size_t size) noexcept -> void;
+    static auto complete_root(coroutine_root_node& root) noexcept -> void;
+    static auto register_timer(event_loop& loop, coroutine_timer_node& timer)
+        -> void;
+    static auto cancel_timer(coroutine_timer_node& timer) noexcept -> void;
+    static auto attach_cancellation(coroutine_cancellation_state& state,
+                                    coroutine_cancellation_node& node) noexcept
+        -> bool;
+    static auto detach_cancellation(coroutine_cancellation_node& node) noexcept
+        -> void;
+    [[nodiscard]] static auto reserve_completion(event_loop& loop) noexcept
+        -> completion_reservation_result;
+    static auto release_completion(event_loop& loop) noexcept -> void;
+    static auto post_completion(event_loop& loop,
+                                execution_task&& completion) noexcept -> void;
+    [[nodiscard]] static auto submit_blocking(event_loop& loop,
+                                              execution_task&& work) noexcept
+        -> blocking_submission_result;
+};
+
+} // namespace eventloop_detail
+
 enum class event_loop_result { stopped, interrupted };
+
+enum class task_spawn_result {
+    accepted,
+    frame_allocation_failure,
+    invalid_task,
+    shutting_down,
+};
 
 struct event_loop_options {
     // 0 selects a single-thread executor; any other value creates a worker
@@ -26,6 +110,27 @@ struct event_loop_options {
     // Capacity of the bounded completion queue used by post(); must be a power
     // of two and at least two.
     std::size_t post_capacity {1024};
+    // Reserved worker-to-loop completions for run_blocking(). Every accepted
+    // blocking operation owns one slot until its completion is dequeued.
+    std::size_t coroutine_completion_capacity {128};
+    // Coroutine frames are served from fixed, per-loop size classes. A zero
+    // capacity disables a class. Exhaustion never falls back to the heap.
+    // Frame-resident state must not require alignment beyond max_align_t.
+    std::array<std::size_t, 6> coroutine_frame_capacities {
+        64, 32, 16, 8, 4, 2,
+    };
+};
+
+inline constexpr std::array<std::size_t, 6> coroutine_frame_sizes {
+    128, 256, 512, 1024, 2048, 4096,
+};
+
+struct coroutine_pool_statistics {
+    std::size_t capacity {0};
+    std::size_t live {0};
+    std::size_t high_watermark {0};
+    std::size_t allocation_failures {0};
+    std::size_t active_roots {0};
 };
 
 class event_loop {
@@ -69,8 +174,13 @@ public:
     // Executor for independent background work. Work submitted here must not
     // access event-loop-owned objects; use post() to deliver results back.
     [[nodiscard]] auto task_executor() noexcept -> executor&;
+    [[nodiscard]] auto spawn(task<void>&& operation) -> task_spawn_result;
+    [[nodiscard]] auto coroutine_statistics() const noexcept
+        -> coroutine_pool_statistics;
 
 private:
+    friend struct eventloop_detail::coroutine_frame_access;
+
     class implementation;
     std::unique_ptr<implementation> implementation_;
 };
