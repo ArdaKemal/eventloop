@@ -31,6 +31,8 @@ default.
 - A task whose `T` is itself `std::expected` preserves that inner result.
   The outer result describes task infrastructure; the inner result describes
   the application's operation. Combinators preserve this distinction.
+- `task<T>::result()` and `task_handle<T>::take_result()` consume stored values
+  once. Calling either again is a programming error.
 - New syscall-like coroutine operations should return
   `std::expected<T, std::error_code>`, using `std::errc::operation_canceled`
   for cancellation and `std::errc::resource_unavailable_try_again` for a full

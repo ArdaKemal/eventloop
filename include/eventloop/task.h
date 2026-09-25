@@ -374,7 +374,11 @@ public:
             return std::unexpected(task_result::frame_allocation_failure);
         }
         if (!handle_.done()) throw std::logic_error("coroutine task has not completed");
-        return std::move(*handle_.promise().value_);
+        auto& value = handle_.promise().value_;
+        if (!value) throw std::logic_error("coroutine task result was already taken");
+        result_type result(std::move(*value));
+        value.reset();
+        return result;
     }
 
     class awaiter {

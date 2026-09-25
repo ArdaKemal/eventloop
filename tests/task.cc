@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <new>
+#include <stdexcept>
 #include <thread>
 
 namespace {
@@ -47,6 +48,23 @@ auto increment(event_loop&, int& value) -> task<void>
 }
 
 auto noop(event_loop&) -> task<void> { co_return; }
+
+auto value_task(event_loop&) -> task<int> { co_return 42; }
+
+auto value_result_test() -> bool
+{
+    event_loop loop;
+    auto operation = value_task(loop);
+    if (operation.start() != task_state::completed) return false;
+    const auto result = operation.result();
+    if (!result || *result != 42) return false;
+    try {
+        (void)operation.result();
+    } catch (const std::logic_error&) {
+        return true;
+    }
+    return false;
+}
 
 auto nested(event_loop& loop, int& value, task_result& child_result)
     -> task<void>
@@ -477,6 +495,10 @@ auto spawn_failure_test() -> bool
 
 auto main() -> int
 {
+    if (!value_result_test()) {
+        std::cerr << "task value result test failed\n";
+        return 1;
+    }
     if (!allocation_and_transfer_test()) {
         std::cerr << "task allocation/symmetric-transfer test failed\n";
         return 1;
