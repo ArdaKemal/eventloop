@@ -117,6 +117,49 @@ private:
     int descriptor_;
 };
 
+class reentrant_shutdown_handler final : public notifiable {
+public:
+    reentrant_shutdown_handler(event_loop& loop, bool& alive_in_read,
+                               bool& alive_in_shutdown, bool& destroyed)
+        : loop_(loop), alive_in_read_(alive_in_read),
+          alive_in_shutdown_(alive_in_shutdown), destroyed_(destroyed),
+          descriptor_(make_event())
+    {
+    }
+
+    ~reentrant_shutdown_handler() override
+    {
+        destroyed_ = true;
+        ::close(descriptor_);
+    }
+
+    [[nodiscard]] auto descriptor() const noexcept -> int override
+    {
+        return descriptor_;
+    }
+
+private:
+    auto on_read() -> void override
+    {
+        loop_.shutdown(event_loop::clock::duration::zero());
+        alive_in_read_ = !destroyed_;
+    }
+
+    auto on_write() -> void override {}
+    auto on_error() -> void override {}
+    auto on_shutdown() -> void override
+    {
+        loop_.shutdown(event_loop::clock::duration::zero());
+        alive_in_shutdown_ = !destroyed_;
+    }
+
+    event_loop& loop_;
+    bool& alive_in_read_;
+    bool& alive_in_shutdown_;
+    bool& destroyed_;
+    int descriptor_;
+};
+
 class fairness_handler final : public notifiable {
 public:
     fairness_handler(event_loop& loop, int& post_count, int& observed_count)
@@ -401,6 +444,19 @@ auto timer_tests() -> bool
 
 auto shutdown_tests() -> bool
 {
+    {
+        event_loop loop;
+        bool alive_in_read = false;
+        bool alive_in_shutdown = false;
+        bool destroyed = false;
+        loop.add(std::make_unique<reentrant_shutdown_handler>(
+            loop, alive_in_read, alive_in_shutdown, destroyed));
+        if (loop.run() != event_loop_result::stopped || !alive_in_read ||
+            !alive_in_shutdown || !destroyed) {
+            return false;
+        }
+    }
+
     {
         event_loop loop;
         int shutdowns = 0;

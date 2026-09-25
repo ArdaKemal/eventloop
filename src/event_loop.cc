@@ -590,6 +590,18 @@ public:
         pending_removals.clear();
     }
 
+    auto finish_dispatch() -> void
+    {
+        if (--dispatch_depth != 0) return;
+        if (force_shutdown_pending) {
+            force_shutdown_pending = false;
+            pending_removals.clear();
+            handlers.clear();
+        } else {
+            erase_pending();
+        }
+    }
+
     auto arm_next_timer() -> void
     {
         std::optional<event_loop::clock::time_point> deadline;
@@ -699,6 +711,10 @@ public:
 
     auto force_shutdown() noexcept -> void
     {
+        if (dispatch_depth != 0) {
+            force_shutdown_pending = true;
+            return;
+        }
         pending_removals.clear();
         handlers.clear();
     }
@@ -802,7 +818,8 @@ public:
     std::unordered_set<int> pending_removals;
     std::map<timer_key, execution_task> timers;
     event_loop::timer_id next_timer {1};
-    bool dispatching {false};
+    std::size_t dispatch_depth {0};
+    bool force_shutdown_pending {false};
     bool shutting_down {false};
     event_loop* owner {nullptr};
     eventloop_detail::coroutine_root_node* active_roots {nullptr};
@@ -830,10 +847,11 @@ auto event_loop::run() -> event_loop_result
             return event_loop_result::stopped;
         }
         const auto result = implementation_->poller.poll(events);
-        implementation_->dispatching = true;
+        ++implementation_->dispatch_depth;
 
         try {
             for (std::size_t index = 0; index < result.event_count; ++index) {
+                if (implementation_->force_shutdown_pending) break;
                 const auto event = events[index];
                 if (event.descriptor ==
                     implementation_->file_ring_descriptor()) {
@@ -854,18 +872,18 @@ auto event_loop::run() -> event_loop_result
                     handler->on_read();
                 }
                 if (event.writable &&
-                    !implementation_->pending_removals.contains(event.descriptor)) {
+                    !implementation_->force_shutdown_pending &&
+                    !implementation_->pending_removals.contains(
+                        event.descriptor)) {
                     handler->on_write();
                 }
             }
         } catch (...) {
-            implementation_->dispatching = false;
-            implementation_->erase_pending();
+            implementation_->finish_dispatch();
             throw;
         }
 
-        implementation_->dispatching = false;
-        implementation_->erase_pending();
+        implementation_->finish_dispatch();
         implementation_->drain_completed_roots();
 
         if (result.wake_requested) {
@@ -908,21 +926,19 @@ auto event_loop::shutdown(clock::duration timeout) -> void
     }
 
     implementation_->shutting_down = true;
-    implementation_->request_root_cancellation();
-    implementation_->dispatching = true;
+    ++implementation_->dispatch_depth;
     try {
+        implementation_->request_root_cancellation();
         for (auto& [descriptor, handler] : implementation_->handlers) {
             if (!implementation_->pending_removals.contains(descriptor)) {
                 handler->on_shutdown();
             }
         }
     } catch (...) {
-        implementation_->dispatching = false;
-        implementation_->erase_pending();
+        implementation_->finish_dispatch();
         throw;
     }
-    implementation_->dispatching = false;
-    implementation_->erase_pending();
+    implementation_->finish_dispatch();
 
     if (implementation_->handlers.empty()) {
         implementation_->poller.wake();
@@ -967,7 +983,7 @@ auto event_loop::remove(int descriptor) -> void
         return;
     }
     implementation_->poller.remove_descriptor(descriptor);
-    if (implementation_->dispatching) {
+    if (implementation_->dispatch_depth != 0) {
         implementation_->pending_removals.insert(descriptor);
     } else {
         implementation_->handlers.erase(descriptor);

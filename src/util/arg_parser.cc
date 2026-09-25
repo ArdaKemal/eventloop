@@ -2,13 +2,18 @@
 
 #include <charconv>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 
 using namespace std::string_view_literals;
 
 auto arg_parser::exit_with_usage() -> void
 {
-    std::puts(usage_.data());
+    if (!usage_.empty()) {
+        (void)std::fwrite(usage_.data(), 1, usage_.size(), stdout);
+    }
+    (void)std::fputc('\n', stdout);
     exit(0);
 }
 
@@ -69,10 +74,10 @@ auto arg_parser::parse(int argc, char *argv[]) -> void
             int n = 0;
             std::string_view arg = args[i];
 
-            auto [_, ec] =
+            auto [end, ec] =
                 std::from_chars(arg.data(), arg.data() + arg.size(), n);
 
-            if (ec != std::errc()) {
+            if (ec != std::errc() || end != arg.data() + arg.size()) {
                 exit_with_usage();
             }
 
