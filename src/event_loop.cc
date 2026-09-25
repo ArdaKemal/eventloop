@@ -847,7 +847,7 @@ auto event_loop::run() -> event_loop_result
             return event_loop_result::stopped;
         }
         const auto result = implementation_->poller.poll(events);
-        ++implementation_->dispatch_depth;
+        if (result.event_count != 0) ++implementation_->dispatch_depth;
 
         try {
             for (std::size_t index = 0; index < result.event_count; ++index) {
@@ -879,11 +879,11 @@ auto event_loop::run() -> event_loop_result
                 }
             }
         } catch (...) {
-            implementation_->finish_dispatch();
+            if (result.event_count != 0) implementation_->finish_dispatch();
             throw;
         }
 
-        implementation_->finish_dispatch();
+        if (result.event_count != 0) implementation_->finish_dispatch();
         implementation_->drain_completed_roots();
 
         if (result.wake_requested) {
