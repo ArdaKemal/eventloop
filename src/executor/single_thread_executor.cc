@@ -8,6 +8,7 @@ class single_thread_executor final : public executor {
 public:
     auto execute(execution_task&& task) noexcept -> bool override
     {
+        if (!task) return false;
         task();
         return true;
     }

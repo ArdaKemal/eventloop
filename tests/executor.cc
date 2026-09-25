@@ -169,6 +169,9 @@ auto single_thread_tests() -> bool
 {
     bool ok = true;
     auto executor = make_single_thread_executor();
+    execution_task empty;
+    ok &= check(!executor->execute(std::move(empty)),
+                "single-thread rejects empty task");
     const auto submitter = std::this_thread::get_id();
 
     bool ran = false;
@@ -201,6 +204,13 @@ auto single_thread_tests() -> bool
 auto queue_tests() -> bool
 {
     bool ok = true;
+    execution_task empty;
+    {
+        bounded_task_queue queue(2);
+        ok &= check(!queue.try_push(std::move(empty)), "queue rejects empty task");
+        execution_task output;
+        ok &= check(!queue.try_pop(output), "empty task was not queued");
+    }
 
     for (const std::size_t capacity : {0, 1, 3}) {
         try {
@@ -344,6 +354,13 @@ auto queue_tests() -> bool
 auto multi_thread_tests() -> bool
 {
     bool ok = true;
+
+    {
+        auto executor = make_multi_thread_executor({.worker_count = 1});
+        execution_task empty;
+        ok &= check(!executor->execute(std::move(empty)),
+                    "multi-thread rejects empty task");
+    }
 
     {
         const auto submitter = std::this_thread::get_id();

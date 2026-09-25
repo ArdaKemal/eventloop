@@ -173,10 +173,10 @@ public:
     auto set_write_interest(int descriptor, bool enabled) -> void;
 
     // Thread-safe. Enqueues a task to run on the event-loop thread and wakes
-    // the poller. Returns false if the bounded queue is full. A named task is
-    // left intact on failure. The caller must stop posting before destroying
-    // the loop; a posted task must not access loop-owned objects other than
-    // through this loop's own thread.
+    // the poller. Returns false if the task is empty or the bounded queue is
+    // full. A named task is left intact on failure. The caller must stop
+    // posting before destroying the loop; a posted task must access
+    // loop-owned objects only on this loop's thread.
     [[nodiscard]] auto post(execution_task&& task) noexcept -> bool;
 
     // Timers run on the event-loop thread. Scheduling and cancellation must

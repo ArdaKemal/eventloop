@@ -32,6 +32,7 @@ public:
     // intact. Never blocks and never allocates. May retry on a lost race.
     auto try_push(execution_task&& task) noexcept -> bool
     {
+        if (!task) return false;
         std::size_t position = enqueue_position_.load(std::memory_order_relaxed);
         for (;;) {
             slot& current = slots_[position & mask_];

@@ -609,6 +609,8 @@ auto post_tests() -> bool
     {
         event_loop loop(event_loop_options {.post_capacity = 2});
         int count = 0;
+        execution_task empty;
+        if (loop.post(std::move(empty))) return false;
         const bool first = loop.post(execution_task([&]() noexcept { ++count; }));
         const bool second = loop.post(execution_task([&]() noexcept {
             ++count;

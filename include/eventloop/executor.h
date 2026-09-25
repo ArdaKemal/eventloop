@@ -116,10 +116,10 @@ private:
 // Executors own a fixed execution strategy. Submitting work never allocates.
 // execute() returns true once ownership of the task has been accepted:
 // the single-thread executor has already run it; the multi-thread executor
-// has queued it for a worker. A false result means the multi-thread queue is
-// full or the executor is shutting down, and a named task remains valid for a
-// fallback path. Calling execute() concurrently is supported; destroying an
-// executor while execute() is running is not.
+// has queued it for a worker. A false result means the task is empty, the
+// multi-thread queue is full, or the executor is shutting down; a named task
+// remains valid for a fallback path. Calling execute() concurrently is
+// supported; destroying an executor while execute() is running is not.
 class executor {
 public:
     virtual ~executor() = default;
