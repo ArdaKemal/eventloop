@@ -28,6 +28,7 @@ public:
     auto operator=(const web_socket&) -> web_socket& = delete;
 
     auto receive(std::span<const std::byte> data) -> void;
+    // Sends throw std::length_error if the pending output limit is reached.
     auto write(std::u8string_view message) -> void;
     auto write_binary(std::span<const std::byte> message) -> void;
     auto ping(std::span<const std::byte> payload = {}) -> void;
@@ -69,6 +70,7 @@ private:
 
     byte_stream& stream_;
     std::size_t maximum_message_size_;
+    std::size_t maximum_pending_output_;
     std::vector<std::byte> input_;
     std::vector<std::byte> fragmented_message_;
     std::optional<opcode> fragmented_type_;

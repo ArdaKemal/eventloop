@@ -89,18 +89,31 @@ auto clear_buffer(std::vector<std::byte>& buffer) -> void
 } // namespace
 
 web_socket::web_socket(byte_stream& stream, std::size_t maximum_message_size)
-    : stream_(stream), maximum_message_size_(maximum_message_size)
+    : stream_(stream), maximum_message_size_(maximum_message_size),
+      maximum_pending_output_(maximum_message_size)
 {
-    if (maximum_message_size_ == 0) {
-        throw std::invalid_argument("WebSocket maximum message size cannot be zero");
+    constexpr std::size_t frame_and_control_overhead = 137;
+    if (maximum_message_size_ == 0 ||
+        maximum_message_size_ >
+            std::numeric_limits<std::size_t>::max() - frame_and_control_overhead) {
+        throw std::invalid_argument("WebSocket maximum message size is invalid");
     }
+    maximum_pending_output_ += frame_and_control_overhead;
 }
 
 auto web_socket::receive(std::span<const std::byte> data) -> void
 {
     if (failed_ || close_received_ || data.empty()) return;
-    input_.insert(input_.end(), data.begin(), data.end());
-    if (!processing_) process_frames();
+    if (processing_) {
+        throw std::logic_error("reentrant WebSocket receive");
+    }
+    constexpr std::size_t input_chunk_size = 4096;
+    while (!data.empty() && !failed_ && !close_received_) {
+        const auto chunk = data.first(std::min(data.size(), input_chunk_size));
+        input_.insert(input_.end(), chunk.begin(), chunk.end());
+        process_frames();
+        data = data.subspan(chunk.size());
+    }
 }
 
 auto web_socket::write(std::u8string_view message) -> void
@@ -379,6 +392,10 @@ auto web_socket::send_frame(opcode type, std::span<const std::byte> payload) -> 
     const auto size = static_cast<std::uint64_t>(payload.size());
     const std::size_t header_size = size <= 125 ? 2 : size <= 0xffff ? 4 : 10;
     const auto frame_offset = output_.size();
+    if (payload.size() > maximum_pending_output_ - header_size ||
+        frame_offset > maximum_pending_output_ - header_size - payload.size()) {
+        throw std::length_error("WebSocket output buffer capacity exceeded");
+    }
     output_.resize(frame_offset + header_size + payload.size());
     auto* frame = output_.data() + frame_offset;
     frame[0] = static_cast<std::byte>(0x80u | static_cast<std::uint8_t>(type));

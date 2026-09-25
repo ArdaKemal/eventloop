@@ -247,6 +247,41 @@ auto backpressure_test() -> bool
            byte_at(stream.output, 0) == 0x82 && byte_at(stream.output, 1) == 126;
 }
 
+auto bounded_output_test() -> bool
+{
+    memory_stream stream;
+    stream.block_writes = true;
+    socket writer(stream, 32);
+    constexpr std::array<std::byte, 16> payload {};
+    int accepted = 0;
+    try {
+        for (; accepted < 100; ++accepted) writer.write_binary(payload);
+        return false;
+    } catch (const std::length_error&) {
+    }
+    if (accepted < 2 || !stream.open) return false;
+    for (int index = 0; index < 3; ++index) {
+        stream.drain();
+        writer.write_drained();
+    }
+    writer.write_binary(payload);
+    return stream.open;
+}
+
+auto large_input_batch_test() -> bool
+{
+    memory_stream stream;
+    counting_socket reader(stream);
+    const auto frame = masked_frame(0x01, true, bytes("x"));
+    std::vector<std::byte> batch;
+    batch.reserve(frame.size() * 10000);
+    for (int index = 0; index < 10000; ++index) {
+        batch.insert(batch.end(), frame.begin(), frame.end());
+    }
+    reader.receive(batch);
+    return reader.messages == 10000 && stream.open;
+}
+
 auto allocation_reuse_test() -> bool
 {
     memory_stream output_stream;
@@ -358,6 +393,14 @@ auto main() -> int
     }
     if (!backpressure_test()) {
         std::cerr << "WebSocket backpressure test failed\n";
+        return 1;
+    }
+    if (!bounded_output_test()) {
+        std::cerr << "WebSocket bounded output test failed\n";
+        return 1;
+    }
+    if (!large_input_batch_test()) {
+        std::cerr << "WebSocket large input batch test failed\n";
         return 1;
     }
     if (!allocation_reuse_test()) {

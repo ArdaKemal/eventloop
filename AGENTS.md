@@ -26,6 +26,10 @@ switching PCs; a fresh clone will not contain uncommitted work.
 - A WebSocket message callback or underlying write exception now retires the
   parser/output state and closes its stream. Normal-path allocation reuse is
   still covered by `tests/web_socket.cc`.
+- WebSocket outbound framing is capped at the configured maximum message size
+  plus frame/control overhead. A saturated send throws `std::length_error`.
+  Large inbound batches are parsed in 4 KiB chunks; reentrant `receive` is
+  rejected to keep callback payload views valid.
 
 ## Current file-I/O slice
 
@@ -89,9 +93,10 @@ switching PCs; a fresh clone will not contain uncommitted work.
    return. This is not a proof of memory safety across every transport and
    coroutine path; keep auditing ownership boundaries and use sanitizer runs
    for new exception or cancellation paths.
-7. WebSocket outbound queuing does not yet have an explicit total byte limit.
-   Define a bounded backpressure contract before using it for untrusted
-   broadcast fan-out; measure the normal path after that change.
+7. WebSocket output is bounded within its framing layer, but application
+   broadcast fan-out still needs a policy for slow clients. Confirm the
+   configured message and queue limits against the target workload before
+   deployment.
 
 ## Environment and verification
 
