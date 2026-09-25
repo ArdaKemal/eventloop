@@ -24,7 +24,12 @@ constexpr std::size_t max_pending_output = 64 * 1024;
 } // namespace
 
 tcp_stream::tcp_stream(event_loop& loop, int descriptor)
-    : loop_(loop), descriptor_(descriptor)
+    : tcp_stream(loop, unique_fd(descriptor))
+{
+}
+
+tcp_stream::tcp_stream(event_loop& loop, unique_fd descriptor)
+    : loop_(loop), descriptor_(descriptor.release())
 {
 }
 

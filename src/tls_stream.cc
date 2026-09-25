@@ -297,7 +297,15 @@ public:
 tls_stream::tls_stream(event_loop& loop, int descriptor,
                        std::shared_ptr<tls_context> context,
                        tls_client_options options)
-    : tcp_stream(loop, descriptor),
+    : tls_stream(loop, unique_fd(descriptor), std::move(context),
+                 std::move(options))
+{
+}
+
+tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
+                       std::shared_ptr<tls_context> context,
+                       tls_client_options options)
+    : tcp_stream(loop, std::move(descriptor)),
       implementation_(std::make_unique<implementation>(
           *this, std::move(context), std::move(options)))
 {
@@ -306,7 +314,15 @@ tls_stream::tls_stream(event_loop& loop, int descriptor,
 tls_stream::tls_stream(event_loop& loop, int descriptor,
                        std::shared_ptr<tls_context> context,
                        tls_server_options options)
-    : tcp_stream(loop, descriptor),
+    : tls_stream(loop, unique_fd(descriptor), std::move(context),
+                 std::move(options))
+{
+}
+
+tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
+                       std::shared_ptr<tls_context> context,
+                       tls_server_options options)
+    : tcp_stream(loop, std::move(descriptor)),
       implementation_(std::make_unique<implementation>(
           *this, std::move(context), std::move(options)))
 {

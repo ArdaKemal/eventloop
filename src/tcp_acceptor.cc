@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -98,16 +99,15 @@ auto tcp_acceptor::owner() noexcept -> event_loop&
 auto tcp_acceptor::on_read() -> void
 {
     for (std::size_t attempt = 0; attempt < max_accepts_per_event; ++attempt) {
-        const int client = accept4(
-            descriptor_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (client >= 0) {
+        unique_fd client(accept4(
+            descriptor_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
+        if (client) {
             const int enabled = 1;
-            if (setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &enabled,
+            if (setsockopt(client.get(), IPPROTO_TCP, TCP_NODELAY, &enabled,
                            sizeof(enabled)) == -1) {
-                ::close(client);
                 continue;
             }
-            on_accept(client);
+            on_accept_owned(std::move(client));
             continue;
         }
         if (errno == EINTR) {
@@ -125,6 +125,11 @@ auto tcp_acceptor::on_read() -> void
         }
         throw system_error("accept4");
     }
+}
+
+auto tcp_acceptor::on_accept_owned(unique_fd descriptor) -> void
+{
+    on_accept(descriptor.release());
 }
 
 auto tcp_acceptor::on_error() -> void

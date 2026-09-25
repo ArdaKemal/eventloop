@@ -53,9 +53,10 @@ private:
 
 class redirect_connection final : public tcp_stream {
 public:
-    redirect_connection(event_loop& loop, int descriptor,
+    redirect_connection(event_loop& loop, unique_fd descriptor,
                         std::string_view hostname, std::uint16_t https_port)
-        : tcp_stream(loop, descriptor), hostname_(hostname), https_port_(https_port)
+        : tcp_stream(loop, std::move(descriptor)), hostname_(hostname),
+          https_port_(https_port)
     {
     }
 
@@ -170,10 +171,15 @@ server::~server()
     }
 }
 
-auto server::on_accept(int descriptor) -> void
+auto server::on_accept_owned(unique_fd descriptor) -> void
 {
     owner().add(std::make_unique<serving_connection<tcp_stream>>(
-        root_descriptor_, options_, owner(), descriptor));
+        root_descriptor_, options_, owner(), std::move(descriptor)));
+}
+
+auto server::on_accept(int descriptor) -> void
+{
+    on_accept_owned(unique_fd(descriptor));
 }
 
 https_server::https_server(event_loop& loop, std::uint16_t port,
@@ -192,11 +198,17 @@ https_server::~https_server()
     }
 }
 
-auto https_server::make_stream(int descriptor) -> std::unique_ptr<tls_stream>
+auto https_server::make_owned_stream(unique_fd descriptor)
+    -> std::unique_ptr<tls_stream>
 {
     return std::make_unique<serving_connection<tls_stream>>(
-        root_descriptor_, options_, owner(), descriptor, context(),
+        root_descriptor_, options_, owner(), std::move(descriptor), context(),
         tls_server_options {.application_protocols = {"http/1.1"}});
+}
+
+auto https_server::make_stream(int descriptor) -> std::unique_ptr<tls_stream>
+{
+    return make_owned_stream(unique_fd(descriptor));
 }
 
 redirect_server::redirect_server(event_loop& loop, std::uint16_t port,
@@ -209,10 +221,15 @@ redirect_server::redirect_server(event_loop& loop, std::uint16_t port,
     validate_hostname(hostname_);
 }
 
-auto redirect_server::on_accept(int descriptor) -> void
+auto redirect_server::on_accept_owned(unique_fd descriptor) -> void
 {
     owner().add(std::make_unique<redirect_connection>(
-        owner(), descriptor, hostname_, https_port_));
+        owner(), std::move(descriptor), hostname_, https_port_));
+}
+
+auto redirect_server::on_accept(int descriptor) -> void
+{
+    on_accept_owned(unique_fd(descriptor));
 }
 
 } // namespace http

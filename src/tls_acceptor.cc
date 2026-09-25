@@ -18,7 +18,19 @@ auto tls_acceptor::context() const noexcept -> const std::shared_ptr<tls_context
     return context_;
 }
 
+auto tls_acceptor::make_owned_stream(unique_fd descriptor)
+    -> std::unique_ptr<tls_stream>
+{
+    // Compatibility path for subclasses using the original int interface.
+    return make_stream(descriptor.release());
+}
+
+auto tls_acceptor::on_accept_owned(unique_fd descriptor) -> void
+{
+    owner().add(make_owned_stream(std::move(descriptor)));
+}
+
 auto tls_acceptor::on_accept(int descriptor) -> void
 {
-    owner().add(make_stream(descriptor));
+    on_accept_owned(unique_fd(descriptor));
 }

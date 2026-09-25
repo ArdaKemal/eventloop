@@ -8,6 +8,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace {
 class echo_session final : public tcp_stream {
@@ -28,7 +29,13 @@ public:
 private:
     auto on_accept(int descriptor) -> void override
     {
-        owner().add(std::make_unique<echo_session>(owner(), descriptor));
+        on_accept_owned(unique_fd(descriptor));
+    }
+
+    auto on_accept_owned(unique_fd descriptor) -> void override
+    {
+        owner().add(std::make_unique<echo_session>(owner(),
+                                                 std::move(descriptor)));
     }
 };
 

@@ -31,7 +31,13 @@ class tls_stream : public tcp_stream {
 public:
     tls_stream(event_loop& loop, int descriptor, std::shared_ptr<tls_context> context,
                tls_client_options options);
+    tls_stream(event_loop& loop, unique_fd descriptor,
+               std::shared_ptr<tls_context> context,
+               tls_client_options options);
     tls_stream(event_loop& loop, int descriptor, std::shared_ptr<tls_context> context,
+               tls_server_options options = {});
+    tls_stream(event_loop& loop, unique_fd descriptor,
+               std::shared_ptr<tls_context> context,
                tls_server_options options = {});
     ~tls_stream() override;
 

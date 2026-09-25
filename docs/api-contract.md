@@ -12,6 +12,11 @@ default.
   stay on that loop thread.
 - A task is move-only. Start it once, by awaiting it or spawning it. Destroying
   an unfinished started task is a programming error, not cancellation.
+- New acceptor subclasses should override `on_accept_owned(unique_fd)` (or
+  `make_owned_stream(unique_fd)` for TLS). The descriptor stays owned through
+  allocation and construction and moves into a stream on success. The old
+  `int` callbacks remain for source compatibility and require subclasses to
+  manage the descriptor on every failure path.
 - `event_loop::spawn(task<void>)` transfers a fire-and-forget root to the loop.
   `event_loop::spawn(task<T>, task_handle<T>&)` transfers an observed root. The
   handle is a stable, single-use scope and must remain alive until `done()`.

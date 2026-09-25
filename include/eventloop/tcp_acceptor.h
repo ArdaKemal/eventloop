@@ -1,6 +1,7 @@
 #pragma once
 
 #include "eventloop/event_loop.h"
+#include "eventloop/unique_fd.h"
 
 #include <cstdint>
 #include <string_view>
@@ -19,6 +20,9 @@ public:
 
 protected:
     [[nodiscard]] auto owner() noexcept -> event_loop&;
+    // The owning callback keeps the accepted descriptor safe if construction
+    // of a session throws. The int callback is retained for existing users.
+    virtual auto on_accept_owned(unique_fd descriptor) -> void;
     virtual auto on_accept(int descriptor) -> void = 0;
 
 private:

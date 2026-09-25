@@ -9,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace {
 class echo_session final : public tls_stream {
@@ -29,8 +30,14 @@ public:
 private:
     auto make_stream(int descriptor) -> std::unique_ptr<tls_stream> override
     {
+        return make_owned_stream(unique_fd(descriptor));
+    }
+
+    auto make_owned_stream(unique_fd descriptor)
+        -> std::unique_ptr<tls_stream> override
+    {
         return std::make_unique<echo_session>(
-            owner(), descriptor, context(),
+            owner(), std::move(descriptor), context(),
             tls_server_options {.application_protocols = {"echo"}});
     }
 };

@@ -1,4 +1,5 @@
 #include "eventloop/event_loop.h"
+#include "eventloop/tcp_acceptor.h"
 #include "eventloop/tcp_stream.h"
 
 #include <array>
@@ -8,13 +9,17 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <utility>
 
 #include <sys/eventfd.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -257,6 +262,120 @@ public:
 private:
     auto on_data(std::span<const std::byte>) -> void override {}
 };
+
+class throwing_owned_stream final : public tcp_stream {
+public:
+    throwing_owned_stream(event_loop& loop, unique_fd descriptor)
+        : tcp_stream(loop, std::move(descriptor))
+    {
+        throw std::runtime_error("expected stream construction failure");
+    }
+
+private:
+    auto on_data(std::span<const std::byte>) -> void override {}
+};
+
+auto descriptor_ownership_test() -> bool
+{
+    event_loop loop;
+    const int descriptor = make_event(0);
+    try {
+        auto stream = std::make_unique<throwing_owned_stream>(
+            loop, unique_fd(descriptor));
+        return false;
+    } catch (const std::runtime_error&) {
+    }
+    return ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
+}
+
+class failing_acceptor final : public tcp_acceptor {
+public:
+    failing_acceptor(event_loop& loop, int& accepted_descriptor)
+        : tcp_acceptor(loop, 0), accepted_descriptor_(accepted_descriptor) {}
+
+private:
+    auto on_accept(int descriptor) -> void override
+    {
+        on_accept_owned(unique_fd(descriptor));
+    }
+
+    auto on_accept_owned(unique_fd descriptor) -> void override
+    {
+        accepted_descriptor_ = descriptor.get();
+        throw std::bad_alloc {};
+    }
+
+    int& accepted_descriptor_;
+};
+
+class legacy_acceptor final : public tcp_acceptor {
+public:
+    legacy_acceptor(event_loop& loop, bool& accepted)
+        : tcp_acceptor(loop, 0), accepted_(accepted) {}
+
+private:
+    auto on_accept(int descriptor) -> void override
+    {
+        unique_fd client(descriptor);
+        accepted_ = true;
+        owner().stop();
+    }
+
+    bool& accepted_;
+};
+
+[[nodiscard]] auto connect_to(int listening_descriptor) -> unique_fd
+{
+    sockaddr_in address {};
+    socklen_t address_size = sizeof(address);
+    if (::getsockname(listening_descriptor,
+                      reinterpret_cast<sockaddr*>(&address),
+                      &address_size) != 0) return {};
+    unique_fd client(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (!client || ::connect(client.get(),
+                             reinterpret_cast<sockaddr*>(&address),
+                             address_size) != 0) return {};
+    return client;
+}
+
+auto accepted_descriptor_failure_test() -> bool
+{
+    event_loop loop;
+    int accepted_descriptor = -1;
+    auto acceptor = std::make_unique<failing_acceptor>(loop, accepted_descriptor);
+    auto client = connect_to(acceptor->descriptor());
+    if (!client) return false;
+    loop.add(std::move(acceptor));
+    try {
+        (void)loop.run();
+        return false;
+    } catch (const std::bad_alloc&) {
+    }
+    return accepted_descriptor != -1 &&
+           ::fcntl(accepted_descriptor, F_GETFD) == -1 && errno == EBADF;
+}
+
+auto legacy_acceptor_test() -> bool
+{
+    event_loop loop;
+    bool accepted = false;
+    auto acceptor = std::make_unique<legacy_acceptor>(loop, accepted);
+    auto client = connect_to(acceptor->descriptor());
+    if (!client) return false;
+    loop.add(std::move(acceptor));
+    return loop.run() == event_loop_result::stopped && accepted;
+}
+
+auto empty_handler_test() -> bool
+{
+    event_loop loop;
+    try {
+        loop.add({});
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
 
 class receiving_handler final : public notifiable {
 public:
@@ -563,6 +682,10 @@ auto main() -> int
     loop.run();
 
     if (!backpressure_test()) return 1;
+    if (!descriptor_ownership_test()) return 1;
+    if (!accepted_descriptor_failure_test()) return 1;
+    if (!legacy_acceptor_test()) return 1;
+    if (!empty_handler_test()) return 1;
     if (!post_tests()) return 1;
     if (!executor_integration_test()) return 1;
     if (!timer_tests()) return 1;

@@ -961,6 +961,9 @@ auto event_loop::shutdown(clock::duration timeout) -> void
 
 auto event_loop::add(std::unique_ptr<notifiable> handler) -> void
 {
+    if (!handler) {
+        throw std::invalid_argument("cannot add an empty handler");
+    }
     if (implementation_->shutting_down) {
         throw std::logic_error("cannot add a handler during shutdown");
     }

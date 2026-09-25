@@ -2,6 +2,7 @@
 
 #include "eventloop/byte_stream.h"
 #include "eventloop/event_loop.h"
+#include "eventloop/unique_fd.h"
 
 #include <array>
 #include <cstddef>
@@ -12,6 +13,7 @@
 class tcp_stream : public byte_stream, public notifiable {
 public:
     tcp_stream(event_loop& loop, int descriptor);
+    tcp_stream(event_loop& loop, unique_fd descriptor);
     ~tcp_stream() override;
 
     tcp_stream(const tcp_stream&) = delete;

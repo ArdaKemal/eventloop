@@ -19,6 +19,10 @@ switching PCs; a fresh clone will not contain uncommitted work.
   event-loop thread. Worker threads must post completions back to that loop.
 - Do not treat destruction of an unfinished task as cancellation. Outstanding
   kernel or worker references must retire before a frame is destroyed.
+- Accepted socket descriptors use `unique_fd` through the built-in TCP/TLS
+  accept and stream construction paths. New subclasses should override the
+  owning callback; the original `int` callbacks remain as compatibility paths
+  and still require explicit descriptor ownership on every failure path.
 
 ## Current file-I/O slice
 
@@ -70,6 +74,10 @@ switching PCs; a fresh clone will not contain uncommitted work.
 5. The fallback handles Linux builds without liburing or systems where ring
    setup is denied. The overall library still compiles a Linux epoll backend
    unconditionally; other operating systems are **not** supported yet.
+6. A recent lifetime audit fixed reentrant and throwing shutdown callbacks,
+   but it is not a proof of memory safety across every transport and coroutine
+   path. Keep auditing ownership boundaries and use sanitizer runs for any
+   new exception or cancellation path.
 
 ## Environment and verification
 
@@ -105,6 +113,12 @@ cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-asan --target file_io_test -j2
 ./build-asan/file_io_test
 ```
+
+The event-loop test also passed under ASan/UBSan after the accepted-descriptor
+failure-path test was added. A local HTTP `Connection: close` benchmark at
+16 connections and one client thread measured about 13.7k requests/s before
+and after the ownership change; this is evidence of no detectable regression
+on this host, not a broader performance claim.
 
 Use build directories ignored by Git or outside the repository on the new
 machine. Recheck warnings, `git diff --check`, and test results after changes.

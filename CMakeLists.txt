@@ -29,6 +29,7 @@ add_library(eventloop
     include/eventloop/tls_acceptor.h
     include/eventloop/tls_context.h
     include/eventloop/tls_stream.h
+    include/eventloop/unique_fd.h
     include/eventloop/util/arg_parser.h
     include/eventloop/ws/web_socket.h
     src/linux/epoll_loop.cc
