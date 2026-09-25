@@ -769,10 +769,41 @@ auto signal_test() -> bool
     return result == event_loop_result::interrupted;
 }
 
+auto nested_signal_mask_test() -> bool
+{
+    sigset_t signals {};
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGTERM);
+    sigset_t original {};
+    if (sigprocmask(SIG_UNBLOCK, &signals, &original) == -1) return false;
+
+    bool valid = false;
+    try {
+        auto first = std::make_unique<event_loop>();
+        auto second = std::make_unique<event_loop>();
+        first.reset();
+        sigset_t current {};
+        valid = sigprocmask(SIG_SETMASK, nullptr, &current) == 0 &&
+                sigismember(&current, SIGINT) == 1 &&
+                sigismember(&current, SIGTERM) == 1;
+        second.reset();
+        valid = valid && sigprocmask(SIG_SETMASK, nullptr, &current) == 0 &&
+                sigismember(&current, SIGINT) == 0 &&
+                sigismember(&current, SIGTERM) == 0;
+    } catch (...) {
+        sigprocmask(SIG_SETMASK, &original, nullptr);
+        return false;
+    }
+    sigprocmask(SIG_SETMASK, &original, nullptr);
+    return valid;
+}
+
 } // namespace
 
 auto main() -> int
 {
+    if (!nested_signal_mask_test()) return 1;
     event_loop loop;
     auto throwing = std::make_unique<throwing_handler>(loop);
     const int released_descriptor = throwing->descriptor();

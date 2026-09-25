@@ -7,6 +7,7 @@
 #include <csignal>
 #include <optional>
 #include <span>
+#include <thread>
 
 struct ready_event {
     int descriptor;
@@ -56,7 +57,7 @@ private:
 
     private:
         sigset_t signals_ {};
-        sigset_t original_ {};
+        std::thread::id owner_thread_;
     };
 
     auto update_descriptor(int descriptor, bool write_enabled, int operation) -> void;

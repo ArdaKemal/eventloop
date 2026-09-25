@@ -154,6 +154,8 @@ public:
     using clock = std::chrono::steady_clock;
     using timer_id = std::uint64_t;
 
+    // Construct, run, and destroy on the same thread. post() and stop() may
+    // be called from other threads while the loop remains alive.
     event_loop();
     explicit event_loop(event_loop_options options);
     ~event_loop();

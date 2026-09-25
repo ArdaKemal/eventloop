@@ -20,21 +20,39 @@ namespace {
 {
     return {errno, std::system_category(), operation};
 }
+
+struct signal_mask_state {
+    std::size_t users {0};
+    sigset_t original {};
+};
+
+thread_local signal_mask_state thread_signal_mask;
 } // namespace
 
 epoll_loop::signal_mask_guard::signal_mask_guard()
+    : owner_thread_(std::this_thread::get_id())
 {
     sigemptyset(&signals_);
     sigaddset(&signals_, SIGINT);
     sigaddset(&signals_, SIGTERM);
-    if (sigprocmask(SIG_BLOCK, &signals_, &original_) == -1) {
-        throw system_error("sigprocmask");
+    if (thread_signal_mask.users == 0) {
+        if (sigprocmask(SIG_BLOCK, &signals_,
+                        &thread_signal_mask.original) == -1) {
+            throw system_error("sigprocmask");
+        }
     }
+    ++thread_signal_mask.users;
 }
 
 epoll_loop::signal_mask_guard::~signal_mask_guard()
 {
-    sigprocmask(SIG_SETMASK, &original_, nullptr);
+    if (owner_thread_ != std::this_thread::get_id() ||
+        thread_signal_mask.users == 0) {
+        std::terminate();
+    }
+    if (--thread_signal_mask.users == 0) {
+        sigprocmask(SIG_SETMASK, &thread_signal_mask.original, nullptr);
+    }
 }
 
 epoll_loop::epoll_loop()

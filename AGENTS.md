@@ -25,7 +25,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
   and still require explicit descriptor ownership on every failure path.
 - The epoll backend and TCP listener now keep their own descriptors in
   `unique_fd`. The epoll signal mask has a scope guard that restores it after
-  all backend descriptors close, including constructor failures.
+  all backend descriptors close, including constructor failures. Nested loops
+  on one thread share a mask count; the mask is restored after the last loop
+  closes. Construct, run, and destroy a loop on the same thread.
 - Built-in HTTP connections share ownership of the document-root descriptor
   with their listener, so removing the listener cannot invalidate an accepted
   session. Redirect connections likewise retain their hostname after listener
