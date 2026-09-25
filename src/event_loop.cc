@@ -1000,10 +1000,16 @@ auto event_loop::remove(int descriptor) -> void
         implementation_->pending_removals.contains(descriptor)) {
         return;
     }
-    implementation_->poller.remove_descriptor(descriptor);
     if (implementation_->dispatch_depth != 0) {
         implementation_->pending_removals.insert(descriptor);
+        try {
+            implementation_->poller.remove_descriptor(descriptor);
+        } catch (...) {
+            implementation_->pending_removals.erase(descriptor);
+            throw;
+        }
     } else {
+        implementation_->poller.remove_descriptor(descriptor);
         implementation_->handlers.erase(descriptor);
     }
 }
