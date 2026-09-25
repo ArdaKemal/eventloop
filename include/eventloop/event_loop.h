@@ -149,6 +149,19 @@ struct coroutine_pool_statistics {
     std::size_t active_roots {0};
 };
 
+namespace eventloop_detail {
+[[nodiscard]] inline auto deadline_after(
+    std::chrono::steady_clock::duration delay) noexcept
+    -> std::chrono::steady_clock::time_point
+{
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    if (delay <= clock::duration::zero()) return now;
+    const auto latest = clock::time_point::max();
+    return now >= latest - delay ? latest : now + delay;
+}
+} // namespace eventloop_detail
+
 class event_loop {
 public:
     using clock = std::chrono::steady_clock;

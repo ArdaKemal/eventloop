@@ -683,6 +683,10 @@ auto timer_tests() -> bool
         std::chrono::milliseconds {1},
         execution_task([&]() noexcept { cancelled_ran = true; }));
     if (!loop.cancel(cancelled) || loop.cancel(cancelled)) return false;
+    const auto distant = loop.schedule_after(
+        event_loop::clock::duration::max(),
+        execution_task([&]() noexcept { cancelled_ran = true; }));
+    if (!loop.cancel(distant)) return false;
 
     const auto deadline = event_loop::clock::now() +
                           std::chrono::milliseconds {5};

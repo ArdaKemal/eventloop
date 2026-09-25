@@ -17,6 +17,8 @@ switching PCs; a fresh clone will not contain uncommitted work.
   return resource-exhaustion errors instead of silently falling back to heap.
 - I/O, cancellation, and coroutine resumption are serialized on the owning
   event-loop thread. Worker threads must post completions back to that loop.
+- Relative timer deadlines saturate at the latest representable time point;
+  cancellation tests cover `duration::max()` without waiting for that delay.
 - Do not treat destruction of an unfinished task as cancellation. Outstanding
   kernel or worker references must retire before a frame is destroyed.
 - Accepted socket descriptors use `unique_fd` through the built-in TCP/TLS

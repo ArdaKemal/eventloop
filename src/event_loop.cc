@@ -1039,7 +1039,7 @@ auto event_loop::schedule_at(clock::time_point deadline, execution_task&& task)
 auto event_loop::schedule_after(clock::duration delay, execution_task&& task)
     -> timer_id
 {
-    return schedule_at(clock::now() + delay, std::move(task));
+    return schedule_at(eventloop_detail::deadline_after(delay), std::move(task));
 }
 
 auto event_loop::cancel(timer_id timer) noexcept -> bool

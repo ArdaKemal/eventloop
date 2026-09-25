@@ -979,7 +979,7 @@ private:
     event_loop& loop, event_loop::clock::duration delay) noexcept
     -> event_loop_timer_awaiter
 {
-    return sleep_until(loop, event_loop::clock::now() + delay);
+    return sleep_until(loop, eventloop_detail::deadline_after(delay));
 }
 
 class event_loop_yield_awaiter {

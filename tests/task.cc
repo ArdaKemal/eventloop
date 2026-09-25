@@ -118,7 +118,7 @@ auto timer_root(event_loop& loop, timer_wait_result& result) -> task<void>
 
 auto timer_child(event_loop& loop, timer_wait_result& result) -> task<void>
 {
-    result = co_await sleep_for(loop, std::chrono::hours {1});
+    result = co_await sleep_for(loop, event_loop::clock::duration::max());
 }
 
 auto nested_timer_root(event_loop& loop, timer_wait_result& result,

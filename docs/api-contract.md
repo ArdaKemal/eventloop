@@ -59,6 +59,8 @@ default.
 - A timer can retire immediately. Worker and file operations may still hold
   references into a coroutine frame; their completion must reach the loop
   before that frame is destroyed. `race` and `with_timeout` follow this rule.
+- `schedule_after` and `sleep_for` clamp oversized positive delays to the
+  latest representable deadline. Zero or negative delays are due immediately.
 - Caller-owned buffers passed to asynchronous file I/O remain valid until
   completion, including after cancellation is requested. New socket awaiters
   should use the same rule or explicitly copy into bounded storage.
