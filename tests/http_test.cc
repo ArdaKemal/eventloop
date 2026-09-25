@@ -143,6 +143,7 @@ auto session_tests() -> bool
         "HEAD /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     const auto split = requests.size() / 2;
     const auto before = allocations;
+    session.receive({});
     session.receive(std::as_bytes(std::span {requests.data(), split}));
     session.receive(std::as_bytes(std::span {
         requests.data() + split, requests.size() - split}));

@@ -126,6 +126,7 @@ session::session(byte_stream& stream, int root_descriptor,
 
 auto session::receive(std::span<const std::byte> data) -> void
 {
+    if (data.empty()) return;
     if (data.size() > input_.size() - input_size_) {
         if (responding_) stream_.close();
         else send_error(parse_status::payload_too_large);

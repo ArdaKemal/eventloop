@@ -33,6 +33,7 @@ public:
     auto write_binary(std::span<const std::byte> message) -> void;
     auto ping(std::span<const std::byte> payload = {}) -> void;
     auto pong(std::span<const std::byte> payload = {}) -> void;
+    // If the output limit prevents a close frame, close the transport.
     auto close() -> void;
     auto close(std::uint16_t code, std::u8string_view reason = {}) -> void;
     // Forward the underlying stream's write-drained notification here.

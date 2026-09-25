@@ -44,6 +44,8 @@ switching PCs; a fresh clone will not contain uncommitted work.
   still covered by `tests/web_socket.cc`.
 - WebSocket outbound framing is capped at the configured maximum message size
   plus frame/control overhead. A saturated send throws `std::length_error`.
+  Public `close()` retires the socket if a saturated queue cannot fit its
+  close frame. Empty close reasons and empty HTTP receive spans are safe.
   Large inbound batches are parsed in 4 KiB chunks; reentrant `receive` is
   rejected to keep callback payload views valid.
 

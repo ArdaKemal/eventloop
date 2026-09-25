@@ -268,6 +268,31 @@ auto bounded_output_test() -> bool
     return stream.open;
 }
 
+auto saturated_close_test(bool with_code) -> bool
+{
+    memory_stream stream;
+    stream.block_writes = true;
+    socket writer(stream, 32);
+    constexpr std::array<std::byte, 1> payload {};
+    bool saturated = false;
+    try {
+        for (int index = 0; index < 1000; ++index) writer.write_binary(payload);
+    } catch (const std::length_error&) {
+        saturated = true;
+    }
+    if (!saturated || !stream.open) return false;
+    if (with_code) writer.close(1000);
+    else writer.close();
+    writer.close();
+    if (stream.open) return false;
+    try {
+        writer.write_binary(payload);
+    } catch (const std::logic_error&) {
+        return true;
+    }
+    return false;
+}
+
 auto large_input_batch_test() -> bool
 {
     memory_stream stream;
@@ -397,6 +422,10 @@ auto main() -> int
     }
     if (!bounded_output_test()) {
         std::cerr << "WebSocket bounded output test failed\n";
+        return 1;
+    }
+    if (!saturated_close_test(false) || !saturated_close_test(true)) {
+        std::cerr << "WebSocket saturated close test failed\n";
         return 1;
     }
     if (!large_input_batch_test()) {

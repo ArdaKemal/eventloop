@@ -154,7 +154,12 @@ auto web_socket::pong(std::span<const std::byte> payload) -> void
 auto web_socket::close() -> void
 {
     if (close_sent_) return;
-    send_frame(opcode::close, {});
+    try {
+        send_frame(opcode::close, {});
+    } catch (const std::length_error&) {
+        retire_after_exception();
+        return;
+    }
     close_sent_ = true;
 }
 
@@ -174,9 +179,16 @@ auto web_socket::close(std::uint16_t code, std::u8string_view reason) -> void
     std::array<std::byte, 125> payload {};
     payload[0] = static_cast<std::byte>(code >> 8);
     payload[1] = static_cast<std::byte>(code & 0xff);
-    std::memcpy(payload.data() + 2, reason.data(), reason.size());
-    send_frame(opcode::close,
-               std::span {payload}.first(2 + reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(payload.data() + 2, reason.data(), reason.size());
+    }
+    try {
+        send_frame(opcode::close,
+                   std::span {payload}.first(2 + reason.size()));
+    } catch (const std::length_error&) {
+        retire_after_exception();
+        return;
+    }
     close_sent_ = true;
 }
 
@@ -466,6 +478,8 @@ auto web_socket::fail(errc error, std::uint16_t close_code) -> void
 auto web_socket::retire_after_exception() noexcept -> void
 {
     failed_ = true;
+    close_sent_ = true;
+    close_after_write_ = false;
     processing_ = false;
     pumping_output_ = false;
     awaiting_write_ = false;
