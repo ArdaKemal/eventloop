@@ -128,6 +128,46 @@ auto recovered_submission(event_loop& loop, bool& passed) -> task<void>
     loop.stop();
 }
 
+auto ready_batch_open(event_loop& loop, int& completed, bool& passed)
+    -> task<void>
+{
+    const auto result = co_await async_openat(
+        loop, AT_FDCWD, "/tmp/eventloop-file-absent-8573126", O_RDONLY);
+    if (result || result.error().value() != ENOENT) passed = false;
+    if (result) (void)::close(*result);
+    if (++completed == 96) loop.stop();
+}
+
+auto test_ring_ready_batch() -> bool
+{
+    const pid_t child = ::fork();
+    if (child < 0) return false;
+    if (child == 0) {
+        ::alarm(3);
+        event_loop_options options;
+        options.file_backend = file_io_backend::io_uring;
+        options.file_io_depth = 128;
+        options.coroutine_frame_capacities.fill(128);
+        event_loop loop(options);
+        int completed = 0;
+        bool passed = true;
+        for (int index = 0; index < 96; ++index) {
+            if (loop.spawn(ready_batch_open(loop, completed, passed)) !=
+                task_spawn_result::accepted) {
+                ::_exit(1);
+            }
+        }
+        ::usleep(20000);
+        const bool drained = loop.run() == event_loop_result::stopped &&
+                             completed == 96 && passed &&
+                             loop.coroutine_statistics().live == 0;
+        ::_exit(drained ? 0 : 1);
+    }
+    int status = 0;
+    return ::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+}
+
 auto test_ring_submit_recovery(int injected_result) -> bool
 {
     event_loop_options options;
@@ -271,6 +311,7 @@ int main()
 #if defined(EVENTLOOP_TEST_HAS_LIBURING)
                       test_ring_submit_recovery(-EAGAIN) &&
                       test_ring_submit_recovery(0) &&
+                      test_ring_ready_batch() &&
 #endif
                       test_roundtrip(file_io_backend::io_uring) &&
                       test_errors(file_io_backend::io_uring) &&

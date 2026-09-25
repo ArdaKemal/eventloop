@@ -1,6 +1,7 @@
 #include "eventloop/event_loop.h"
 #include "eventloop/file_io.h"
 #include "eventloop/task.h"
+#include "eventloop/unique_fd.h"
 
 #include "executor/bounded_task_queue.h"
 #include "linux/epoll_loop.h"
@@ -254,7 +255,6 @@ public:
     ~file_ring()
     {
         if (registered_) io_uring_queue_exit(&ring_);
-        if (notification_ != -1) ::close(notification_);
     }
 
     file_ring(const file_ring&) = delete;
@@ -270,12 +270,13 @@ public:
             static_cast<unsigned>(depth), &ring_, &params);
         if (result < 0) return result;
         registered_ = true;
-        notification_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (notification_ == -1) return -errno;
-        const int registration = io_uring_register_eventfd(&ring_, notification_);
+        notification_.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+        if (!notification_) return -errno;
+        const int registration = io_uring_register_eventfd(&ring_,
+                                                            notification_.get());
         if (registration < 0) return registration;
         try {
-            poller.add_descriptor(notification_);
+            poller.add_descriptor(notification_.get());
         } catch (const std::system_error& error) {
             return -error.code().value();
         } catch (...) {
@@ -284,7 +285,10 @@ public:
         return 0;
     }
 
-    [[nodiscard]] auto descriptor() const noexcept -> int { return notification_; }
+    [[nodiscard]] auto descriptor() const noexcept -> int
+    {
+        return notification_.get();
+    }
 
     [[nodiscard]] auto submit(eventloop_detail::file_io_operation& operation)
         noexcept -> int
@@ -329,10 +333,10 @@ public:
     }
 
     template<typename Complete>
-    auto drain(Complete&& complete) noexcept -> bool
+    auto drain(Complete&& complete) noexcept -> void
     {
         std::uint64_t notification;
-        while (::read(notification_, &notification, sizeof(notification)) == -1 &&
+        while (::read(notification_.get(), &notification, sizeof(notification)) == -1 &&
                errno == EINTR) {}
         io_uring_cqe* cqe = nullptr;
         std::size_t count = 0;
@@ -345,13 +349,21 @@ public:
             if (operation != nullptr) complete(*operation, result);
             ++count;
         }
-        return count == max_file_completions_per_iteration &&
-               io_uring_peek_cqe(&ring_, &cqe) == 0;
+        if (count == max_file_completions_per_iteration &&
+            io_uring_peek_cqe(&ring_, &cqe) == 0) {
+            const std::uint64_t one = 1;
+            for (;;) {
+                if (::write(notification_.get(), &one, sizeof(one)) != -1) break;
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN) break;
+                std::terminate();
+            }
+        }
     }
 
 private:
     io_uring ring_ {};
-    int notification_ {-1};
+    unique_fd notification_;
     bool registered_ {false};
 };
 } // namespace
@@ -494,10 +506,9 @@ public:
     {
 #if defined(EVENTLOOP_HAS_LIBURING)
         if (ring != nullptr) {
-            const bool more = ring->drain([this](auto& operation, int result) noexcept {
+            ring->drain([this](auto& operation, int result) noexcept {
                 complete_file(operation, result);
             });
-            if (more) poller.wake();
         }
 #endif
     }

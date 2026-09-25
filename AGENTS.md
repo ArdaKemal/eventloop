@@ -58,6 +58,10 @@ switching PCs; a fresh clone will not contain uncommitted work.
   force either backend; `automatic` currently prefers io_uring on Linux when
   ring setup succeeds. `file_io_depth` bounds accepted operations.
 - Ring completions are processed in capped batches to protect other loop work.
+  When a batch leaves completions ready, the ring re-signals its own eventfd
+  so the next poll drains them. A 96-operation test catches stranded completions
+  after the 64-operation batch cap. The ring notification descriptor is owned
+  by `unique_fd`.
   A failed/short submission reports an error; an unsubmitted SQE is changed
   into a NOP so it cannot retain a pointer into a destroyed coroutine frame.
 - `tests/file_io.cc` covers both backends, round-trip I/O, missing files,
