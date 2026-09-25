@@ -32,5 +32,5 @@ private:
     auto on_shutdown() -> void override;
 
     event_loop& loop_;
-    int descriptor_ {-1};
+    unique_fd descriptor_;
 };

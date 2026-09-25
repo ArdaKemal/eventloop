@@ -44,51 +44,43 @@ tcp_acceptor::tcp_acceptor(event_loop& loop, std::uint16_t port,
                            std::string_view address, bool reuse_port)
     : loop_(loop)
 {
-    descriptor_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (descriptor_ == -1) {
+    descriptor_.reset(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+    if (!descriptor_) {
         throw system_error("socket");
     }
 
-    try {
-        const int enabled = 1;
-        if (setsockopt(descriptor_, SOL_SOCKET, SO_REUSEADDR, &enabled,
-                       sizeof(enabled)) == -1) {
-            throw system_error("setsockopt");
-        }
-        if (reuse_port &&
-            setsockopt(descriptor_, SOL_SOCKET, SO_REUSEPORT, &enabled,
-                       sizeof(enabled)) == -1) {
-            throw system_error("setsockopt(SO_REUSEPORT)");
-        }
+    const int enabled = 1;
+    if (setsockopt(descriptor_.get(), SOL_SOCKET, SO_REUSEADDR, &enabled,
+                   sizeof(enabled)) == -1) {
+        throw system_error("setsockopt");
+    }
+    if (reuse_port &&
+        setsockopt(descriptor_.get(), SOL_SOCKET, SO_REUSEPORT, &enabled,
+                   sizeof(enabled)) == -1) {
+        throw system_error("setsockopt(SO_REUSEPORT)");
+    }
 
-        sockaddr_in endpoint {};
-        endpoint.sin_family = AF_INET;
-        endpoint.sin_port = htons(port);
-        const std::string address_text {address};
-        if (inet_pton(AF_INET, address_text.c_str(), &endpoint.sin_addr) != 1) {
-            throw std::invalid_argument("invalid IPv4 address");
-        }
-        if (bind(descriptor_, reinterpret_cast<const sockaddr*>(&endpoint),
-                 sizeof(endpoint)) == -1) {
-            throw system_error("bind");
-        }
-        if (listen(descriptor_, SOMAXCONN) == -1) {
-            throw system_error("listen");
-        }
-    } catch (...) {
-        ::close(descriptor_);
-        throw;
+    sockaddr_in endpoint {};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_port = htons(port);
+    const std::string address_text {address};
+    if (inet_pton(AF_INET, address_text.c_str(), &endpoint.sin_addr) != 1) {
+        throw std::invalid_argument("invalid IPv4 address");
+    }
+    if (bind(descriptor_.get(), reinterpret_cast<const sockaddr*>(&endpoint),
+             sizeof(endpoint)) == -1) {
+        throw system_error("bind");
+    }
+    if (listen(descriptor_.get(), SOMAXCONN) == -1) {
+        throw system_error("listen");
     }
 }
 
-tcp_acceptor::~tcp_acceptor()
-{
-    ::close(descriptor_);
-}
+tcp_acceptor::~tcp_acceptor() = default;
 
 auto tcp_acceptor::descriptor() const noexcept -> int
 {
-    return descriptor_;
+    return descriptor_.get();
 }
 
 auto tcp_acceptor::owner() noexcept -> event_loop&
@@ -100,7 +92,7 @@ auto tcp_acceptor::on_read() -> void
 {
     for (std::size_t attempt = 0; attempt < max_accepts_per_event; ++attempt) {
         unique_fd client(accept4(
-            descriptor_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
+            descriptor_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
         if (client) {
             const int enabled = 1;
             if (setsockopt(client.get(), IPPROTO_TCP, TCP_NODELAY, &enabled,
@@ -139,5 +131,5 @@ auto tcp_acceptor::on_error() -> void
 
 auto tcp_acceptor::on_shutdown() -> void
 {
-    loop_.remove(descriptor_);
+    loop_.remove(descriptor_.get());
 }

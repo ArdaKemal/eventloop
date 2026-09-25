@@ -1,5 +1,7 @@
 #pragma once
 
+#include "eventloop/unique_fd.h"
+
 #include <chrono>
 #include <cstddef>
 #include <csignal>
@@ -39,12 +41,30 @@ public:
     [[nodiscard]] auto poll(std::span<ready_event> events) -> poll_result;
 
 private:
+    class signal_mask_guard {
+    public:
+        signal_mask_guard();
+        ~signal_mask_guard();
+
+        signal_mask_guard(const signal_mask_guard&) = delete;
+        auto operator=(const signal_mask_guard&) -> signal_mask_guard& = delete;
+
+        [[nodiscard]] auto signals() const noexcept -> const sigset_t&
+        {
+            return signals_;
+        }
+
+    private:
+        sigset_t signals_ {};
+        sigset_t original_ {};
+    };
+
     auto update_descriptor(int descriptor, bool write_enabled, int operation) -> void;
 
-    int signal_descriptor_ {-1};
-    int stop_descriptor_ {-1};
-    int wake_descriptor_ {-1};
-    int timer_descriptor_ {-1};
-    int epoll_descriptor_ {-1};
-    sigset_t original_signal_mask_ {};
+    signal_mask_guard signal_mask_;
+    unique_fd signal_descriptor_;
+    unique_fd stop_descriptor_;
+    unique_fd wake_descriptor_;
+    unique_fd timer_descriptor_;
+    unique_fd epoll_descriptor_;
 };

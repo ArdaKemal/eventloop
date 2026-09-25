@@ -22,87 +22,47 @@ namespace {
 }
 } // namespace
 
-epoll_loop::epoll_loop()
+epoll_loop::signal_mask_guard::signal_mask_guard()
 {
-    sigset_t signals;
-    sigemptyset(&signals);
-    sigaddset(&signals, SIGINT);
-    sigaddset(&signals, SIGTERM);
-    if (sigprocmask(SIG_BLOCK, &signals, &original_signal_mask_) == -1) {
+    sigemptyset(&signals_);
+    sigaddset(&signals_, SIGINT);
+    sigaddset(&signals_, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &signals_, &original_) == -1) {
         throw system_error("sigprocmask");
     }
-
-    signal_descriptor_ = signalfd(-1, &signals, SFD_CLOEXEC | SFD_NONBLOCK);
-    if (signal_descriptor_ == -1) {
-        const auto error = system_error("signalfd");
-        sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
-        throw error;
-    }
-
-    epoll_descriptor_ = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_descriptor_ == -1) {
-        const auto error = system_error("epoll_create1");
-        close(signal_descriptor_);
-        sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
-        throw error;
-    }
-
-    stop_descriptor_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (stop_descriptor_ == -1) {
-        const auto error = system_error("eventfd");
-        close(epoll_descriptor_);
-        close(signal_descriptor_);
-        sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
-        throw error;
-    }
-
-    wake_descriptor_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (wake_descriptor_ == -1) {
-        const auto error = system_error("eventfd");
-        close(stop_descriptor_);
-        close(epoll_descriptor_);
-        close(signal_descriptor_);
-        sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
-        throw error;
-    }
-
-    timer_descriptor_ = timerfd_create(
-        CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-    if (timer_descriptor_ == -1) {
-        const auto error = system_error("timerfd_create");
-        close(wake_descriptor_);
-        close(stop_descriptor_);
-        close(epoll_descriptor_);
-        close(signal_descriptor_);
-        sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
-        throw error;
-    }
-
-    try {
-        update_descriptor(signal_descriptor_, false, EPOLL_CTL_ADD);
-        update_descriptor(stop_descriptor_, false, EPOLL_CTL_ADD);
-        update_descriptor(wake_descriptor_, false, EPOLL_CTL_ADD);
-        update_descriptor(timer_descriptor_, false, EPOLL_CTL_ADD);
-    } catch (...) {
-        close(timer_descriptor_);
-        close(wake_descriptor_);
-        close(stop_descriptor_);
-        close(epoll_descriptor_);
-        close(signal_descriptor_);
-        sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
-        throw;
-    }
 }
 
-epoll_loop::~epoll_loop()
+epoll_loop::signal_mask_guard::~signal_mask_guard()
 {
-    close(signal_descriptor_);
-    close(stop_descriptor_);
-    close(wake_descriptor_);
-    close(timer_descriptor_);
-    close(epoll_descriptor_);
-    sigprocmask(SIG_SETMASK, &original_signal_mask_, nullptr);
+    sigprocmask(SIG_SETMASK, &original_, nullptr);
 }
+
+epoll_loop::epoll_loop()
+{
+    signal_descriptor_.reset(signalfd(
+        -1, &signal_mask_.signals(), SFD_CLOEXEC | SFD_NONBLOCK));
+    if (!signal_descriptor_) throw system_error("signalfd");
+
+    epoll_descriptor_.reset(epoll_create1(EPOLL_CLOEXEC));
+    if (!epoll_descriptor_) throw system_error("epoll_create1");
+
+    stop_descriptor_.reset(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (!stop_descriptor_) throw system_error("eventfd");
+
+    wake_descriptor_.reset(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (!wake_descriptor_) throw system_error("eventfd");
+
+    timer_descriptor_.reset(timerfd_create(
+        CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
+    if (!timer_descriptor_) throw system_error("timerfd_create");
+
+    update_descriptor(signal_descriptor_.get(), false, EPOLL_CTL_ADD);
+    update_descriptor(stop_descriptor_.get(), false, EPOLL_CTL_ADD);
+    update_descriptor(wake_descriptor_.get(), false, EPOLL_CTL_ADD);
+    update_descriptor(timer_descriptor_.get(), false, EPOLL_CTL_ADD);
+}
+
+epoll_loop::~epoll_loop() = default;
 
 auto epoll_loop::add_descriptor(int descriptor) -> void
 {
@@ -111,7 +71,7 @@ auto epoll_loop::add_descriptor(int descriptor) -> void
 
 auto epoll_loop::remove_descriptor(int descriptor) -> void
 {
-    if (epoll_ctl(epoll_descriptor_, EPOLL_CTL_DEL, descriptor, nullptr) == -1 &&
+    if (epoll_ctl(epoll_descriptor_.get(), EPOLL_CTL_DEL, descriptor, nullptr) == -1 &&
         errno != ENOENT && errno != EBADF) {
         throw system_error("epoll_ctl(DEL)");
     }
@@ -125,7 +85,7 @@ auto epoll_loop::set_write_interest(int descriptor, bool enabled) -> void
 auto epoll_loop::request_stop() -> void
 {
     const std::uint64_t value = 1;
-    if (write(stop_descriptor_, &value, sizeof(value)) == -1 && errno != EAGAIN) {
+    if (write(stop_descriptor_.get(), &value, sizeof(value)) == -1 && errno != EAGAIN) {
         throw system_error("eventfd write");
     }
 }
@@ -134,7 +94,7 @@ auto epoll_loop::wake() noexcept -> void
 {
     const std::uint64_t value = 1;
     for (;;) {
-        if (write(wake_descriptor_, &value, sizeof(value)) != -1) return;
+        if (write(wake_descriptor_.get(), &value, sizeof(value)) != -1) return;
         if (errno == EINTR) continue;
         if (errno == EAGAIN) return;
         std::terminate();
@@ -156,7 +116,7 @@ auto epoll_loop::arm_timer(
         value.it_value.tv_sec = static_cast<time_t>(seconds.count());
         value.it_value.tv_nsec = static_cast<long>(remainder.count());
     }
-    if (timerfd_settime(timer_descriptor_, 0, &value, nullptr) == -1) {
+    if (timerfd_settime(timer_descriptor_.get(), 0, &value, nullptr) == -1) {
         throw system_error("timerfd_settime");
     }
 }
@@ -168,7 +128,7 @@ auto epoll_loop::poll(std::span<ready_event> events) -> poll_result
 
     int count;
     do {
-        count = epoll_wait(epoll_descriptor_, native_events.data(), capacity, -1);
+        count = epoll_wait(epoll_descriptor_.get(), native_events.data(), capacity, -1);
     } while (count == -1 && errno == EINTR);
     if (count == -1) {
         throw system_error("epoll_wait");
@@ -181,27 +141,27 @@ auto epoll_loop::poll(std::span<ready_event> events) -> poll_result
     bool timer_requested = false;
     for (int index = 0; index < count; ++index) {
         const auto& native = native_events[static_cast<std::size_t>(index)];
-        if (native.data.fd == signal_descriptor_) {
+        if (native.data.fd == signal_descriptor_.get()) {
             signalfd_siginfo info {};
-            (void)read(signal_descriptor_, &info, sizeof(info));
+            (void)read(signal_descriptor_.get(), &info, sizeof(info));
             signal_requested = true;
             continue;
         }
-        if (native.data.fd == stop_descriptor_) {
+        if (native.data.fd == stop_descriptor_.get()) {
             std::uint64_t value;
-            (void)read(stop_descriptor_, &value, sizeof(value));
+            (void)read(stop_descriptor_.get(), &value, sizeof(value));
             stop_requested = true;
             continue;
         }
-        if (native.data.fd == wake_descriptor_) {
+        if (native.data.fd == wake_descriptor_.get()) {
             std::uint64_t value;
-            (void)read(wake_descriptor_, &value, sizeof(value));
+            (void)read(wake_descriptor_.get(), &value, sizeof(value));
             wake_requested = true;
             continue;
         }
-        if (native.data.fd == timer_descriptor_) {
+        if (native.data.fd == timer_descriptor_.get()) {
             std::uint64_t value;
-            (void)read(timer_descriptor_, &value, sizeof(value));
+            (void)read(timer_descriptor_.get(), &value, sizeof(value));
             timer_requested = true;
             continue;
         }
@@ -228,7 +188,7 @@ auto epoll_loop::update_descriptor(int descriptor, bool write_enabled, int opera
         event.events |= EPOLLOUT;
     }
     event.data.fd = descriptor;
-    if (epoll_ctl(epoll_descriptor_, operation, descriptor, &event) == -1) {
+    if (epoll_ctl(epoll_descriptor_.get(), operation, descriptor, &event) == -1) {
         throw system_error("epoll_ctl");
     }
 }

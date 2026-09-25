@@ -23,6 +23,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
   accept and stream construction paths. New subclasses should override the
   owning callback; the original `int` callbacks remain as compatibility paths
   and still require explicit descriptor ownership on every failure path.
+- The epoll backend and TCP listener now keep their own descriptors in
+  `unique_fd`. The epoll signal mask has a scope guard that restores it after
+  all backend descriptors close, including constructor failures.
 - Built-in HTTP connections share ownership of the document-root descriptor
   with their listener, so removing the listener cannot invalidate an accepted
   session. Redirect connections likewise retain their hostname after listener
