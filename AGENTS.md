@@ -39,7 +39,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
   into a NOP so it cannot retain a pointer into a destroyed coroutine frame.
 - `tests/file_io.cc` covers both backends, round-trip I/O, missing files,
   capacity, shutdown cancellation, and an isolated seccomp-injected submission
-  error. Forced-ring tests skip if the environment prohibits io_uring.
+  error. Link-wrapped one-shot negative and zero-count submission results
+  check that a later ring operation flushes the NOP and completes. Forced-ring
+  tests skip if the environment prohibits io_uring.
 - `benchmark/file_io_benchmark.cc` compares 100,000 cached 4 KiB reads at
   16-way concurrency and records throughput, per-read latency, and timer
   lateness. It currently creates its file in `/tmp`.
@@ -58,11 +60,11 @@ switching PCs; a fresh clone will not contain uncommitted work.
    lateness than the current one-submit-per-operation io_uring path. Measure
    representative files on the target filesystem/host before choosing a
    production default or integrating the path into HTTP.
-2. Test recovery *after* a failed io_uring submission. The current injected
-   failure test proves the error reaches the coroutine without terminating;
-   it does not prove that a later successful submission flushes the NOP and
-   completes correctly. Review the non-SQPOLL and short-submit assumptions in
-   `file_ring::submit` while adding this test.
+2. Submission recovery is tested with one-shot synthetic negative and
+   zero-count results when liburing and GNU/Clang linker wrapping are
+   available. The production path
+   relies on non-SQPOLL ordering and admits one new SQE only after flushing
+   pending NOPs. Revisit these assumptions before adding SQPOLL or batching.
 3. If optimizing io_uring, investigate safe submission batching and preserve
    the capped completion-drain/fairness behavior. Compare p99 timer latency as
    well as throughput. Do not optimize on one WSL/tmpfs result alone.

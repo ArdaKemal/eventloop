@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <limits>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <sys/prctl.h>
@@ -14,6 +15,28 @@
 #include <string_view>
 #include <system_error>
 #include <unistd.h>
+
+#if defined(EVENTLOOP_TEST_HAS_LIBURING)
+#include <liburing.h>
+
+namespace {
+int injected_ring_submit_result = std::numeric_limits<int>::max();
+int injected_ring_submissions = 0;
+}
+
+extern "C" auto __real_io_uring_submit(io_uring* ring) -> int;
+
+extern "C" auto __wrap_io_uring_submit(io_uring* ring) -> int
+{
+    if (injected_ring_submit_result != std::numeric_limits<int>::max()) {
+        const int result = injected_ring_submit_result;
+        injected_ring_submit_result = std::numeric_limits<int>::max();
+        ++injected_ring_submissions;
+        return result;
+    }
+    return __real_io_uring_submit(ring);
+}
+#endif
 
 namespace {
 
@@ -91,6 +114,37 @@ auto denied_submission(event_loop& loop, bool& passed) -> task<void>
     passed = !result && result.error().value() == EPERM;
     loop.stop();
 }
+
+#if defined(EVENTLOOP_TEST_HAS_LIBURING)
+auto recovered_submission(event_loop& loop, bool& passed) -> task<void>
+{
+    const auto first = co_await async_openat(loop, AT_FDCWD, "/dev/null",
+                                             O_RDONLY);
+    if (first) (void)::close(*first);
+    const auto second = co_await async_openat(loop, AT_FDCWD, "/dev/null",
+                                              O_RDONLY);
+    if (second) (void)::close(*second);
+    passed = !first && first.error().value() == EAGAIN && second.has_value();
+    loop.stop();
+}
+
+auto test_ring_submit_recovery(int injected_result) -> bool
+{
+    event_loop_options options;
+    options.file_backend = file_io_backend::io_uring;
+    event_loop loop(options);
+    bool passed = false;
+    const int before = injected_ring_submissions;
+    injected_ring_submit_result = injected_result;
+    if (loop.spawn(recovered_submission(loop, passed)) !=
+        task_spawn_result::accepted) return false;
+    const auto stopped = loop.run();
+    injected_ring_submit_result = std::numeric_limits<int>::max();
+    return stopped == event_loop_result::stopped && passed &&
+           injected_ring_submissions == before + 1 &&
+           loop.coroutine_statistics().live == 0;
+}
+#endif
 
 auto test_ring_submit_error_in_child() -> bool
 {
@@ -213,7 +267,12 @@ int main()
 {
     bool ring_passed = true;
     try {
-        ring_passed = test_roundtrip(file_io_backend::io_uring) &&
+        ring_passed =
+#if defined(EVENTLOOP_TEST_HAS_LIBURING)
+                      test_ring_submit_recovery(-EAGAIN) &&
+                      test_ring_submit_recovery(0) &&
+#endif
+                      test_roundtrip(file_io_backend::io_uring) &&
                       test_errors(file_io_backend::io_uring) &&
                       test_depth(file_io_backend::io_uring) &&
                       test_cancellation(file_io_backend::io_uring);
