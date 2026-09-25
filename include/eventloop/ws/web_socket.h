@@ -65,6 +65,7 @@ private:
     auto send_frame(opcode type, std::span<const std::byte> payload) -> void;
     auto pump_output() -> void;
     auto fail(errc error, std::uint16_t close_code) -> void;
+    auto retire_after_exception() noexcept -> void;
 
     byte_stream& stream_;
     std::size_t maximum_message_size_;

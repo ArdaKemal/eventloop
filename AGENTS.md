@@ -23,6 +23,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
   accept and stream construction paths. New subclasses should override the
   owning callback; the original `int` callbacks remain as compatibility paths
   and still require explicit descriptor ownership on every failure path.
+- A WebSocket message callback or underlying write exception now retires the
+  parser/output state and closes its stream. Normal-path allocation reuse is
+  still covered by `tests/web_socket.cc`.
 
 ## Current file-I/O slice
 
@@ -86,6 +89,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
    return. This is not a proof of memory safety across every transport and
    coroutine path; keep auditing ownership boundaries and use sanitizer runs
    for new exception or cancellation paths.
+7. WebSocket outbound queuing does not yet have an explicit total byte limit.
+   Define a bounded backpressure contract before using it for untrusted
+   broadcast fan-out; measure the normal path after that change.
 
 ## Environment and verification
 

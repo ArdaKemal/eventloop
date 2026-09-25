@@ -173,7 +173,7 @@ auto web_socket::write_drained() -> void
     pump_output();
 }
 
-auto web_socket::process_frames() -> void
+auto web_socket::process_frames() -> void try
 {
     processing_ = true;
     std::size_t consumed = 0;
@@ -254,6 +254,10 @@ auto web_socket::process_frames() -> void
         input_.erase(input_.begin(), input_.begin() + static_cast<std::ptrdiff_t>(consumed));
     }
     processing_ = false;
+}
+catch (...) {
+    retire_after_exception();
+    throw;
 }
 
 auto web_socket::handle_frame(opcode type, bool final,
@@ -358,6 +362,9 @@ auto web_socket::handle_close(std::span<const std::byte> payload) -> bool
 
 auto web_socket::send_frame(opcode type, std::span<const std::byte> payload) -> void
 {
+    if (failed_ && type != opcode::close) {
+        throw std::logic_error("cannot write after a WebSocket failure");
+    }
     if (close_sent_ && type != opcode::close) {
         throw std::logic_error("cannot write after sending a WebSocket close frame");
     }
@@ -392,7 +399,7 @@ auto web_socket::send_frame(opcode type, std::span<const std::byte> payload) -> 
     pump_output();
 }
 
-auto web_socket::pump_output() -> void
+auto web_socket::pump_output() -> void try
 {
     if (pumping_output_ || awaiting_write_) return;
     pumping_output_ = true;
@@ -411,9 +418,12 @@ auto web_socket::pump_output() -> void
         stream_.write(chunk);
         if (!stream_.write_pending()) awaiting_write_ = false;
     }
-
     pumping_output_ = false;
     if (!awaiting_write_ && output_.empty() && close_after_write_) stream_.close();
+}
+catch (...) {
+    retire_after_exception();
+    throw;
 }
 
 auto web_socket::fail(errc error, std::uint16_t close_code) -> void
@@ -434,6 +444,23 @@ auto web_socket::fail(errc error, std::uint16_t close_code) -> void
     }
     close_after_write_ = true;
     pump_output();
+}
+
+auto web_socket::retire_after_exception() noexcept -> void
+{
+    failed_ = true;
+    processing_ = false;
+    pumping_output_ = false;
+    awaiting_write_ = false;
+    fragmented_type_.reset();
+    clear_buffer(input_);
+    clear_buffer(fragmented_message_);
+    clear_buffer(output_);
+    output_offset_ = 0;
+    try {
+        stream_.close();
+    } catch (...) {
+    }
 }
 
 } // namespace ws

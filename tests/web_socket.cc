@@ -10,6 +10,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -43,6 +44,7 @@ class memory_stream final : public byte_stream {
 public:
     auto write(std::span<const std::byte> data) -> void override
     {
+        if (fail_write) throw std::runtime_error("expected stream write failure");
         output.insert(output.end(), data.begin(), data.end());
         pending = block_writes;
     }
@@ -57,6 +59,7 @@ public:
     bool open {true};
     bool block_writes {false};
     bool pending {false};
+    bool fail_write {false};
 
 private:
     auto on_data(std::span<const std::byte>) -> void override {}
@@ -116,6 +119,19 @@ public:
 
 private:
     auto on_text(std::u8string_view) -> void override { ++messages; }
+};
+
+class throwing_socket final : public ws::web_socket {
+public:
+    explicit throwing_socket(memory_stream& stream) : web_socket(stream) {}
+    int callbacks {0};
+
+private:
+    auto on_text(std::u8string_view) -> void override
+    {
+        ++callbacks;
+        throw std::runtime_error("expected message callback failure");
+    }
 };
 
 [[nodiscard]] auto bytes(std::string_view input) -> std::vector<std::byte>
@@ -255,6 +271,36 @@ auto allocation_reuse_test() -> bool
     return allocations == before_reads && reader.messages == 101;
 }
 
+auto exception_cleanup_test() -> bool
+{
+    memory_stream input_stream;
+    throwing_socket reader(input_stream);
+    const auto frame = masked_frame(0x01, true, bytes("hello"));
+    try {
+        reader.receive(frame);
+        return false;
+    } catch (const std::runtime_error&) {
+    }
+    reader.receive(frame);
+    if (input_stream.open || reader.callbacks != 1) return false;
+
+    memory_stream output_stream;
+    output_stream.fail_write = true;
+    socket writer(output_stream);
+    try {
+        writer.write(u8"hello");
+        return false;
+    } catch (const std::runtime_error&) {
+    }
+    if (output_stream.open) return false;
+    try {
+        writer.write(u8"again");
+    } catch (const std::logic_error&) {
+        return true;
+    }
+    return false;
+}
+
 auto control_and_error_tests() -> bool
 {
     memory_stream close_stream;
@@ -316,6 +362,10 @@ auto main() -> int
     }
     if (!allocation_reuse_test()) {
         std::cerr << "WebSocket allocation reuse test failed\n";
+        return 1;
+    }
+    if (!exception_cleanup_test()) {
+        std::cerr << "WebSocket exception cleanup test failed\n";
         return 1;
     }
     if (!control_and_error_tests()) {
