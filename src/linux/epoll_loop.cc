@@ -85,7 +85,10 @@ auto epoll_loop::set_write_interest(int descriptor, bool enabled) -> void
 auto epoll_loop::request_stop() -> void
 {
     const std::uint64_t value = 1;
-    if (write(stop_descriptor_.get(), &value, sizeof(value)) == -1 && errno != EAGAIN) {
+    for (;;) {
+        if (write(stop_descriptor_.get(), &value, sizeof(value)) != -1) return;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN) return;
         throw system_error("eventfd write");
     }
 }
