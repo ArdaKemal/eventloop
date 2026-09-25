@@ -21,6 +21,10 @@ public:
 
     [[nodiscard]] auto descriptor() const noexcept -> int override;
     auto write(std::span<const std::byte> data) -> void override;
+    // Takes ownership of the file descriptor, including on failure.
+    auto send_file(std::span<const std::byte> header, unique_fd descriptor,
+                   std::size_t size) -> void;
+    // Compatibility overload: ownership of descriptor transfers on entry.
     auto send_file(std::span<const std::byte> header, int descriptor,
                    std::size_t size) -> void;
     auto close() -> void override;
@@ -46,10 +50,10 @@ private:
     auto watch_writes(bool enabled) -> void;
 
     event_loop& loop_;
-    int descriptor_;
+    unique_fd descriptor_;
     std::vector<std::byte> output_;
     std::size_t written_ {0};
-    int file_descriptor_ {-1};
+    unique_fd file_descriptor_;
     std::size_t file_remaining_ {0};
     bool watching_writes_ {false};
     bool peer_closed_ {false};

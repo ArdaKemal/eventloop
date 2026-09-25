@@ -384,12 +384,49 @@ private:
 auto descriptor_ownership_test() -> bool
 {
     event_loop loop;
+    try {
+        sending_stream invalid(loop, -1);
+        return false;
+    } catch (const std::invalid_argument&) {
+    }
     const int descriptor = make_event(0);
     try {
         auto stream = std::make_unique<throwing_owned_stream>(
             loop, unique_fd(descriptor));
         return false;
     } catch (const std::runtime_error&) {
+    }
+    return ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
+}
+
+auto file_transfer_ownership_test() -> bool
+{
+    int sockets[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+        return false;
+    }
+    unique_fd peer(sockets[1]);
+    event_loop loop;
+    sending_stream stream(loop, sockets[0]);
+    try {
+        stream.send_file({}, unique_fd {}, 1);
+        return false;
+    } catch (const std::invalid_argument&) {
+    }
+    try {
+        stream.send_file({}, stream.descriptor(), 1);
+        return false;
+    } catch (const std::invalid_argument&) {
+    }
+    if (::fcntl(stream.descriptor(), F_GETFD) == -1) return false;
+
+    const int descriptor = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (descriptor == -1) return false;
+    const std::array<std::byte, 64 * 1024 + 1> oversized {};
+    try {
+        stream.send_file(oversized, unique_fd(descriptor), 1);
+        return false;
+    } catch (const std::length_error&) {
     }
     return ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
 }
@@ -828,6 +865,7 @@ auto main() -> int
     if (!callback_failure_test(false) || !callback_failure_test(true) ||
         !write_callback_failure_test() || !self_closing_write_test()) return 1;
     if (!descriptor_ownership_test()) return 1;
+    if (!file_transfer_ownership_test()) return 1;
     if (!accepted_descriptor_failure_test()) return 1;
     if (!legacy_acceptor_test()) return 1;
     if (!empty_handler_test()) return 1;

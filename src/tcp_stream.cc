@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 #include <sys/sendfile.h>
 #include <sys/socket.h>
@@ -29,19 +30,21 @@ tcp_stream::tcp_stream(event_loop& loop, int descriptor)
 }
 
 tcp_stream::tcp_stream(event_loop& loop, unique_fd descriptor)
-    : loop_(loop), descriptor_(descriptor.release())
+    : loop_(loop), descriptor_(std::move(descriptor))
 {
+    if (!descriptor_) {
+        throw std::invalid_argument("TCP stream descriptor is invalid");
+    }
 }
 
 tcp_stream::~tcp_stream()
 {
     close_file();
-    ::close(descriptor_);
 }
 
 auto tcp_stream::descriptor() const noexcept -> int
 {
-    return descriptor_;
+    return descriptor_.get();
 }
 
 auto tcp_stream::write(std::span<const std::byte> data) -> void
@@ -49,7 +52,7 @@ auto tcp_stream::write(std::span<const std::byte> data) -> void
     if (closing_ || closed_) {
         throw std::logic_error("cannot write to a closing TCP stream");
     }
-    if (file_descriptor_ != -1) {
+    if (file_descriptor_) {
         throw std::logic_error("cannot write during a file transfer");
     }
     if (data.empty()) return;
@@ -60,7 +63,7 @@ auto tcp_stream::write(std::span<const std::byte> data) -> void
     if (output_.empty()) {
         std::size_t offset = 0;
         while (offset < data.size()) {
-            const auto size = send(descriptor_, data.data() + offset,
+            const auto size = send(descriptor_.get(), data.data() + offset,
                                    data.size() - offset, MSG_NOSIGNAL);
             if (size > 0) {
                 offset += static_cast<std::size_t>(size);
@@ -94,35 +97,44 @@ auto tcp_stream::write(std::span<const std::byte> data) -> void
 auto tcp_stream::send_file(std::span<const std::byte> header, int descriptor,
                            std::size_t size) -> void
 {
+    send_file(header, unique_fd(descriptor), size);
+}
+
+auto tcp_stream::send_file(std::span<const std::byte> header,
+                           unique_fd descriptor, std::size_t size) -> void
+{
+    if (!descriptor) {
+        throw std::invalid_argument("file transfer descriptor is invalid");
+    }
+    if (descriptor.get() == descriptor_.get() ||
+        (file_descriptor_ && descriptor.get() == file_descriptor_.get())) {
+        (void)descriptor.release();
+        throw std::invalid_argument("file transfer descriptor is already owned");
+    }
     if (!sigpipe_ignored()) {
         const int error = errno;
-        ::close(descriptor);
         throw std::system_error(error, std::system_category(),
                                 "ignore SIGPIPE");
     }
     if (closing_ || closed_) {
-        ::close(descriptor);
         throw std::logic_error("cannot start a file transfer while closing");
     }
     if (written_ < output_.size()) {
-        ::close(descriptor);
         throw std::logic_error("cannot start a file transfer with pending bytes");
     }
-    if (file_descriptor_ != -1) {
-        ::close(descriptor);
+    if (file_descriptor_) {
         throw std::logic_error("cannot start a concurrent file transfer");
     }
     if (header.size() > max_pending_output) {
-        ::close(descriptor);
         throw std::length_error("TCP write buffer capacity exceeded");
     }
 
-    file_descriptor_ = descriptor;
+    file_descriptor_ = std::move(descriptor);
     file_remaining_ = size;
 
     std::size_t offset = 0;
     while (offset < header.size()) {
-        const auto sent = send(descriptor_, header.data() + offset,
+        const auto sent = send(descriptor_.get(), header.data() + offset,
                                header.size() - offset,
                                MSG_NOSIGNAL | (size != 0 ? MSG_MORE : 0));
         if (sent > 0) {
@@ -169,7 +181,7 @@ auto tcp_stream::ready() const noexcept -> bool
 
 auto tcp_stream::write_pending() const noexcept -> bool
 {
-    return written_ < output_.size() || file_descriptor_ != -1;
+    return written_ < output_.size() || static_cast<bool>(file_descriptor_);
 }
 
 auto tcp_stream::on_read() -> void
@@ -177,7 +189,7 @@ auto tcp_stream::on_read() -> void
     std::array<std::byte, 4096> buffer {};
     std::size_t received = 0;
     while (received < max_read_per_event) {
-        const auto size = recv(descriptor_, buffer.data(), buffer.size(), 0);
+        const auto size = recv(descriptor_.get(), buffer.data(), buffer.size(), 0);
         if (size > 0) {
             received += static_cast<std::size_t>(size);
             try {
@@ -219,7 +231,7 @@ auto tcp_stream::on_error() -> void
 {
     int error = 0;
     socklen_t size = sizeof(error);
-    if (getsockopt(descriptor_, SOL_SOCKET, SO_ERROR, &error, &size) == -1) {
+    if (getsockopt(descriptor_.get(), SOL_SOCKET, SO_ERROR, &error, &size) == -1) {
         error = errno;
     } else if (error == 0) {
         error = ECONNRESET;
@@ -237,8 +249,8 @@ auto tcp_stream::flush() -> void
     const bool had_output = write_pending();
     while (written_ < output_.size()) {
         const int flags = MSG_NOSIGNAL |
-            (file_descriptor_ != -1 && file_remaining_ != 0 ? MSG_MORE : 0);
-        const auto size = send(descriptor_, output_.data() + written_,
+            (file_descriptor_ && file_remaining_ != 0 ? MSG_MORE : 0);
+        const auto size = send(descriptor_.get(), output_.data() + written_,
                                output_.size() - written_, flags);
         if (size > 0) {
             written_ += static_cast<std::size_t>(size);
@@ -258,10 +270,11 @@ auto tcp_stream::flush() -> void
     std::vector<std::byte> {}.swap(output_);
     written_ = 0;
 
-    while (file_descriptor_ != -1 && file_remaining_ != 0) {
+    while (file_descriptor_ && file_remaining_ != 0) {
         constexpr std::size_t maximum_send = 0x7ffff000;
         const auto requested = std::min(file_remaining_, maximum_send);
-        const auto size = sendfile(descriptor_, file_descriptor_, nullptr, requested);
+        const auto size = sendfile(descriptor_.get(), file_descriptor_.get(), nullptr,
+                                   requested);
         if (size > 0) {
             file_remaining_ -= static_cast<std::size_t>(size);
             continue;
@@ -343,23 +356,20 @@ auto tcp_stream::abort() -> void
         closed_ = true;
         closing_ = true;
         close_file();
-        loop_.remove(descriptor_);
+        loop_.remove(descriptor_.get());
     }
 }
 
 auto tcp_stream::close_file() noexcept -> void
 {
-    if (file_descriptor_ != -1) {
-        ::close(file_descriptor_);
-        file_descriptor_ = -1;
-        file_remaining_ = 0;
-    }
+    file_descriptor_.reset();
+    file_remaining_ = 0;
 }
 
 auto tcp_stream::watch_writes(bool enabled) -> void
 {
     if (watching_writes_ != enabled) {
-        loop_.set_write_interest(descriptor_, enabled);
+        loop_.set_write_interest(descriptor_.get(), enabled);
         watching_writes_ = enabled;
     }
 }

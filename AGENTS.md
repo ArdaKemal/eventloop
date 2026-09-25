@@ -25,6 +25,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
   accept and stream construction paths. New subclasses should override the
   owning callback; the original `int` callbacks remain as compatibility paths
   and still require explicit descriptor ownership on every failure path.
+- TCP streams own both their socket and any active sendfile descriptor via
+  `unique_fd`. The owning `send_file` overload rejects an invalid file
+  descriptor; the `int` overload transfers ownership on entry for compatibility.
 - The epoll backend and TCP listener now keep their own descriptors in
   `unique_fd`. The epoll signal mask has a scope guard that restores it after
   all backend descriptors close, including constructor failures. Nested loops

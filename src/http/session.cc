@@ -304,7 +304,7 @@ auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
         responding_ = true;
         file_stream_->send_file(
             std::as_bytes(std::span {header}.first(header_length)),
-            descriptor.release(), body_size);
+            std::move(descriptor), body_size);
         return;
     }
 
