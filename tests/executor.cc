@@ -9,6 +9,7 @@
 #include <iostream>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -200,6 +201,14 @@ auto single_thread_tests() -> bool
 auto queue_tests() -> bool
 {
     bool ok = true;
+
+    for (const std::size_t capacity : {0, 1, 3}) {
+        try {
+            bounded_task_queue invalid(capacity);
+            ok &= check(false, "invalid queue capacity rejected");
+        } catch (const std::invalid_argument&) {
+        }
+    }
 
     {
         bounded_task_queue queue(4);

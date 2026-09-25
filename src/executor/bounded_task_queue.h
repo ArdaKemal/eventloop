@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -15,9 +16,9 @@
 class bounded_task_queue {
 public:
     explicit bounded_task_queue(std::size_t capacity)
-        : capacity_(capacity),
-          mask_(capacity - 1),
-          slots_(std::make_unique<slot[]>(capacity))
+        : capacity_(checked_capacity(capacity)),
+          mask_(capacity_ - 1),
+          slots_(std::make_unique<slot[]>(capacity_))
     {
         for (std::size_t index = 0; index < capacity_; ++index) {
             slots_[index].sequence.store(index, std::memory_order_relaxed);
@@ -90,6 +91,15 @@ public:
     }
 
 private:
+    [[nodiscard]] static auto checked_capacity(std::size_t capacity) -> std::size_t
+    {
+        if (capacity < 2 || (capacity & (capacity - 1)) != 0) {
+            throw std::invalid_argument(
+                "executor queue capacity must be a power of two and at least two");
+        }
+        return capacity;
+    }
+
     struct slot {
         std::atomic<std::size_t> sequence;
         execution_task task;
