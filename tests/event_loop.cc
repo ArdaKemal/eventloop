@@ -263,6 +263,112 @@ private:
     auto on_data(std::span<const std::byte>) -> void override {}
 };
 
+class throwing_callback_stream final : public tcp_stream {
+public:
+    throwing_callback_stream(event_loop& loop, int descriptor,
+                             bool throw_on_close)
+        : tcp_stream(loop, descriptor), throw_on_close_(throw_on_close) {}
+
+private:
+    auto on_data(std::span<const std::byte>) -> void override
+    {
+        if (!throw_on_close_) {
+            throw std::runtime_error("expected data callback failure");
+        }
+    }
+
+    auto on_close() -> void override
+    {
+        if (throw_on_close_) {
+            throw std::runtime_error("expected close callback failure");
+        }
+    }
+
+    bool throw_on_close_;
+};
+
+class throwing_write_drained_stream final : public tcp_stream {
+public:
+    using tcp_stream::tcp_stream;
+
+private:
+    auto on_data(std::span<const std::byte>) -> void override {}
+    auto on_write_drained() -> void override
+    {
+        throw std::runtime_error("expected write callback failure");
+    }
+};
+
+class self_closing_stream final : public tcp_stream {
+public:
+    using tcp_stream::tcp_stream;
+
+private:
+    auto on_data(std::span<const std::byte>) -> void override {}
+    auto on_write_drained() -> void override { close(); }
+};
+
+auto callback_failure_test(bool throw_on_close) -> bool
+{
+    int sockets[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+        return false;
+    }
+    unique_fd peer(sockets[1]);
+    event_loop loop;
+    loop.add(std::make_unique<throwing_callback_stream>(
+        loop, sockets[0], throw_on_close));
+    if (throw_on_close) {
+        if (::shutdown(peer.get(), SHUT_WR) != 0) return false;
+    } else {
+        const char byte = 'x';
+        if (::send(peer.get(), &byte, 1, 0) != 1) return false;
+    }
+    try {
+        (void)loop.run();
+        return false;
+    } catch (const std::runtime_error&) {
+    }
+    return ::fcntl(sockets[0], F_GETFD) == -1 && errno == EBADF;
+}
+
+auto write_callback_failure_test() -> bool
+{
+    int sockets[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+        return false;
+    }
+    unique_fd peer(sockets[1]);
+    event_loop loop;
+    auto sender = std::make_unique<throwing_write_drained_stream>(loop,
+                                                                  sockets[0]);
+    auto* stream = sender.get();
+    loop.add(std::move(sender));
+    constexpr std::array<std::byte, 1> byte {std::byte {'x'}};
+    try {
+        stream->write(byte);
+        return false;
+    } catch (const std::runtime_error&) {
+    }
+    return ::fcntl(sockets[0], F_GETFD) == -1 && errno == EBADF;
+}
+
+auto self_closing_write_test() -> bool
+{
+    int sockets[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+        return false;
+    }
+    unique_fd peer(sockets[1]);
+    event_loop loop;
+    auto sender = std::make_unique<self_closing_stream>(loop, sockets[0]);
+    auto* stream = sender.get();
+    loop.add(std::move(sender));
+    constexpr std::array<std::byte, 1> byte {std::byte {'x'}};
+    stream->write(byte);
+    return ::fcntl(sockets[0], F_GETFD) == -1 && errno == EBADF;
+}
+
 class throwing_owned_stream final : public tcp_stream {
 public:
     throwing_owned_stream(event_loop& loop, unique_fd descriptor)
@@ -682,6 +788,8 @@ auto main() -> int
     loop.run();
 
     if (!backpressure_test()) return 1;
+    if (!callback_failure_test(false) || !callback_failure_test(true) ||
+        !write_callback_failure_test() || !self_closing_write_test()) return 1;
     if (!descriptor_ownership_test()) return 1;
     if (!accepted_descriptor_failure_test()) return 1;
     if (!legacy_acceptor_test()) return 1;

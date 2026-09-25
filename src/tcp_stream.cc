@@ -180,7 +180,13 @@ auto tcp_stream::on_read() -> void
         const auto size = recv(descriptor_, buffer.data(), buffer.size(), 0);
         if (size > 0) {
             received += static_cast<std::size_t>(size);
-            on_transport_data(std::span {buffer}.first(static_cast<std::size_t>(size)));
+            try {
+                on_transport_data(
+                    std::span {buffer}.first(static_cast<std::size_t>(size)));
+            } catch (...) {
+                abort();
+                throw;
+            }
             if (closing_ || closed_) {
                 return;
             }
@@ -283,6 +289,7 @@ auto tcp_stream::flush() -> void
 
 auto tcp_stream::notify_write_drained() -> void
 {
+    event_loop::handler_call_scope callback_scope(loop_);
     if (notifying_write_drained_) {
         write_drained_deferred_ = true;
         return;
@@ -290,7 +297,13 @@ auto tcp_stream::notify_write_drained() -> void
     do {
         write_drained_deferred_ = false;
         notifying_write_drained_ = true;
-        on_write_drained();
+        try {
+            on_write_drained();
+        } catch (...) {
+            notifying_write_drained_ = false;
+            abort();
+            throw;
+        }
         notifying_write_drained_ = false;
     } while (write_drained_deferred_ && !write_pending() && !closing_ && !closed_);
 }
@@ -302,13 +315,25 @@ auto tcp_stream::on_transport_data(std::span<const std::byte> data) -> void
 
 auto tcp_stream::on_transport_close() -> void
 {
-    emit_close();
+    event_loop::handler_call_scope callback_scope(loop_);
+    try {
+        emit_close();
+    } catch (...) {
+        abort();
+        throw;
+    }
     close();
 }
 
 auto tcp_stream::on_transport_error(std::error_code error) -> void
 {
-    emit_error(error);
+    event_loop::handler_call_scope callback_scope(loop_);
+    try {
+        emit_error(error);
+    } catch (...) {
+        abort();
+        throw;
+    }
     abort();
 }
 

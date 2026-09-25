@@ -838,6 +838,19 @@ event_loop::event_loop(event_loop_options options)
 
 event_loop::~event_loop() = default;
 
+event_loop::handler_call_scope::handler_call_scope(event_loop& loop) noexcept
+{
+    if (loop.implementation_->dispatch_depth == 0) {
+        loop_ = &loop;
+        ++loop.implementation_->dispatch_depth;
+    }
+}
+
+event_loop::handler_call_scope::~handler_call_scope() noexcept
+{
+    if (loop_ != nullptr) loop_->implementation_->finish_dispatch();
+}
+
 auto event_loop::run() -> event_loop_result
 {
     std::array<ready_event, 64> events {};

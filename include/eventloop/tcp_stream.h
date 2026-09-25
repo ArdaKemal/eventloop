@@ -28,6 +28,7 @@ public:
     [[nodiscard]] auto write_pending() const noexcept -> bool override;
 
 protected:
+    [[nodiscard]] auto owner_loop() noexcept -> event_loop& { return loop_; }
     virtual auto on_transport_data(std::span<const std::byte> data) -> void;
     virtual auto on_transport_close() -> void;
     virtual auto on_transport_error(std::error_code error) -> void;

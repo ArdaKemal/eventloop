@@ -81,9 +81,11 @@ switching PCs; a fresh clone will not contain uncommitted work.
    setup is denied. The overall library still compiles a Linux epoll backend
    unconditionally; other operating systems are **not** supported yet.
 6. A recent lifetime audit fixed reentrant and throwing shutdown callbacks,
-   but it is not a proof of memory safety across every transport and coroutine
-   path. Keep auditing ownership boundaries and use sanitizer runs for any
-   new exception or cancellation path.
+   and an ASan-confirmed use-after-free when a direct write callback closed its
+   own stream. Direct transport callbacks now defer handler removal until they
+   return. This is not a proof of memory safety across every transport and
+   coroutine path; keep auditing ownership boundaries and use sanitizer runs
+   for new exception or cancellation paths.
 
 ## Environment and verification
 

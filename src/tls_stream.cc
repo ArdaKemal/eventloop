@@ -332,6 +332,7 @@ tls_stream::~tls_stream() = default;
 
 auto tls_stream::write(std::span<const std::byte> data) -> void
 {
+    event_loop::handler_call_scope callback_scope(owner_loop());
     if (!ready()) {
         throw std::logic_error("cannot write before the TLS handshake completes");
     }
@@ -339,16 +340,16 @@ auto tls_stream::write(std::span<const std::byte> data) -> void
         implementation_->channel_->send({
             reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
     } catch (const Botan::TLS::TLS_Exception& error) {
-        emit_error({static_cast<int>(error.type()), tls_error_category()});
-        abort();
+        on_transport_error({static_cast<int>(error.type()),
+                            tls_error_category()});
     } catch (const Botan::Exception&) {
-        emit_error(make_error_code(tls_errc::protocol_error));
-        abort();
+        on_transport_error(make_error_code(tls_errc::protocol_error));
     }
 }
 
 auto tls_stream::close() -> void
 {
+    event_loop::handler_call_scope callback_scope(owner_loop());
     if (closing_) {
         return;
     }
@@ -359,8 +360,7 @@ auto tls_stream::close() -> void
         }
         tcp_stream::close();
     } catch (const Botan::Exception&) {
-        emit_error(make_error_code(tls_errc::protocol_error));
-        abort();
+        on_transport_error(make_error_code(tls_errc::protocol_error));
     }
 }
 
@@ -384,25 +384,28 @@ auto tls_stream::on_transport_data(std::span<const std::byte> data) -> void
         implementation_->channel_->received_data({
             reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
     } catch (const Botan::TLS::TLS_Exception& error) {
-        emit_error({static_cast<int>(error.type()), tls_error_category()});
-        abort();
+        on_transport_error({static_cast<int>(error.type()),
+                            tls_error_category()});
         return;
     } catch (const Botan::Exception&) {
-        emit_error(make_error_code(ready() ? tls_errc::protocol_error
-                                           : tls_errc::handshake_failed));
-        abort();
+        on_transport_error(make_error_code(
+            ready() ? tls_errc::protocol_error : tls_errc::handshake_failed));
         return;
     }
 
     if (implementation_->fatal_error_) {
-        emit_error(implementation_->fatal_error_);
-        abort();
+        on_transport_error(implementation_->fatal_error_);
         return;
     }
     if (implementation_->peer_closed_) {
         if (!close_emitted_) {
             close_emitted_ = true;
-            emit_close();
+            try {
+                emit_close();
+            } catch (...) {
+                abort();
+                throw;
+            }
         }
         close();
     }
@@ -414,17 +417,20 @@ auto tls_stream::on_transport_close() -> void
         implementation_->channel_->is_closed_for_reading()) {
         if (!close_emitted_) {
             close_emitted_ = true;
-            emit_close();
+            try {
+                emit_close();
+            } catch (...) {
+                abort();
+                throw;
+            }
         }
         tcp_stream::close();
         return;
     }
-    emit_error(make_error_code(tls_errc::truncated));
-    abort();
+    on_transport_error(make_error_code(tls_errc::truncated));
 }
 
 auto tls_stream::on_transport_error(std::error_code error) -> void
 {
-    emit_error(error);
-    abort();
+    tcp_stream::on_transport_error(error);
 }

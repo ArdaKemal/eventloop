@@ -200,6 +200,20 @@ public:
 
 private:
     friend struct eventloop_detail::coroutine_frame_access;
+    friend class tcp_stream;
+    friend class tls_stream;
+
+    class handler_call_scope {
+    public:
+        explicit handler_call_scope(event_loop& loop) noexcept;
+        ~handler_call_scope() noexcept;
+
+        handler_call_scope(const handler_call_scope&) = delete;
+        auto operator=(const handler_call_scope&) -> handler_call_scope& = delete;
+
+    private:
+        event_loop* loop_ {nullptr};
+    };
 
     [[nodiscard]] auto spawn_root(eventloop_detail::coroutine_root_node& root,
                                   std::coroutine_handle<> handle,
