@@ -19,6 +19,8 @@ switching PCs; a fresh clone will not contain uncommitted work.
   event-loop thread. Worker threads must post completions back to that loop.
 - Relative timer deadlines saturate at the latest representable time point;
   cancellation tests cover `duration::max()` without waiting for that delay.
+- Coroutine `yield`, timer, and blocking awaiters check loop affinity before
+  queuing work. Wrong-loop use terminates as a programming error.
 - Do not treat destruction of an unfinished task as cancellation. Outstanding
   kernel or worker references must retire before a frame is destroyed.
 - Accepted socket descriptors use `unique_fd` through the built-in TCP/TLS

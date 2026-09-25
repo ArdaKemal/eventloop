@@ -782,6 +782,7 @@ public:
     template<typename Promise>
     auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
     {
+        if (handle.promise().owner_loop() != &loop_) std::terminate();
         auto& cancellation = *handle.promise().cancellation_;
         if (cancellation.requested) {
             error_ = blocking_error::cancelled;
@@ -907,14 +908,13 @@ public:
     auto operator=(const event_loop_timer_awaiter&)
         -> event_loop_timer_awaiter& = delete;
 
-    [[nodiscard]] auto await_ready() const noexcept -> bool
-    {
-        return timer_.deadline <= event_loop::clock::now();
-    }
+    [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
 
     template<typename Promise>
     auto await_suspend(std::coroutine_handle<Promise> handle) -> bool
     {
+        if (handle.promise().owner_loop() != &loop_) std::terminate();
+        if (timer_.deadline <= event_loop::clock::now()) return false;
         auto& cancellation = *handle.promise().cancellation_;
         if (cancellation.requested) {
             result_ = timer_wait_result::cancelled;
@@ -988,8 +988,10 @@ public:
 
     [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
 
-    auto await_suspend(std::coroutine_handle<> handle) noexcept -> bool
+    template<typename Promise>
+    auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
     {
+        if (handle.promise().owner_loop() != &loop_) std::terminate();
         execution_task continuation(
             [handle]() noexcept { handle.resume(); });
         queued_ = true;

@@ -47,6 +47,8 @@ default.
   programming error. Resource exhaustion is a returned result. Unhandled
   exceptions in a task currently terminate the process; task bodies should
   return anticipated application errors as values.
+- `yield`, `sleep_for`, and `run_blocking` verify the awaiting task's loop
+  before posting or registering work, including for an already-due timer.
 
 ## Cancellation and lifetime
 

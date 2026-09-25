@@ -5,10 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <new>
 #include <stdexcept>
 #include <thread>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 std::size_t allocations = 0;
@@ -48,6 +52,35 @@ auto increment(event_loop&, int& value) -> task<void>
 }
 
 auto noop(event_loop&) -> task<void> { co_return; }
+
+auto foreign_awaiter_root(event_loop& owner, event_loop& foreign, int kind)
+    -> task<void>
+{
+    (void)owner;
+    if (kind == 0) (void)co_await yield(foreign);
+    else if (kind == 1) (void)co_await sleep_for(foreign, std::chrono::hours {1});
+    else if (kind == 2) (void)co_await sleep_for(foreign, {});
+    else (void)co_await run_blocking(foreign, []() noexcept {});
+}
+
+auto wrong_loop_awaiter_test() -> bool
+{
+    for (int kind = 0; kind < 4; ++kind) {
+        const pid_t child = ::fork();
+        if (child == -1) return false;
+        if (child == 0) {
+            std::set_terminate([] { std::_Exit(77); });
+            event_loop owner;
+            event_loop foreign(event_loop_options {.worker_count = 1});
+            (void)owner.spawn(foreign_awaiter_root(owner, foreign, kind));
+            std::_Exit(1);
+        }
+        int status = 0;
+        if (::waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 77) return false;
+    }
+    return true;
+}
 
 auto value_task(event_loop&) -> task<int> { co_return 42; }
 
@@ -495,6 +528,10 @@ auto spawn_failure_test() -> bool
 
 auto main() -> int
 {
+    if (!wrong_loop_awaiter_test()) {
+        std::cerr << "wrong-loop awaiter test failed\n";
+        return 1;
+    }
     if (!value_result_test()) {
         std::cerr << "task value result test failed\n";
         return 1;
