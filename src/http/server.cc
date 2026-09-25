@@ -23,10 +23,12 @@ template<typename Stream>
 class serving_connection final : public Stream {
 public:
     template<typename... Arguments>
-    serving_connection(int root_descriptor, server_options options,
+    serving_connection(std::shared_ptr<unique_fd> root_descriptor,
+                       server_options options,
                        Arguments&&... arguments)
         : Stream(std::forward<Arguments>(arguments)...),
-          session_(*this, root_descriptor, options.directory_listing,
+          root_descriptor_(std::move(root_descriptor)),
+          session_(*this, root_descriptor_->get(), options.directory_listing,
                    file_stream(this))
     {
     }
@@ -48,14 +50,16 @@ private:
     auto on_write_drained() -> void override { session_.write_drained(); }
     auto on_shutdown() -> void override { session_.shutdown(); }
 
+    std::shared_ptr<unique_fd> root_descriptor_;
     session session_;
 };
 
 class redirect_connection final : public tcp_stream {
 public:
     redirect_connection(event_loop& loop, unique_fd descriptor,
-                        std::string_view hostname, std::uint16_t https_port)
-        : tcp_stream(loop, std::move(descriptor)), hostname_(hostname),
+                        std::shared_ptr<const std::string> hostname,
+                        std::uint16_t https_port)
+        : tcp_stream(loop, std::move(descriptor)), hostname_(std::move(hostname)),
           https_port_(https_port)
     {
     }
@@ -85,14 +89,14 @@ private:
                   "HTTP/1.1 308 Permanent Redirect\r\n"
                   "Location: https://%.*s%.*s\r\n"
                   "Content-Length: 0\r\nConnection: close\r\n\r\n",
-                  static_cast<int>(hostname_.size()), hostname_.data(),
+                  static_cast<int>(hostname_->size()), hostname_->data(),
                   static_cast<int>(request.target.size()), request.target.data())
             : std::snprintf(
                   response_.data(), response_.size(),
                   "HTTP/1.1 308 Permanent Redirect\r\n"
                   "Location: https://%.*s:%u%.*s\r\n"
                   "Content-Length: 0\r\nConnection: close\r\n\r\n",
-                  static_cast<int>(hostname_.size()), hostname_.data(),
+                  static_cast<int>(hostname_->size()), hostname_->data(),
                   static_cast<unsigned int>(https_port_),
                   static_cast<int>(request.target.size()), request.target.data());
         if (size < 0 || static_cast<std::size_t>(size) >= response_.size()) {
@@ -116,7 +120,7 @@ private:
         close();
     }
 
-    std::string_view hostname_;
+    std::shared_ptr<const std::string> hostname_;
     std::uint16_t https_port_;
     std::array<char, max_message_size> input_ {};
     std::array<char, 4096> response_ {};
@@ -128,15 +132,15 @@ private:
     return {errno, std::system_category(), operation};
 }
 
-[[nodiscard]] auto open_root(std::string_view root) -> int
+[[nodiscard]] auto open_root(std::string_view root) -> unique_fd
 {
     std::array<char, 4096> path {};
     if (root.empty() || root.size() >= path.size()) {
         throw std::invalid_argument("HTTP root path is invalid or too long");
     }
     std::memcpy(path.data(), root.data(), root.size());
-    const int descriptor = open(path.data(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (descriptor == -1) {
+    unique_fd descriptor(open(path.data(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!descriptor) {
         throw system_error("open HTTP root");
     }
     return descriptor;
@@ -161,15 +165,10 @@ server::server(event_loop& loop, std::uint16_t port, std::string_view root,
                std::string_view address, server_options options)
     : tcp_acceptor(loop, port, address, options.reuse_port), options_(options)
 {
-    root_descriptor_ = open_root(root);
+    root_descriptor_ = std::make_shared<unique_fd>(open_root(root));
 }
 
-server::~server()
-{
-    if (root_descriptor_ != -1) {
-        ::close(root_descriptor_);
-    }
-}
+server::~server() = default;
 
 auto server::on_accept_owned(unique_fd descriptor) -> void
 {
@@ -188,15 +187,10 @@ https_server::https_server(event_loop& loop, std::uint16_t port,
                            server_options options)
     : tls_acceptor(loop, port, std::move(context), address), options_(options)
 {
-    root_descriptor_ = open_root(root);
+    root_descriptor_ = std::make_shared<unique_fd>(open_root(root));
 }
 
-https_server::~https_server()
-{
-    if (root_descriptor_ != -1) {
-        ::close(root_descriptor_);
-    }
-}
+https_server::~https_server() = default;
 
 auto https_server::make_owned_stream(unique_fd descriptor)
     -> std::unique_ptr<tls_stream>
@@ -215,10 +209,10 @@ redirect_server::redirect_server(event_loop& loop, std::uint16_t port,
                                  std::string_view hostname,
                                  std::uint16_t https_port,
                                  std::string_view address)
-    : tcp_acceptor(loop, port, address), hostname_(hostname),
-      https_port_(https_port)
+    : tcp_acceptor(loop, port, address), https_port_(https_port)
 {
-    validate_hostname(hostname_);
+    validate_hostname(hostname);
+    hostname_ = std::make_shared<const std::string>(hostname);
 }
 
 auto redirect_server::on_accept_owned(unique_fd descriptor) -> void

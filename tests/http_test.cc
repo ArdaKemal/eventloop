@@ -1,17 +1,23 @@
 #include "eventloop/http/mime_types.h"
 #include "eventloop/http/request.h"
+#include "eventloop/http/server.h"
 #include "eventloop/http/session.h"
+#include "eventloop/unique_fd.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <new>
 #include <span>
 #include <string_view>
 
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -229,11 +235,76 @@ auto session_tests() -> bool
            graceful_shutdown_valid;
 }
 
+auto request_after_listener_removal(event_loop& loop,
+                                    std::unique_ptr<notifiable> listener,
+                                    std::string_view request,
+                                    std::string_view expected) -> bool
+{
+    const int listener_descriptor = listener->descriptor();
+    sockaddr_in endpoint {};
+    socklen_t endpoint_size = sizeof(endpoint);
+    if (getsockname(listener_descriptor, reinterpret_cast<sockaddr*>(&endpoint),
+                    &endpoint_size) == -1) return false;
+    loop.add(std::move(listener));
+
+    unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (!client || connect(client.get(), reinterpret_cast<sockaddr*>(&endpoint),
+                           endpoint_size) == -1) return false;
+
+    bool sent = false;
+    if (!loop.post(execution_task([&]() noexcept {
+            loop.remove(listener_descriptor);
+            sent = send(client.get(), request.data(), request.size(), MSG_NOSIGNAL) ==
+                   static_cast<ssize_t>(request.size());
+        }))) return false;
+    (void)loop.schedule_after(std::chrono::milliseconds(100),
+                              execution_task([&loop]() noexcept { loop.stop(); }));
+    loop.run();
+
+    std::array<char, 2048> response {};
+    const auto received = recv(client.get(), response.data(), response.size(),
+                               MSG_DONTWAIT);
+    const bool valid = sent && received > 0 &&
+        std::string_view {response.data(), static_cast<std::size_t>(received)}
+            .find(expected) != std::string_view::npos;
+    return valid;
+}
+
+auto listener_removal_test() -> bool
+{
+    char directory_name[] = "/tmp/eventloop-http-root-XXXXXX";
+    if (mkdtemp(directory_name) == nullptr) return false;
+    unique_fd directory(open(directory_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!directory || !write_file(directory.get(), "index.html", "root survives")) {
+        return false;
+    }
+
+    event_loop loop;
+    const bool valid = request_after_listener_removal(
+        loop, std::make_unique<http::server>(loop, 0, directory_name),
+        "GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "root survives");
+    unlinkat(directory.get(), "index.html", 0);
+    directory.reset();
+    unlinkat(AT_FDCWD, directory_name, AT_REMOVEDIR);
+    return valid;
+}
+
+auto redirect_listener_removal_test() -> bool
+{
+    event_loop loop;
+    return request_after_listener_removal(
+        loop, std::make_unique<http::redirect_server>(loop, 0, "localhost", 443),
+        "GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "Location: https://localhost/next");
+}
+
 } // namespace
 
 auto main() -> int
 {
-    if (!parser_and_mime_tests() || !session_tests()) {
+    if (!parser_and_mime_tests() || !session_tests() ||
+        !listener_removal_test() || !redirect_listener_removal_test()) {
         std::cerr << "HTTP tests failed\n";
         return 1;
     }

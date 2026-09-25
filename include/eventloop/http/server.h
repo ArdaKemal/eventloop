@@ -26,7 +26,7 @@ private:
     auto on_accept(int descriptor) -> void override;
     auto on_accept_owned(unique_fd descriptor) -> void override;
 
-    int root_descriptor_ {-1};
+    std::shared_ptr<unique_fd> root_descriptor_;
     server_options options_;
 };
 
@@ -43,7 +43,7 @@ private:
     auto make_owned_stream(unique_fd descriptor)
         -> std::unique_ptr<tls_stream> override;
 
-    int root_descriptor_ {-1};
+    std::shared_ptr<unique_fd> root_descriptor_;
     server_options options_;
 };
 
@@ -57,7 +57,7 @@ private:
     auto on_accept(int descriptor) -> void override;
     auto on_accept_owned(unique_fd descriptor) -> void override;
 
-    std::string hostname_;
+    std::shared_ptr<const std::string> hostname_;
     std::uint16_t https_port_;
 };
 
