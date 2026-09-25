@@ -48,6 +48,10 @@ switching PCs; a fresh clone will not contain uncommitted work.
 - No production HTTP or WebSocket path uses the new file-I/O awaiters yet.
   HTTP still uses synchronous `openat`/`fstat`/small-file reads, and plain HTTP
   uses `sendfile` for larger files. Do not replace those paths blindly.
+- HTTP path walking and response construction now hold intermediate file
+  descriptors in `unique_fd`; `sendfile` and directory listing receive an
+  explicit ownership release. The component-by-component `O_NOFOLLOW` walk
+  remains in place.
 - `task<T>`, fixed-arity composition, and `task_handle<T>` are available.
   The handle is a stable observed-root scope and must remain alive until its
   task completes. See `docs/api-contract.md` and `tests/task_handle.cc`.

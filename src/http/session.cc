@@ -13,6 +13,7 @@
 #include <ctime>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -63,11 +64,12 @@ auto format_http_time(std::time_t value, std::span<char> output) noexcept
                          "%a, %d %b %Y %H:%M:%S GMT", &time);
 }
 
-[[nodiscard]] auto open_beneath(int root, std::span<char> path) noexcept -> int
+[[nodiscard]] auto open_beneath(int root, std::span<char> path) noexcept
+    -> unique_fd
 {
     std::size_t start = 0;
     int parent = root;
-    int owned_parent = -1;
+    unique_fd owned_parent;
 
     while (start < path.size()) {
         while (start < path.size() && path[start] == '/') ++start;
@@ -79,22 +81,21 @@ auto format_http_time(std::time_t value, std::span<char> output) noexcept
         if (end < path.size()) path[end] = '\0';
         const int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
                           (end < path.size() ? O_DIRECTORY : 0);
-        const int next = openat(parent, path.data() + start, flags);
+        unique_fd next(openat(parent, path.data() + start, flags));
         if (end < path.size()) path[end] = saved;
-        if (next == -1) {
+        if (!next) {
             const int error = errno;
-            if (owned_parent != -1) ::close(owned_parent);
+            owned_parent.reset();
             errno = error;
-            return -1;
+            return {};
         }
-        if (owned_parent != -1) ::close(owned_parent);
-        owned_parent = next;
-        parent = next;
+        owned_parent = std::move(next);
+        parent = owned_parent.get();
         start = end + 1;
     }
 
-    if (owned_parent != -1) return owned_parent;
-    return openat(root, ".", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (owned_parent) return owned_parent;
+    return unique_fd(openat(root, ".", O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
 }
 
 auto read_file(int descriptor, std::span<std::byte> output) noexcept -> bool
@@ -207,59 +208,59 @@ auto session::serve_resource(bool headers_only) -> void
         return;
     }
 
-    int descriptor = open_beneath(root_descriptor_,
-                                  std::span {path}.first(path_size));
-    if (descriptor == -1) {
+    auto descriptor = open_beneath(root_descriptor_,
+                                   std::span {path}.first(path_size));
+    if (!descriptor) {
         send_response(not_found);
         return;
     }
 
     struct stat info {};
-    if (fstat(descriptor, &info) == -1 ||
+    if (fstat(descriptor.get(), &info) == -1 ||
         (!S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode))) {
-        ::close(descriptor);
+        descriptor.reset();
         send_response(not_found);
         return;
     }
     if (S_ISREG(info.st_mode)) {
-        serve_file(descriptor, info, headers_only, request_.target);
+        serve_file(std::move(descriptor), info, headers_only, request_.target);
         return;
     }
 
     const auto raw_path = request_.target.substr(
         0, request_.target.find_first_of("?#"));
     if (raw_path.empty() || raw_path.back() != '/') {
-        ::close(descriptor);
+        descriptor.reset();
         send_directory_redirect();
         return;
     }
 
-    const int index = openat(descriptor, "index.html",
-                             O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    unique_fd index(openat(descriptor.get(), "index.html",
+                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
     struct stat index_info {};
-    if (index != -1 && fstat(index, &index_info) == 0 &&
+    if (index && fstat(index.get(), &index_info) == 0 &&
         S_ISREG(index_info.st_mode)) {
-        ::close(descriptor);
-        serve_file(index, index_info, headers_only, "index.html");
+        descriptor.reset();
+        serve_file(std::move(index), index_info, headers_only, "index.html");
         return;
     }
-    if (index != -1) ::close(index);
+    index.reset();
 
     if (!directory_listing_) {
-        ::close(descriptor);
+        descriptor.reset();
         send_response(forbidden);
         return;
     }
-    serve_directory(descriptor, headers_only);
+    serve_directory(std::move(descriptor), headers_only);
 }
 
-auto session::serve_file(int descriptor, const struct ::stat& info,
+auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
                          bool headers_only, std::string_view mime_path) -> void
 {
     if (info.st_size < 0 ||
         static_cast<std::uintmax_t>(info.st_size) >
             std::numeric_limits<std::size_t>::max()) {
-        ::close(descriptor);
+        descriptor.reset();
         close_after_response_ = true;
         send_response(internal_error);
         return;
@@ -282,7 +283,7 @@ auto session::serve_file(int descriptor, const struct ::stat& info,
         static_cast<int>(mime.size()), mime.data(),
         close_after_response_ ? "close" : "keep-alive");
     if (header_size < 0 || static_cast<std::size_t>(header_size) >= header.size()) {
-        ::close(descriptor);
+        descriptor.reset();
         send_error(parse_status::headers_too_large);
         return;
     }
@@ -291,7 +292,7 @@ auto session::serve_file(int descriptor, const struct ::stat& info,
                                         : static_cast<std::size_t>(info.st_size);
     const auto header_length = static_cast<std::size_t>(header_size);
     if (body_size > std::numeric_limits<std::size_t>::max() - header_length) {
-        ::close(descriptor);
+        descriptor.reset();
         close_after_response_ = true;
         send_response(internal_error);
         return;
@@ -303,7 +304,7 @@ auto session::serve_file(int descriptor, const struct ::stat& info,
         responding_ = true;
         file_stream_->send_file(
             std::as_bytes(std::span {header}.first(header_length)),
-            descriptor, body_size);
+            descriptor.release(), body_size);
         return;
     }
 
@@ -311,10 +312,10 @@ auto session::serve_file(int descriptor, const struct ::stat& info,
         std::array<char, buffer_size> response {};
         std::memcpy(response.data(), header.data(), header_length);
         const bool read = headers_only || read_file(
-            descriptor,
+            descriptor.get(),
             std::as_writable_bytes(std::span {response}.subspan(header_length,
                                                                  body_size)));
-        ::close(descriptor);
+        descriptor.reset();
         if (!read) {
             close_after_response_ = true;
             send_response(internal_error);
@@ -327,33 +328,33 @@ auto session::serve_file(int descriptor, const struct ::stat& info,
     try {
         auto response = allocate_response(response_size);
         std::memcpy(response.data(), header.data(), header_length);
-        if (!read_file(descriptor, std::as_writable_bytes(
+        if (!read_file(descriptor.get(), std::as_writable_bytes(
                 response.subspan(header_length, body_size)))) {
-            ::close(descriptor);
+            descriptor.reset();
             output_.reset();
             close_after_response_ = true;
             send_response(internal_error);
             return;
         }
     } catch (const std::bad_alloc&) {
-        ::close(descriptor);
+        descriptor.reset();
         close_after_response_ = true;
         send_response(internal_error);
         return;
     } catch (const std::length_error&) {
-        ::close(descriptor);
+        descriptor.reset();
         close_after_response_ = true;
         send_response(internal_error);
         return;
     }
-    ::close(descriptor);
+    descriptor.reset();
     start_large_response();
 }
 
-auto session::serve_directory(int descriptor, bool headers_only) -> void
+auto session::serve_directory(unique_fd descriptor, bool headers_only) -> void
 {
     try {
-        auto listing = make_directory_listing(descriptor);
+        auto listing = make_directory_listing(descriptor.release());
         if (!listing) {
             close_after_response_ = true;
             send_response(internal_error);

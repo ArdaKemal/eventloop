@@ -2,6 +2,7 @@
 
 #include "eventloop/byte_stream.h"
 #include "eventloop/http/request.h"
+#include "eventloop/unique_fd.h"
 
 #include <array>
 #include <cstddef>
@@ -38,9 +39,9 @@ private:
     auto process_requests() -> void;
     auto handle_request() -> void;
     auto serve_resource(bool headers_only) -> void;
-    auto serve_file(int descriptor, const struct ::stat& info,
+    auto serve_file(unique_fd descriptor, const struct ::stat& info,
                     bool headers_only, std::string_view mime_path) -> void;
-    auto serve_directory(int descriptor, bool headers_only) -> void;
+    auto serve_directory(unique_fd descriptor, bool headers_only) -> void;
     auto send_directory_redirect() -> void;
     auto send_options() -> void;
     auto send_error(parse_status status) -> void;
