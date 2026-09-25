@@ -160,6 +160,35 @@ private:
     int descriptor_;
 };
 
+class throwing_shutdown_handler final : public notifiable {
+public:
+    explicit throwing_shutdown_handler(bool& destroyed)
+        : destroyed_(destroyed), descriptor_(make_event(0)) {}
+
+    ~throwing_shutdown_handler() override
+    {
+        destroyed_ = true;
+        ::close(descriptor_);
+    }
+
+    [[nodiscard]] auto descriptor() const noexcept -> int override
+    {
+        return descriptor_;
+    }
+
+private:
+    auto on_read() -> void override {}
+    auto on_write() -> void override {}
+    auto on_error() -> void override {}
+    auto on_shutdown() -> void override
+    {
+        throw std::runtime_error("expected shutdown failure");
+    }
+
+    bool& destroyed_;
+    int descriptor_;
+};
+
 class fairness_handler final : public notifiable {
 public:
     fairness_handler(event_loop& loop, int& post_count, int& observed_count)
@@ -444,6 +473,20 @@ auto timer_tests() -> bool
 
 auto shutdown_tests() -> bool
 {
+    {
+        event_loop loop;
+        bool destroyed = false;
+        loop.add(std::make_unique<throwing_shutdown_handler>(destroyed));
+        try {
+            loop.shutdown(std::chrono::seconds {1});
+            return false;
+        } catch (const std::runtime_error&) {
+        }
+        if (!destroyed || loop.run() != event_loop_result::stopped) {
+            return false;
+        }
+    }
+
     {
         event_loop loop;
         bool alive_in_read = false;

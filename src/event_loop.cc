@@ -935,7 +935,9 @@ auto event_loop::shutdown(clock::duration timeout) -> void
             }
         }
     } catch (...) {
+        implementation_->force_shutdown();
         implementation_->finish_dispatch();
+        implementation_->poller.wake();
         throw;
     }
     implementation_->finish_dispatch();
