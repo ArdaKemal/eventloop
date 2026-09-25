@@ -1,0 +1,223 @@
+#include "eventloop/task_composition.h"
+
+#include <chrono>
+#include <atomic>
+#include <expected>
+#include <iostream>
+#include <thread>
+#include <system_error>
+
+using namespace std::chrono_literals;
+
+namespace {
+auto value(event_loop&, int number) -> task<int> { co_return number; }
+auto no_value(event_loop&) -> task<void> { co_return; }
+auto later(event_loop& loop, int number, std::chrono::milliseconds delay,
+           bool& cancelled) -> task<int>
+{
+    const auto result = co_await sleep_for(loop, delay);
+    cancelled = result == timer_wait_result::cancelled;
+    co_return number;
+}
+auto error_value(event_loop&) -> task<std::expected<int, std::error_code>>
+{
+    co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+}
+auto all_root(event_loop& loop, bool& passed) -> task<void>
+{
+    auto results = co_await when_all(value(loop, 3), no_value(loop), error_value(loop));
+    passed = std::get<0>(results) && *std::get<0>(results) == 3 &&
+             std::get<1>(results) == task_result::success &&
+             std::get<2>(results) && !*std::get<2>(results);
+}
+auto delayed_all_root(event_loop& loop, bool& passed) -> task<void>
+{
+    bool first_cancelled = false;
+    bool second_cancelled = false;
+    auto results = co_await when_all(later(loop, 3, 1ms, first_cancelled),
+                                     later(loop, 4, 2ms, second_cancelled));
+    passed = std::get<0>(results) && std::get<1>(results) &&
+             *std::get<0>(results) == 3 && *std::get<1>(results) == 4 &&
+             !first_cancelled && !second_cancelled;
+}
+auto race_root(event_loop& loop, bool& passed) -> task<void>
+{
+    bool cancelled = false;
+    auto result = co_await race(value(loop, 7), later(loop, 9, 1h, cancelled));
+    passed = result && result->index == 0 &&
+             *std::get<0>(result->result) == 7 && cancelled;
+}
+auto error_race_root(event_loop& loop, bool& passed) -> task<void>
+{
+    bool cancelled = false;
+    auto result = co_await race(error_value(loop),
+                                later(loop, 9, 1h, cancelled));
+    passed = result && result->index == 0 && cancelled &&
+             std::get<0>(result->result) &&
+             !*std::get<0>(result->result);
+}
+auto timeout_root(event_loop& loop, bool& passed) -> task<void>
+{
+    bool cancelled = false;
+    auto first = co_await with_timeout(loop, later(loop, 4, 1h, cancelled), 1ms);
+    auto second = co_await with_timeout(loop, value(loop, 5), 1h);
+    auto immediate = co_await with_timeout(loop, value(loop, 6), 0ms);
+    passed = first && first->state == timeout_result<int>::outcome::timed_out &&
+             cancelled && second &&
+             second->state == timeout_result<int>::outcome::completed &&
+             second->result && **second->result == 5 && immediate &&
+             immediate->state == timeout_result<int>::outcome::timed_out;
+}
+auto blocking_child(event_loop& loop, std::atomic<bool>& release,
+                    bool& cancelled) -> task<int>
+{
+    auto result = co_await run_blocking(loop, [&release]() noexcept {
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        return 8;
+    });
+    cancelled = !result && result.error() == blocking_error::cancelled;
+    co_return 8;
+}
+auto worker_race_root(event_loop& loop, std::atomic<bool>& release,
+                      bool& cancelled, bool& passed) -> task<void>
+{
+    auto result = co_await race(blocking_child(loop, release, cancelled),
+                                later(loop, 2, 1ms, passed));
+    passed = result && result->index == 1 && cancelled &&
+             release.load(std::memory_order_acquire);
+}
+auto worker_race_test() -> bool
+{
+    event_loop_options options;
+    options.worker_count = 1;
+    event_loop loop(options);
+    std::atomic<bool> release {false};
+    bool cancelled = false;
+    bool passed = false;
+    auto root = worker_race_root(loop, release, cancelled, passed);
+    if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
+    (void)loop.schedule_after(5ms, execution_task([&release]() noexcept {
+        release.store(true, std::memory_order_release);
+    }));
+    (void)loop.schedule_after(50ms, execution_task([&loop]() noexcept { loop.stop(); }));
+    (void)loop.run();
+    return passed && loop.coroutine_statistics().active_roots == 0;
+}
+auto cancellation_root(event_loop& loop, bool& first, bool& second,
+                       bool& reached) -> task<void>
+{
+    auto result = co_await when_all(later(loop, 1, 1h, first),
+                                    later(loop, 2, 1h, second));
+    reached = std::get<0>(result) && std::get<1>(result);
+}
+auto shutdown_test() -> bool
+{
+    event_loop loop;
+    bool first = false;
+    bool second = false;
+    bool reached = false;
+    auto root = cancellation_root(loop, first, second, reached);
+    if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
+    loop.shutdown(event_loop::clock::duration::zero());
+    (void)loop.run();
+    return first && second && reached &&
+           loop.coroutine_statistics().active_roots == 0;
+}
+auto cancelled_race_root(event_loop& loop, bool& first, bool& second,
+                         bool& reached) -> task<void>
+{
+    auto result = co_await race(later(loop, 1, 1h, first),
+                                later(loop, 2, 1h, second));
+    reached = !result && result.error() == task_result::cancelled;
+}
+auto race_shutdown_test() -> bool
+{
+    event_loop loop;
+    bool first = false;
+    bool second = false;
+    bool reached = false;
+    auto root = cancelled_race_root(loop, first, second, reached);
+    if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
+    loop.shutdown(event_loop::clock::duration::zero());
+    (void)loop.run();
+    return first && second && reached &&
+           loop.coroutine_statistics().active_roots == 0;
+}
+auto worker_shutdown_root(event_loop& loop, std::atomic<bool>& release,
+                          bool& cancelled, bool& reached) -> task<void>
+{
+    bool timer_cancelled = false;
+    auto result = co_await race(blocking_child(loop, release, cancelled),
+                                later(loop, 2, 1h, timer_cancelled));
+    reached = !result && result.error() == task_result::cancelled &&
+              timer_cancelled && cancelled;
+}
+auto worker_shutdown_test() -> bool
+{
+    event_loop_options options;
+    options.worker_count = 1;
+    event_loop loop(options);
+    std::atomic<bool> release {false};
+    bool cancelled = false;
+    bool reached = false;
+    auto root = worker_shutdown_root(loop, release, cancelled, reached);
+    if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
+    std::thread worker_release([&release] {
+        std::this_thread::sleep_for(5ms);
+        release.store(true, std::memory_order_release);
+    });
+    loop.shutdown(event_loop::clock::duration::zero());
+    (void)loop.run();
+    worker_release.join();
+    return reached && loop.coroutine_statistics().active_roots == 0;
+}
+auto exhaustion_root(event_loop& loop, bool& passed) -> task<void>
+{
+    auto result = co_await when_all(value(loop, 1), value(loop, 2));
+    passed = !std::get<0>(result) && !std::get<1>(result) &&
+             std::get<0>(result).error() == task_result::frame_allocation_failure &&
+             std::get<1>(result).error() == task_result::frame_allocation_failure;
+}
+auto exhaustion_test() -> bool
+{
+    event_loop_options options;
+    options.coroutine_frame_capacities.fill(0);
+    options.coroutine_frame_capacities.back() = 1;
+    event_loop loop(options);
+    bool passed = false;
+    auto root = exhaustion_root(loop, passed);
+    return loop.spawn(std::move(root)) == task_spawn_result::accepted &&
+           passed && loop.coroutine_statistics().live == 0;
+}
+auto run_case(auto factory) -> bool
+{
+    event_loop loop;
+    bool passed = false;
+    auto root = factory(loop, passed);
+    if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
+    if (loop.coroutine_statistics().active_roots != 0) {
+        (void)loop.schedule_after(10ms, execution_task([&loop]() noexcept { loop.stop(); }));
+        (void)loop.run();
+    }
+    return passed && loop.coroutine_statistics().live == 0;
+}
+}
+int main()
+{
+    bool a = run_case(all_root);
+    bool b = run_case(delayed_all_root);
+    bool c = run_case(race_root);
+    bool d = run_case(error_race_root);
+    bool e = run_case(timeout_root);
+    bool f = worker_race_test();
+    bool g = shutdown_test();
+    bool h = race_shutdown_test();
+    bool i = worker_shutdown_test();
+    bool j = exhaustion_test();
+    if (!a || !b || !c || !d || !e || !f || !g || !h || !i || !j) {
+        std::cerr << "task composition test failed\n";
+        return 1;
+    }
+}

@@ -22,8 +22,16 @@ public:
 class event_loop;
 template<typename T>
 class task;
+template<typename T>
+class task_handle;
+
+enum class file_io_backend { automatic, executor, io_uring };
+enum class active_file_io_backend { executor, io_uring };
 
 namespace eventloop_detail {
+
+struct file_io_operation;
+enum class file_opcode;
 
 enum class completion_reservation_result {
     accepted,
@@ -82,6 +90,8 @@ struct coroutine_frame_access {
         -> bool;
     static auto detach_cancellation(coroutine_cancellation_node& node) noexcept
         -> void;
+    static auto request_cancellation(coroutine_cancellation_state& state) noexcept
+        -> void;
     [[nodiscard]] static auto reserve_completion(event_loop& loop) noexcept
         -> completion_reservation_result;
     static auto release_completion(event_loop& loop) noexcept -> void;
@@ -90,6 +100,9 @@ struct coroutine_frame_access {
     [[nodiscard]] static auto submit_blocking(event_loop& loop,
                                               execution_task&& work) noexcept
         -> blocking_submission_result;
+    [[nodiscard]] static auto submit_file(event_loop& loop,
+                                          file_io_operation& operation) noexcept
+        -> int;
 };
 
 } // namespace eventloop_detail
@@ -113,6 +126,9 @@ struct event_loop_options {
     // Reserved worker-to-loop completions for run_blocking(). Every accepted
     // blocking operation owns one slot until its completion is dequeued.
     std::size_t coroutine_completion_capacity {128};
+    // File operations are bounded independently of the existing post queue.
+    std::size_t file_io_depth {128};
+    file_io_backend file_backend {file_io_backend::automatic};
     // Coroutine frames are served from fixed, per-loop size classes. A zero
     // capacity disables a class. Exhaustion never falls back to the heap.
     // Frame-resident state must not require alignment beyond max_align_t.
@@ -175,11 +191,20 @@ public:
     // access event-loop-owned objects; use post() to deliver results back.
     [[nodiscard]] auto task_executor() noexcept -> executor&;
     [[nodiscard]] auto spawn(task<void>&& operation) -> task_spawn_result;
+    template<typename T>
+    [[nodiscard]] auto spawn(task<T>&& operation, task_handle<T>& observer)
+        -> task_spawn_result;
     [[nodiscard]] auto coroutine_statistics() const noexcept
         -> coroutine_pool_statistics;
+    [[nodiscard]] auto file_backend() -> active_file_io_backend;
 
 private:
     friend struct eventloop_detail::coroutine_frame_access;
+
+    [[nodiscard]] auto spawn_root(eventloop_detail::coroutine_root_node& root,
+                                  std::coroutine_handle<> handle,
+                                  bool started) -> task_spawn_result;
+    [[nodiscard]] auto can_spawn() const noexcept -> bool;
 
     class implementation;
     std::unique_ptr<implementation> implementation_;

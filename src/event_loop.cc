@@ -1,4 +1,5 @@
 #include "eventloop/event_loop.h"
+#include "eventloop/file_io.h"
 #include "eventloop/task.h"
 
 #include "executor/bounded_task_queue.h"
@@ -7,7 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <fcntl.h>
 #include <limits>
 #include <map>
 #include <new>
@@ -16,6 +19,13 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+#if defined(EVENTLOOP_HAS_LIBURING)
+#include <liburing.h>
+#endif
 
 #if defined(__SANITIZE_ADDRESS__)
 #define EVENTLOOP_ADDRESS_SANITIZER 1
@@ -32,6 +42,7 @@
 namespace {
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
 constexpr std::size_t max_timers_per_iteration = 64;
+constexpr std::size_t max_file_completions_per_iteration = 64;
 constexpr std::size_t coroutine_frame_alignment = 64;
 static_assert(coroutine_frame_alignment >= alignof(std::max_align_t));
 
@@ -225,9 +236,126 @@ private:
         throw std::invalid_argument(
             "coroutine completion capacity must be a power of two and at least two");
     }
+    if (options.file_io_depth < 2 ||
+        !is_power_of_two(options.file_io_depth) ||
+        options.file_io_depth > std::numeric_limits<unsigned>::max() / 2) {
+        throw std::invalid_argument(
+            "file I/O depth must be a power of two between 2 and UINT_MAX/2");
+    }
     return options;
 }
 } // namespace
+
+#if defined(EVENTLOOP_HAS_LIBURING)
+namespace {
+class file_ring {
+public:
+    file_ring() = default;
+    ~file_ring()
+    {
+        if (registered_) io_uring_queue_exit(&ring_);
+        if (notification_ != -1) ::close(notification_);
+    }
+
+    file_ring(const file_ring&) = delete;
+    auto operator=(const file_ring&) -> file_ring& = delete;
+
+    [[nodiscard]] auto initialize(epoll_loop& poller, std::size_t depth) noexcept
+        -> int
+    {
+        io_uring_params params {};
+        params.flags = IORING_SETUP_CQSIZE;
+        params.cq_entries = static_cast<unsigned>(depth * 2);
+        const int result = io_uring_queue_init_params(
+            static_cast<unsigned>(depth), &ring_, &params);
+        if (result < 0) return result;
+        registered_ = true;
+        notification_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (notification_ == -1) return -errno;
+        const int registration = io_uring_register_eventfd(&ring_, notification_);
+        if (registration < 0) return registration;
+        try {
+            poller.add_descriptor(notification_);
+        } catch (const std::system_error& error) {
+            return -error.code().value();
+        } catch (...) {
+            return -EIO;
+        }
+        return 0;
+    }
+
+    [[nodiscard]] auto descriptor() const noexcept -> int { return notification_; }
+
+    [[nodiscard]] auto submit(eventloop_detail::file_io_operation& operation)
+        noexcept -> int
+    {
+        // This ring does not use SQPOLL. If an earlier failed submission left
+        // an unsubmitted NOP, consume it before accepting another operation.
+        if (io_uring_sq_ready(&ring_) != 0) {
+            const int flushed = io_uring_submit(&ring_);
+            if (flushed < 0) return flushed;
+            if (io_uring_sq_ready(&ring_) != 0) return -EAGAIN;
+        }
+        auto* sqe = io_uring_get_sqe(&ring_);
+        if (sqe == nullptr) return -EAGAIN;
+        using eventloop_detail::file_opcode;
+        switch (operation.opcode) {
+        case file_opcode::openat:
+            io_uring_prep_openat(sqe, operation.descriptor, operation.path,
+                                 operation.flags, operation.mode);
+            break;
+        case file_opcode::read_at:
+            io_uring_prep_read(sqe, operation.descriptor, operation.buffer,
+                               static_cast<unsigned>(operation.length),
+                               static_cast<std::uint64_t>(operation.offset));
+            break;
+        case file_opcode::write_at:
+            io_uring_prep_write(sqe, operation.descriptor, operation.buffer,
+                                static_cast<unsigned>(operation.length),
+                                static_cast<std::uint64_t>(operation.offset));
+            break;
+        }
+        io_uring_sqe_set_data(sqe, &operation);
+        const int submitted = io_uring_submit(&ring_);
+        if (submitted > 0) return 0;
+
+        // Submission is ordered, and without SQPOLL the kernel does not
+        // consume an SQE that io_uring_submit did not report submitted. It
+        // remains in the shared SQ; replace its frame pointer with a NOP so
+        // a later submission can safely flush it.
+        io_uring_prep_nop(sqe);
+        io_uring_sqe_set_data(sqe, nullptr);
+        return submitted < 0 ? submitted : -EAGAIN;
+    }
+
+    template<typename Complete>
+    auto drain(Complete&& complete) noexcept -> bool
+    {
+        std::uint64_t notification;
+        while (::read(notification_, &notification, sizeof(notification)) == -1 &&
+               errno == EINTR) {}
+        io_uring_cqe* cqe = nullptr;
+        std::size_t count = 0;
+        while (count < max_file_completions_per_iteration &&
+               io_uring_peek_cqe(&ring_, &cqe) == 0) {
+            auto* operation = static_cast<eventloop_detail::file_io_operation*>(
+                io_uring_cqe_get_data(cqe));
+            const int result = cqe->res;
+            io_uring_cqe_seen(&ring_, cqe);
+            if (operation != nullptr) complete(*operation, result);
+            ++count;
+        }
+        return count == max_file_completions_per_iteration &&
+               io_uring_peek_cqe(&ring_, &cqe) == 0;
+    }
+
+private:
+    io_uring ring_ {};
+    int notification_ {-1};
+    bool registered_ {false};
+};
+} // namespace
+#endif
 
 class event_loop::implementation {
 public:
@@ -240,8 +368,148 @@ public:
           task_executor(options.worker_count == 0
                             ? make_single_thread_executor()
                             : make_multi_thread_executor(
-                                  {.worker_count = options.worker_count}))
-    {}
+                                  {.worker_count = options.worker_count})),
+          file_io_depth(options.file_io_depth),
+          requested_file_backend(options.file_backend)
+    {
+        if (requested_file_backend == file_io_backend::io_uring) {
+            initialize_file_backend();
+        }
+    }
+
+    auto initialize_file_backend() -> void
+    {
+        if (file_backend_initialized) return;
+#if defined(EVENTLOOP_HAS_LIBURING)
+        if (requested_file_backend != file_io_backend::executor) {
+            auto candidate = std::make_unique<file_ring>();
+            const int result = candidate->initialize(poller, file_io_depth);
+            if (result == 0) {
+                ring = std::move(candidate);
+                selected_file_backend = active_file_io_backend::io_uring;
+            } else if (requested_file_backend == file_io_backend::io_uring) {
+                throw std::system_error(-result, std::generic_category(),
+                                        "io_uring setup");
+            }
+        }
+#else
+        if (requested_file_backend == file_io_backend::io_uring) {
+            throw std::invalid_argument("io_uring is unavailable in this build");
+        }
+#endif
+        if (selected_file_backend == active_file_io_backend::executor) {
+            file_executor = make_multi_thread_executor(
+                {.worker_count = 1, .queue_capacity = file_io_depth});
+        }
+        file_backend_initialized = true;
+    }
+
+    [[nodiscard]] static auto perform_file_operation(
+        eventloop_detail::file_io_operation& operation) noexcept -> int
+    {
+        using eventloop_detail::file_opcode;
+        if (operation.cancelled.load(std::memory_order_acquire)) {
+            return -ECANCELED;
+        }
+        for (;;) {
+            ssize_t result = -1;
+            switch (operation.opcode) {
+            case file_opcode::openat:
+                result = ::openat(operation.descriptor, operation.path,
+                                  operation.flags, operation.mode);
+                break;
+            case file_opcode::read_at:
+                result = ::pread(operation.descriptor, operation.buffer,
+                                 operation.length,
+                                 static_cast<off_t>(operation.offset));
+                break;
+            case file_opcode::write_at:
+                result = ::pwrite(operation.descriptor, operation.buffer,
+                                  operation.length,
+                                  static_cast<off_t>(operation.offset));
+                break;
+            }
+            if (result >= 0) return static_cast<int>(result);
+            if (errno != EINTR) return -errno;
+            if (operation.cancelled.load(std::memory_order_acquire)) {
+                return -ECANCELED;
+            }
+        }
+    }
+
+    [[nodiscard]] auto submit_file(eventloop_detail::file_io_operation& operation)
+        noexcept -> int
+    {
+        if (shutting_down) return -ECANCELED;
+        if (!file_backend_initialized) {
+            try {
+                initialize_file_backend();
+            } catch (const std::system_error& error) {
+                return -error.code().value();
+            } catch (const std::bad_alloc&) {
+                return -ENOMEM;
+            } catch (...) {
+                return -EIO;
+            }
+        }
+        if (file_io_inflight == file_io_depth) {
+            return -EAGAIN;
+        }
+#if defined(EVENTLOOP_HAS_LIBURING)
+        if (ring != nullptr) {
+            const int result = ring->submit(operation);
+            if (result < 0) return result;
+            ++file_io_inflight;
+            return 0;
+        }
+#endif
+        if (reserve_coroutine_completion() !=
+            eventloop_detail::completion_reservation_result::accepted) {
+            return -EAGAIN;
+        }
+        execution_task work([this, &operation]() noexcept {
+            const int result = perform_file_operation(operation);
+            execution_task completion([this, &operation, result]() noexcept {
+                complete_file(operation, result);
+            });
+            post_coroutine_completion(std::move(completion));
+        });
+        if (!file_executor->execute(std::move(work))) {
+            release_coroutine_completion();
+            return -EAGAIN;
+        }
+        ++file_io_inflight;
+        return 0;
+    }
+
+    auto complete_file(eventloop_detail::file_io_operation& operation,
+                       int result) noexcept -> void
+    {
+        if (file_io_inflight == 0) std::terminate();
+        --file_io_inflight;
+        operation.finish(operation, result);
+    }
+
+    auto drain_file_ring() noexcept -> void
+    {
+#if defined(EVENTLOOP_HAS_LIBURING)
+        if (ring != nullptr) {
+            const bool more = ring->drain([this](auto& operation, int result) noexcept {
+                complete_file(operation, result);
+            });
+            if (more) poller.wake();
+        }
+#endif
+    }
+
+    [[nodiscard]] auto file_ring_descriptor() const noexcept -> int
+    {
+#if defined(EVENTLOOP_HAS_LIBURING)
+        return ring != nullptr ? ring->descriptor() : -1;
+#else
+        return -1;
+#endif
+    }
 
     [[nodiscard]] auto drain_posted() -> bool
     {
@@ -521,6 +789,15 @@ public:
     std::atomic<std::size_t> reserved_coroutine_completions {0};
     const bool blocking_executor_available;
     std::unique_ptr<executor> task_executor;
+    const std::size_t file_io_depth;
+    const file_io_backend requested_file_backend;
+#if defined(EVENTLOOP_HAS_LIBURING)
+    std::unique_ptr<file_ring> ring;
+#endif
+    std::unique_ptr<executor> file_executor;
+    active_file_io_backend selected_file_backend {active_file_io_backend::executor};
+    bool file_backend_initialized {false};
+    std::size_t file_io_inflight {0};
     std::unordered_map<int, std::unique_ptr<notifiable>> handlers;
     std::unordered_set<int> pending_removals;
     std::map<timer_key, execution_task> timers;
@@ -558,6 +835,11 @@ auto event_loop::run() -> event_loop_result
         try {
             for (std::size_t index = 0; index < result.event_count; ++index) {
                 const auto event = events[index];
+                if (event.descriptor ==
+                    implementation_->file_ring_descriptor()) {
+                    implementation_->drain_file_ring();
+                    continue;
+                }
                 const auto found = implementation_->handlers.find(event.descriptor);
                 if (found == implementation_->handlers.end()) {
                     continue;
@@ -739,20 +1021,33 @@ auto event_loop::spawn(task<void>&& operation) -> task_spawn_result
     if (operation.handle_.promise().loop_ != this) {
         return task_spawn_result::invalid_task;
     }
-    if (implementation_->shutting_down) {
+    if (!can_spawn()) {
         return task_spawn_result::shutting_down;
     }
 
     auto handle = operation.release_for_spawn();
     auto& promise = handle.promise();
+    const bool started = promise.started_;
+    promise.started_ = true;
+    return spawn_root(promise.root_, handle, started);
+}
+
+auto event_loop::can_spawn() const noexcept -> bool
+{
+    return !implementation_->shutting_down;
+}
+
+auto event_loop::spawn_root(eventloop_detail::coroutine_root_node& root,
+                            std::coroutine_handle<> handle,
+                            bool started) -> task_spawn_result
+{
     if (handle.done()) {
         handle.destroy();
         return task_spawn_result::accepted;
     }
 
-    implementation_->attach_root(promise.root_);
-    if (!promise.started_) {
-        promise.started_ = true;
+    implementation_->attach_root(root);
+    if (!started) {
         handle.resume();
     }
     implementation_->drain_completed_roots();
@@ -765,6 +1060,12 @@ auto event_loop::coroutine_statistics() const noexcept
     auto statistics = implementation_->coroutine_frames.statistics();
     statistics.active_roots = implementation_->active_root_count;
     return statistics;
+}
+
+auto event_loop::file_backend() -> active_file_io_backend
+{
+    implementation_->initialize_file_backend();
+    return implementation_->selected_file_backend;
 }
 
 auto eventloop_detail::coroutine_frame_access::allocate(
@@ -827,6 +1128,17 @@ auto eventloop_detail::coroutine_frame_access::detach_cancellation(
     node.state = nullptr;
 }
 
+auto eventloop_detail::coroutine_frame_access::request_cancellation(
+    coroutine_cancellation_state& state) noexcept -> void
+{
+    state.requested = true;
+    while (state.head != nullptr) {
+        auto* node = state.head;
+        if (node->cancel == nullptr) std::terminate();
+        node->cancel(*node);
+    }
+}
+
 auto eventloop_detail::coroutine_frame_access::reserve_completion(
     event_loop& loop) noexcept -> completion_reservation_result
 {
@@ -850,4 +1162,11 @@ auto eventloop_detail::coroutine_frame_access::submit_blocking(
     -> blocking_submission_result
 {
     return loop.implementation_->submit_blocking(std::move(work));
+}
+
+auto eventloop_detail::coroutine_frame_access::submit_file(
+    event_loop& loop, file_io_operation& operation) noexcept
+    -> int
+{
+    return loop.implementation_->submit_file(operation);
 }

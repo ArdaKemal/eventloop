@@ -1,0 +1,119 @@
+# Agent handoff: eventloop
+
+Updated 2026-09-25. Read this before continuing work after a machine or
+session switch. Verify all status claims with `git status` and the tests below;
+this file is a handoff snapshot, not a substitute for inspecting the code.
+Commit or otherwise sync this file and the uncommitted implementation before
+switching PCs; a fresh clone will not contain uncommitted work.
+
+## Project intent and constraints
+
+- This is a C++23 library with a Linux epoll event loop, bounded executor,
+  WebSocket implementation, and a bounded, loop-affine coroutine runtime.
+- Preserve the existing interfaces and implementation style where practical.
+  The owner explicitly prefers small changes to the original WebSocket code.
+- Coroutine frames come from bounded per-loop size classes. Keep operation
+  state in the awaiting frame, avoid general-heap allocation on hot paths, and
+  return resource-exhaustion errors instead of silently falling back to heap.
+- I/O, cancellation, and coroutine resumption are serialized on the owning
+  event-loop thread. Worker threads must post completions back to that loop.
+- Do not treat destruction of an unfinished task as cancellation. Outstanding
+  kernel or worker references must retire before a frame is destroyed.
+
+## Current file-I/O slice
+
+- `include/eventloop/file_io.h` exposes `async_openat`, `async_read_at`, and
+  `async_write_at` for loop-affine tasks. They return `std::expected` with
+  `std::error_code`. Paths are copied into a 256-byte awaiter buffer; read and
+  write buffers remain caller-owned until completion, including cancellation.
+- `src/event_loop.cc` implements a liburing backend when available and a
+  dedicated bounded worker fallback. `event_loop_options::file_backend` may
+  force either backend; `automatic` currently prefers io_uring on Linux when
+  ring setup succeeds. `file_io_depth` bounds accepted operations.
+- Ring completions are processed in capped batches to protect other loop work.
+  A failed/short submission reports an error; an unsubmitted SQE is changed
+  into a NOP so it cannot retain a pointer into a destroyed coroutine frame.
+- `tests/file_io.cc` covers both backends, round-trip I/O, missing files,
+  capacity, shutdown cancellation, and an isolated seccomp-injected submission
+  error. Forced-ring tests skip if the environment prohibits io_uring.
+- `benchmark/file_io_benchmark.cc` compares 100,000 cached 4 KiB reads at
+  16-way concurrency and records throughput, per-read latency, and timer
+  lateness. It currently creates its file in `/tmp`.
+- No production HTTP or WebSocket path uses the new file-I/O awaiters yet.
+  HTTP still uses synchronous `openat`/`fstat`/small-file reads, and plain HTTP
+  uses `sendfile` for larger files. Do not replace those paths blindly.
+- `task<T>`, fixed-arity composition, and `task_handle<T>` are available.
+  The handle is a stable observed-root scope and must remain alive until its
+  task completes. See `docs/api-contract.md` and `tests/task_handle.cc`.
+
+## Important limits and decisions still open
+
+1. Do not claim a performance win yet. On this WSL2 machine, `/tmp` is
+   `tmpfs`, so the existing benchmark is primarily an overhead test. In
+   repeated local runs the worker fallback was faster and had lower timer
+   lateness than the current one-submit-per-operation io_uring path. Measure
+   representative files on the target filesystem/host before choosing a
+   production default or integrating the path into HTTP.
+2. Test recovery *after* a failed io_uring submission. The current injected
+   failure test proves the error reaches the coroutine without terminating;
+   it does not prove that a later successful submission flushes the NOP and
+   completes correctly. Review the non-SQPOLL and short-submit assumptions in
+   `file_ring::submit` while adding this test.
+3. If optimizing io_uring, investigate safe submission batching and preserve
+   the capped completion-drain/fairness behavior. Compare p99 timer latency as
+   well as throughput. Do not optimize on one WSL/tmpfs result alone.
+4. An HTTP integration needs explicit session/coroutine lifetime ownership
+   before a suspended operation may refer to a session. Preserve
+   `open_beneath`'s component-by-component `O_NOFOLLOW` checks; replacing it
+   with one unrestricted `openat` would change path security. Leave large-file
+   `sendfile` in place until measured otherwise.
+5. The fallback handles Linux builds without liburing or systems where ring
+   setup is denied. The overall library still compiles a Linux epoll backend
+   unconditionally; other operating systems are **not** supported yet.
+
+## Environment and verification
+
+Build dependencies include a C++23 compiler, CMake, Botan 3, threads, and
+optionally `pkg-config` plus `liburing-dev`. On the WSL2 machine used for this
+handoff, `io_uring_setup` returns `EPERM` inside the agent's command sandbox
+but succeeds when the test is run outside that sandbox. Do not mistake that
+for a kernel or liburing failure. `/home/anon/eventloop` is WSL ext4; `/tmp`
+is memory-backed `tmpfs`. Windows-mounted `/mnt/...` paths have different I/O
+characteristics.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+./build/file_io_test
+./build/file_io_benchmark
+```
+
+Run the forced-ring test and benchmark outside a seccomp sandbox (or with the
+necessary approval) to exercise io_uring. Loopback tests also require socket
+access. The latest full elevated run passed all 10 tests. A fallback-only build
+and ASan/UBSan file-I/O test also passed:
+
+```sh
+cmake -S . -B build-no-uring -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON
+cmake --build build-no-uring --target file_io_test -j2
+ctest --test-dir build-no-uring --output-on-failure -R '^file_io$'
+
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+  -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+cmake --build build-asan --target file_io_test -j2
+./build-asan/file_io_test
+```
+
+Use build directories ignored by Git or outside the repository on the new
+machine. Recheck warnings, `git diff --check`, and test results after changes.
+
+## Worktree and commit scope
+
+`docs/executor-implementation-plan.md` was untracked before the file-I/O
+work; preserve it and do not stage all of `docs/` by accident. Before any
+commit, inspect `git status` and stage only intended files. The file-I/O
+slice remains experimental infrastructure, not a completed cross-platform or
+performance improvement. After a commit, verify the commit and worktree with
+`git status` rather than relying on this snapshot.

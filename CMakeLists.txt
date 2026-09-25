@@ -5,12 +5,19 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(Botan 3 REQUIRED)
 find_package(Threads REQUIRED)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LIBURING QUIET IMPORTED_TARGET liburing)
+    endif()
+endif()
 include(CTest)
 
 add_library(eventloop
     include/eventloop/byte_stream.h
     include/eventloop/event_loop.h
     include/eventloop/executor.h
+    include/eventloop/file_io.h
     include/eventloop/http/mime_types.h
     include/eventloop/http/request.h
     include/eventloop/http/server.h
@@ -18,6 +25,7 @@ add_library(eventloop
     include/eventloop/tcp_acceptor.h
     include/eventloop/tcp_stream.h
     include/eventloop/task.h
+    include/eventloop/task_composition.h
     include/eventloop/tls_acceptor.h
     include/eventloop/tls_context.h
     include/eventloop/tls_stream.h
@@ -48,6 +56,10 @@ target_include_directories(eventloop
 )
 target_compile_features(eventloop PUBLIC cxx_std_23)
 target_link_libraries(eventloop PUBLIC botan::botan Threads::Threads)
+if(LIBURING_FOUND)
+    target_link_libraries(eventloop PRIVATE PkgConfig::LIBURING)
+    target_compile_definitions(eventloop PRIVATE EVENTLOOP_HAS_LIBURING=1)
+endif()
 target_compile_options(eventloop PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(tcp_echo examples/tcp_echo.cc)
@@ -73,6 +85,13 @@ target_compile_options(executor_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wcon
 add_executable(event_loop_benchmark benchmark/event_loop_benchmark.cc)
 target_link_libraries(event_loop_benchmark PRIVATE eventloop::eventloop)
 target_compile_options(event_loop_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(file_io_benchmark benchmark/file_io_benchmark.cc)
+target_link_libraries(file_io_benchmark PRIVATE eventloop::eventloop)
+target_compile_options(file_io_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(file_io_benchmark PRIVATE -Wno-mismatched-new-delete)
+endif()
 
 if(BUILD_TESTING)
     find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
@@ -118,6 +137,31 @@ if(BUILD_TESTING)
         target_compile_options(task_test PRIVATE -Wno-mismatched-new-delete)
     endif()
     add_test(NAME task COMMAND task_test)
+
+    add_executable(task_composition_test tests/task_composition.cc)
+    target_link_libraries(task_composition_test PRIVATE eventloop::eventloop)
+    target_compile_options(task_composition_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(task_composition_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME task_composition COMMAND task_composition_test)
+
+    add_executable(task_handle_test tests/task_handle.cc)
+    target_link_libraries(task_handle_test PRIVATE eventloop::eventloop)
+    target_compile_options(task_handle_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(task_handle_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME task_handle COMMAND task_handle_test)
+
+    add_executable(file_io_test tests/file_io.cc)
+    target_link_libraries(file_io_test PRIVATE eventloop::eventloop)
+    target_compile_options(file_io_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(file_io_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME file_io COMMAND file_io_test)
+    set_tests_properties(file_io PROPERTIES TIMEOUT 10)
 
     add_test(
         NAME http_server
