@@ -2,10 +2,15 @@
 
 #include <chrono>
 #include <atomic>
+#include <cstdlib>
 #include <expected>
+#include <exception>
 #include <iostream>
 #include <thread>
 #include <system_error>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace std::chrono_literals;
 
@@ -67,6 +72,32 @@ auto timeout_root(event_loop& loop, bool& passed) -> task<void>
              second->state == timeout_result<int>::outcome::completed &&
              second->result && **second->result == 5 && immediate &&
              immediate->state == timeout_result<int>::outcome::timed_out;
+}
+auto invalid_immediate_timeout_root(event_loop& loop, event_loop& foreign,
+                                    bool started) -> task<void>
+{
+    auto operation = value(started ? loop : foreign, 1);
+    if (started) (void)operation.start();
+    (void)co_await with_timeout(loop, std::move(operation), 0ms);
+}
+auto immediate_timeout_validation_test() -> bool
+{
+    for (const bool started : {false, true}) {
+        const pid_t child = ::fork();
+        if (child < 0) return false;
+        if (child == 0) {
+            std::set_terminate([] { std::_Exit(77); });
+            event_loop loop;
+            event_loop foreign;
+            (void)loop.spawn(invalid_immediate_timeout_root(loop, foreign,
+                                                            started));
+            std::_Exit(1);
+        }
+        int status = 0;
+        if (::waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 77) return false;
+    }
+    return true;
 }
 auto blocking_child(event_loop& loop, std::atomic<bool>& release,
                     bool& cancelled) -> task<int>
@@ -216,7 +247,8 @@ int main()
     bool h = race_shutdown_test();
     bool i = worker_shutdown_test();
     bool j = exhaustion_test();
-    if (!a || !b || !c || !d || !e || !f || !g || !h || !i || !j) {
+    bool k = immediate_timeout_validation_test();
+    if (!a || !b || !c || !d || !e || !f || !g || !h || !i || !j || !k) {
         std::cerr << "task composition test failed\n";
         return 1;
     }

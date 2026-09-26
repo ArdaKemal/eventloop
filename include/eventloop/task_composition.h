@@ -314,6 +314,11 @@ template<typename T>
     -> task<timeout_result<T>>
 {
     if (duration <= event_loop::clock::duration::zero()) {
+        const auto* child_loop = eventloop_detail::composition_task_access::loop(operation);
+        if (eventloop_detail::composition_task_access::started(operation) ||
+            (child_loop != nullptr && child_loop != &loop)) {
+            throw std::logic_error("timeout operand is not an unstarted task on this loop");
+        }
         co_return timeout_result<T> {timeout_result<T>::outcome::timed_out, {}};
     }
     auto winner = co_await race(std::move(operation),
