@@ -42,6 +42,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
 - A WebSocket message callback or underlying write exception now retires the
   parser/output state and closes its stream. Normal-path allocation reuse is
   still covered by `tests/web_socket.cc`.
+- Direct TLS writes and close notifications retire the transport if a
+  non-Botan exception interrupts output, since TLS record state may already
+  have advanced. A loopback test fills the TCP queue during a TLS write.
 - WebSocket outbound framing is capped at the configured maximum message size
   plus frame/control overhead. A saturated send throws `std::length_error`.
   Public `close()` retires the socket if a saturated queue cannot fit its

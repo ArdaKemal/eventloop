@@ -344,6 +344,9 @@ auto tls_stream::write(std::span<const std::byte> data) -> void
                             tls_error_category()});
     } catch (const Botan::Exception&) {
         on_transport_error(make_error_code(tls_errc::protocol_error));
+    } catch (...) {
+        abort();
+        throw;
     }
 }
 
@@ -361,6 +364,9 @@ auto tls_stream::close() -> void
         tcp_stream::close();
     } catch (const Botan::Exception&) {
         on_transport_error(make_error_code(tls_errc::protocol_error));
+    } catch (...) {
+        abort();
+        throw;
     }
 }
 

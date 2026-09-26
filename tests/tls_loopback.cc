@@ -166,6 +166,41 @@ private:
     auto on_data(std::span<const std::byte>) -> void override {}
 };
 
+class saturating_client_stream final : public tls_stream {
+public:
+    saturating_client_stream(event_loop& loop, unique_fd descriptor,
+                             std::shared_ptr<tls_context> context,
+                             bool& saturated, bool& retired)
+        : tls_stream(loop, std::move(descriptor), std::move(context),
+                     tls_client_options {
+                         .hostname = "localhost",
+                         .application_protocols = {},
+                     }),
+          loop_(loop), saturated_(saturated), retired_(retired)
+    {
+    }
+
+private:
+    auto on_ready() -> void override
+    {
+        constexpr std::array<std::byte, 8192> payload {};
+        try {
+            for (int index = 0; index < 4096; ++index) write(payload);
+        } catch (const std::length_error&) {
+            saturated_ = true;
+            retired_ = !ready();
+        }
+        loop_.stop();
+    }
+
+    auto on_data(std::span<const std::byte>) -> void override {}
+    auto on_error(std::error_code) -> void override { loop_.stop(); }
+
+    event_loop& loop_;
+    bool& saturated_;
+    bool& retired_;
+};
+
 class rejecting_client_stream final : public tls_stream {
 public:
     rejecting_client_stream(event_loop& loop, int descriptor,
@@ -251,6 +286,29 @@ private:
     return rejected;
 }
 
+[[nodiscard]] auto test_saturated_tls_write(const std::filesystem::path& certificate,
+                                            const std::filesystem::path& key) -> bool
+{
+    auto sockets = connect_loopback();
+    unique_fd client(sockets.client);
+    unique_fd server(sockets.server);
+    const int buffer_size = 4096;
+    if (setsockopt(client.get(), SOL_SOCKET, SO_SNDBUF, &buffer_size,
+                   sizeof(buffer_size)) == -1) {
+        return false;
+    }
+    event_loop loop;
+    bool saturated = false;
+    bool retired = false;
+    loop.add(std::make_unique<passive_server_stream>(
+        loop, std::move(server), tls_context::make_server(certificate, key)));
+    loop.add(std::make_unique<saturating_client_stream>(
+        loop, std::move(client), tls_context::make_client(certificate), saturated,
+        retired));
+    loop.run();
+    return saturated && retired;
+}
+
 [[nodiscard]] auto test_truncation(const std::filesystem::path& certificate,
                                    const std::filesystem::path& key) -> bool
 {
@@ -280,6 +338,7 @@ auto main(int argc, char* argv[]) -> int
         const std::filesystem::path certificate = argv[1];
         const std::filesystem::path key = argv[2];
         const bool passed = test_echo_and_close(certificate, key) &&
+                            test_saturated_tls_write(certificate, key) &&
                             test_hostname_rejection(certificate, key) &&
                             test_truncation(certificate, key);
         return passed ? 0 : 1;
