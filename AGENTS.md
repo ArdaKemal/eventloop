@@ -21,8 +21,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
   contended runs remain noisy.
 - I/O, cancellation, and coroutine resumption are serialized on the owning
   event-loop thread. Worker threads must post completions back to that loop.
-- Relative timer deadlines saturate at the latest representable time point;
-  cancellation tests cover `duration::max()` without waiting for that delay.
+- Relative timer and shutdown grace deadlines saturate at the latest
+  representable time point; tests cover `duration::max()` without waiting for
+  that delay.
 - Coroutine `yield`, timer, and blocking awaiters check loop affinity before
   queuing work. Wrong-loop use terminates as a programming error.
 - Do not treat destruction of an unfinished task as cancellation. Outstanding

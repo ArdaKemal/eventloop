@@ -795,6 +795,27 @@ auto shutdown_tests() -> bool
             return false;
         }
     }
+
+    {
+        event_loop loop;
+        int shutdowns = 0;
+        bool destroyed = false;
+        bool drained = false;
+        auto handler = std::make_unique<shutdown_handler>(
+            loop, shutdowns, destroyed, false);
+        const int descriptor = handler->descriptor();
+        loop.add(std::move(handler));
+        loop.shutdown(event_loop::clock::duration::max());
+        (void)loop.schedule_after(std::chrono::milliseconds {5},
+                                  execution_task([&]() noexcept {
+                                      drained = true;
+                                      loop.remove(descriptor);
+                                  }));
+        if (loop.run() != event_loop_result::stopped || !drained ||
+            shutdowns != 1 || !destroyed) {
+            return false;
+        }
+    }
     return true;
 }
 
