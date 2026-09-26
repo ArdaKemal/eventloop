@@ -468,7 +468,12 @@ auto web_socket::fail(errc error, std::uint16_t close_code) -> void
             static_cast<std::byte>(close_code >> 8),
             static_cast<std::byte>(close_code & 0xff),
         };
-        send_frame(opcode::close, payload);
+        try {
+            send_frame(opcode::close, payload);
+        } catch (const std::length_error&) {
+            retire_after_exception();
+            return;
+        }
         close_sent_ = true;
     }
     close_after_write_ = true;

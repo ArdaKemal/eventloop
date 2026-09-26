@@ -293,6 +293,29 @@ auto saturated_close_test(bool with_code) -> bool
     return false;
 }
 
+auto saturated_protocol_error_test() -> bool
+{
+    memory_stream stream;
+    stream.block_writes = true;
+    socket writer(stream, 32);
+    constexpr std::array<std::byte, 1> payload {};
+    try {
+        for (int index = 0; index < 1000; ++index) writer.write_binary(payload);
+        return false;
+    } catch (const std::length_error&) {
+    }
+
+    const std::array<std::byte, 3> unmasked {
+        std::byte {0x81}, std::byte {0x01}, std::byte {'x'},
+    };
+    try {
+        writer.receive(unmasked);
+    } catch (...) {
+        return false;
+    }
+    return writer.error == ws::errc::protocol_error && !stream.open;
+}
+
 auto large_input_batch_test() -> bool
 {
     memory_stream stream;
@@ -426,6 +449,10 @@ auto main() -> int
     }
     if (!saturated_close_test(false) || !saturated_close_test(true)) {
         std::cerr << "WebSocket saturated close test failed\n";
+        return 1;
+    }
+    if (!saturated_protocol_error_test()) {
+        std::cerr << "WebSocket saturated protocol error test failed\n";
         return 1;
     }
     if (!large_input_batch_test()) {
