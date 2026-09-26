@@ -15,6 +15,10 @@ switching PCs; a fresh clone will not contain uncommitted work.
 - Coroutine frames come from bounded per-loop size classes. Keep operation
   state in the awaiting frame, avoid general-heap allocation on hot paths, and
   return resource-exhaustion errors instead of silently falling back to heap.
+- Executor permit publication and waiter registration use one sequentially
+  consistent handshake so an idle worker and a producer cannot both miss the
+  other's state. Paired local handoff benchmarks showed similar median rates;
+  contended runs remain noisy.
 - I/O, cancellation, and coroutine resumption are serialized on the owning
   event-loop thread. Worker threads must post completions back to that loop.
 - Relative timer deadlines saturate at the latest representable time point;

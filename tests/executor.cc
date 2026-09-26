@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
@@ -360,6 +361,27 @@ auto multi_thread_tests() -> bool
         execution_task empty;
         ok &= check(!executor->execute(std::move(empty)),
                     "multi-thread rejects empty task");
+    }
+
+    {
+        auto executor = make_multi_thread_executor(
+            {.worker_count = 1, .queue_capacity = 2});
+        std::atomic<int> completed {0};
+        for (int index = 1; index <= 1000; ++index) {
+            std::this_thread::sleep_for(std::chrono::microseconds {20});
+            if (!executor->execute(execution_task([&completed, index]() noexcept {
+                    completed.store(index, std::memory_order_release);
+                    completed.notify_one();
+                }))) {
+                ok &= check(false, "idle worker accepts handoff");
+                break;
+            }
+            while (completed.load(std::memory_order_acquire) < index) {
+                completed.wait(index - 1, std::memory_order_acquire);
+            }
+        }
+        ok &= check(completed.load(std::memory_order_acquire) == 1000,
+                    "idle worker completes every handoff");
     }
 
     {

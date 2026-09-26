@@ -28,8 +28,8 @@ public:
 
     auto release() noexcept -> void
     {
-        permits_.fetch_add(1, std::memory_order_release);
-        if (waiters_.load(std::memory_order_relaxed) != 0) {
+        permits_.fetch_add(1, std::memory_order_seq_cst);
+        if (waiters_.load(std::memory_order_seq_cst) != 0) {
             permits_.notify_one();
         }
     }
@@ -39,9 +39,11 @@ public:
         for (;;) {
             int permits = permits_.load(std::memory_order_relaxed);
             while (permits == 0) {
-                waiters_.fetch_add(1, std::memory_order_relaxed);
+                // The producer cannot miss this waiter while this worker
+                // also misses the producer's new permit.
+                waiters_.fetch_add(1, std::memory_order_seq_cst);
                 for (;;) {
-                    permits = permits_.load(std::memory_order_acquire);
+                    permits = permits_.load(std::memory_order_seq_cst);
                     if (permits != 0) break;
                     permits_.wait(0, std::memory_order_relaxed);
                 }
