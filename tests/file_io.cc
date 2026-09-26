@@ -1,4 +1,5 @@
 #include "eventloop/file_io.h"
+#include "eventloop/unique_fd.h"
 
 #include <array>
 #include <cerrno>
@@ -105,6 +106,15 @@ auto cancelled_open(event_loop& loop, std::string_view path, bool& passed)
     const auto opened = co_await async_openat(loop, AT_FDCWD, path, O_RDONLY);
     if (opened) (void)::close(*opened);
     passed = !opened && opened.error().value() == ECANCELED;
+}
+
+auto cancelled_read(event_loop& loop, int descriptor, int& completed,
+                    bool& passed) -> task<void>
+{
+    std::array<std::byte, 32> buffer {};
+    const auto result = co_await async_read_at(loop, descriptor, buffer, 0);
+    if (result || result.error().value() != ECANCELED) passed = false;
+    ++completed;
 }
 
 auto foreign_file_awaiter(event_loop& owner, event_loop& foreign,
@@ -330,6 +340,35 @@ auto test_cancellation(file_io_backend backend) -> bool
            loop.coroutine_statistics().live == 0;
 }
 
+auto test_cancelled_read_batch(file_io_backend backend) -> bool
+{
+    temporary_file file;
+    if (!file.valid) return false;
+    unique_fd descriptor(::open(file.path.data(), O_RDONLY | O_CLOEXEC));
+    if (!descriptor) return false;
+    event_loop_options options;
+    options.file_backend = backend;
+    options.file_io_depth = 128;
+    options.coroutine_completion_capacity = 128;
+    options.coroutine_frame_capacities.fill(128);
+    event_loop loop(options);
+    int completed = 0;
+    bool passed = true;
+    constexpr int operation_count = 64;
+    for (int index = 0; index < operation_count; ++index) {
+        if (loop.spawn(cancelled_read(loop, descriptor.get(), completed,
+                                      passed)) != task_spawn_result::accepted) {
+            loop.shutdown(event_loop::clock::duration::zero());
+            (void)loop.run();
+            return false;
+        }
+    }
+    loop.shutdown(event_loop::clock::duration::zero());
+    return loop.run() == event_loop_result::stopped && passed &&
+           completed == operation_count &&
+           loop.coroutine_statistics().live == 0;
+}
+
 } // namespace
 
 int main()
@@ -345,7 +384,8 @@ int main()
                       test_roundtrip(file_io_backend::io_uring) &&
                       test_errors(file_io_backend::io_uring) &&
                       test_depth(file_io_backend::io_uring) &&
-                      test_cancellation(file_io_backend::io_uring);
+                      test_cancellation(file_io_backend::io_uring) &&
+                      test_cancelled_read_batch(file_io_backend::io_uring);
     } catch (const std::system_error& error) {
         if (error.code().value() != EPERM && error.code().value() != EACCES &&
             error.code().value() != ENOSYS &&
@@ -363,7 +403,8 @@ int main()
                         test_roundtrip(file_io_backend::automatic) &&
                         test_errors(file_io_backend::executor) &&
                         test_depth(file_io_backend::executor) &&
-                        test_cancellation(file_io_backend::executor);
+                        test_cancellation(file_io_backend::executor) &&
+                        test_cancelled_read_batch(file_io_backend::executor);
     if (!passed) std::cerr << "file I/O coroutine test failed\n";
     return passed ? 0 : 1;
 }
