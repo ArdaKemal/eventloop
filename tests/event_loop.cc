@@ -848,6 +848,25 @@ auto shutdown_tests() -> bool
         }
     }
 
+#if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
+    {
+        event_loop loop;
+        int shutdowns = 0;
+        bool destroyed = false;
+        loop.add(std::make_unique<shutdown_handler>(
+            loop, shutdowns, destroyed, false));
+        injected_timer_arm_errors = 1;
+        try {
+            loop.shutdown(std::chrono::seconds {1});
+            return false;
+        } catch (const std::system_error& error) {
+            if (error.code().value() != EIO) return false;
+        }
+        if (injected_timer_arm_errors != 0 || shutdowns != 1 || !destroyed ||
+            loop.run() != event_loop_result::stopped) return false;
+    }
+#endif
+
     {
         event_loop loop;
         int shutdowns = 0;

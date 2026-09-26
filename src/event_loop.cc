@@ -991,9 +991,15 @@ auto event_loop::shutdown(clock::duration timeout) -> void
     }
 
     auto* const state = implementation_.get();
-    (void)implementation_->add_timer(
-        eventloop_detail::deadline_after(timeout),
-        execution_task([state]() noexcept { state->force_shutdown(); }));
+    try {
+        (void)implementation_->add_timer(
+            eventloop_detail::deadline_after(timeout),
+            execution_task([state]() noexcept { state->force_shutdown(); }));
+    } catch (...) {
+        implementation_->force_shutdown();
+        implementation_->poller.wake();
+        throw;
+    }
     implementation_->poller.wake();
 }
 
