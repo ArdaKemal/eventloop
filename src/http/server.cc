@@ -135,7 +135,8 @@ private:
 [[nodiscard]] auto open_root(std::string_view root) -> unique_fd
 {
     std::array<char, 4096> path {};
-    if (root.empty() || root.size() >= path.size()) {
+    if (root.empty() || root.size() >= path.size() ||
+        root.find('\0') != std::string_view::npos) {
         throw std::invalid_argument("HTTP root path is invalid or too long");
     }
     std::memcpy(path.data(), root.data(), root.size());

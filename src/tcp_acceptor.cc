@@ -63,6 +63,9 @@ tcp_acceptor::tcp_acceptor(event_loop& loop, std::uint16_t port,
     sockaddr_in endpoint {};
     endpoint.sin_family = AF_INET;
     endpoint.sin_port = htons(port);
+    if (address.find('\0') != std::string_view::npos) {
+        throw std::invalid_argument("invalid IPv4 address");
+    }
     const std::string address_text {address};
     if (inet_pton(AF_INET, address_text.c_str(), &endpoint.sin_addr) != 1) {
         throw std::invalid_argument("invalid IPv4 address");

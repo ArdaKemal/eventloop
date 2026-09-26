@@ -13,6 +13,7 @@
 #include <memory>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 
 #include <fcntl.h>
@@ -316,12 +317,35 @@ auto redirect_listener_removal_test() -> bool
         "Location: https://localhost/next");
 }
 
+auto invalid_configuration_test() -> bool
+{
+    event_loop loop;
+    constexpr char root[] {'.', '\0', 'x'};
+    constexpr char address[] {'1', '2', '7', '.', '0', '.', '0', '.', '1',
+                              '\0', 'x'};
+    bool root_rejected = false;
+    bool address_rejected = false;
+    try {
+        http::server server(loop, 0, std::string_view {root, sizeof(root)});
+    } catch (const std::invalid_argument&) {
+        root_rejected = true;
+    }
+    try {
+        http::server server(loop, 0, ".",
+                            std::string_view {address, sizeof(address)});
+    } catch (const std::invalid_argument&) {
+        address_rejected = true;
+    }
+    return root_rejected && address_rejected;
+}
+
 } // namespace
 
 auto main() -> int
 {
     if (!parser_and_mime_tests() || !session_tests() ||
-        !listener_removal_test() || !redirect_listener_removal_test()) {
+        !listener_removal_test() || !redirect_listener_removal_test() ||
+        !invalid_configuration_test()) {
         std::cerr << "HTTP tests failed\n";
         return 1;
     }
