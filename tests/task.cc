@@ -191,6 +191,34 @@ auto cancellable_blocking_root(event_loop& loop, std::atomic<bool>& started,
     if (!result) error = result.error();
 }
 
+auto active_worker_destruction_test() -> bool
+{
+    const pid_t child = ::fork();
+    if (child == -1) return false;
+    if (child == 0) {
+        std::set_terminate([] { std::_Exit(77); });
+        ::alarm(3);
+        std::atomic<bool> started {false};
+        std::atomic<bool> release {false};
+        blocking_error error = blocking_error::cancelled;
+        {
+            event_loop loop(event_loop_options {.worker_count = 1});
+            if (loop.spawn(cancellable_blocking_root(loop, started, release,
+                                                    error)) !=
+                task_spawn_result::accepted) {
+                std::_Exit(1);
+            }
+            while (!started.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        }
+        std::_Exit(1);
+    }
+    int status = 0;
+    return ::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 77;
+}
+
 auto rejected_blocking_root(event_loop& loop, bool& ran,
                             blocking_error& error) -> task<void>
 {
@@ -582,6 +610,10 @@ auto main() -> int
     }
     if (!run_blocking_cancellation_test()) {
         std::cerr << "run-blocking cancellation test failed\n";
+        return 1;
+    }
+    if (!active_worker_destruction_test()) {
+        std::cerr << "active worker destruction test failed\n";
         return 1;
     }
     if (!run_blocking_requires_worker_test()) {

@@ -47,6 +47,9 @@ default.
   programming error. Resource exhaustion is a returned result. Unhandled
   exceptions in a task currently terminate the process; task bodies should
   return anticipated application errors as values.
+- Destroy the event loop only after every coroutine frame has retired. The
+  loop checks this before tearing down worker and ring backends and terminates
+  if a frame is still live.
 - `yield`, `sleep_for`, and `run_blocking` verify the awaiting task's loop
   before posting or registering work, including for an already-due timer.
 

@@ -389,6 +389,14 @@ public:
         }
     }
 
+    ~implementation()
+    {
+        // A worker or the kernel may still hold a pointer into a live frame.
+        // Reject invalid lifetime use before joining workers or freeing the
+        // ring, rather than detecting it only when the frame pool is destroyed.
+        if (coroutine_frames.statistics().live != 0) std::terminate();
+    }
+
     auto initialize_file_backend() -> void
     {
         if (file_backend_initialized) return;
