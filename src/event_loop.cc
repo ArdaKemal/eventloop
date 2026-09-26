@@ -644,8 +644,14 @@ public:
         }
 
         const auto id = next_timer++;
-        timers.emplace(timer_key {deadline, id}, std::move(task));
-        arm_next_timer();
+        auto timer = timers.emplace(timer_key {deadline, id},
+                                    std::move(task)).first;
+        try {
+            arm_next_timer();
+        } catch (...) {
+            timers.erase(timer);
+            throw;
+        }
         return id;
     }
 

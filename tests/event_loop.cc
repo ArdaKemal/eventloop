@@ -19,9 +19,32 @@
 #include <utility>
 
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
+namespace {
+int injected_timer_arm_errors = 0;
+}
+
+extern "C" auto __real_timerfd_settime(int descriptor, int flags,
+                                         const itimerspec* value,
+                                         itimerspec* old_value) -> int;
+
+extern "C" auto __wrap_timerfd_settime(int descriptor, int flags,
+                                         const itimerspec* value,
+                                         itimerspec* old_value) -> int
+{
+    if (injected_timer_arm_errors != 0) {
+        --injected_timer_arm_errors;
+        errno = EIO;
+        return -1;
+    }
+    return __real_timerfd_settime(descriptor, flags, value, old_value);
+}
+#endif
 
 namespace {
 
@@ -739,6 +762,35 @@ auto timer_tests() -> bool
            event_loop::clock::now() >= deadline;
 }
 
+auto timer_arm_failure_test() -> bool
+{
+#if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
+    event_loop loop;
+    bool rejected_ran = false;
+    bool accepted_ran = false;
+    (void)loop.schedule_after(std::chrono::milliseconds {5},
+                              execution_task([&]() noexcept {
+                                  accepted_ran = true;
+                                  loop.stop();
+                              }));
+    injected_timer_arm_errors = 1;
+    try {
+        (void)loop.schedule_after(std::chrono::milliseconds {1},
+                                  execution_task([&]() noexcept {
+                                      rejected_ran = true;
+                                  }));
+        return false;
+    } catch (const std::system_error& error) {
+        if (error.code().value() != EIO) return false;
+    }
+    if (injected_timer_arm_errors != 0 ||
+        loop.run() != event_loop_result::stopped) return false;
+    return accepted_ran && !rejected_ran;
+#else
+    return true;
+#endif
+}
+
 auto shutdown_tests() -> bool
 {
     {
@@ -893,6 +945,7 @@ auto main() -> int
     if (!post_tests()) return 1;
     if (!executor_integration_test()) return 1;
     if (!timer_tests()) return 1;
+    if (!timer_arm_failure_test()) return 1;
     if (!shutdown_tests()) return 1;
     if (!signal_test()) return 1;
     return 0;
