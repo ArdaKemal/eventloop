@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <expected>
 #include <limits>
 #include <span>
@@ -96,11 +97,10 @@ public:
     template<typename Promise>
     auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
     {
-        if (result_ < 0) return false;
         if (handle.promise().loop_ != &loop_) {
-            result_ = -EINVAL;
-            return false;
+            std::terminate();
         }
+        if (result_ < 0) return false;
         auto& cancellation = *handle.promise().cancellation_;
         if (cancellation.requested) {
             result_ = -ECANCELED;

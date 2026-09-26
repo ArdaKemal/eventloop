@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <iostream>
 #include <limits>
@@ -104,6 +105,34 @@ auto cancelled_open(event_loop& loop, std::string_view path, bool& passed)
     const auto opened = co_await async_openat(loop, AT_FDCWD, path, O_RDONLY);
     if (opened) (void)::close(*opened);
     passed = !opened && opened.error().value() == ECANCELED;
+}
+
+auto foreign_file_awaiter(event_loop& owner, event_loop& foreign,
+                          bool invalid_path) -> task<void>
+{
+    (void)owner;
+    const auto path = invalid_path ? std::string_view {} : "/dev/null";
+    (void)co_await async_openat(foreign, AT_FDCWD, path, O_RDONLY);
+}
+
+auto test_wrong_loop() -> bool
+{
+    for (const bool invalid_path : {false, true}) {
+        const pid_t child = ::fork();
+        if (child < 0) return false;
+        if (child == 0) {
+            std::set_terminate([] { std::_Exit(77); });
+            event_loop owner;
+            event_loop foreign;
+            (void)owner.spawn(foreign_file_awaiter(owner, foreign,
+                                                   invalid_path));
+            std::_Exit(1);
+        }
+        int status = 0;
+        if (::waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 77) return false;
+    }
+    return true;
 }
 
 auto denied_submission(event_loop& loop, bool& passed) -> task<void>
@@ -328,7 +357,8 @@ int main()
     } catch (const std::invalid_argument&) {
         std::cerr << "io_uring unavailable in this build\n";
     }
-    const bool passed = ring_passed && test_ring_submit_error_in_child() &&
+    const bool passed = ring_passed && test_wrong_loop() &&
+                        test_ring_submit_error_in_child() &&
                         test_roundtrip(file_io_backend::executor) &&
                         test_roundtrip(file_io_backend::automatic) &&
                         test_errors(file_io_backend::executor) &&
