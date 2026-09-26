@@ -38,7 +38,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
 - Built-in HTTP connections share ownership of the document-root descriptor
   with their listener, so removing the listener cannot invalidate an accepted
   session. Redirect connections likewise retain their hostname after listener
-  removal. `tests/http_test.cc` exercises both lifetimes.
+  removal. `tests/http_test.cc` exercises both lifetimes. The request parser
+  rejects control characters in targets and header values before redirects
+  can place a target in a `Location` response header.
 - A WebSocket message callback or underlying write exception now retires the
   parser/output state and closes its stream. Normal-path allocation reuse is
   still covered by `tests/web_socket.cc`.

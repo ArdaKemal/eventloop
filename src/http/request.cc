@@ -62,6 +62,24 @@ namespace {
     return true;
 }
 
+[[nodiscard]] auto valid_target(std::string_view target) noexcept -> bool
+{
+    for (const unsigned char value : target) {
+        if (value <= 0x20 || value == 0x7f) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] auto valid_header_value(std::string_view value) noexcept -> bool
+{
+    for (const unsigned char character : value) {
+        if ((character < 0x20 && character != '\t') || character == 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] auto parse_method(std::string_view value) noexcept -> method_type
 {
     if (value == "GET") return method_type::get;
@@ -115,7 +133,7 @@ auto parse_request(std::string_view input, request& output) noexcept -> parse_re
     output.method = parse_method(first_line.substr(0, first_space));
     output.target = first_line.substr(first_space + 1, second_space - first_space - 1);
     if (output.method == method_type::unknown || output.target.empty() ||
-        output.target.front() != '/') {
+        output.target.front() != '/' || !valid_target(output.target)) {
         return {parse_status::bad_request};
     }
     if (output.target.size() > max_target_size) {
@@ -145,7 +163,7 @@ auto parse_request(std::string_view input, request& output) noexcept -> parse_re
         }
         auto name = line.substr(0, colon);
         auto value = line.substr(colon + 1);
-        if (!valid_header_name(name)) {
+        if (!valid_header_name(name) || !valid_header_value(value)) {
             return {parse_status::bad_request};
         }
         while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {

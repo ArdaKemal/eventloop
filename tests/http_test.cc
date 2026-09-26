@@ -108,6 +108,13 @@ auto parser_and_mime_tests() -> bool
     if (http::parse_request(
             "POST / HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n",
             chunked).status != http::parse_status::unsupported_transfer_encoding) return false;
+    http::request control;
+    if (http::parse_request(
+            "GET /listing?\nInjected:yes HTTP/1.1\r\nHost: local\r\n\r\n",
+            control).status != http::parse_status::bad_request ||
+        http::parse_request(
+            "GET / HTTP/1.1\r\nHost: local\nInjected:yes\r\n\r\n",
+            control).status != http::parse_status::bad_request) return false;
     return true;
 }
 
@@ -171,6 +178,13 @@ auto session_tests() -> bool
     redirect_session.receive(std::as_bytes(std::span {redirect_request}));
     redirect_session.write_drained();
 
+    fixed_stream injected_redirect_stream;
+    http::session injected_redirect(injected_redirect_stream, directory, true);
+    constexpr std::string_view injected_redirect_request =
+        "GET /listing?\nInjected:yes HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    injected_redirect.receive(std::as_bytes(std::span {injected_redirect_request}));
+    injected_redirect.write_drained();
+
     fixed_stream listing_stream;
     http::session listing_session(listing_stream, directory, true);
     constexpr std::string_view listing_request =
@@ -191,6 +205,8 @@ auto session_tests() -> bool
         contains(forbidden_stream, "403 Forbidden") &&
         contains(redirect_stream, "308 Permanent Redirect") &&
         contains(redirect_stream, "Location: /listing/") &&
+        contains(injected_redirect_stream, "400 Bad Request") &&
+        !contains(injected_redirect_stream, "Injected:yes") &&
         contains(listing_stream, "Content-Length:") &&
         contains(listing_stream, "href=\"a%26b.txt\"") &&
         contains(listing_stream, "a&amp;b.txt") && !listing_stream.open;
