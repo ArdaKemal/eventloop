@@ -137,6 +137,15 @@ auto yielding(event_loop& loop, int& value, bool& queued) -> task<void>
     loop.stop();
 }
 
+auto repeated_yields(event_loop& loop, int& count) -> task<void>
+{
+    for (int index = 0; index < 1024; ++index) {
+        if (!co_await yield(loop)) co_return;
+        ++count;
+    }
+    loop.stop();
+}
+
 auto cancellable_root(event_loop& loop, bool& cancellation_seen) -> task<void>
 {
     (void)co_await yield(loop);
@@ -357,6 +366,26 @@ auto event_loop_queue_full_test() -> bool
     const auto before = allocations;
     return operation.start() == task_state::completed && value == 2 && !queued &&
            operation.result() == task_result::success && allocations == before;
+}
+
+auto event_loop_dispatch_yield_test() -> bool
+{
+    event_loop loop;
+    int count = 0;
+    bool timer_ran = false;
+    bool spawned = false;
+    if (!loop.post(execution_task([&]() noexcept {
+            spawned = loop.spawn(repeated_yields(loop, count)) ==
+                      task_spawn_result::accepted;
+            (void)loop.schedule_after(event_loop::clock::duration::zero(),
+                                      execution_task([&]() noexcept {
+                                          timer_ran = true;
+                                      }));
+        }))) {
+        return false;
+    }
+    return loop.run() == event_loop_result::stopped && spawned &&
+           count == 1024 && timer_ran;
 }
 
 auto root_task_test() -> bool
@@ -586,6 +615,10 @@ auto main() -> int
     }
     if (!event_loop_queue_full_test()) {
         std::cerr << "event-loop coroutine queue-full test failed\n";
+        return 1;
+    }
+    if (!event_loop_dispatch_yield_test()) {
+        std::cerr << "event-loop dispatch yield test failed\n";
         return 1;
     }
     if (!root_task_test()) {

@@ -1,6 +1,6 @@
 # Agent handoff: eventloop
 
-Updated 2026-09-25. Read this before continuing work after a machine or
+Updated 2026-09-27. Read this before continuing work after a machine or
 session switch. Verify all status claims with `git status` and the tests below;
 this file is a handoff snapshot, not a substitute for inspecting the code.
 Commit or otherwise sync this file and the uncommitted implementation before
@@ -27,7 +27,7 @@ switching PCs; a fresh clone will not contain uncommitted work.
 - Coroutine `yield`, timer, and blocking awaiters check loop affinity before
   queuing work. Wrong-loop use terminates as a programming error.
 - Do not treat destruction of an unfinished task as cancellation. Outstanding
-  kernel or worker references must retire before a frame is destroyed.
+  worker references must retire before a frame is destroyed.
 - Accepted socket descriptors use `unique_fd` through the built-in TCP/TLS
   accept and stream construction paths. New subclasses should override the
   owning callback; the original `int` callbacks remain as compatibility paths
@@ -67,23 +67,12 @@ switching PCs; a fresh clone will not contain uncommitted work.
   `async_write_at` for loop-affine tasks. They return `std::expected` with
   `std::error_code`. Paths are copied into a 256-byte awaiter buffer; read and
   write buffers remain caller-owned until completion, including cancellation.
-- `src/event_loop.cc` implements a liburing backend when available and a
-  dedicated bounded worker fallback. `event_loop_options::file_backend` may
-  force either backend; `automatic` currently prefers io_uring on Linux when
-  ring setup succeeds. `file_io_depth` bounds accepted operations.
-- Ring completions are processed in capped batches to protect other loop work.
-  When a batch leaves completions ready, the ring re-signals its own eventfd
-  so the next poll drains them. A 96-operation test catches stranded completions
-  after the 64-operation batch cap. The ring notification descriptor is owned
-  by `unique_fd`.
-  A failed/short submission reports an error; an unsubmitted SQE is changed
-  into a NOP so it cannot retain a pointer into a destroyed coroutine frame.
-- `tests/file_io.cc` covers both backends, round-trip I/O, missing files,
-  capacity, shutdown cancellation, and an isolated seccomp-injected submission
-  error. Link-wrapped one-shot negative and zero-count submission results
-  check that a later ring operation flushes the NOP and completes. Forced-ring
-  tests skip if the environment prohibits io_uring.
-- `benchmark/file_io_benchmark.cc` compares 100,000 cached 4 KiB reads at
+- `src/event_loop.cc` runs file operations on a dedicated bounded worker and
+  posts completions back to the owning loop. `file_io_depth` bounds accepted
+  operations; there is no backend-selection option.
+- `tests/file_io.cc` covers round-trip I/O, missing files, capacity, shutdown
+  cancellation, wrong-loop use, and cancelled reads with frame-local buffers.
+- `benchmark/file_io_benchmark.cc` measures 100,000 cached 4 KiB reads at
   16-way concurrency and records throughput, per-read latency, and timer
   lateness. It currently creates its file in `/tmp`.
 - No production HTTP or WebSocket path uses the new file-I/O awaiters yet.
@@ -99,48 +88,35 @@ switching PCs; a fresh clone will not contain uncommitted work.
 
 ## Important limits and decisions still open
 
-1. Do not claim a performance win yet. On this WSL2 machine, `/tmp` is
-   `tmpfs`, so the existing benchmark is primarily an overhead test. In
-   repeated local runs the worker fallback was faster and had lower timer
-   lateness than the current one-submit-per-operation io_uring path. Measure
-   representative files on the target filesystem/host before choosing a
-   production default or integrating the path into HTTP.
-2. Submission recovery is tested with one-shot synthetic negative and
-   zero-count results when liburing and GNU/Clang linker wrapping are
-   available. The production path
-   relies on non-SQPOLL ordering and admits one new SQE only after flushing
-   pending NOPs. Revisit these assumptions before adding SQPOLL or batching.
-3. If optimizing io_uring, investigate safe submission batching and preserve
-   the capped completion-drain/fairness behavior. Compare p99 timer latency as
-   well as throughput. Do not optimize on one WSL/tmpfs result alone.
-4. An HTTP integration needs explicit session/coroutine lifetime ownership
+1. Do not claim a storage-performance win from the file-I/O benchmark. On
+   Fedora 44, three cached-read runs favored the bounded worker over the
+   former io_uring path (median 608k vs 578k ops/s and 8.1 vs 234.1 us timer
+   lateness p99). The benchmark uses `/tmp`, which is `tmpfs` on this host, so
+   it measures runtime overhead rather than storage. The io_uring backend was
+   removed on 2026-09-27 because no project workload justified its complexity.
+2. An HTTP integration needs explicit session/coroutine lifetime ownership
    before a suspended operation may refer to a session. Preserve
    `open_beneath`'s component-by-component `O_NOFOLLOW` checks; replacing it
    with one unrestricted `openat` would change path security. Leave large-file
    `sendfile` in place until measured otherwise.
-5. The fallback handles Linux builds without liburing or systems where ring
-   setup is denied. The overall library still compiles a Linux epoll backend
-   unconditionally; other operating systems are **not** supported yet.
-6. A recent lifetime audit fixed reentrant and throwing shutdown callbacks,
+3. The overall library still compiles a Linux epoll backend unconditionally;
+   other operating systems are **not** supported yet.
+4. A recent lifetime audit fixed reentrant and throwing shutdown callbacks,
    and an ASan-confirmed use-after-free when a direct write callback closed its
    own stream. Direct transport callbacks now defer handler removal until they
    return. This is not a proof of memory safety across every transport and
    coroutine path; keep auditing ownership boundaries and use sanitizer runs
    for new exception or cancellation paths.
-7. WebSocket output is bounded within its framing layer, but application
+5. WebSocket output is bounded within its framing layer, but application
    broadcast fan-out still needs a policy for slow clients. Confirm the
    configured message and queue limits against the target workload before
    deployment.
 
 ## Environment and verification
 
-Build dependencies include a C++23 compiler, CMake, Botan 3, threads, and
-optionally `pkg-config` plus `liburing-dev`. On the WSL2 machine used for this
-handoff, `io_uring_setup` returns `EPERM` inside the agent's command sandbox
-but succeeds when the test is run outside that sandbox. Do not mistake that
-for a kernel or liburing failure. `/home/anon/eventloop` is WSL ext4; `/tmp`
-is memory-backed `tmpfs`. Windows-mounted `/mnt/...` paths have different I/O
-characteristics.
+Build dependencies include a C++23 compiler, CMake, Botan 3, and threads. The
+current host is Fedora 44 on Linux 7.2.5 with the project on Btrfs and `/tmp`
+on memory-backed `tmpfs`.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -150,28 +126,14 @@ ctest --test-dir build --output-on-failure
 ./build/file_io_benchmark
 ```
 
-Run the forced-ring test and benchmark outside a seccomp sandbox (or with the
-necessary approval) to exercise io_uring. Loopback tests also require socket
-access. The latest full elevated run passed all 10 tests. A fallback-only build
-and ASan/UBSan file-I/O test also passed:
-
-```sh
-cmake -S . -B build-no-uring -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON
-cmake --build build-no-uring --target file_io_test -j2
-ctest --test-dir build-no-uring --output-on-failure -R '^file_io$'
-
-cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
-  -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
-cmake --build build-asan --target file_io_test -j2
-./build-asan/file_io_test
-```
-
-The event-loop test also passed under ASan/UBSan after the accepted-descriptor
-failure-path test was added. A local HTTP `Connection: close` benchmark at
-16 connections and one client thread measured about 13.7k requests/s before
-and after the ownership change; this is evidence of no detectable regression
-on this host, not a broader performance claim.
+The fresh Release build succeeded on Fedora 44, and the file-I/O coroutine test
+passed directly. The elevated full CTest run passed 9/10 tests; `tls_loopback`
+failed during TLS negotiation with `bad_certificate` using its generated test
+certificate. The other loopback tests passed when run with socket access. A
+local HTTP `Connection: close` benchmark at 16 connections and one client
+thread measured about 13.7k requests/s before and after the ownership change;
+this is evidence of no detectable regression on this host, not a broader
+performance claim.
 
 Use build directories ignored by Git or outside the repository on the new
 machine. Recheck warnings, `git diff --check`, and test results after changes.

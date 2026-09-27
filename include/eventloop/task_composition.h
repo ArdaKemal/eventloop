@@ -55,10 +55,6 @@ struct composition_task_access {
     {
         return operation.result();
     }
-    static auto result(task<void>& operation) -> task_result
-    {
-        return operation.result();
-    }
 
     static auto request_cancel(coroutine_cancellation_state& state) noexcept -> void
     {
@@ -70,9 +66,7 @@ struct composition_task_access {
     }
 };
 
-template<typename T> struct composition_result { using type = typename task<T>::result_type; };
-template<> struct composition_result<void> { using type = task_result; };
-template<typename T> using composition_result_t = typename composition_result<T>::type;
+template<typename T> using composition_result_t = typename task<T>::result_type;
 
 template<typename T>
 [[nodiscard]] auto cancelled_result() -> composition_result_t<T>
@@ -98,16 +92,10 @@ class task_composition_awaiter {
     static_assert(sizeof...(T) != 0);
     static constexpr std::size_t count = sizeof...(T);
 
-    struct branch_context {
-        task_composition_awaiter* owner;
-        std::size_t index;
-    };
-
 public:
     explicit task_composition_awaiter(task<T>&&... operations)
         : operations_(std::move(operations)...)
     {
-        for (std::size_t i = 0; i < count; ++i) contexts_[i] = {this, i};
         parent_node_.operation = this;
         parent_node_.cancel = &cancel_parent;
     }
@@ -146,7 +134,7 @@ public:
                     std::unexpected(task_result::cancelled));
             }
             return std::expected<winner_type, task_result>(
-                make_winner(std::index_sequence_for<T...> {}));
+                make_winner());
         } else {
             return take_all(std::index_sequence_for<T...> {});
         }
@@ -183,13 +171,13 @@ private:
             return;
         }
         eventloop_detail::composition_task_access::start(
-            operation, branches_[I], &contexts_[I], &complete_branch);
+            operation, branches_[I], this, &complete_branch<I>);
     }
 
+    template<std::size_t I>
     static auto complete_branch(void* context) noexcept -> std::coroutine_handle<>
     {
-        auto& branch = *static_cast<branch_context*>(context);
-        return branch.owner->finish(branch.index);
+        return static_cast<task_composition_awaiter*>(context)->finish(I);
     }
 
     auto finish(std::size_t index) noexcept -> std::coroutine_handle<>
@@ -260,19 +248,22 @@ private:
             std::get<I>(operations_));
     }
 
-    template<std::size_t... I>
-    auto make_winner(std::index_sequence<I...>) -> race_winner<T...>
+    template<std::size_t I = 0>
+    auto make_winner() -> race_winner<T...>
     {
-        using variant_type = std::variant<eventloop_detail::composition_result_t<T>...>;
-        std::optional<variant_type> value;
-        ((winner_ == I ? (value.emplace(std::in_place_index<I>, take_one<I>()), void())
-                       : void()), ...);
-        return {winner_, std::move(*value)};
+        if constexpr (I == count) {
+            std::terminate();
+        } else {
+            if (winner_ == I) {
+                return {I, std::variant<eventloop_detail::composition_result_t<T>...>(
+                    std::in_place_index<I>, take_one<I>())};
+            }
+            return make_winner<I + 1>();
+        }
     }
 
     std::tuple<task<T>...> operations_;
     std::array<eventloop_detail::coroutine_cancellation_state, count> branches_ {};
-    std::array<branch_context, count> contexts_ {};
     std::array<bool, count> finished_ {};
     eventloop_detail::coroutine_cancellation_node parent_node_ {};
     std::coroutine_handle<> parent_ {};

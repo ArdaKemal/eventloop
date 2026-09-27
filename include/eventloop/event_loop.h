@@ -25,9 +25,6 @@ class task;
 template<typename T>
 class task_handle;
 
-enum class file_io_backend { automatic, executor, io_uring };
-enum class active_file_io_backend { executor, io_uring };
-
 namespace eventloop_detail {
 
 struct file_io_operation;
@@ -128,9 +125,9 @@ struct event_loop_options {
     std::size_t coroutine_completion_capacity {128};
     // File operations are bounded independently of the existing post queue.
     std::size_t file_io_depth {128};
-    file_io_backend file_backend {file_io_backend::automatic};
-    // Coroutine frames are served from fixed, per-loop size classes. A zero
-    // capacity disables a class. Exhaustion never falls back to the heap.
+    // Coroutine frames are preallocated from fixed, per-loop size classes.
+    // Defaults reserve 126 frames (57,216 bytes including pool headers).
+    // A zero capacity disables a class. Exhaustion never falls back to the heap.
     // Frame-resident state must not require alignment beyond max_align_t.
     std::array<std::size_t, 6> coroutine_frame_capacities {
         64, 32, 16, 8, 4, 2,
@@ -211,10 +208,10 @@ public:
         -> task_spawn_result;
     [[nodiscard]] auto coroutine_statistics() const noexcept
         -> coroutine_pool_statistics;
-    [[nodiscard]] auto file_backend() -> active_file_io_backend;
 
 private:
     friend struct eventloop_detail::coroutine_frame_access;
+    friend class event_loop_yield_awaiter;
     friend class tcp_stream;
     friend class tls_stream;
 
@@ -234,6 +231,7 @@ private:
                                   std::coroutine_handle<> handle,
                                   bool started) -> task_spawn_result;
     [[nodiscard]] auto can_spawn() const noexcept -> bool;
+    [[nodiscard]] auto post_local(execution_task&& task) noexcept -> bool;
 
     class implementation;
     std::unique_ptr<implementation> implementation_;

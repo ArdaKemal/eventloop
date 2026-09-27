@@ -91,11 +91,9 @@ auto percentile(std::vector<double>& values, double fraction) -> double
     return values[index];
 }
 
-auto run_case(file_io_backend backend, const char* name, int descriptor)
-    -> bool
+auto run_case(int descriptor) -> bool
 {
     event_loop_options options;
-    options.file_backend = backend;
     options.coroutine_frame_capacities.fill(32);
     event_loop loop(options);
     measurements data {.loop = loop,
@@ -120,11 +118,7 @@ auto run_case(file_io_backend backend, const char* name, int descriptor)
     (void)loop.run();
     const double seconds = std::chrono::duration<double>(clock::now() - start)
                                .count();
-    std::cout << name << " ("
-              << (loop.file_backend() == active_file_io_backend::io_uring
-                      ? "io_uring"
-                      : "executor") << "): "
-              << std::fixed << std::setprecision(1)
+    std::cout << "executor: " << std::fixed << std::setprecision(1)
               << static_cast<double>(data.completed) / seconds << " ops/s, "
               << "read p50/p99 " << percentile(data.operation_us, 0.5)
               << "/" << percentile(data.operation_us, 0.99) << " us, "
@@ -140,18 +134,5 @@ auto run_case(file_io_backend backend, const char* name, int descriptor)
 auto main() -> int
 {
     temporary_file file;
-    if (!run_case(file_io_backend::executor, "fallback", file.descriptor)) {
-        return 1;
-    }
-    try {
-        if (!run_case(file_io_backend::io_uring, "ring", file.descriptor)) {
-            return 1;
-        }
-    } catch (const std::system_error& error) {
-        std::cerr << "io_uring unavailable: " << error.code().message()
-                  << '\n';
-    } catch (const std::invalid_argument&) {
-        std::cerr << "io_uring unavailable in this build\n";
-    }
-    return 0;
+    return run_case(file.descriptor) ? 0 : 1;
 }

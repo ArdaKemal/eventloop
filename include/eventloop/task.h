@@ -43,6 +43,134 @@ template<typename T>
 class task;
 namespace eventloop_detail { struct composition_task_access; }
 
+namespace eventloop_detail {
+
+struct task_promise_base {
+    template<typename... Arguments>
+    explicit task_promise_base(event_loop& loop, Arguments&&...) noexcept
+        : loop_(&loop), cancellation_(&root_.cancellation) {}
+
+    static auto operator delete(void* pointer) noexcept -> void
+    {
+        coroutine_frame_access::deallocate(pointer, 0);
+    }
+
+    template<typename... Arguments>
+    static auto operator new(std::size_t size, event_loop& loop,
+                             Arguments&&...) noexcept -> void*
+    {
+        return coroutine_frame_access::allocate(loop, size);
+    }
+
+    template<typename... Arguments>
+    static auto operator delete(void* pointer, std::size_t size,
+                                event_loop&, Arguments&&...) noexcept -> void
+    {
+        coroutine_frame_access::deallocate(pointer, size);
+    }
+
+    [[nodiscard]] static auto initial_suspend() noexcept -> std::suspend_always
+    {
+        return {};
+    }
+
+    struct final_awaiter {
+        [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+
+        template<typename Promise>
+        static auto await_suspend(std::coroutine_handle<Promise> handle) noexcept
+            -> std::coroutine_handle<>
+        {
+            auto& promise = handle.promise();
+            auto continuation = promise.completion_ != nullptr
+                ? promise.completion_(promise.completion_context_)
+                : promise.completion_context_ != nullptr
+                    ? std::coroutine_handle<>::from_address(promise.completion_context_)
+                    : std::noop_coroutine();
+            if (promise.root_.owner != nullptr) {
+                coroutine_frame_access::complete_root(promise.root_);
+            }
+            return continuation;
+        }
+
+        static auto await_resume() noexcept -> void {}
+    };
+
+    [[nodiscard]] static auto final_suspend() noexcept -> final_awaiter
+    {
+        return {};
+    }
+
+    [[noreturn]] static auto unhandled_exception() noexcept -> void
+    {
+        std::terminate();
+    }
+
+    [[nodiscard]] auto owner_loop() const noexcept -> event_loop* { return loop_; }
+    [[nodiscard]] auto cancellation_state() const noexcept
+        -> coroutine_cancellation_state*
+    {
+        return cancellation_;
+    }
+
+    // A direct await stores its continuation address here. Composed and
+    // observed tasks use the same slot with completion_ as a discriminator.
+    event_loop* loop_;
+    coroutine_root_node root_;
+    coroutine_cancellation_state* cancellation_;
+    void* completion_context_ {nullptr};
+    std::coroutine_handle<> (*completion_)(void*) noexcept {nullptr};
+    bool started_ {false};
+};
+
+template<typename Handle>
+[[nodiscard]] auto task_state_of(Handle handle, bool allocation_failed) noexcept
+    -> task_state
+{
+    if (allocation_failed) return task_state::frame_allocation_failure;
+    if (handle == nullptr || handle.done()) return task_state::completed;
+    return handle.promise().started_ ? task_state::suspended
+                                     : task_state::not_started;
+}
+
+template<typename Handle>
+auto start_task(Handle handle, bool allocation_failed) -> task_state
+{
+    if (allocation_failed) return task_state::frame_allocation_failure;
+    if (handle == nullptr || handle.done()) return task_state::completed;
+    if (handle.promise().started_) {
+        throw std::logic_error("coroutine task has already been started");
+    }
+    handle.promise().started_ = true;
+    handle.resume();
+    return handle.done() ? task_state::completed : task_state::suspended;
+}
+
+template<typename Handle>
+auto destroy_task(Handle handle) noexcept -> void
+{
+    if (handle == nullptr) return;
+    if (handle.promise().started_ && !handle.done()) std::terminate();
+    handle.destroy();
+}
+
+template<typename Handle, typename Promise>
+auto suspend_on_task(Handle handle,
+                     std::coroutine_handle<Promise> continuation) noexcept
+    -> std::coroutine_handle<>
+{
+    auto& promise = handle.promise();
+    if (promise.started_ || promise.loop_ != continuation.promise().owner_loop()) {
+        std::terminate();
+    }
+    promise.started_ = true;
+    promise.completion_context_ = continuation.address();
+    promise.cancellation_ = continuation.promise().cancellation_state();
+    return handle;
+}
+
+} // namespace eventloop_detail
+
 // Coroutine functions returning task must take their owning event_loop as the
 // first argument. Started tasks and their frames remain loop-affine. Root
 // tasks should normally be transferred to event_loop::spawn().
@@ -83,23 +211,12 @@ public:
 
     [[nodiscard]] auto state() const noexcept -> task_state
     {
-        if (allocation_failed_) return task_state::frame_allocation_failure;
-        if (handle_ == nullptr) return task_state::completed;
-        if (handle_.done()) return task_state::completed;
-        return handle_.promise().started_ ? task_state::suspended
-                                          : task_state::not_started;
+        return eventloop_detail::task_state_of(handle_, allocation_failed_);
     }
 
     auto start() -> task_state
     {
-        if (allocation_failed_) return task_state::frame_allocation_failure;
-        if (handle_ == nullptr || handle_.done()) return task_state::completed;
-        if (handle_.promise().started_) {
-            throw std::logic_error("coroutine task has already been started");
-        }
-        handle_.promise().started_ = true;
-        handle_.resume();
-        return handle_.done() ? task_state::completed : task_state::suspended;
+        return eventloop_detail::start_task(handle_, allocation_failed_);
     }
 
     [[nodiscard]] auto result() const -> task_result
@@ -142,15 +259,7 @@ public:
         auto await_suspend(std::coroutine_handle<Promise> continuation) noexcept
             -> std::coroutine_handle<>
         {
-            if (handle_.promise().started_ ||
-                handle_.promise().loop_ != continuation.promise().owner_loop()) {
-                std::terminate();
-            }
-            handle_.promise().started_ = true;
-            handle_.promise().continuation_ = continuation;
-            handle_.promise().cancellation_ =
-                continuation.promise().cancellation_state();
-            return handle_;
+            return eventloop_detail::suspend_on_task(handle_, continuation);
         }
 
         auto await_resume() noexcept -> task_result
@@ -166,9 +275,7 @@ public:
     private:
         auto reset() noexcept -> void
         {
-            if (handle_ == nullptr) return;
-            if (handle_.promise().started_ && !handle_.done()) std::terminate();
-            handle_.destroy();
+            eventloop_detail::destroy_task(handle_);
         }
 
         handle_type handle_ {};
@@ -180,31 +287,10 @@ public:
         return awaiter(std::move(*this));
     }
 
-    struct promise_type {
-        template<typename... Arguments>
-        explicit promise_type(event_loop& loop, Arguments&&...) noexcept
-            : loop_(&loop), cancellation_(&root_.cancellation)
-        {
-        }
-
-        static auto operator delete(void* pointer) noexcept -> void
-        {
-            eventloop_detail::coroutine_frame_access::deallocate(pointer, 0);
-        }
-
-        template<typename... Arguments>
-        static auto operator new(std::size_t size, event_loop& loop,
-                                 Arguments&&...) noexcept -> void*
-        {
-            return eventloop_detail::coroutine_frame_access::allocate(loop, size);
-        }
-
-        template<typename... Arguments>
-        static auto operator delete(void* pointer, std::size_t size,
-                                    event_loop&, Arguments&&...) noexcept -> void
-        {
-            eventloop_detail::coroutine_frame_access::deallocate(pointer, size);
-        }
+    struct promise_type : eventloop_detail::task_promise_base {
+        using eventloop_detail::task_promise_base::task_promise_base;
+        using eventloop_detail::task_promise_base::operator new;
+        using eventloop_detail::task_promise_base::operator delete;
 
         [[nodiscard]] static auto get_return_object_on_allocation_failure() noexcept
             -> task
@@ -219,82 +305,8 @@ public:
             return task(handle, false);
         }
 
-        [[nodiscard]] static auto initial_suspend() noexcept
-            -> std::suspend_always
-        {
-            return {};
-        }
-
-        struct final_awaiter {
-            [[nodiscard]] static auto await_ready() noexcept -> bool
-            {
-                return false;
-            }
-
-            static auto await_suspend(handle_type handle) noexcept
-                -> std::coroutine_handle<>
-            {
-                auto& promise = handle.promise();
-                if (promise.root_.owner != nullptr) {
-                    std::coroutine_handle<> continuation =
-                        promise.completion_ != nullptr
-                            ? promise.completion_(promise.completion_context_)
-                            : std::noop_coroutine();
-                    eventloop_detail::coroutine_frame_access::complete_root(
-                        promise.root_);
-                    return continuation;
-                }
-                if (promise.completion_ != nullptr) {
-                    return promise.completion_(promise.completion_context_);
-                }
-                const auto continuation = promise.continuation_;
-                return continuation != nullptr ? continuation
-                                               : std::noop_coroutine();
-            }
-
-            static auto await_resume() noexcept -> void {}
-        };
-
-        [[nodiscard]] static auto final_suspend() noexcept -> final_awaiter
-        {
-            return {};
-        }
-
         static auto return_void() noexcept -> void {}
-        [[noreturn]] static auto unhandled_exception() noexcept -> void
-        {
-            std::terminate();
-        }
-
-        [[nodiscard]] auto owner_loop() const noexcept -> event_loop* { return loop_; }
-        [[nodiscard]] auto cancellation_state() const noexcept
-            -> eventloop_detail::coroutine_cancellation_state*
-        {
-            return cancellation_;
-        }
-
-    private:
-        friend class task;
-        friend class task::awaiter;
-        friend class event_loop;
-        template<typename> friend class task_handle;
-        friend struct eventloop_detail::composition_task_access;
-        friend class task_cancellation_awaiter;
-        friend class event_loop_timer_awaiter;
-        template<typename Function>
-        friend class event_loop_blocking_awaiter;
-        template<eventloop_detail::file_opcode Kind>
-        friend class file_io_awaiter;
-
-        event_loop* loop_;
-        eventloop_detail::coroutine_root_node root_;
-        eventloop_detail::coroutine_cancellation_state* cancellation_;
-        std::coroutine_handle<> continuation_ {};
-        void* completion_context_ {nullptr};
-        std::coroutine_handle<> (*completion_)(void*) noexcept {nullptr};
-        bool started_ {false};
     };
-
 private:
     friend class event_loop;
     template<typename> friend class task_handle;
@@ -352,22 +364,14 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept { return handle_ != nullptr; }
     [[nodiscard]] auto state() const noexcept -> task_state
     {
-        if (allocation_failed_) return task_state::frame_allocation_failure;
-        if (handle_ == nullptr || handle_.done()) return task_state::completed;
-        return handle_.promise().started_ ? task_state::suspended
-                                          : task_state::not_started;
+        return eventloop_detail::task_state_of(handle_, allocation_failed_);
     }
+
     auto start() -> task_state
     {
-        if (allocation_failed_) return task_state::frame_allocation_failure;
-        if (handle_ == nullptr || handle_.done()) return task_state::completed;
-        if (handle_.promise().started_) {
-            throw std::logic_error("coroutine task has already been started");
-        }
-        handle_.promise().started_ = true;
-        handle_.resume();
-        return handle_.done() ? task_state::completed : task_state::suspended;
+        return eventloop_detail::start_task(handle_, allocation_failed_);
     }
+
     [[nodiscard]] auto result() -> result_type
     {
         if (allocation_failed_ || handle_ == nullptr) {
@@ -400,16 +404,9 @@ public:
         auto await_suspend(std::coroutine_handle<Promise> continuation) noexcept
             -> std::coroutine_handle<>
         {
-            auto& promise = handle_.promise();
-            if (promise.started_ ||
-                promise.loop_ != continuation.promise().owner_loop()) {
-                std::terminate();
-            }
-            promise.started_ = true;
-            promise.continuation_ = continuation;
-            promise.cancellation_ = continuation.promise().cancellation_state();
-            return handle_;
+            return eventloop_detail::suspend_on_task(handle_, continuation);
         }
+
         auto await_resume() -> result_type
         {
             if (allocation_failed_ || handle_ == nullptr) {
@@ -423,99 +420,37 @@ public:
     private:
         auto reset() noexcept -> void
         {
-            if (handle_ == nullptr) return;
-            if (handle_.promise().started_ && !handle_.done()) std::terminate();
-            handle_.destroy();
+            eventloop_detail::destroy_task(handle_);
         }
         handle_type handle_ {};
         bool allocation_failed_ {false};
     };
     auto operator co_await() && noexcept -> awaiter { return awaiter(std::move(*this)); }
 
-    struct promise_type {
-        template<typename... Arguments>
-        explicit promise_type(event_loop& loop, Arguments&&...) noexcept
-            : loop_(&loop), cancellation_(&root_.cancellation) {}
-        static auto operator delete(void* pointer) noexcept -> void
-        {
-            eventloop_detail::coroutine_frame_access::deallocate(pointer, 0);
-        }
-        template<typename... Arguments>
-        static auto operator new(std::size_t size, event_loop& loop,
-                                 Arguments&&...) noexcept -> void*
-        {
-            return eventloop_detail::coroutine_frame_access::allocate(loop, size);
-        }
-        template<typename... Arguments>
-        static auto operator delete(void* pointer, std::size_t size,
-                                    event_loop&, Arguments&&...) noexcept -> void
-        {
-            eventloop_detail::coroutine_frame_access::deallocate(pointer, size);
-        }
-        [[nodiscard]] static auto get_return_object_on_allocation_failure() noexcept -> task
+    struct promise_type : eventloop_detail::task_promise_base {
+        using eventloop_detail::task_promise_base::task_promise_base;
+        using eventloop_detail::task_promise_base::operator new;
+        using eventloop_detail::task_promise_base::operator delete;
+
+        [[nodiscard]] static auto get_return_object_on_allocation_failure() noexcept
+            -> task
         {
             return task({}, true);
         }
+
         [[nodiscard]] auto get_return_object() noexcept -> task
         {
-            auto handle = handle_type::from_promise(*this);
+            const auto handle = handle_type::from_promise(*this);
             root_.handle = handle;
             return task(handle, false);
         }
-        [[nodiscard]] static auto initial_suspend() noexcept -> std::suspend_always { return {}; }
-        struct final_awaiter {
-            [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
-            static auto await_suspend(handle_type handle) noexcept -> std::coroutine_handle<>
-            {
-                auto& promise = handle.promise();
-                if (promise.root_.owner != nullptr) {
-                    std::coroutine_handle<> continuation =
-                        promise.completion_ != nullptr
-                            ? promise.completion_(promise.completion_context_)
-                            : std::noop_coroutine();
-                    eventloop_detail::coroutine_frame_access::complete_root(
-                        promise.root_);
-                    return continuation;
-                }
-                if (promise.completion_ != nullptr) {
-                    return promise.completion_(promise.completion_context_);
-                }
-                return promise.continuation_ != nullptr ? promise.continuation_
-                                                        : std::noop_coroutine();
-            }
-            static auto await_resume() noexcept -> void {}
-        };
-        [[nodiscard]] static auto final_suspend() noexcept -> final_awaiter { return {}; }
+
         template<typename Value>
         auto return_value(Value&& value) -> void
         {
             value_.emplace(std::forward<Value>(value));
         }
-        [[noreturn]] static auto unhandled_exception() noexcept -> void { std::terminate(); }
-        [[nodiscard]] auto owner_loop() const noexcept -> event_loop* { return loop_; }
-        [[nodiscard]] auto cancellation_state() const noexcept
-            -> eventloop_detail::coroutine_cancellation_state*
-        {
-            return cancellation_;
-        }
-    private:
-        friend class task;
-        friend class task::awaiter;
-        friend class event_loop;
-        template<typename> friend class task_handle;
-        friend struct eventloop_detail::composition_task_access;
-        friend class task_cancellation_awaiter;
-        friend class event_loop_timer_awaiter;
-        template<typename Function> friend class event_loop_blocking_awaiter;
-        template<eventloop_detail::file_opcode Kind> friend class file_io_awaiter;
-        event_loop* loop_;
-        eventloop_detail::coroutine_root_node root_;
-        eventloop_detail::coroutine_cancellation_state* cancellation_;
-        std::coroutine_handle<> continuation_ {};
-        void* completion_context_ {nullptr};
-        std::coroutine_handle<> (*completion_)(void*) noexcept {nullptr};
         std::optional<T> value_;
-        bool started_ {false};
     };
 private:
     friend class event_loop;
@@ -558,7 +493,10 @@ public:
     task_handle(task_handle&&) = delete;
     auto operator=(task_handle&&) -> task_handle& = delete;
 
-    [[nodiscard]] auto done() const noexcept -> bool { return completed_; }
+    [[nodiscard]] auto done() const noexcept -> bool
+    {
+        return loop_ != nullptr && root_ == nullptr;
+    }
 
     // Cooperative cancellation. Completion may be delayed by worker or
     // kernel references to the task frame.
@@ -572,7 +510,7 @@ public:
 
     [[nodiscard]] auto take_result() -> result_type
     {
-        if (!completed_ || !result_) {
+        if (!done() || !result_) {
             throw std::logic_error("observed task result is unavailable");
         }
         auto value = std::move(*result_);
@@ -596,13 +534,13 @@ public:
         awaiter(awaiter&&) = delete;
         [[nodiscard]] auto await_ready() const noexcept -> bool
         {
-            return owner_.completed_;
+            return owner_.done();
         }
         template<typename Promise>
         auto await_suspend(std::coroutine_handle<Promise> continuation) noexcept
             -> bool
         {
-            if (!owner_.bound_ || owner_.waiter_ != nullptr ||
+            if (owner_.loop_ == nullptr || owner_.waiter_ != nullptr ||
                 owner_.loop_ != continuation.promise().owner_loop()) {
                 std::terminate();
             }
@@ -614,7 +552,7 @@ public:
                 (void)owner_.cancel();
             }
             arming_ = false;
-            return !owner_.completed_;
+            return !owner_.done();
         }
         auto await_resume() -> result_type { return owner_.take_result(); }
 
@@ -655,7 +593,6 @@ private:
             self.result_.emplace(std::move(*handle.promise().value_));
         }
         self.root_ = nullptr;
-        self.completed_ = true;
         if (self.waiter_ == nullptr) return std::noop_coroutine();
         auto* waiter = std::exchange(self.waiter_, nullptr);
         return waiter->complete();
@@ -665,8 +602,6 @@ private:
     eventloop_detail::coroutine_root_node* root_ {nullptr};
     std::optional<result_type> result_;
     awaiter* waiter_ {nullptr};
-    bool bound_ {false};
-    bool completed_ {false};
 };
 
 template<typename T>
@@ -676,7 +611,7 @@ auto event_loop::spawn(task<T>&& operation, task_handle<T>& observer)
     if (operation.allocation_failed_) {
         return task_spawn_result::frame_allocation_failure;
     }
-    if (operation.handle_ == nullptr || observer.bound_) {
+    if (operation.handle_ == nullptr || observer.loop_ != nullptr) {
         return task_spawn_result::invalid_task;
     }
     auto& promise = operation.handle_.promise();
@@ -687,7 +622,6 @@ auto event_loop::spawn(task<T>&& operation, task_handle<T>& observer)
 
     observer.loop_ = this;
     observer.root_ = &promise.root_;
-    observer.bound_ = true;
     promise.completion_context_ = &observer;
     promise.completion_ = &task_handle<T>::complete_root;
     promise.started_ = true;
@@ -995,7 +929,7 @@ public:
         execution_task continuation(
             [handle]() noexcept { handle.resume(); });
         queued_ = true;
-        if (loop_.post(std::move(continuation))) return true;
+        if (loop_.post_local(std::move(continuation))) return true;
         queued_ = false;
         return false;
     }

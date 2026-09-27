@@ -39,7 +39,8 @@ public:
     auto wake() noexcept -> void;
     auto arm_timer(std::optional<std::chrono::steady_clock::duration> delay)
         -> void;
-    [[nodiscard]] auto poll(std::span<ready_event> events) -> poll_result;
+    [[nodiscard]] auto poll(std::span<ready_event> events,
+                            bool nonblocking = false) -> poll_result;
 
 private:
     class signal_mask_guard {

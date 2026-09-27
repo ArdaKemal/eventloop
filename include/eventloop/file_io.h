@@ -23,8 +23,8 @@ namespace eventloop_detail {
 
 enum class file_opcode { openat, read_at, write_at };
 
-// The kernel or worker may access the path/buffer until the completion is
-// delivered, including after cancellation has been requested.
+// The worker may access the path/buffer until the completion is delivered,
+// including after cancellation has been requested.
 struct file_io_operation {
     explicit file_io_operation(file_opcode kind) noexcept : opcode(kind) {}
 

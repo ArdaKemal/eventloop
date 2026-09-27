@@ -97,27 +97,21 @@ third-party awaitables; use them inside a `task<T>` instead.
 ## Coroutine file I/O
 
 Include `eventloop/file_io.h` to `co_await` `async_openat`, `async_read_at`, or
-`async_write_at` from a task owned by an `event_loop`. On Linux with
-liburing available, the first file operation attempts an io_uring backend;
-otherwise it uses a dedicated worker and posts completion back to the same
-event loop. Set `event_loop_options::file_backend` to `executor` or `io_uring`
-to force a backend. Forcing io_uring reports setup failure instead of silently
-falling back. `file_io_depth` bounds concurrent file operations; a full backend
-returns `EAGAIN`.
+`async_write_at` from a task owned by an `event_loop`. Operations run on a
+dedicated bounded worker and post completion back to the same event loop.
+`file_io_depth` bounds concurrent file operations; a full queue returns
+`EAGAIN`.
 
 The operations return `std::expected` with `std::error_code` on failure.
 `async_openat` copies paths up to 255 bytes into the coroutine frame. Read and
 write buffers must remain valid until completion, including after cancellation
 is requested. Cancellation does not abort an already-running syscall; the
 coroutine resumes with `ECANCELED` after that syscall completes. The current
-event-loop implementation itself remains Linux/epoll-only; the worker fallback
-also covers Linux systems where io_uring is unavailable or disallowed.
+event-loop implementation itself remains Linux/epoll-only.
 
-`./build/file_io_benchmark` compares the two backends using cached 4 KiB
-reads at 16-way concurrency and reports operation throughput/latency plus
-event-loop timer lateness. It is a backend-overhead probe, not a storage-device
-benchmark; run it outside a sandbox that blocks `io_uring_setup` to measure
-both backends.
+`./build/file_io_benchmark` measures cached 4 KiB reads at 16-way concurrency
+and reports operation throughput/latency plus event-loop timer lateness. It is
+an executor and event-loop overhead probe, not a storage-device benchmark.
 
 ## HTTP throughput comparison
 

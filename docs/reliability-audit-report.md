@@ -8,6 +8,10 @@ Scope: the experimental coroutine file I/O slice and the subsequent ownership,
 error-path, bounded-resource, and performance review. The work spans 35 commits
 from `23108ee` through `01fb250`.
 
+Historical note: this report describes the audited revision. The optional
+io_uring backend documented below was removed on 2026-09-27; current file I/O
+uses the dedicated bounded worker executor only.
+
 ## Outcome
 
 The planned audit is closed at this revision. The new file I/O API was committed
@@ -78,14 +82,13 @@ library cannot be certified free of all defects by this audit or its tests.
 
 The code remains Linux-only. File read and write buffers are caller-owned
 through completion, including after cancellation is requested. An observed
-`task_handle` must stay alive until its task completes. Raw pointers inside
-the ring, cancellation nodes, and callbacks are constrained by those lifetime
-rules; they were not all removed. The default automatic file backend currently
-prefers io_uring when setup succeeds, but a deployment decision needs a
-representative target-host and filesystem benchmark, including p99 timer
-latency. The HTTP file path needs explicit session/coroutine lifetime ownership
-before using the new awaiters. WebSocket application broadcast fan-out still
-needs a slow-client policy and workload-specific queue limits.
+`task_handle` must stay alive until its task completes. At the audited revision,
+raw pointers inside the ring, cancellation nodes, and callbacks were constrained
+by those lifetime rules; the default backend preferred io_uring when setup
+succeeded. The ring-specific concerns no longer apply after its removal. The
+HTTP file path still needs explicit session/coroutine lifetime ownership before
+using the awaiters. WebSocket application broadcast fan-out still needs a
+slow-client policy and workload-specific queue limits.
 
 The preexisting untracked `docs/executor-implementation-plan.md` was preserved
 and is outside this report's commit scope.

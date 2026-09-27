@@ -1,7 +1,6 @@
 #include "eventloop/event_loop.h"
 #include "eventloop/file_io.h"
 #include "eventloop/task.h"
-#include "eventloop/unique_fd.h"
 
 #include "executor/bounded_task_queue.h"
 #include "linux/epoll_loop.h"
@@ -17,16 +16,12 @@
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
-#include <sys/eventfd.h>
 #include <unistd.h>
-
-#if defined(EVENTLOOP_HAS_LIBURING)
-#include <liburing.h>
-#endif
 
 #if defined(__SANITIZE_ADDRESS__)
 #define EVENTLOOP_ADDRESS_SANITIZER 1
@@ -43,7 +38,6 @@
 namespace {
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
 constexpr std::size_t max_timers_per_iteration = 64;
-constexpr std::size_t max_file_completions_per_iteration = 64;
 constexpr std::size_t coroutine_frame_alignment = 64;
 static_assert(coroutine_frame_alignment >= alignof(std::max_align_t));
 
@@ -237,137 +231,13 @@ private:
         throw std::invalid_argument(
             "coroutine completion capacity must be a power of two and at least two");
     }
-    if (options.file_io_depth < 2 ||
-        !is_power_of_two(options.file_io_depth) ||
-        options.file_io_depth > std::numeric_limits<unsigned>::max() / 2) {
+    if (options.file_io_depth < 2 || !is_power_of_two(options.file_io_depth)) {
         throw std::invalid_argument(
-            "file I/O depth must be a power of two between 2 and UINT_MAX/2");
+            "file I/O depth must be a power of two and at least two");
     }
     return options;
 }
 } // namespace
-
-#if defined(EVENTLOOP_HAS_LIBURING)
-namespace {
-class file_ring {
-public:
-    file_ring() = default;
-    ~file_ring()
-    {
-        if (registered_) io_uring_queue_exit(&ring_);
-    }
-
-    file_ring(const file_ring&) = delete;
-    auto operator=(const file_ring&) -> file_ring& = delete;
-
-    [[nodiscard]] auto initialize(epoll_loop& poller, std::size_t depth) noexcept
-        -> int
-    {
-        io_uring_params params {};
-        params.flags = IORING_SETUP_CQSIZE;
-        params.cq_entries = static_cast<unsigned>(depth * 2);
-        const int result = io_uring_queue_init_params(
-            static_cast<unsigned>(depth), &ring_, &params);
-        if (result < 0) return result;
-        registered_ = true;
-        notification_.reset(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
-        if (!notification_) return -errno;
-        const int registration = io_uring_register_eventfd(&ring_,
-                                                            notification_.get());
-        if (registration < 0) return registration;
-        try {
-            poller.add_descriptor(notification_.get());
-        } catch (const std::system_error& error) {
-            return -error.code().value();
-        } catch (...) {
-            return -EIO;
-        }
-        return 0;
-    }
-
-    [[nodiscard]] auto descriptor() const noexcept -> int
-    {
-        return notification_.get();
-    }
-
-    [[nodiscard]] auto submit(eventloop_detail::file_io_operation& operation)
-        noexcept -> int
-    {
-        // This ring does not use SQPOLL. If an earlier failed submission left
-        // an unsubmitted NOP, consume it before accepting another operation.
-        if (io_uring_sq_ready(&ring_) != 0) {
-            const int flushed = io_uring_submit(&ring_);
-            if (flushed < 0) return flushed;
-            if (io_uring_sq_ready(&ring_) != 0) return -EAGAIN;
-        }
-        auto* sqe = io_uring_get_sqe(&ring_);
-        if (sqe == nullptr) return -EAGAIN;
-        using eventloop_detail::file_opcode;
-        switch (operation.opcode) {
-        case file_opcode::openat:
-            io_uring_prep_openat(sqe, operation.descriptor, operation.path,
-                                 operation.flags, operation.mode);
-            break;
-        case file_opcode::read_at:
-            io_uring_prep_read(sqe, operation.descriptor, operation.buffer,
-                               static_cast<unsigned>(operation.length),
-                               static_cast<std::uint64_t>(operation.offset));
-            break;
-        case file_opcode::write_at:
-            io_uring_prep_write(sqe, operation.descriptor, operation.buffer,
-                                static_cast<unsigned>(operation.length),
-                                static_cast<std::uint64_t>(operation.offset));
-            break;
-        }
-        io_uring_sqe_set_data(sqe, &operation);
-        const int submitted = io_uring_submit(&ring_);
-        if (submitted > 0) return 0;
-
-        // Submission is ordered, and without SQPOLL the kernel does not
-        // consume an SQE that io_uring_submit did not report submitted. It
-        // remains in the shared SQ; replace its frame pointer with a NOP so
-        // a later submission can safely flush it.
-        io_uring_prep_nop(sqe);
-        io_uring_sqe_set_data(sqe, nullptr);
-        return submitted < 0 ? submitted : -EAGAIN;
-    }
-
-    template<typename Complete>
-    auto drain(Complete&& complete) noexcept -> void
-    {
-        std::uint64_t notification;
-        while (::read(notification_.get(), &notification, sizeof(notification)) == -1 &&
-               errno == EINTR) {}
-        io_uring_cqe* cqe = nullptr;
-        std::size_t count = 0;
-        while (count < max_file_completions_per_iteration &&
-               io_uring_peek_cqe(&ring_, &cqe) == 0) {
-            auto* operation = static_cast<eventloop_detail::file_io_operation*>(
-                io_uring_cqe_get_data(cqe));
-            const int result = cqe->res;
-            io_uring_cqe_seen(&ring_, cqe);
-            if (operation != nullptr) complete(*operation, result);
-            ++count;
-        }
-        if (count == max_file_completions_per_iteration &&
-            io_uring_peek_cqe(&ring_, &cqe) == 0) {
-            const std::uint64_t one = 1;
-            for (;;) {
-                if (::write(notification_.get(), &one, sizeof(one)) != -1) break;
-                if (errno == EINTR) continue;
-                if (errno == EAGAIN) break;
-                std::terminate();
-            }
-        }
-    }
-
-private:
-    io_uring ring_ {};
-    unique_fd notification_;
-    bool registered_ {false};
-};
-} // namespace
-#endif
 
 class event_loop::implementation {
 public:
@@ -381,12 +251,8 @@ public:
                             ? make_single_thread_executor()
                             : make_multi_thread_executor(
                                   {.worker_count = options.worker_count})),
-          file_io_depth(options.file_io_depth),
-          requested_file_backend(options.file_backend)
+          file_io_depth(options.file_io_depth)
     {
-        if (requested_file_backend == file_io_backend::io_uring) {
-            initialize_file_backend();
-        }
     }
 
     ~implementation()
@@ -397,31 +263,11 @@ public:
         if (coroutine_frames.statistics().live != 0) std::terminate();
     }
 
-    auto initialize_file_backend() -> void
+    auto initialize_file_executor() -> void
     {
-        if (file_backend_initialized) return;
-#if defined(EVENTLOOP_HAS_LIBURING)
-        if (requested_file_backend != file_io_backend::executor) {
-            auto candidate = std::make_unique<file_ring>();
-            const int result = candidate->initialize(poller, file_io_depth);
-            if (result == 0) {
-                ring = std::move(candidate);
-                selected_file_backend = active_file_io_backend::io_uring;
-            } else if (requested_file_backend == file_io_backend::io_uring) {
-                throw std::system_error(-result, std::generic_category(),
-                                        "io_uring setup");
-            }
-        }
-#else
-        if (requested_file_backend == file_io_backend::io_uring) {
-            throw std::invalid_argument("io_uring is unavailable in this build");
-        }
-#endif
-        if (selected_file_backend == active_file_io_backend::executor) {
-            file_executor = make_multi_thread_executor(
-                {.worker_count = 1, .queue_capacity = file_io_depth});
-        }
-        file_backend_initialized = true;
+        if (file_executor) return;
+        file_executor = make_multi_thread_executor(
+            {.worker_count = 1, .queue_capacity = file_io_depth});
     }
 
     [[nodiscard]] static auto perform_file_operation(
@@ -461,9 +307,9 @@ public:
         noexcept -> int
     {
         if (shutting_down) return -ECANCELED;
-        if (!file_backend_initialized) {
+        if (!file_executor) {
             try {
-                initialize_file_backend();
+                initialize_file_executor();
             } catch (const std::system_error& error) {
                 return -error.code().value();
             } catch (const std::bad_alloc&) {
@@ -475,14 +321,6 @@ public:
         if (file_io_inflight == file_io_depth) {
             return -EAGAIN;
         }
-#if defined(EVENTLOOP_HAS_LIBURING)
-        if (ring != nullptr) {
-            const int result = ring->submit(operation);
-            if (result < 0) return result;
-            ++file_io_inflight;
-            return 0;
-        }
-#endif
         if (reserve_coroutine_completion() !=
             eventloop_detail::completion_reservation_result::accepted) {
             return -EAGAIN;
@@ -508,26 +346,6 @@ public:
         if (file_io_inflight == 0) std::terminate();
         --file_io_inflight;
         operation.finish(operation, result);
-    }
-
-    auto drain_file_ring() noexcept -> void
-    {
-#if defined(EVENTLOOP_HAS_LIBURING)
-        if (ring != nullptr) {
-            ring->drain([this](auto& operation, int result) noexcept {
-                complete_file(operation, result);
-            });
-        }
-#endif
-    }
-
-    [[nodiscard]] auto file_ring_descriptor() const noexcept -> int
-    {
-#if defined(EVENTLOOP_HAS_LIBURING)
-        return ring != nullptr ? ring->descriptor() : -1;
-#else
-        return -1;
-#endif
     }
 
     [[nodiscard]] auto drain_posted() -> bool
@@ -824,20 +642,19 @@ public:
                                 event_loop::timer_id>;
     coroutine_frame_pool coroutine_frames;
     epoll_loop poller;
+    const std::thread::id owner_thread {std::this_thread::get_id()};
     bounded_task_queue posted_tasks;
+    // Only the owning loop thread reads or writes this hint. Local yield
+    // continuations and same-thread posts use posted_tasks without writing
+    // to the wake eventfd.
+    bool local_post_pending {false};
     bounded_task_queue coroutine_completions;
     const std::size_t coroutine_completion_capacity;
     std::atomic<std::size_t> reserved_coroutine_completions {0};
     const bool blocking_executor_available;
     std::unique_ptr<executor> task_executor;
     const std::size_t file_io_depth;
-    const file_io_backend requested_file_backend;
-#if defined(EVENTLOOP_HAS_LIBURING)
-    std::unique_ptr<file_ring> ring;
-#endif
     std::unique_ptr<executor> file_executor;
-    active_file_io_backend selected_file_backend {active_file_io_backend::executor};
-    bool file_backend_initialized {false};
     std::size_t file_io_inflight {0};
     std::unordered_map<int, std::unique_ptr<notifiable>> handlers;
     std::unordered_set<int> pending_removals;
@@ -884,18 +701,14 @@ auto event_loop::run() -> event_loop_result
         if (implementation_->shutdown_complete()) {
             return event_loop_result::stopped;
         }
-        const auto result = implementation_->poller.poll(events);
+        const auto result = implementation_->poller.poll(
+            events, implementation_->local_post_pending);
         if (result.event_count != 0) ++implementation_->dispatch_depth;
 
         try {
             for (std::size_t index = 0; index < result.event_count; ++index) {
                 if (implementation_->force_shutdown_pending) break;
                 const auto event = events[index];
-                if (event.descriptor ==
-                    implementation_->file_ring_descriptor()) {
-                    implementation_->drain_file_ring();
-                    continue;
-                }
                 const auto found = implementation_->handlers.find(event.descriptor);
                 if (found == implementation_->handlers.end()) {
                     continue;
@@ -924,12 +737,13 @@ auto event_loop::run() -> event_loop_result
         if (result.event_count != 0) implementation_->finish_dispatch();
         implementation_->drain_completed_roots();
 
-        if (result.wake_requested) {
+        if (result.wake_requested || implementation_->local_post_pending) {
+            implementation_->local_post_pending = false;
             const bool more_posted = implementation_->drain_posted();
             const bool more_completions =
                 implementation_->drain_coroutine_completions();
             if (more_posted || more_completions) {
-                implementation_->poller.wake();
+                implementation_->local_post_pending = true;
             }
             implementation_->drain_completed_roots();
         }
@@ -1054,10 +868,20 @@ auto event_loop::set_write_interest(int descriptor, bool enabled) -> void
 
 auto event_loop::post(execution_task&& task) noexcept -> bool
 {
+    if (std::this_thread::get_id() == implementation_->owner_thread) {
+        return post_local(std::move(task));
+    }
     if (!implementation_->posted_tasks.try_push(std::move(task))) {
         return false;
     }
     implementation_->poller.wake();
+    return true;
+}
+
+auto event_loop::post_local(execution_task&& task) noexcept -> bool
+{
+    if (!implementation_->posted_tasks.try_push(std::move(task))) return false;
+    implementation_->local_post_pending = true;
     return true;
 }
 
@@ -1131,12 +955,6 @@ auto event_loop::coroutine_statistics() const noexcept
     auto statistics = implementation_->coroutine_frames.statistics();
     statistics.active_roots = implementation_->active_root_count;
     return statistics;
-}
-
-auto event_loop::file_backend() -> active_file_io_backend
-{
-    implementation_->initialize_file_backend();
-    return implementation_->selected_file_backend;
 }
 
 auto eventloop_detail::coroutine_frame_access::allocate(

@@ -142,14 +142,16 @@ auto epoll_loop::arm_timer(
     }
 }
 
-auto epoll_loop::poll(std::span<ready_event> events) -> poll_result
+auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
+    -> poll_result
 {
     std::array<epoll_event, 64> native_events {};
     const auto capacity = static_cast<int>(std::min(events.size(), native_events.size()));
 
     int count;
     do {
-        count = epoll_wait(epoll_descriptor_.get(), native_events.data(), capacity, -1);
+        count = epoll_wait(epoll_descriptor_.get(), native_events.data(), capacity,
+                           nonblocking ? 0 : -1);
     } while (count == -1 && errno == EINTR);
     if (count == -1) {
         throw system_error("epoll_wait");
