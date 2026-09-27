@@ -32,8 +32,10 @@ public:
     epoll_loop(const epoll_loop&) = delete;
     auto operator=(const epoll_loop&) -> epoll_loop& = delete;
 
-    auto add_descriptor(int descriptor) -> void;
+    auto add_descriptor(int descriptor, bool read_enabled = true) -> void;
     auto remove_descriptor(int descriptor) -> void;
+    auto set_io_interest(int descriptor, bool read_enabled,
+                         bool write_enabled) -> void;
     auto set_write_interest(int descriptor, bool enabled) -> void;
     auto request_stop() -> void;
     auto wake() noexcept -> void;
@@ -61,7 +63,8 @@ private:
         std::thread::id owner_thread_;
     };
 
-    auto update_descriptor(int descriptor, bool write_enabled, int operation) -> void;
+    auto update_descriptor(int descriptor, bool read_enabled,
+                           bool write_enabled, int operation) -> void;
 
     signal_mask_guard signal_mask_;
     unique_fd signal_descriptor_;

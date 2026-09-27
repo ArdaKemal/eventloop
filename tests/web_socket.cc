@@ -4,134 +4,99 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <new>
-#include <optional>
 #include <span>
-#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
-std::size_t allocations = 0;
-}
 
-auto operator new(std::size_t size) -> void*
-{
-    ++allocations;
-    if (void* memory = std::malloc(size)) return memory;
-    throw std::bad_alloc {};
-}
-
-auto operator new[](std::size_t size) -> void*
-{
-    ++allocations;
-    if (void* memory = std::malloc(size)) return memory;
-    throw std::bad_alloc {};
-}
-
-void operator delete(void* memory) noexcept { std::free(memory); }
-void operator delete[](void* memory) noexcept { std::free(memory); }
-void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
-void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
-
-namespace {
-
-class memory_stream final : public byte_stream {
+class memory_stream {
 public:
-    auto write(std::span<const std::byte> data) -> void override
+    struct io_awaiter {
+        std::expected<std::size_t, std::error_code> result;
+        memory_stream* owner {nullptr};
+        [[nodiscard]] auto await_ready() const noexcept -> bool
+        {
+            return owner == nullptr || !owner->block_write;
+        }
+        auto await_suspend(std::coroutine_handle<> handle) const noexcept -> void
+        {
+            owner->pending_write = handle;
+        }
+        [[nodiscard]] auto await_resume() const noexcept
+            -> std::expected<std::size_t, std::error_code> { return result; }
+    };
+
+    [[nodiscard]] auto async_read_some(std::span<std::byte> buffer) -> io_awaiter
     {
-        if (fail_write) throw std::runtime_error("expected stream write failure");
-        output.insert(output.end(), data.begin(), data.end());
-        pending = block_writes;
+        if (read_offset == input.size()) return {{0}};
+        const auto size = std::min({buffer.size(), input.size() - read_offset,
+                                    max_read_chunk});
+        std::memcpy(buffer.data(), input.data() + read_offset, size);
+        read_offset += size;
+        return {{size}, nullptr};
     }
 
-    auto close() -> void override { open = false; }
-    [[nodiscard]] auto ready() const noexcept -> bool override { return open; }
-    [[nodiscard]] auto write_pending() const noexcept -> bool override { return pending; }
+    [[nodiscard]] auto async_write_some(std::span<const std::byte> buffer)
+        -> io_awaiter
+    {
+        if (fail_write)
+            return {{std::unexpected(std::make_error_code(std::errc::broken_pipe))}};
+        const auto size = std::min(buffer.size(), max_write_chunk);
+        output.insert(output.end(), buffer.begin(), buffer.begin() +
+                                             static_cast<std::ptrdiff_t>(size));
+        return {{size}, this};
+    }
 
-    auto drain() -> void { pending = false; }
+    auto close() noexcept -> void { open = false; }
+    auto release_write() -> void
+    {
+        block_write = false;
+        auto handle = std::exchange(pending_write, {});
+        if (handle) handle.resume();
+    }
+    auto append(std::span<const std::byte> data) -> void
+    {
+        input.insert(input.end(), data.begin(), data.end());
+    }
 
+    std::vector<std::byte> input;
     std::vector<std::byte> output;
+    std::size_t read_offset {0};
+    std::size_t max_read_chunk {4096};
+    std::size_t max_write_chunk {4096};
     bool open {true};
-    bool block_writes {false};
-    bool pending {false};
     bool fail_write {false};
-
-private:
-    auto on_data(std::span<const std::byte>) -> void override {}
+    bool block_write {false};
+    std::coroutine_handle<> pending_write {};
 };
 
-class socket final : public ws::web_socket {
+class tls_like_stream : public memory_stream {
 public:
-    explicit socket(memory_stream& stream, std::size_t maximum = 1024 * 1024)
-        : web_socket(stream, maximum)
+    explicit tls_like_stream(event_loop& loop) : loop_(loop) {}
+
+    [[nodiscard]] auto async_close() -> task<std::expected<void, std::error_code>>
     {
+        return close_task(loop_, *this);
     }
 
-    std::vector<std::u8string> texts;
-    std::vector<std::vector<std::byte>> binaries;
-    std::vector<std::vector<std::byte>> pings;
-    std::vector<std::vector<std::byte>> pongs;
-    std::optional<std::uint16_t> close_code;
-    std::u8string close_reason;
-    std::optional<ws::errc> error;
+    bool graceful_closed {false};
 
 private:
-    auto on_text(std::u8string_view message) -> void override
+    static auto close_task(event_loop& loop, tls_like_stream& self)
+        -> task<std::expected<void, std::error_code>>
     {
-        texts.emplace_back(message);
+        (void)loop;
+        self.graceful_closed = true;
+        self.open = false;
+        co_return std::expected<void, std::error_code> {};
     }
 
-    auto on_binary(std::span<const std::byte> message) -> void override
-    {
-        binaries.emplace_back(message.begin(), message.end());
-    }
-
-    auto on_ping(std::span<const std::byte> payload) -> void override
-    {
-        pings.emplace_back(payload.begin(), payload.end());
-    }
-
-    auto on_pong(std::span<const std::byte> payload) -> void override
-    {
-        pongs.emplace_back(payload.begin(), payload.end());
-    }
-
-    auto on_close(std::optional<std::uint16_t> code,
-                  std::u8string_view reason) -> void override
-    {
-        close_code = code;
-        close_reason = reason;
-    }
-
-    auto on_error(ws::errc value) -> void override { error = value; }
-};
-
-class counting_socket final : public ws::web_socket {
-public:
-    explicit counting_socket(memory_stream& stream) : web_socket(stream) {}
-
-    std::size_t messages {0};
-
-private:
-    auto on_text(std::u8string_view) -> void override { ++messages; }
-};
-
-class throwing_socket final : public ws::web_socket {
-public:
-    explicit throwing_socket(memory_stream& stream) : web_socket(stream) {}
-    int callbacks {0};
-
-private:
-    auto on_text(std::u8string_view) -> void override
-    {
-        ++callbacks;
-        throw std::runtime_error("expected message callback failure");
-    }
+    event_loop& loop_;
 };
 
 [[nodiscard]] auto bytes(std::string_view input) -> std::vector<std::byte>
@@ -159,17 +124,14 @@ private:
         frame[3] = static_cast<std::byte>(size & 0xff);
     } else {
         frame[1] = std::byte {0xff};
-        for (std::size_t index = 0; index < 8; ++index) {
-            frame[2 + index] = static_cast<std::byte>(
-                (size >> ((7 - index) * 8)) & 0xff);
-        }
+        for (std::size_t index = 0; index < 8; ++index)
+            frame[2 + index] = static_cast<std::byte>((size >> ((7 - index) * 8)) & 0xff);
     }
     std::copy(key.begin(), key.end(), frame.begin() +
               static_cast<std::ptrdiff_t>(header_size));
     const auto payload_offset = header_size + key.size();
-    for (std::size_t index = 0; index < payload.size(); ++index) {
+    for (std::size_t index = 0; index < payload.size(); ++index)
         frame[payload_offset + index] = payload[index] ^ key[index % key.size()];
-    }
     return frame;
 }
 
@@ -179,297 +141,218 @@ private:
     return std::to_integer<std::uint8_t>(input[index]);
 }
 
-auto receive_and_fragmentation_tests() -> bool
+template<typename T>
+[[nodiscard]] auto complete(task<T>& operation) -> std::optional<T>
 {
-    memory_stream stream;
-    socket web_socket(stream);
-    const auto hello = bytes("hello");
-    const auto frame = masked_frame(0x01, true, hello);
-    web_socket.receive(std::span {frame}.first(1));
-    web_socket.receive(std::span {frame}.subspan(1, 3));
-    web_socket.receive(std::span {frame}.subspan(4));
-    if (web_socket.texts != std::vector<std::u8string> {u8"hello"}) return false;
-
-    const auto first = masked_frame(0x01, false, bytes("hel"));
-    const auto ping = masked_frame(0x09, true, bytes("p"));
-    const auto last = masked_frame(0x00, true, bytes("lo"));
-    std::vector<std::byte> combined;
-    combined.insert(combined.end(), first.begin(), first.end());
-    combined.insert(combined.end(), ping.begin(), ping.end());
-    combined.insert(combined.end(), last.begin(), last.end());
-    web_socket.receive(combined);
-
-    return web_socket.texts.size() == 2 && web_socket.texts[1] == u8"hello" &&
-           web_socket.pings == std::vector<std::vector<std::byte>> {bytes("p")} &&
-           stream.output.size() >= 3 && byte_at(stream.output, 0) == 0x8a &&
-           byte_at(stream.output, 1) == 1 && byte_at(stream.output, 2) == 'p';
+    if (operation.start() != task_state::completed) return {};
+    auto result = operation.result();
+    if (!result) return {};
+    return std::move(*result);
 }
 
-auto length_tests() -> bool
+auto receive_test() -> bool
 {
+    event_loop loop;
     memory_stream stream;
-    socket web_socket(stream, 128 * 1024);
-    std::vector<std::byte> medium(126, std::byte {'m'});
-    auto input = masked_frame(0x02, true, medium);
-    web_socket.receive(input);
-    if (web_socket.binaries.size() != 1 || web_socket.binaries[0] != medium) return false;
-
-    web_socket.write(std::u8string(126, u8'x'));
-    if (stream.output.size() != 130 || byte_at(stream.output, 0) != 0x81 ||
-        byte_at(stream.output, 1) != 126 || byte_at(stream.output, 2) != 0 ||
-        byte_at(stream.output, 3) != 126) return false;
-
-    stream.output.clear();
-    std::vector<std::byte> large(65536, std::byte {0x5a});
-    web_socket.write_binary(large);
-    return stream.output.size() == large.size() + 10 &&
-           byte_at(stream.output, 0) == 0x82 && byte_at(stream.output, 1) == 127 &&
-           byte_at(stream.output, 6) == 0 && byte_at(stream.output, 7) == 1 &&
-           byte_at(stream.output, 8) == 0 && byte_at(stream.output, 9) == 0;
+    stream.max_read_chunk = 2;
+    auto first = masked_frame(0x1, true, bytes("hello"));
+    auto second = masked_frame(0x2, true, bytes("binary"));
+    stream.append(first);
+    stream.append(second);
+    ws::web_socket socket(loop, stream);
+    auto read1 = socket.async_receive();
+    const auto message1 = complete(read1);
+    if (!message1 || !*message1 || (*message1)->type != ws::message_type::text ||
+        !std::ranges::equal((*message1)->payload, bytes("hello"))) return false;
+    auto read2 = socket.async_receive();
+    const auto message2 = complete(read2);
+    return message2 && *message2 &&
+           (*message2)->type == ws::message_type::binary &&
+           std::ranges::equal((*message2)->payload, bytes("binary"));
 }
 
-auto backpressure_test() -> bool
+auto fragmentation_and_control_test() -> bool
 {
+    event_loop loop;
     memory_stream stream;
-    stream.block_writes = true;
-    socket web_socket(stream);
-    const std::vector<std::byte> payload(40 * 1024, std::byte {0x2a});
-    web_socket.write_binary(payload);
-    if (stream.output.size() != 16 * 1024) return false;
-
-    while (stream.output.size() < payload.size() + 4) {
-        stream.drain();
-        web_socket.write_drained();
-    }
-    stream.drain();
-    web_socket.write_drained();
-    return stream.output.size() == payload.size() + 4 &&
-           byte_at(stream.output, 0) == 0x82 && byte_at(stream.output, 1) == 126;
+    const auto part1 = masked_frame(0x1, false, bytes("hel"));
+    const auto ping = masked_frame(0x9, true, bytes("p"));
+    const auto part2 = masked_frame(0x0, true, bytes("lo"));
+    stream.append(part1);
+    stream.append(ping);
+    stream.append(part2);
+    ws::web_socket socket(loop, stream);
+    auto read1 = socket.async_receive();
+    const auto first = complete(read1);
+    if (!first || !*first || (*first)->type != ws::message_type::ping ||
+        !std::ranges::equal((*first)->payload, bytes("p")) ||
+        stream.output.size() != 3 || byte_at(stream.output, 0) != 0x8a) return false;
+    auto read2 = socket.async_receive();
+    const auto second = complete(read2);
+    return second && *second && (*second)->type == ws::message_type::text &&
+           std::ranges::equal((*second)->payload, bytes("hello"));
 }
 
-auto bounded_output_test() -> bool
+auto send_test() -> bool
 {
+    event_loop loop;
     memory_stream stream;
-    stream.block_writes = true;
-    socket writer(stream, 32);
-    constexpr std::array<std::byte, 16> payload {};
-    int accepted = 0;
-    try {
-        for (; accepted < 100; ++accepted) writer.write_binary(payload);
+    stream.max_write_chunk = 7;
+    ws::web_socket socket(loop, stream, 128 * 1024);
+    const auto payload = bytes(std::string(70 * 1024, 'x'));
+    auto send = socket.async_send_binary(payload);
+    const auto result = complete(send);
+    if (!result || !*result || stream.output.size() != payload.size() + 10 ||
+        byte_at(stream.output, 0) != 0x82 || byte_at(stream.output, 1) != 127)
         return false;
-    } catch (const std::length_error&) {
-    }
-    if (accepted < 2 || !stream.open) return false;
-    for (int index = 0; index < 3; ++index) {
-        stream.drain();
-        writer.write_drained();
-    }
-    writer.write_binary(payload);
-    return stream.open;
+    auto invalid = socket.async_send_text(std::u8string_view {
+        reinterpret_cast<const char8_t*>("\xff"), 1});
+    const auto invalid_result = complete(invalid);
+    return invalid_result && !*invalid_result &&
+           invalid_result->error() == ws::make_error_code(ws::errc::invalid_utf8);
 }
 
-auto saturated_close_test(bool with_code) -> bool
+auto close_test() -> bool
 {
+    event_loop loop;
     memory_stream stream;
-    stream.block_writes = true;
-    socket writer(stream, 32);
-    constexpr std::array<std::byte, 1> payload {};
-    bool saturated = false;
-    try {
-        for (int index = 0; index < 1000; ++index) writer.write_binary(payload);
-    } catch (const std::length_error&) {
-        saturated = true;
-    }
-    if (!saturated || !stream.open) return false;
-    if (with_code) writer.close(1000);
-    else writer.close();
-    writer.close();
-    if (stream.open) return false;
-    try {
-        writer.write_binary(payload);
-    } catch (const std::logic_error&) {
-        return true;
-    }
-    return false;
-}
-
-auto saturated_protocol_error_test() -> bool
-{
-    memory_stream stream;
-    stream.block_writes = true;
-    socket writer(stream, 32);
-    constexpr std::array<std::byte, 1> payload {};
-    try {
-        for (int index = 0; index < 1000; ++index) writer.write_binary(payload);
-        return false;
-    } catch (const std::length_error&) {
-    }
-
-    const std::array<std::byte, 3> unmasked {
-        std::byte {0x81}, std::byte {0x01}, std::byte {'x'},
+    constexpr std::array<std::byte, 3> close_payload {
+        std::byte {0x03}, std::byte {0xe8}, std::byte {'a'},
     };
-    try {
-        writer.receive(unmasked);
-    } catch (...) {
-        return false;
-    }
-    return writer.error == ws::errc::protocol_error && !stream.open;
+    const auto close = masked_frame(0x8, true, close_payload);
+    stream.append(close);
+    ws::web_socket socket(loop, stream);
+    auto receive = socket.async_receive();
+    const auto message = complete(receive);
+    return message && *message && (*message)->type == ws::message_type::close &&
+           (*message)->close_code == 1000 &&
+           std::ranges::equal((*message)->payload, close_payload) &&
+           stream.output.size() == 5 && byte_at(stream.output, 0) == 0x88 &&
+           !stream.open;
 }
 
-auto large_input_batch_test() -> bool
+auto active_close_test() -> bool
 {
-    memory_stream stream;
-    counting_socket reader(stream);
-    const auto frame = masked_frame(0x01, true, bytes("x"));
-    std::vector<std::byte> batch;
-    batch.reserve(frame.size() * 10000);
-    for (int index = 0; index < 10000; ++index) {
-        batch.insert(batch.end(), frame.begin(), frame.end());
-    }
-    reader.receive(batch);
-    return reader.messages == 10000 && stream.open;
+    event_loop loop;
+    memory_stream tcp;
+    ws::web_socket tcp_socket(loop, tcp);
+    auto tcp_close = tcp_socket.async_close(1000, u8"bye");
+    const auto tcp_result = complete(tcp_close);
+    if (!tcp_result || !*tcp_result || !tcp.open || tcp.output.size() != 7 ||
+        byte_at(tcp.output, 0) != 0x88) return false;
+    const auto peer_close = masked_frame(0x8, true, bytes(""));
+    tcp.append(peer_close);
+    auto tcp_receive = tcp_socket.async_receive();
+    const auto tcp_message = complete(tcp_receive);
+    if (!tcp_message || !*tcp_message ||
+        (*tcp_message)->type != ws::message_type::close || tcp.open ||
+        tcp.output.size() != 7) return false;
+
+    tls_like_stream tls(loop);
+    ws::web_socket tls_socket(loop, tls);
+    auto tls_close = tls_socket.async_close();
+    const auto tls_result = complete(tls_close);
+    if (!tls_result || !*tls_result || tls.graceful_closed || !tls.open ||
+        tls.output.size() != 2 || byte_at(tls.output, 0) != 0x88) return false;
+    tls.append(peer_close);
+    auto tls_receive = tls_socket.async_receive();
+    const auto tls_message = complete(tls_receive);
+    return tls_message && *tls_message &&
+           (*tls_message)->type == ws::message_type::close &&
+           tls.graceful_closed && !tls.open && tls.output.size() == 2;
 }
 
-auto allocation_reuse_test() -> bool
+auto passive_tls_close_test() -> bool
 {
-    memory_stream output_stream;
-    output_stream.output.reserve(4096);
-    const auto before_construction = allocations;
-    socket web_socket(output_stream);
-    if (allocations != before_construction) return false;
-    web_socket.write(u8"message");
-    output_stream.output.clear();
-
-    const auto before = allocations;
-    for (int index = 0; index < 100; ++index) web_socket.write(u8"message");
-    const auto after = allocations;
-    if (before != after) return false;
-
-    memory_stream input_stream;
-    counting_socket reader(input_stream);
-    const auto frame = masked_frame(0x01, true, bytes("message"));
-    reader.receive(frame);
-    const auto before_reads = allocations;
-    for (int index = 0; index < 100; ++index) reader.receive(frame);
-    return allocations == before_reads && reader.messages == 101;
-}
-
-auto exception_cleanup_test() -> bool
-{
-    memory_stream input_stream;
-    throwing_socket reader(input_stream);
-    const auto frame = masked_frame(0x01, true, bytes("hello"));
-    try {
-        reader.receive(frame);
-        return false;
-    } catch (const std::runtime_error&) {
-    }
-    reader.receive(frame);
-    if (input_stream.open || reader.callbacks != 1) return false;
-
-    memory_stream output_stream;
-    output_stream.fail_write = true;
-    socket writer(output_stream);
-    try {
-        writer.write(u8"hello");
-        return false;
-    } catch (const std::runtime_error&) {
-    }
-    if (output_stream.open) return false;
-    try {
-        writer.write(u8"again");
-    } catch (const std::logic_error&) {
-        return true;
-    }
-    return false;
-}
-
-auto control_and_error_tests() -> bool
-{
-    memory_stream close_stream;
-    socket closing(close_stream);
-    std::vector<std::byte> close_payload {std::byte {0x03}, std::byte {0xe8}};
-    const auto reason = bytes("bye");
-    close_payload.insert(close_payload.end(), reason.begin(), reason.end());
-    const auto close_frame = masked_frame(0x08, true, close_payload);
-    closing.receive(close_frame);
-    if (closing.close_code != 1000 || closing.close_reason != u8"bye" ||
-        close_stream.open || close_stream.output.size() != close_payload.size() + 2 ||
-        byte_at(close_stream.output, 0) != 0x88) return false;
-
-    memory_stream mask_stream;
-    socket unmasked(mask_stream);
-    const std::array<std::byte, 3> invalid {
-        std::byte {0x81}, std::byte {0x01}, std::byte {'x'},
+    event_loop loop;
+    tls_like_stream tls(loop);
+    constexpr std::array<std::byte, 2> payload {
+        std::byte {0x03}, std::byte {0xe8},
     };
-    unmasked.receive(invalid);
-    if (unmasked.error != ws::errc::protocol_error || mask_stream.open ||
-        mask_stream.output.size() != 4 || byte_at(mask_stream.output, 0) != 0x88 ||
-        byte_at(mask_stream.output, 2) != 0x03 ||
-        byte_at(mask_stream.output, 3) != 0xea) return false;
+    tls.append(masked_frame(0x8, true, payload));
+    ws::web_socket socket(loop, tls);
+    auto receive = socket.async_receive();
+    const auto message = complete(receive);
+    return message && *message &&
+           (*message)->type == ws::message_type::close &&
+           (*message)->close_code == 1000 &&
+           tls.graceful_closed && !tls.open && tls.output.size() == 4 &&
+           byte_at(tls.output, 0) == 0x88;
+}
 
-    memory_stream utf8_stream;
-    socket invalid_utf8(utf8_stream);
-    const std::array<std::byte, 2> bad_utf8 {std::byte {0xc0}, std::byte {0x80}};
-    const auto utf8_frame = masked_frame(0x01, true, bad_utf8);
-    invalid_utf8.receive(utf8_frame);
-    if (invalid_utf8.error != ws::errc::invalid_utf8 || utf8_stream.open ||
-        utf8_stream.output.size() != 4 || byte_at(utf8_stream.output, 2) != 0x03 ||
-        byte_at(utf8_stream.output, 3) != 0xef) return false;
+auto protocol_failure_test() -> bool
+{
+    event_loop loop;
+    memory_stream stream;
+    stream.append(bytes(std::string_view {"\x81\x00", 2})); // Client frame lacks a mask.
+    ws::web_socket socket(loop, stream);
+    auto receive = socket.async_receive();
+    const auto result = complete(receive);
+    return result && !*result &&
+           result->error() == ws::make_error_code(ws::errc::protocol_error) &&
+           stream.output.size() == 4 && byte_at(stream.output, 0) == 0x88 &&
+           !stream.open;
+}
 
-    memory_stream size_stream;
-    socket oversized(size_stream, 16);
-    const auto oversized_frame = masked_frame(0x02, true,
-                                               std::vector<std::byte>(17));
-    oversized.receive(oversized_frame);
-    return oversized.error == ws::errc::message_too_large && !size_stream.open &&
-           size_stream.output.size() == 4 && byte_at(size_stream.output, 2) == 0x03 &&
-           byte_at(size_stream.output, 3) == 0xf1;
+auto bounded_and_failure_test() -> bool
+{
+    event_loop loop;
+    memory_stream stream;
+    ws::web_socket socket(loop, stream, 8);
+    auto large = socket.async_send_binary(bytes("123456789"));
+    const auto large_result = complete(large);
+    if (!large_result || *large_result ||
+        large_result->error() != ws::make_error_code(ws::errc::message_too_large))
+        return false;
+    stream.fail_write = true;
+    auto send = socket.async_send_text(u8"small");
+    const auto result = complete(send);
+    return result && !*result && !stream.open;
+}
+
+auto concurrent_writer_test() -> bool
+{
+    event_loop loop;
+    memory_stream stream;
+    stream.block_write = true;
+    ws::web_socket socket(loop, stream);
+    auto first = socket.async_send_text(u8"first");
+    if (first.start() != task_state::suspended || !stream.pending_write)
+        return false;
+    auto second = socket.async_send_text(u8"second");
+    const auto rejected = complete(second);
+    if (!rejected || *rejected ||
+        rejected->error() != ws::make_error_code(ws::errc::concurrent_operation))
+        return false;
+    stream.release_write();
+    return first.state() == task_state::completed && first.result() &&
+           stream.output.size() == 7;
 }
 
 } // namespace
 
 auto main() -> int
 {
-    if (!receive_and_fragmentation_tests()) {
-        std::cerr << "WebSocket receive/fragmentation tests failed\n";
-        return 1;
+    if (!receive_test()) { std::cerr << "receive test failed\n"; return 1; }
+    if (!fragmentation_and_control_test()) {
+        std::cerr << "fragmentation/control test failed\n"; return 1;
     }
-    if (!length_tests()) {
-        std::cerr << "WebSocket length tests failed\n";
-        return 1;
+    if (!send_test()) { std::cerr << "send test failed\n"; return 1; }
+    if (!close_test()) { std::cerr << "close test failed\n"; return 1; }
+    if (!active_close_test()) {
+        std::cerr << "active close test failed\n"; return 1;
     }
-    if (!backpressure_test()) {
-        std::cerr << "WebSocket backpressure test failed\n";
-        return 1;
+    if (!passive_tls_close_test()) {
+        std::cerr << "passive TLS close test failed\n"; return 1;
     }
-    if (!bounded_output_test()) {
-        std::cerr << "WebSocket bounded output test failed\n";
-        return 1;
+    if (!protocol_failure_test()) {
+        std::cerr << "protocol failure test failed\n"; return 1;
     }
-    if (!saturated_close_test(false) || !saturated_close_test(true)) {
-        std::cerr << "WebSocket saturated close test failed\n";
-        return 1;
+    if (!bounded_and_failure_test()) {
+        std::cerr << "bounded/failure test failed\n"; return 1;
     }
-    if (!saturated_protocol_error_test()) {
-        std::cerr << "WebSocket saturated protocol error test failed\n";
-        return 1;
-    }
-    if (!large_input_batch_test()) {
-        std::cerr << "WebSocket large input batch test failed\n";
-        return 1;
-    }
-    if (!allocation_reuse_test()) {
-        std::cerr << "WebSocket allocation reuse test failed\n";
-        return 1;
-    }
-    if (!exception_cleanup_test()) {
-        std::cerr << "WebSocket exception cleanup test failed\n";
-        return 1;
-    }
-    if (!control_and_error_tests()) {
-        std::cerr << "WebSocket control/error tests failed\n";
-        return 1;
+    if (!concurrent_writer_test()) {
+        std::cerr << "concurrent writer test failed\n"; return 1;
     }
     return 0;
 }

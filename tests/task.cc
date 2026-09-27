@@ -146,6 +146,12 @@ auto repeated_yields(event_loop& loop, int& count) -> task<void>
     loop.stop();
 }
 
+auto immediate_timer(event_loop& loop, bool& fired) -> task<void>
+{
+    fired = co_await sleep_for(loop, event_loop::clock::duration::zero()) ==
+            timer_wait_result::expired;
+}
+
 auto cancellable_root(event_loop& loop, bool& cancellation_seen) -> task<void>
 {
     (void)co_await yield(loop);
@@ -377,10 +383,8 @@ auto event_loop_dispatch_yield_test() -> bool
     if (!loop.post(execution_task([&]() noexcept {
             spawned = loop.spawn(repeated_yields(loop, count)) ==
                       task_spawn_result::accepted;
-            (void)loop.schedule_after(event_loop::clock::duration::zero(),
-                                      execution_task([&]() noexcept {
-                                          timer_ran = true;
-                                      }));
+            spawned = spawned && loop.spawn(immediate_timer(loop, timer_ran)) ==
+                                     task_spawn_result::accepted;
         }))) {
         return false;
     }

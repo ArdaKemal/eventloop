@@ -8,7 +8,6 @@ find_package(Threads REQUIRED)
 include(CTest)
 
 add_library(eventloop
-    include/eventloop/byte_stream.h
     include/eventloop/event_loop.h
     include/eventloop/executor.h
     include/eventloop/file_io.h
@@ -20,10 +19,10 @@ add_library(eventloop
     include/eventloop/tcp_stream.h
     include/eventloop/task.h
     include/eventloop/task_composition.h
-    include/eventloop/tls_acceptor.h
     include/eventloop/tls_context.h
     include/eventloop/tls_stream.h
     include/eventloop/unique_fd.h
+    include/eventloop/udp_socket.h
     include/eventloop/util/arg_parser.h
     include/eventloop/ws/web_socket.h
     src/linux/epoll_loop.cc
@@ -37,9 +36,9 @@ add_library(eventloop
     src/http/session.cc
     src/tcp_acceptor.cc
     src/tcp_stream.cc
-    src/tls_acceptor.cc
     src/tls_stream.cc
     src/util/arg_parser.cc
+    src/udp_socket.cc
     src/ws/web_socket.cpp
 )
 
@@ -82,6 +81,13 @@ target_link_libraries(file_io_benchmark PRIVATE eventloop::eventloop)
 target_compile_options(file_io_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(file_io_benchmark PRIVATE -Wno-mismatched-new-delete)
+endif()
+
+add_executable(coroutine_socket_benchmark benchmark/coroutine_socket_benchmark.cc)
+target_link_libraries(coroutine_socket_benchmark PRIVATE eventloop::eventloop)
+target_compile_options(coroutine_socket_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(coroutine_socket_benchmark PRIVATE -Wno-mismatched-new-delete)
 endif()
 
 if(BUILD_TESTING)
@@ -157,6 +163,24 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME file_io COMMAND file_io_test)
     set_tests_properties(file_io PROPERTIES TIMEOUT 10)
+
+    add_executable(coroutine_tcp_test tests/tcp_coroutine.cc)
+    target_link_libraries(coroutine_tcp_test PRIVATE eventloop::eventloop)
+    target_compile_options(coroutine_tcp_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(coroutine_tcp_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME coroutine_tcp COMMAND coroutine_tcp_test)
+    set_tests_properties(coroutine_tcp PROPERTIES TIMEOUT 10)
+
+    add_executable(coroutine_udp_test tests/udp_coroutine.cc)
+    target_link_libraries(coroutine_udp_test PRIVATE eventloop::eventloop)
+    target_compile_options(coroutine_udp_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(coroutine_udp_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME coroutine_udp COMMAND coroutine_udp_test)
+    set_tests_properties(coroutine_udp PROPERTIES TIMEOUT 10)
 
     add_test(
         NAME http_server

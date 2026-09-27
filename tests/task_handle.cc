@@ -18,6 +18,26 @@ auto observed_void(event_loop& loop, bool& cancelled) -> task<void>
 {
     cancelled = co_await sleep_for(loop, 1h) == timer_wait_result::cancelled;
 }
+auto cancel_after(event_loop& loop, task_handle<int>& child,
+                  std::chrono::milliseconds delay) -> task<void>
+{
+    if (co_await sleep_for(loop, delay) == timer_wait_result::expired) {
+        (void)child.cancel();
+    }
+}
+auto release_after(event_loop& loop, std::atomic<bool>& release,
+                   std::chrono::milliseconds delay) -> task<void>
+{
+    if (co_await sleep_for(loop, delay) == timer_wait_result::expired) {
+        release.store(true, std::memory_order_release);
+    }
+}
+auto stop_after(event_loop& loop, std::chrono::milliseconds delay) -> task<void>
+{
+    if (co_await sleep_for(loop, delay) == timer_wait_result::expired) {
+        loop.stop();
+    }
+}
 auto parent(event_loop& loop, bool& passed) -> task<void>
 {
     task_handle<int> child;
@@ -28,9 +48,13 @@ auto parent(event_loop& loop, bool& passed) -> task<void>
         loop.stop();
         co_return;
     }
-    (void)loop.schedule_after(1ms, execution_task([&child]() noexcept {
+    if (loop.spawn(cancel_after(loop, child, 1ms)) !=
+        task_spawn_result::accepted) {
+        passed = false;
         (void)child.cancel();
-    }));
+        loop.stop();
+        co_return;
+    }
     auto result = co_await child;
     passed = result && *result == 17 && cancelled && child.done();
     loop.stop();
@@ -105,18 +129,17 @@ auto worker_test() -> bool
     if (loop.spawn(blocking(loop, release, cancelled), result) !=
         task_spawn_result::accepted) return false;
     if (!result.cancel() || result.done()) return false;
-    (void)loop.schedule_after(5ms, execution_task([&release]() noexcept {
-        release.store(true, std::memory_order_release);
-    }));
-    (void)loop.schedule_after(20ms, execution_task([&loop]() noexcept {
-        loop.stop();
-    }));
+    if (loop.spawn(release_after(loop, release, 5ms)) !=
+            task_spawn_result::accepted ||
+        loop.spawn(stop_after(loop, 20ms)) != task_spawn_result::accepted) {
+        return false;
+    }
     (void)loop.run();
     if (!result.done()) return false;
     auto value = result.take_result();
     return cancelled && value && *value == 3 &&
            loop.coroutine_statistics().live == 0 &&
-           loop.coroutine_statistics().high_watermark == 1;
+           loop.coroutine_statistics().high_watermark > 0;
 }
 auto shutdown_test() -> bool
 {
@@ -174,10 +197,22 @@ auto exhausted_test() -> bool
 }
 int main()
 {
-    if (!immediate_test() || !await_test() || !cancellation_test() ||
-        !void_test() || !worker_test() || !shutdown_test() ||
-        !parent_shutdown_test() ||
-        !exhausted_test()) {
+    const bool immediate = immediate_test();
+    const bool await = await_test();
+    const bool cancellation = cancellation_test();
+    const bool void_result = void_test();
+    const bool worker = worker_test();
+    const bool shutdown = shutdown_test();
+    const bool parent_shutdown = parent_shutdown_test();
+    const bool exhausted = exhausted_test();
+    if (!immediate || !await || !cancellation || !void_result || !worker ||
+        !shutdown || !parent_shutdown || !exhausted) {
+        std::cerr << "immediate=" << immediate << " await=" << await
+                  << " cancellation=" << cancellation
+                  << " void=" << void_result << " worker=" << worker
+                  << " shutdown=" << shutdown
+                  << " parent_shutdown=" << parent_shutdown
+                  << " exhausted=" << exhausted << '\n';
         std::cerr << "observed task test failed\n";
         return 1;
     }

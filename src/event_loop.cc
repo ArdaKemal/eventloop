@@ -1,4 +1,8 @@
 #include "eventloop/event_loop.h"
+#include "eventloop/detail/notifiable.h"
+#include "eventloop/tcp_acceptor.h"
+#include "eventloop/tcp_stream.h"
+#include "eventloop/udp_socket.h"
 #include "eventloop/file_io.h"
 #include "eventloop/task.h"
 
@@ -454,8 +458,8 @@ public:
         poller.arm_timer(*deadline - event_loop::clock::now());
     }
 
-    [[nodiscard]] auto add_timer(event_loop::clock::time_point deadline,
-                                 execution_task&& task) -> event_loop::timer_id
+    auto add_timer(event_loop::clock::time_point deadline,
+                   execution_task&& task) -> void
     {
         if (!task) {
             throw std::invalid_argument("timer task cannot be empty");
@@ -470,22 +474,6 @@ public:
             timers.erase(timer);
             throw;
         }
-        return id;
-    }
-
-    auto cancel_timer(event_loop::timer_id id) noexcept -> bool
-    {
-        for (auto timer = timers.begin(); timer != timers.end(); ++timer) {
-            if (timer->first.second != id) continue;
-            timers.erase(timer);
-            try {
-                arm_next_timer();
-            } catch (...) {
-                std::terminate();
-            }
-            return true;
-        }
-        return false;
     }
 
     auto run_due_timers() -> void
@@ -639,7 +627,7 @@ private:
 public:
 
     using timer_key = std::pair<event_loop::clock::time_point,
-                                event_loop::timer_id>;
+                                std::uint64_t>;
     coroutine_frame_pool coroutine_frames;
     epoll_loop poller;
     const std::thread::id owner_thread {std::this_thread::get_id()};
@@ -656,10 +644,10 @@ public:
     const std::size_t file_io_depth;
     std::unique_ptr<executor> file_executor;
     std::size_t file_io_inflight {0};
-    std::unordered_map<int, std::unique_ptr<notifiable>> handlers;
+    std::unordered_map<int, std::unique_ptr<eventloop_detail::notifiable>> handlers;
     std::unordered_set<int> pending_removals;
     std::map<timer_key, execution_task> timers;
-    event_loop::timer_id next_timer {1};
+    std::uint64_t next_timer {1};
     std::size_t dispatch_depth {0};
     bool force_shutdown_pending {false};
     bool shutting_down {false};
@@ -806,7 +794,7 @@ auto event_loop::shutdown(clock::duration timeout) -> void
 
     auto* const state = implementation_.get();
     try {
-        (void)implementation_->add_timer(
+        implementation_->add_timer(
             eventloop_detail::deadline_after(timeout),
             execution_task([state]() noexcept { state->force_shutdown(); }));
     } catch (...) {
@@ -817,7 +805,29 @@ auto event_loop::shutdown(clock::duration timeout) -> void
     implementation_->poller.wake();
 }
 
-auto event_loop::add(std::unique_ptr<notifiable> handler) -> void
+auto event_loop::add(std::unique_ptr<tcp_acceptor> handler) -> void
+{
+    auto base = std::unique_ptr<eventloop_detail::notifiable>(
+        static_cast<eventloop_detail::notifiable*>(handler.release()));
+    add_handler(std::move(base));
+}
+
+auto event_loop::add(std::unique_ptr<tcp_stream> handler) -> void
+{
+    auto base = std::unique_ptr<eventloop_detail::notifiable>(
+        static_cast<eventloop_detail::notifiable*>(handler.release()));
+    add_handler(std::move(base));
+}
+
+auto event_loop::add(std::unique_ptr<udp_socket> handler) -> void
+{
+    auto base = std::unique_ptr<eventloop_detail::notifiable>(
+        static_cast<eventloop_detail::notifiable*>(handler.release()));
+    add_handler(std::move(base));
+}
+
+auto event_loop::add_handler(
+    std::unique_ptr<eventloop_detail::notifiable> handler) -> void
 {
     if (!handler) {
         throw std::invalid_argument("cannot add an empty handler");
@@ -830,7 +840,8 @@ auto event_loop::add(std::unique_ptr<notifiable> handler) -> void
         throw std::logic_error("descriptor is already registered");
     }
 
-    implementation_->poller.add_descriptor(descriptor);
+    implementation_->poller.add_descriptor(
+        descriptor, handler->initial_read_interest());
     try {
         implementation_->handlers.emplace(descriptor, std::move(handler));
     } catch (...) {
@@ -859,11 +870,18 @@ auto event_loop::remove(int descriptor) -> void
     }
 }
 
-auto event_loop::set_write_interest(int descriptor, bool enabled) -> void
+auto event_loop::set_io_interest(int descriptor, bool read_enabled,
+                                 bool write_enabled) -> void
 {
     if (!implementation_->pending_removals.contains(descriptor)) {
-        implementation_->poller.set_write_interest(descriptor, enabled);
+        implementation_->poller.set_io_interest(descriptor, read_enabled,
+                                                write_enabled);
     }
+}
+
+auto event_loop::set_write_interest(int descriptor, bool enabled) -> void
+{
+    set_io_interest(descriptor, true, enabled);
 }
 
 auto event_loop::post(execution_task&& task) noexcept -> bool
@@ -883,23 +901,6 @@ auto event_loop::post_local(execution_task&& task) noexcept -> bool
     if (!implementation_->posted_tasks.try_push(std::move(task))) return false;
     implementation_->local_post_pending = true;
     return true;
-}
-
-auto event_loop::schedule_at(clock::time_point deadline, execution_task&& task)
-    -> timer_id
-{
-    return implementation_->add_timer(deadline, std::move(task));
-}
-
-auto event_loop::schedule_after(clock::duration delay, execution_task&& task)
-    -> timer_id
-{
-    return schedule_at(eventloop_detail::deadline_after(delay), std::move(task));
-}
-
-auto event_loop::cancel(timer_id timer) noexcept -> bool
-{
-    return implementation_->cancel_timer(timer);
 }
 
 auto event_loop::task_executor() noexcept -> executor&

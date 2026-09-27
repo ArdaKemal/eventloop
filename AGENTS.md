@@ -1,6 +1,6 @@
 # Agent handoff: eventloop
 
-Updated 2026-09-27. Read this before continuing work after a machine or
+Updated 2026-09-28. Read this before continuing work after a machine or
 session switch. Verify all status claims with `git status` and the tests below;
 this file is a handoff snapshot, not a substitute for inspecting the code.
 Commit or otherwise sync this file and the uncommitted implementation before
@@ -10,8 +10,10 @@ switching PCs; a fresh clone will not contain uncommitted work.
 
 - This is a C++23 library with a Linux epoll event loop, bounded executor,
   WebSocket implementation, and a bounded, loop-affine coroutine runtime.
-- Preserve the existing interfaces and implementation style where practical.
-  The owner explicitly prefers small changes to the original WebSocket code.
+- Public TCP, TLS, and UDP I/O is coroutine based. Keep the readiness layer
+  internal and preserve the bounded coroutine runtime's ownership contracts.
+- Keep WebSocket framing bounded and share one parser/output implementation
+  across transport types.
 - Coroutine frames come from bounded per-loop size classes. Keep operation
   state in the awaiting frame, avoid general-heap allocation on hot paths, and
   return resource-exhaustion errors instead of silently falling back to heap.
@@ -28,38 +30,32 @@ switching PCs; a fresh clone will not contain uncommitted work.
   queuing work. Wrong-loop use terminates as a programming error.
 - Do not treat destruction of an unfinished task as cancellation. Outstanding
   worker references must retire before a frame is destroyed.
-- Accepted socket descriptors use `unique_fd` through the built-in TCP/TLS
-  accept and stream construction paths. New subclasses should override the
-  owning callback; the original `int` callbacks remain as compatibility paths
-  and still require explicit descriptor ownership on every failure path.
-- TCP streams own both their socket and any active sendfile descriptor via
-  `unique_fd`. The owning `send_file` overload rejects an invalid file
-  descriptor; the `int` overload transfers ownership on entry for compatibility.
-- The epoll backend and TCP listener now keep their own descriptors in
+- `tcp_acceptor::async_accept()` returns a `unique_fd`. Built-in TCP/TLS
+  connection tasks retain it until stream construction transfers ownership.
+- TCP streams own their sockets, and `async_send_file()` takes ownership of its
+  file descriptor through completion.
+- The epoll backend and TCP acceptor keep their own descriptors in
   `unique_fd`. The epoll signal mask has a scope guard that restores it after
   all backend descriptors close, including constructor failures. Nested loops
   on one thread share a mask count; the mask is restored after the last loop
   closes. Construct, run, and destroy a loop on the same thread.
-- Built-in HTTP connections share ownership of the document-root descriptor
-  with their listener, so removing the listener cannot invalidate an accepted
-  session. Redirect connections likewise retain their hostname after listener
-  removal. `tests/http_test.cc` exercises both lifetimes. The request parser
+- Built-in HTTP connection coroutines own their session state and share the
+  document-root descriptor with their listener, so listener removal cannot
+  invalidate an accepted session. Redirect connections likewise retain their
+  hostname after listener removal. `tests/http_test.cc` exercises both
+  lifetimes. The request parser
   rejects control characters in targets and header values before redirects
   can place a target in a `Location` response header.
-- A WebSocket message callback or underlying write exception now retires the
-  parser/output state and closes its stream. Normal-path allocation reuse is
-  still covered by `tests/web_socket.cc`.
-- Direct TLS writes and close notifications retire the transport if a
-  non-Botan exception interrupts output, since TLS record state may already
-  have advanced. A loopback test fills the TCP queue during a TLS write.
+- WebSocket receive and send are awaitable operations. Protocol or transport
+  failures retire parser/output state and close the stream.
+- TLS handshake, read, write, and close are awaitable operations. A transport
+  failure closes the stream.
 - WebSocket outbound framing is capped at the configured maximum message size
-  plus frame/control overhead. A saturated send throws `std::length_error`.
-  Public `close()` retires the socket if a saturated queue cannot fit its
-  close frame. A malformed inbound frame also retires without throwing if a
-  saturated queue cannot fit the protocol close frame. Empty close reasons
-  and empty HTTP receive spans are safe.
-  Large inbound batches are parsed in 4 KiB chunks; reentrant `receive` is
-  rejected to keep callback payload views valid.
+  plus frame/control overhead. A full output buffer returns
+  `ws::errc::output_full`; protocol and transport failures retire the parser
+  and close the stream. Empty close reasons and empty HTTP receive spans are
+  safe. A received payload view remains valid until the next `async_receive()`
+  or socket destruction.
 
 ## Current file-I/O slice
 
@@ -86,6 +82,44 @@ switching PCs; a fresh clone will not contain uncommitted work.
   The handle is a stable observed-root scope and must remain alive until its
   task completes. See `docs/api-contract.md` and `tests/task_handle.cc`.
 
+## Current coroutine socket I/O slice
+
+- `include/eventloop/tcp_acceptor.h` and `tcp_stream.h` provide loop-owned TCP
+  acceptors/streams with awaitable accept, numeric IPv4 connect, partial
+  read/write, and sendfile. `tls_stream.h` adds awaitable TLS operations.
+  Accepted descriptors remain `unique_fd` until moved into a registered stream.
+- `include/eventloop/udp_socket.h` provides loop-owned numeric IPv4 datagram
+  send/receive operations. Datagrams remain atomic; oversized receives return
+  `EMSGSIZE`, and zero-length datagrams succeed.
+- Socket awaiters keep one pending operation per direction, use caller-owned
+  buffers, and resume on the owning loop. Register handlers with
+  `event_loop::add` before awaiting. Use `close()` to cancel pending operations
+  and remove a handler; direct removal with a suspended awaiter is a programming
+  error. A pending connect failure/cancellation removes its TCP socket; an
+  immediate connect error leaves it registered for the caller to close.
+- TLS permits one read and one write at a time, and those directions may
+  overlap. A duplicate same-direction operation reports `EBUSY`; handshake and
+  `async_close()` require an idle stream. The shared encrypted-output buffer
+  uses one bounded flusher with one waiting operation.
+- The epoll backend supports independently enabled read/write readiness. The
+  socket APIs do not add DNS or IPv6.
+- `tests/tcp_coroutine.cc` and `tests/udp_coroutine.cc` cover loopback I/O,
+  duplicate waiters, cancellation, shutdown, readiness rearming, and descriptor
+  closure. The focused CTest run passed both on 2026-09-27 with local socket
+  access, and Valgrind Memcheck passed both after the refused-connect case was
+  added. An AddressSanitizer build is unavailable on this host because GCC's
+  `libasan.so` linker stub points to a missing `/usr/lib64/libasan.so.8.0.0`.
+- `benchmark/coroutine_socket_benchmark.cc` runs concurrent 64-byte loopback
+  echo clients for TCP or UDP. The 2026-09-27 16-client, 10,000-round-trip
+  profiles measured 59.1k TCP and 74.3k UDP round trips/s before the current
+  public API migration. They are historical baselines, not measurements of the
+  current branch. Those runs included the local kernel network stack and do
+  not predict NIC throughput. Kernel function symbols were unavailable in
+  perf reports on this host. Three sequential runs after the migration on
+  2026-09-28 measured medians of 60.7k TCP and 75.6k UDP round trips/s at the
+  same settings. This is a small directional difference from separate-day
+  measurements, not a controlled performance claim.
+
 ## Important limits and decisions still open
 
 1. Do not claim a storage-performance win from the file-I/O benchmark. On
@@ -94,23 +128,28 @@ switching PCs; a fresh clone will not contain uncommitted work.
    lateness p99). The benchmark uses `/tmp`, which is `tmpfs` on this host, so
    it measures runtime overhead rather than storage. The io_uring backend was
    removed on 2026-09-27 because no project workload justified its complexity.
-2. An HTTP integration needs explicit session/coroutine lifetime ownership
-   before a suspended operation may refer to a session. Preserve
+2. HTTP connection coroutines own their sessions while suspended. Preserve
    `open_beneath`'s component-by-component `O_NOFOLLOW` checks; replacing it
-   with one unrestricted `openat` would change path security. Leave large-file
-   `sendfile` in place until measured otherwise.
+   with one unrestricted `openat` would change path security. Plain HTTP still
+   uses `sendfile` for large files.
 3. The overall library still compiles a Linux epoll backend unconditionally;
    other operating systems are **not** supported yet.
-4. A recent lifetime audit fixed reentrant and throwing shutdown callbacks,
-   and an ASan-confirmed use-after-free when a direct write callback closed its
-   own stream. Direct transport callbacks now defer handler removal until they
-   return. This is not a proof of memory safety across every transport and
-   coroutine path; keep auditing ownership boundaries and use sanitizer runs
-   for new exception or cancellation paths.
-5. WebSocket output is bounded within its framing layer, but application
-   broadcast fan-out still needs a policy for slow clients. Confirm the
-   configured message and queue limits against the target workload before
-   deployment.
+4. The historical lifetime audit predates the coroutine-native transport
+   migration. `event_loop::shutdown()` requests cancellation of active roots
+   immediately, and built-in socket handlers close in `on_shutdown()`. The
+   timeout only bounds handlers still registered after notification; it does
+   not let HTTP responses drain. Keep auditing ownership boundaries and use
+   sanitizer runs for new exception or cancellation paths.
+5. WebSocket output is bounded within its framing layer. The `ws::broadcast`
+   and `ws::broadcast_binary` helpers use best-effort fan-out: a full recipient
+   drops only the current message, the result counts drops, and healthy
+   recipients continue. Callers own recipient lifetimes and may choose their
+   own response to drops. Confirm the configured message and queue limits
+   against the target workload before deployment.
+6. TCP/TLS echo and HTTP examples use the coroutine socket APIs. UDP
+   cancellation of an already-pending send is not
+   directly covered because saturating the kernel's UDP send queue is not
+   deterministic. Keep validating these APIs against their target workloads.
 
 ## Environment and verification
 
@@ -124,25 +163,26 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ./build/file_io_test
 ./build/file_io_benchmark
+./build/coroutine_tcp_test
+./build/coroutine_udp_test
+./build/coroutine_socket_benchmark both 10000 16
 ```
 
-The fresh Release build succeeded on Fedora 44, and the file-I/O coroutine test
-passed directly. The elevated full CTest run passed 9/10 tests; `tls_loopback`
-failed during TLS negotiation with `bad_certificate` using its generated test
-certificate. The other loopback tests passed when run with socket access. A
-local HTTP `Connection: close` benchmark at 16 connections and one client
+On 2026-09-28, the Release build completed with `CCACHE_DISABLE=1` because the
+configured ccache directory was read-only. The full CTest suite passed 12/12
+with local loopback socket access; the non-socket tests passed 7/7 under the
+restricted sandbox. A local HTTP `Connection: close` benchmark at 16
+connections and one client
 thread measured about 13.7k requests/s before and after the ownership change;
 this is evidence of no detectable regression on this host, not a broader
-performance claim.
+performance claim, and predates the current coroutine-native API migration.
 
 Use build directories ignored by Git or outside the repository on the new
 machine. Recheck warnings, `git diff --check`, and test results after changes.
 
 ## Worktree and commit scope
 
-`docs/executor-implementation-plan.md` was untracked before the file-I/O
-work; preserve it and do not stage all of `docs/` by accident. Before any
-commit, inspect `git status` and stage only intended files. The file-I/O
-slice remains experimental infrastructure, not a completed cross-platform or
-performance improvement. After a commit, verify the commit and worktree with
-`git status` rather than relying on this snapshot.
+Before any commit, inspect `git status` and stage only intended files. The
+file-I/O slice remains experimental infrastructure, not a completed
+cross-platform or performance improvement. After a commit, verify the commit
+and worktree with `git status` rather than relying on this snapshot.

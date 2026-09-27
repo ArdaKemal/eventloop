@@ -9,17 +9,10 @@
 #include <cstdint>
 #include <memory>
 
-class notifiable {
-public:
-    virtual ~notifiable() = default;
-    [[nodiscard]] virtual auto descriptor() const noexcept -> int = 0;
-    virtual auto on_read() -> void = 0;
-    virtual auto on_write() -> void = 0;
-    virtual auto on_error() -> void = 0;
-    virtual auto on_shutdown() -> void {}
-};
-
 class event_loop;
+class tcp_acceptor;
+class tcp_stream;
+class udp_socket;
 template<typename T>
 class task;
 template<typename T>
@@ -28,6 +21,7 @@ class task_handle;
 namespace eventloop_detail {
 
 struct file_io_operation;
+class notifiable;
 enum class file_opcode;
 
 enum class completion_reservation_result {
@@ -126,11 +120,11 @@ struct event_loop_options {
     // File operations are bounded independently of the existing post queue.
     std::size_t file_io_depth {128};
     // Coroutine frames are preallocated from fixed, per-loop size classes.
-    // Defaults reserve 126 frames (57,216 bytes including pool headers).
+    // Defaults reserve 278 frames (222,592 bytes including pool headers).
     // A zero capacity disables a class. Exhaustion never falls back to the heap.
     // Frame-resident state must not require alignment beyond max_align_t.
     std::array<std::size_t, 6> coroutine_frame_capacities {
-        64, 32, 16, 8, 4, 2,
+        64, 32, 16, 160, 4, 2,
     };
 };
 
@@ -162,7 +156,6 @@ namespace eventloop_detail {
 class event_loop {
 public:
     using clock = std::chrono::steady_clock;
-    using timer_id = std::uint64_t;
 
     // Construct, run, and destroy on the same thread. post() and stop() may
     // be called from other threads while the loop remains alive.
@@ -180,9 +173,9 @@ public:
     // force-closes any that remain at the deadline. A second call forces the
     // shutdown immediately. Shutdown is terminal for this event loop.
     auto shutdown(clock::duration timeout) -> void;
-    auto add(std::unique_ptr<notifiable> handler) -> void;
-    auto remove(int descriptor) -> void;
-    auto set_write_interest(int descriptor, bool enabled) -> void;
+    auto add(std::unique_ptr<tcp_acceptor> handler) -> void;
+    auto add(std::unique_ptr<tcp_stream> handler) -> void;
+    auto add(std::unique_ptr<udp_socket> handler) -> void;
 
     // Thread-safe. Enqueues a task to run on the event-loop thread and wakes
     // the poller. Returns false if the task is empty or the bounded queue is
@@ -190,14 +183,6 @@ public:
     // posting before destroying the loop; a posted task must access
     // loop-owned objects only on this loop's thread.
     [[nodiscard]] auto post(execution_task&& task) noexcept -> bool;
-
-    // Timers run on the event-loop thread. Scheduling and cancellation must
-    // also be performed on that thread; use post() from other threads.
-    [[nodiscard]] auto schedule_at(clock::time_point deadline,
-                                   execution_task&& task) -> timer_id;
-    [[nodiscard]] auto schedule_after(clock::duration delay,
-                                      execution_task&& task) -> timer_id;
-    auto cancel(timer_id timer) noexcept -> bool;
 
     // Executor for independent background work. Work submitted here must not
     // access event-loop-owned objects; use post() to deliver results back.
@@ -212,6 +197,8 @@ public:
 private:
     friend struct eventloop_detail::coroutine_frame_access;
     friend class event_loop_yield_awaiter;
+    friend class tcp_acceptor;
+    friend class udp_socket;
     friend class tcp_stream;
     friend class tls_stream;
 
@@ -232,6 +219,11 @@ private:
                                   bool started) -> task_spawn_result;
     [[nodiscard]] auto can_spawn() const noexcept -> bool;
     [[nodiscard]] auto post_local(execution_task&& task) noexcept -> bool;
+    auto add_handler(std::unique_ptr<eventloop_detail::notifiable> handler) -> void;
+    auto remove(int descriptor) -> void;
+    auto set_io_interest(int descriptor, bool read_enabled,
+                         bool write_enabled) -> void;
+    auto set_write_interest(int descriptor, bool enabled) -> void;
 
     class implementation;
     std::unique_ptr<implementation> implementation_;

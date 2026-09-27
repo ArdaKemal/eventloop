@@ -1,6 +1,9 @@
 #include "eventloop/tls_stream.h"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstring>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
@@ -20,8 +23,25 @@
 #include <botan/tls_server.h>
 #include <botan/tls_session_manager_memory.h>
 #include <botan/x509cert.h>
+#include <botan/x509_crl.h>
 
 namespace {
+
+[[nodiscard]] auto system_code(int value) noexcept -> std::error_code
+{
+    return {value, std::generic_category()};
+}
+
+[[nodiscard]] auto task_code(task_result result) noexcept -> std::error_code
+{
+    return system_code(result == task_result::frame_allocation_failure
+                           ? ENOMEM : ECANCELED);
+}
+
+struct active_operation_guard {
+    bool& active;
+    ~active_operation_guard() { active = false; }
+};
 
 enum class context_role { client, server };
 
@@ -35,6 +55,25 @@ public:
     explicit client_credentials(const std::filesystem::path& trusted_ca)
     {
         auto store = std::make_unique<Botan::Certificate_Store_In_Memory>();
+        if (std::filesystem::is_directory(trusted_ca)) {
+            for (const auto& entry : std::filesystem::directory_iterator(trusted_ca)) {
+                if (!entry.is_regular_file()) continue;
+                try {
+                    store->add_certificate(Botan::X509_Certificate(
+                        entry.path().string()));
+                } catch (const Botan::Exception&) {
+                }
+                try {
+                    store->add_crl(Botan::X509_CRL(entry.path().string()));
+                } catch (const Botan::Exception&) {
+                }
+            }
+            if (store->all_subjects().empty()) {
+                throw std::invalid_argument("trusted CA directory contains no certificates");
+            }
+            store_ = std::move(store);
+            return;
+        }
         Botan::DataSource_Stream source(trusted_ca.string());
         while (!source.end_of_data()) {
             try {
@@ -208,9 +247,14 @@ auto make_error_code(tls_errc error) noexcept -> std::error_code
 
 class tls_stream::implementation final : public Botan::TLS::Callbacks {
 public:
-    implementation(tls_stream& owner, std::shared_ptr<tls_context> context,
+    static constexpr std::size_t encrypted_capacity = 64 * 1024;
+    // Raw TCP reads are at most 4 KiB, so one read cannot deliver more
+    // plaintext than this before the caller consumes the queued bytes.
+    static constexpr std::size_t plaintext_capacity = 4096;
+
+    implementation(std::shared_ptr<tls_context> context,
                    tls_client_options options)
-        : owner_(owner), context_(std::move(context)),
+        : context_(std::move(context)),
           callback_(this, [](Botan::TLS::Callbacks*) {})
     {
         if (!context_ || context_->implementation_->role != context_role::client) {
@@ -227,9 +271,9 @@ public:
             options.application_protocols);
     }
 
-    implementation(tls_stream& owner, std::shared_ptr<tls_context> context,
+    implementation(std::shared_ptr<tls_context> context,
                    tls_server_options options)
-        : owner_(owner), context_(std::move(context)),
+        : context_(std::move(context)),
           server_protocols_(std::move(options.application_protocols)),
           callback_(this, [](Botan::TLS::Callbacks*) {})
     {
@@ -243,13 +287,21 @@ public:
 
     auto tls_emit_data(std::span<const std::uint8_t> data) -> void override
     {
-        owner_.tcp_stream::write(std::as_bytes(data));
+        if (data.size() > encrypted_capacity - encrypted_size_) {
+            throw std::length_error("TLS encrypted output capacity exceeded");
+        }
+        std::memcpy(encrypted_.data() + encrypted_size_, data.data(), data.size());
+        encrypted_size_ += data.size();
     }
 
     auto tls_record_received(std::uint64_t, std::span<const std::uint8_t> data)
         -> void override
     {
-        owner_.emit_data(std::as_bytes(data));
+        if (data.size() > plaintext_capacity - plaintext_size_) {
+            throw std::length_error("TLS plaintext input capacity exceeded");
+        }
+        std::memcpy(plaintext_.data() + plaintext_size_, data.data(), data.size());
+        plaintext_size_ += data.size();
     }
 
     auto tls_alert(Botan::TLS::Alert alert) -> void override
@@ -258,11 +310,6 @@ public:
             fatal_error_ = std::error_code(
                 static_cast<int>(alert.type()), tls_error_category());
         }
-    }
-
-    auto tls_session_activated() -> void override
-    {
-        owner_.emit_ready();
     }
 
     auto tls_peer_closed_connection() -> bool override
@@ -285,13 +332,17 @@ public:
         throw Botan::TLS::TLS_Exception(Botan::TLS::AlertType::NoApplicationProtocol);
     }
 
-    tls_stream& owner_;
     std::shared_ptr<tls_context> context_;
     std::vector<std::string> server_protocols_;
     std::shared_ptr<Botan::TLS::Callbacks> callback_;
     std::unique_ptr<Botan::TLS::Channel> channel_;
     std::error_code fatal_error_;
     bool peer_closed_ {false};
+    std::array<std::byte, encrypted_capacity> encrypted_ {};
+    std::size_t encrypted_size_ {0};
+    std::array<std::byte, plaintext_capacity> plaintext_ {};
+    std::size_t plaintext_size_ {0};
+    std::array<std::byte, 4096> input_ {};
 };
 
 tls_stream::tls_stream(event_loop& loop, int descriptor,
@@ -307,7 +358,7 @@ tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
                        tls_client_options options)
     : tcp_stream(loop, std::move(descriptor)),
       implementation_(std::make_unique<implementation>(
-          *this, std::move(context), std::move(options)))
+          std::move(context), std::move(options)))
 {
 }
 
@@ -324,56 +375,23 @@ tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
                        tls_server_options options)
     : tcp_stream(loop, std::move(descriptor)),
       implementation_(std::make_unique<implementation>(
-          *this, std::move(context), std::move(options)))
+          std::move(context), std::move(options)))
 {
 }
 
-tls_stream::~tls_stream() = default;
-
-auto tls_stream::write(std::span<const std::byte> data) -> void
+tls_stream::~tls_stream()
 {
-    event_loop::handler_call_scope callback_scope(owner_loop());
-    if (!ready()) {
-        throw std::logic_error("cannot write before the TLS handshake completes");
-    }
-    try {
-        implementation_->channel_->send({
-            reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
-    } catch (const Botan::TLS::TLS_Exception& error) {
-        on_transport_error({static_cast<int>(error.type()),
-                            tls_error_category()});
-    } catch (const Botan::Exception&) {
-        on_transport_error(make_error_code(tls_errc::protocol_error));
-    } catch (...) {
-        abort();
-        throw;
+    if (exclusive_operation_active_ || read_operation_active_ ||
+        write_operation_active_ || flush_active_ || flush_waiter_) {
+        std::terminate();
     }
 }
 
 auto tls_stream::close() -> void
 {
-    event_loop::handler_call_scope callback_scope(owner_loop());
-    if (closing_) {
-        return;
-    }
+    if (closing_) return;
     closing_ = true;
-    try {
-        if (!implementation_->channel_->is_closed_for_writing()) {
-            implementation_->channel_->close();
-        }
-        tcp_stream::close();
-    } catch (const Botan::Exception&) {
-        on_transport_error(make_error_code(tls_errc::protocol_error));
-    } catch (...) {
-        abort();
-        throw;
-    }
-}
-
-auto tls_stream::ready() const noexcept -> bool
-{
-    return implementation_ && implementation_->channel_->is_active() &&
-           !closing_ && tcp_stream::ready();
+    tcp_stream::close();
 }
 
 auto tls_stream::application_protocol() const -> std::string
@@ -384,59 +402,321 @@ auto tls_stream::application_protocol() const -> std::string
     return implementation_->channel_->application_protocol();
 }
 
-auto tls_stream::on_transport_data(std::span<const std::byte> data) -> void
+auto tls_stream::async_handshake()
+    -> task<std::expected<void, std::error_code>>
+{
+    return handshake_task(owner_loop(), *this);
+}
+
+auto tls_stream::async_read_some(std::span<std::byte> buffer)
+    -> task<std::expected<std::size_t, std::error_code>>
+{
+    return read_task(owner_loop(), *this, buffer);
+}
+
+auto tls_stream::async_write_some(std::span<const std::byte> buffer)
+    -> task<std::expected<std::size_t, std::error_code>>
+{
+    return write_task(owner_loop(), *this, buffer);
+}
+
+auto tls_stream::async_close()
+    -> task<std::expected<void, std::error_code>>
+{
+    return close_task(owner_loop(), *this);
+}
+
+auto tls_stream::activate_async_tls() noexcept
+    -> std::expected<void, std::error_code>
+{
+    if (async_tls_mode_) return {};
+    if (closing_) return std::unexpected(system_code(ECANCELED));
+    auto result = activate_async_transport();
+    if (!result) return result;
+    async_tls_mode_ = true;
+    return {};
+}
+
+auto tls_stream::receive_encrypted(std::span<const std::byte> data) noexcept
+    -> std::error_code
 {
     try {
         implementation_->channel_->received_data({
             reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
     } catch (const Botan::TLS::TLS_Exception& error) {
-        on_transport_error({static_cast<int>(error.type()),
-                            tls_error_category()});
-        return;
+        return {static_cast<int>(error.type()), tls_error_category()};
     } catch (const Botan::Exception&) {
-        on_transport_error(make_error_code(
-            ready() ? tls_errc::protocol_error : tls_errc::handshake_failed));
-        return;
+        return make_error_code(implementation_->channel_->is_active()
+                                   ? tls_errc::protocol_error
+                                   : tls_errc::handshake_failed);
+    } catch (const std::length_error&) {
+        return system_code(ENOBUFS);
+    } catch (...) {
+        return make_error_code(tls_errc::protocol_error);
+    }
+    return implementation_->fatal_error_;
+}
+
+auto tls_stream::take_plaintext(std::span<std::byte> buffer) noexcept
+    -> std::size_t
+{
+    auto& state = *implementation_;
+    const auto size = std::min(buffer.size(), state.plaintext_size_);
+    if (size != 0) {
+        std::memcpy(buffer.data(), state.plaintext_.data(), size);
+        state.plaintext_size_ -= size;
+        std::memmove(state.plaintext_.data(), state.plaintext_.data() + size,
+                     state.plaintext_size_);
+    }
+    return size;
+}
+
+class tls_stream::flush_waiter {
+public:
+    friend class tls_stream;
+    explicit flush_waiter(tls_stream& owner) noexcept : owner_(owner)
+    {
+        cancellation_.operation = this;
+        cancellation_.cancel = &cancel;
     }
 
-    if (implementation_->fatal_error_) {
-        on_transport_error(implementation_->fatal_error_);
+    ~flush_waiter()
+    {
+        if (owner_.flush_waiter_ == this) std::terminate();
+    }
+
+    [[nodiscard]] auto await_ready() noexcept -> bool
+    {
+        if (owner_.flush_active_) return false;
+        owner_.flush_active_ = true;
+        return true;
+    }
+
+    template<typename Promise>
+    [[nodiscard]] auto await_suspend(std::coroutine_handle<Promise> handle)
+        noexcept -> bool
+    {
+        auto& state = *handle.promise().cancellation_state();
+        if (state.requested ||
+            !eventloop_detail::coroutine_frame_access::attach_cancellation(
+                state, cancellation_)) {
+            error_ = system_code(ECANCELED);
+            return false;
+        }
+        if (owner_.flush_waiter_ != nullptr) std::terminate();
+        continuation_ = handle;
+        owner_.flush_waiter_ = this;
+        return true;
+    }
+
+    [[nodiscard]] auto await_resume() const noexcept
+        -> std::expected<void, std::error_code>
+    {
+        if (error_) return std::unexpected(error_);
+        return {};
+    }
+
+    auto finish(std::error_code error) noexcept -> void
+    {
+        error_ = error;
+        continuation_.resume();
+    }
+
+private:
+    static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+        noexcept -> void
+    {
+        auto& self = *static_cast<flush_waiter*>(node.operation);
+        self.owner_.flush_waiter_ = nullptr;
+        eventloop_detail::coroutine_frame_access::detach_cancellation(
+            self.cancellation_);
+        self.finish(system_code(ECANCELED));
+    }
+
+    tls_stream& owner_;
+    std::coroutine_handle<> continuation_ {};
+    eventloop_detail::coroutine_cancellation_node cancellation_;
+    std::error_code error_;
+};
+
+auto tls_stream::release_flush() noexcept -> void
+{
+    auto* waiter = std::exchange(flush_waiter_, nullptr);
+    if (waiter == nullptr) {
+        flush_active_ = false;
         return;
     }
-    if (implementation_->peer_closed_) {
-        if (!close_emitted_) {
-            close_emitted_ = true;
-            try {
-                emit_close();
-            } catch (...) {
-                abort();
-                throw;
-            }
+    eventloop_detail::coroutine_frame_access::detach_cancellation(
+        waiter->cancellation_);
+    // Ownership passes directly to the resumed coroutine. No other flusher
+    // can enter between the current write and its continuation.
+    waiter->finish({});
+}
+
+auto tls_stream::flush_task(event_loop& loop, tls_stream& self)
+    -> task<std::expected<void, std::error_code>>
+{
+    (void)loop;
+    auto acquired = co_await flush_waiter {self};
+    if (!acquired) co_return std::unexpected(acquired.error());
+    struct flush_guard {
+        tls_stream& owner;
+        ~flush_guard() { owner.release_flush(); }
+    } guard {self};
+    auto& state = *self.implementation_;
+    while (state.encrypted_size_ != 0) {
+        const auto result = co_await self.tcp_stream::async_write_some(
+            std::span<const std::byte>(state.encrypted_.data(),
+                                       state.encrypted_size_));
+        if (!result) co_return std::unexpected(result.error());
+        if (*result == 0) co_return std::unexpected(system_code(EPIPE));
+        state.encrypted_size_ -= *result;
+        std::memmove(state.encrypted_.data(), state.encrypted_.data() + *result,
+                     state.encrypted_size_);
+    }
+    co_return std::expected<void, std::error_code> {};
+}
+
+auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
+    -> task<std::expected<void, std::error_code>>
+{
+    if (self.exclusive_operation_active_ || self.read_operation_active_ ||
+        self.write_operation_active_) {
+        co_return std::unexpected(system_code(EBUSY));
+    }
+    self.exclusive_operation_active_ = true;
+    active_operation_guard guard {self.exclusive_operation_active_};
+    if (co_await cancellation_requested()) {
+        co_return std::unexpected(system_code(ECANCELED));
+    }
+    if (auto activated = self.activate_async_tls(); !activated) {
+        co_return std::unexpected(activated.error());
+    }
+    auto& encrypted = self.implementation_->input_;
+    while (!self.implementation_->channel_->is_active()) {
+        auto flushed = co_await flush_task(loop, self);
+        if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+        if (!*flushed) co_return std::unexpected(flushed->error());
+        auto received = co_await self.tcp_stream::async_read_some(encrypted);
+        if (!received) co_return std::unexpected(received.error());
+        if (*received == 0) {
+            co_return std::unexpected(make_error_code(tls_errc::truncated));
         }
-        close();
+        if (auto error = self.receive_encrypted(
+                std::span(encrypted).first(*received)); error) {
+            co_return std::unexpected(error);
+        }
+    }
+    auto flushed = co_await flush_task(loop, self);
+    if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+    if (!*flushed) co_return std::unexpected(flushed->error());
+    co_return std::expected<void, std::error_code> {};
+}
+
+auto tls_stream::read_task(event_loop& loop, tls_stream& self,
+                           std::span<std::byte> buffer)
+    -> task<std::expected<std::size_t, std::error_code>>
+{
+    if (self.exclusive_operation_active_ || self.read_operation_active_) {
+        co_return std::unexpected(system_code(EBUSY));
+    }
+    self.read_operation_active_ = true;
+    active_operation_guard guard {self.read_operation_active_};
+    if (co_await cancellation_requested()) {
+        co_return std::unexpected(system_code(ECANCELED));
+    }
+    if (!self.async_tls_mode_) {
+        co_return std::unexpected(system_code(ENOTCONN));
+    }
+    if (buffer.empty()) co_return std::size_t {0};
+    if (auto size = self.take_plaintext(buffer); size != 0) co_return size;
+    if (self.implementation_->peer_closed_) co_return std::size_t {0};
+    if (!self.implementation_->channel_->is_active()) {
+        co_return std::unexpected(system_code(ENOTCONN));
+    }
+    auto& encrypted = self.implementation_->input_;
+    for (;;) {
+        if (self.implementation_->peer_closed_) co_return std::size_t {0};
+        auto received = co_await self.tcp_stream::async_read_some(encrypted);
+        if (!received) co_return std::unexpected(received.error());
+        if (*received == 0) {
+            if (self.implementation_->peer_closed_) co_return std::size_t {0};
+            co_return std::unexpected(make_error_code(tls_errc::truncated));
+        }
+        if (auto error = self.receive_encrypted(
+                std::span(encrypted).first(*received)); error) {
+            co_return std::unexpected(error);
+        }
+        auto flushed = co_await flush_task(loop, self);
+        if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+        if (!*flushed) co_return std::unexpected(flushed->error());
+        if (auto size = self.take_plaintext(buffer); size != 0) co_return size;
     }
 }
 
-auto tls_stream::on_transport_close() -> void
+auto tls_stream::write_task(event_loop& loop, tls_stream& self,
+                            std::span<const std::byte> buffer)
+    -> task<std::expected<std::size_t, std::error_code>>
 {
-    if (implementation_->peer_closed_ ||
-        implementation_->channel_->is_closed_for_reading()) {
-        if (!close_emitted_) {
-            close_emitted_ = true;
-            try {
-                emit_close();
-            } catch (...) {
-                abort();
-                throw;
-            }
-        }
-        tcp_stream::close();
-        return;
+    if (self.exclusive_operation_active_ || self.write_operation_active_) {
+        co_return std::unexpected(system_code(EBUSY));
     }
-    on_transport_error(make_error_code(tls_errc::truncated));
+    self.write_operation_active_ = true;
+    active_operation_guard guard {self.write_operation_active_};
+    if (co_await cancellation_requested()) {
+        co_return std::unexpected(system_code(ECANCELED));
+    }
+    if (!self.async_tls_mode_ || !self.implementation_->channel_->is_active() ||
+        self.transport_closed() ||
+        self.implementation_->channel_->is_closed_for_writing()) {
+        co_return std::unexpected(system_code(ENOTCONN));
+    }
+    if (buffer.empty()) co_return std::size_t {0};
+    const auto size = std::min<std::size_t>(buffer.size(), 4096);
+    try {
+        self.implementation_->channel_->send({
+            reinterpret_cast<const std::uint8_t*>(buffer.data()), size});
+    } catch (const Botan::TLS::TLS_Exception& error) {
+        co_return std::unexpected(std::error_code(
+            static_cast<int>(error.type()), tls_error_category()));
+    } catch (const Botan::Exception&) {
+        co_return std::unexpected(make_error_code(tls_errc::protocol_error));
+    } catch (const std::length_error&) {
+        co_return std::unexpected(system_code(ENOBUFS));
+    }
+    auto flushed = co_await flush_task(loop, self);
+    if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+    if (!*flushed) co_return std::unexpected(flushed->error());
+    co_return size;
 }
 
-auto tls_stream::on_transport_error(std::error_code error) -> void
+auto tls_stream::close_task(event_loop& loop, tls_stream& self)
+    -> task<std::expected<void, std::error_code>>
 {
-    tcp_stream::on_transport_error(error);
+    if (self.exclusive_operation_active_ || self.read_operation_active_ ||
+        self.write_operation_active_) {
+        co_return std::unexpected(system_code(EBUSY));
+    }
+    self.exclusive_operation_active_ = true;
+    active_operation_guard guard {self.exclusive_operation_active_};
+    if (co_await cancellation_requested()) {
+        co_return std::unexpected(system_code(ECANCELED));
+    }
+    if (!self.async_tls_mode_) {
+        co_return std::unexpected(system_code(ENOTCONN));
+    }
+    try {
+        if (!self.implementation_->channel_->is_closed_for_writing()) {
+            self.implementation_->channel_->close();
+        }
+    } catch (const Botan::Exception&) {
+        co_return std::unexpected(make_error_code(tls_errc::protocol_error));
+    } catch (const std::length_error&) {
+        co_return std::unexpected(system_code(ENOBUFS));
+    } catch (...) {
+        co_return std::unexpected(make_error_code(tls_errc::protocol_error));
+    }
+    auto flushed = co_await flush_task(loop, self);
+    if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+    co_return *flushed;
 }

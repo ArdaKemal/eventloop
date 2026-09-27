@@ -24,6 +24,19 @@ auto later(event_loop& loop, int number, std::chrono::milliseconds delay,
     cancelled = result == timer_wait_result::cancelled;
     co_return number;
 }
+auto release_after(event_loop& loop, std::atomic<bool>& release,
+                   std::chrono::milliseconds delay) -> task<void>
+{
+    if (co_await sleep_for(loop, delay) == timer_wait_result::expired) {
+        release.store(true, std::memory_order_release);
+    }
+}
+auto stop_after(event_loop& loop, std::chrono::milliseconds delay) -> task<void>
+{
+    if (co_await sleep_for(loop, delay) == timer_wait_result::expired) {
+        loop.stop();
+    }
+}
 auto error_value(event_loop&) -> task<std::expected<int, std::error_code>>
 {
     co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
@@ -129,10 +142,11 @@ auto worker_race_test() -> bool
     bool passed = false;
     auto root = worker_race_root(loop, release, cancelled, passed);
     if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
-    (void)loop.schedule_after(5ms, execution_task([&release]() noexcept {
-        release.store(true, std::memory_order_release);
-    }));
-    (void)loop.schedule_after(50ms, execution_task([&loop]() noexcept { loop.stop(); }));
+    if (loop.spawn(release_after(loop, release, 5ms)) !=
+            task_spawn_result::accepted ||
+        loop.spawn(stop_after(loop, 50ms)) != task_spawn_result::accepted) {
+        return false;
+    }
     (void)loop.run();
     return passed && loop.coroutine_statistics().active_roots == 0;
 }
@@ -229,7 +243,8 @@ auto run_case(auto factory) -> bool
     auto root = factory(loop, passed);
     if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
     if (loop.coroutine_statistics().active_roots != 0) {
-        (void)loop.schedule_after(10ms, execution_task([&loop]() noexcept { loop.stop(); }));
+        if (loop.spawn(stop_after(loop, 10ms)) !=
+            task_spawn_result::accepted) return false;
         (void)loop.run();
     }
     return passed && loop.coroutine_statistics().live == 0;

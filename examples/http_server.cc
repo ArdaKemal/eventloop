@@ -13,6 +13,26 @@
 #include <string_view>
 
 namespace {
+template<typename Listener>
+[[nodiscard]] auto serve_listener(event_loop& loop, Listener& listener)
+    -> task<void>
+{
+    (void)loop;
+    (void)co_await listener.run();
+}
+
+template<typename Listener>
+auto start_listener(event_loop& loop, std::unique_ptr<Listener> listener) -> void
+{
+    auto* active = listener.get();
+    loop.add(std::move(listener));
+    if (loop.spawn(serve_listener(loop, *active)) !=
+        task_spawn_result::accepted) {
+        active->close();
+        throw std::runtime_error("could not start HTTP listener task");
+    }
+}
+
 [[nodiscard]] auto valid_port(int port) -> std::uint16_t
 {
     if (port <= 0 || port > 65535) {
@@ -26,7 +46,11 @@ auto run_server(event_loop& loop, int shutdown_timeout) -> void
     if (shutdown_timeout < 0) {
         throw std::invalid_argument("shutdown timeout cannot be negative");
     }
-    if (loop.run() == event_loop_result::stopped) return;
+    if (loop.run() == event_loop_result::stopped) {
+        loop.shutdown(event_loop::clock::duration::zero());
+        (void)loop.run();
+        return;
+    }
 
     loop.shutdown(std::chrono::seconds {shutdown_timeout});
     while (loop.run() == event_loop_result::interrupted) {
@@ -87,7 +111,7 @@ auto main(int argc, char* argv[]) -> int
         const auto server_options =
             http::server_options {.directory_listing = directory_listing};
         if (http_only) {
-            loop.add(std::make_unique<http::server>(
+            start_listener(loop, std::make_unique<http::server>(
                 loop, http_port, root, address, server_options));
             std::cout << "HTTP server listening on http://" << address << ':'
                       << http_port << '\n';
@@ -104,9 +128,9 @@ auto main(int argc, char* argv[]) -> int
         const auto https_port = valid_port(https_port_value);
         auto context = tls_context::make_server(
             certificate, private_key, key_password);
-        loop.add(std::make_unique<http::redirect_server>(
+        start_listener(loop, std::make_unique<http::redirect_server>(
             loop, http_port, hostname, https_port, address));
-        loop.add(std::make_unique<http::https_server>(
+        start_listener(loop, std::make_unique<http::https_server>(
             loop, https_port, std::move(context), root, address, server_options));
         std::cout << "HTTP redirect listening on http://" << address << ':'
                   << http_port << '\n'

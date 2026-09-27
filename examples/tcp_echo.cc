@@ -1,43 +1,56 @@
 #include "eventloop/event_loop.h"
+#include "eventloop/task.h"
 #include "eventloop/tcp_acceptor.h"
 #include "eventloop/tcp_stream.h"
 
+#include <array>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
 
 namespace {
-class echo_session final : public tcp_stream {
-public:
-    using tcp_stream::tcp_stream;
+[[nodiscard]] auto echo_session(event_loop& loop, tcp_stream& stream) -> task<void>
+{
+    (void)loop;
+    std::array<std::byte, 1024> buffer {};
+    for (;;) {
+        const auto received = co_await stream.async_read_some(buffer);
+        if (!received || *received == 0) break;
 
-private:
-    auto on_data(std::span<const std::byte> data) -> void override
-    {
-        write(data);
+        std::size_t offset = 0;
+        while (offset < *received) {
+            const auto sent = co_await stream.async_write_some(
+                std::span<const std::byte>(buffer).subspan(offset, *received - offset));
+            if (!sent || *sent == 0) {
+                stream.close();
+                co_return;
+            }
+            offset += *sent;
+        }
     }
-};
+    stream.close();
+}
 
-class echo_acceptor final : public tcp_acceptor {
-public:
-    using tcp_acceptor::tcp_acceptor;
+[[nodiscard]] auto serve(event_loop& loop, tcp_acceptor& listener) -> task<void>
+{
+    for (;;) {
+        auto accepted = co_await listener.async_accept();
+        if (!accepted) co_return;
 
-private:
-    auto on_accept(int descriptor) -> void override
-    {
-        on_accept_owned(unique_fd(descriptor));
+        auto stream = std::make_unique<tcp_stream>(loop, std::move(*accepted));
+        auto* session = stream.get();
+        loop.add(std::move(stream));
+        if (loop.spawn(echo_session(loop, *session)) != task_spawn_result::accepted) {
+            session->close();
+        }
     }
-
-    auto on_accept_owned(unique_fd descriptor) -> void override
-    {
-        owner().add(std::make_unique<echo_session>(owner(),
-                                                 std::move(descriptor)));
-    }
-};
+}
 
 [[nodiscard]] auto parse_port(std::string_view text) -> std::uint16_t
 {
@@ -56,9 +69,18 @@ auto main(int argc, char* argv[]) -> int
     try {
         const auto port = argc > 1 ? parse_port(argv[1]) : std::uint16_t {7000};
         event_loop loop;
-        loop.add(std::make_unique<echo_acceptor>(loop, port));
+        auto listener = std::make_unique<tcp_acceptor>(loop, port);
+        auto* accepting = listener.get();
+        loop.add(std::move(listener));
+        if (loop.spawn(serve(loop, *accepting)) != task_spawn_result::accepted) {
+            accepting->close();
+            throw std::runtime_error("cannot start TCP echo listener");
+        }
         std::cout << "echo server listening on 127.0.0.1:" << port << '\n';
-        loop.run();
+        if (loop.run() == event_loop_result::interrupted) {
+            loop.shutdown(std::chrono::seconds {0});
+            (void)loop.run();
+        }
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;

@@ -4,6 +4,7 @@
 #include "eventloop/http/session.h"
 #include "eventloop/unique_fd.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +16,8 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -47,31 +50,55 @@ auto operator delete[](void* memory, std::size_t) noexcept -> void { std::free(m
 
 namespace {
 
-class fixed_stream final : public byte_stream {
-public:
-    auto write(std::span<const std::byte> data) -> void override
-    {
-        if (data.size() > output.size() - size) throw std::bad_alloc {};
-        std::memcpy(output.data() + size, data.data(), data.size());
-        size += data.size();
+auto stop_after(event_loop& loop, std::chrono::milliseconds delay) -> task<void>
+{
+    if (co_await sleep_for(loop, delay) == timer_wait_result::expired) {
+        loop.stop();
     }
+}
 
-    auto close() -> void override { open = false; }
-    [[nodiscard]] auto ready() const noexcept -> bool override { return open; }
-    [[nodiscard]] auto write_pending() const noexcept -> bool override { return false; }
-
+struct capture {
     std::array<char, 128 * 1024> output {};
     std::size_t size {0};
     bool open {true};
-
-private:
-    auto on_data(std::span<const std::byte>) -> void override {}
 };
 
-[[nodiscard]] auto contains(const fixed_stream& stream, std::string_view value) -> bool
+[[nodiscard]] auto contains(const capture& stream, std::string_view value) -> bool
 {
     return std::string_view {stream.output.data(), stream.size}.find(value) !=
            std::string_view::npos;
+}
+
+auto collect(http::session& session, capture& stream) -> void
+{
+    while (session.has_response()) {
+        const auto response = session.response();
+        if (response.size() > stream.output.size() - stream.size) {
+            stream.open = false;
+            return;
+        }
+        std::memcpy(stream.output.data() + stream.size, response.data(),
+                    response.size());
+        stream.size += response.size();
+        const auto file_size = session.file_size();
+        auto file = session.take_file();
+        if (file) {
+            std::size_t remaining = file_size;
+            while (remaining != 0) {
+                const auto read_size = ::read(file.get(),
+                    stream.output.data() + stream.size,
+                    std::min(remaining, stream.output.size() - stream.size));
+                if (read_size <= 0) {
+                    stream.open = false;
+                    return;
+                }
+                stream.size += static_cast<std::size_t>(read_size);
+                remaining -= static_cast<std::size_t>(read_size);
+            }
+        }
+        session.finish_response();
+    }
+    stream.open = !session.closed();
 }
 
 auto write_file(int directory, const char* name, std::string_view contents) -> bool
@@ -144,8 +171,8 @@ auto session_tests() -> bool
     }
     ::close(listing);
 
-    fixed_stream stream;
-    http::session session(stream, directory);
+    capture stream;
+    http::session session(directory);
     constexpr std::string_view requests =
         "GET /site.css HTTP/1.1\r\nHost: localhost\r\n\r\n"
         "HEAD /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -155,52 +182,54 @@ auto session_tests() -> bool
     session.receive(std::as_bytes(std::span {requests.data(), split}));
     session.receive(std::as_bytes(std::span {
         requests.data() + split, requests.size() - split}));
-    session.write_drained();
-    session.write_drained();
+    collect(session, stream);
+    collect(session, stream);
     const auto after = allocations;
 
-    const bool valid = before == after &&
+    // Response storage is allocated only while each response is in flight;
+    // the session no longer keeps a small-response buffer while idle.
+    const bool valid = after - before == 2 &&
         contains(stream, "Content-Type: text/css; charset=utf-8") &&
         contains(stream, "body{}") &&
         contains(stream, "Content-Type: text/html; charset=utf-8") &&
         !stream.open;
 
-    fixed_stream forbidden_stream;
-    http::session forbidden_session(forbidden_stream, directory);
+    capture forbidden_stream;
+    http::session forbidden_session(directory);
     constexpr std::string_view forbidden_request =
         "GET /listing/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     forbidden_session.receive(std::as_bytes(std::span {forbidden_request}));
-    forbidden_session.write_drained();
+    collect(forbidden_session, forbidden_stream);
 
-    fixed_stream redirect_stream;
-    http::session redirect_session(redirect_stream, directory, true);
+    capture redirect_stream;
+    http::session redirect_session(directory, true);
     constexpr std::string_view redirect_request =
         "GET /listing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     redirect_session.receive(std::as_bytes(std::span {redirect_request}));
-    redirect_session.write_drained();
+    collect(redirect_session, redirect_stream);
 
-    fixed_stream injected_redirect_stream;
-    http::session injected_redirect(injected_redirect_stream, directory, true);
+    capture injected_redirect_stream;
+    http::session injected_redirect(directory, true);
     constexpr std::string_view injected_redirect_request =
         "GET /listing?\nInjected:yes HTTP/1.1\r\nHost: localhost\r\n\r\n";
     injected_redirect.receive(std::as_bytes(std::span {injected_redirect_request}));
-    injected_redirect.write_drained();
+    collect(injected_redirect, injected_redirect_stream);
 
-    fixed_stream listing_stream;
-    http::session listing_session(listing_stream, directory, true);
+    capture listing_stream;
+    http::session listing_session(directory, true);
     constexpr std::string_view listing_request =
         "GET /listing/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     listing_session.receive(std::as_bytes(std::span {listing_request}));
     for (int index = 0; index < 8 && listing_stream.open; ++index) {
-        listing_session.write_drained();
+        collect(listing_session, listing_stream);
     }
 
-    fixed_stream escape_stream;
-    http::session escape_session(escape_stream, directory);
+    capture escape_stream;
+    http::session escape_session(directory);
     constexpr std::string_view escape_request =
         "GET /escape/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     escape_session.receive(std::as_bytes(std::span {escape_request}));
-    escape_session.write_drained();
+    collect(escape_session, escape_stream);
 
     const bool directories_valid =
         contains(forbidden_stream, "403 Forbidden") &&
@@ -213,30 +242,31 @@ auto session_tests() -> bool
         contains(listing_stream, "a&amp;b.txt") && !listing_stream.open;
     const bool root_confined = contains(escape_stream, "404 Not Found");
 
-    fixed_stream large_stream;
-    http::session large_session(large_stream, directory);
+    capture large_stream;
+    http::session large_session(directory);
     constexpr std::string_view large_request =
         "GET /large.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     large_session.receive(std::as_bytes(std::span {large_request}));
     for (int index = 0; index < 8 && large_stream.open; ++index) {
-        large_session.write_drained();
+        collect(large_session, large_stream);
     }
     const bool large_file_valid =
         contains(large_stream, "Content-Length: 71680") &&
         large_stream.size > large_contents.size() && !large_stream.open;
 
-    fixed_stream draining_stream;
-    http::session draining_session(draining_stream, directory);
+    capture draining_stream;
+    http::session draining_session(directory);
     constexpr std::string_view draining_request =
         "GET /site.css HTTP/1.1\r\nHost: localhost\r\n\r\n";
     draining_session.receive(std::as_bytes(std::span {draining_request}));
     draining_session.shutdown();
     const bool response_was_allowed_to_drain = draining_stream.open;
-    draining_session.write_drained();
+    collect(draining_session, draining_stream);
 
-    fixed_stream idle_stream;
-    http::session idle_session(idle_stream, directory);
+    capture idle_stream;
+    http::session idle_session(directory);
     idle_session.shutdown();
+    idle_stream.open = !idle_session.closed();
     const bool graceful_shutdown_valid = response_was_allowed_to_drain &&
                                          !draining_stream.open &&
                                          !idle_stream.open;
@@ -253,12 +283,14 @@ auto session_tests() -> bool
            graceful_shutdown_valid;
 }
 
+template<typename Listener>
 auto request_after_listener_removal(event_loop& loop,
-                                    std::unique_ptr<notifiable> listener,
+                                    std::unique_ptr<Listener> listener,
                                     std::string_view request,
                                     std::string_view expected) -> bool
 {
-    const int listener_descriptor = listener->descriptor();
+    auto* owner = listener.get();
+    const int listener_descriptor = owner->descriptor();
     sockaddr_in endpoint {};
     socklen_t endpoint_size = sizeof(endpoint);
     if (getsockname(listener_descriptor, reinterpret_cast<sockaddr*>(&endpoint),
@@ -269,15 +301,22 @@ auto request_after_listener_removal(event_loop& loop,
     if (!client || connect(client.get(), reinterpret_cast<sockaddr*>(&endpoint),
                            endpoint_size) == -1) return false;
 
+    if (loop.spawn(owner->run()) != task_spawn_result::accepted) return false;
     bool sent = false;
     if (!loop.post(execution_task([&]() noexcept {
-            loop.remove(listener_descriptor);
+            owner->close();
             sent = send(client.get(), request.data(), request.size(), MSG_NOSIGNAL) ==
                    static_cast<ssize_t>(request.size());
         }))) return false;
-    (void)loop.schedule_after(std::chrono::milliseconds(100),
-                              execution_task([&loop]() noexcept { loop.stop(); }));
-    loop.run();
+    task_handle<void> stop_task;
+    if (loop.spawn(stop_after(loop, std::chrono::milliseconds(100)), stop_task) !=
+        task_spawn_result::accepted) return false;
+    (void)loop.run();
+    if (!stop_task.done()) {
+        (void)stop_task.cancel();
+        loop.stop();
+        (void)loop.run();
+    }
 
     std::array<char, 2048> response {};
     const auto received = recv(client.get(), response.data(), response.size(),
@@ -317,6 +356,156 @@ auto redirect_listener_removal_test() -> bool
         "Location: https://localhost/next");
 }
 
+auto pipelined_sendfile_test() -> bool
+{
+    char directory_name[] = "/tmp/eventloop-http-pipeline-XXXXXX";
+    if (mkdtemp(directory_name) == nullptr) return false;
+    unique_fd directory(open(directory_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    std::array<char, 70 * 1024> contents {};
+    contents.fill('x');
+    if (!directory || !write_file(directory.get(), "large.bin",
+                                  {contents.data(), contents.size()}) ||
+        !write_file(directory.get(), "small.txt", "last response")) {
+        return false;
+    }
+
+    event_loop loop;
+    auto listener = std::make_unique<http::server>(loop, 0, directory_name);
+    auto* active = listener.get();
+    sockaddr_in endpoint {};
+    socklen_t endpoint_size = sizeof(endpoint);
+    if (getsockname(active->descriptor(), reinterpret_cast<sockaddr*>(&endpoint),
+                    &endpoint_size) == -1) return false;
+    loop.add(std::move(listener));
+
+    unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (!client || connect(client.get(), reinterpret_cast<sockaddr*>(&endpoint),
+                           endpoint_size) == -1) return false;
+    constexpr std::string_view requests =
+        "GET /large.bin HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        "GET /small.txt HTTP/1.1\r\nHost: localhost\r\n"
+        "Connection: close\r\n\r\n";
+    if (send(client.get(), requests.data(), requests.size(), MSG_NOSIGNAL) !=
+        static_cast<ssize_t>(requests.size())) return false;
+    if (loop.spawn(active->run()) != task_spawn_result::accepted) return false;
+    std::array<char, 80 * 1024> response {};
+    std::size_t size = 0;
+    std::thread reader([&]() {
+        while (size < response.size()) {
+            const auto received = recv(client.get(), response.data() + size,
+                                       response.size() - size, 0);
+            if (received <= 0) break;
+            size += static_cast<std::size_t>(received);
+        }
+        loop.stop();
+    });
+    task_handle<void> stop_task;
+    if (loop.spawn(stop_after(loop, std::chrono::seconds(2)), stop_task) !=
+        task_spawn_result::accepted) {
+        (void)::shutdown(client.get(), SHUT_RD);
+        reader.join();
+        active->close();
+        return false;
+    }
+    (void)loop.run();
+    if (!stop_task.done()) {
+        (void)stop_task.cancel();
+        loop.stop();
+        (void)loop.run();
+    }
+    (void)::shutdown(client.get(), SHUT_RD);
+    reader.join();
+    active->close();
+    loop.shutdown(event_loop::clock::duration::zero());
+    loop.run();
+    const std::string_view result {response.data(), size};
+    const auto header_end = result.find("\r\n\r\n");
+    const bool body_valid = header_end != std::string_view::npos &&
+        header_end + 4 + contents.size() <= result.size() &&
+        std::all_of(result.begin() + static_cast<std::ptrdiff_t>(header_end + 4),
+                    result.begin() + static_cast<std::ptrdiff_t>(
+                        header_end + 4 + contents.size()),
+                    [](char value) { return value == 'x'; });
+    const bool valid = result.find("Content-Length: 71680") !=
+            std::string_view::npos &&
+        result.find("last response") != std::string_view::npos &&
+        body_valid;
+    unlinkat(directory.get(), "large.bin", 0);
+    unlinkat(directory.get(), "small.txt", 0);
+    directory.reset();
+    unlinkat(AT_FDCWD, directory_name, AT_REMOVEDIR);
+    return valid;
+}
+
+auto concurrent_connection_capacity_test() -> bool
+{
+    char directory_name[] = "/tmp/eventloop-http-capacity-XXXXXX";
+    if (mkdtemp(directory_name) == nullptr) return false;
+    unique_fd directory(open(directory_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!directory || !write_file(directory.get(), "index.html", "capacity")) {
+        return false;
+    }
+
+    event_loop loop;
+    auto listener = std::make_unique<http::server>(loop, 0, directory_name);
+    auto* active = listener.get();
+    sockaddr_in endpoint {};
+    socklen_t endpoint_size = sizeof(endpoint);
+    if (getsockname(active->descriptor(), reinterpret_cast<sockaddr*>(&endpoint),
+                    &endpoint_size) == -1) return false;
+    loop.add(std::move(listener));
+    if (loop.spawn(active->run()) != task_spawn_result::accepted) return false;
+
+    constexpr std::size_t connection_count = 128;
+    constexpr std::string_view request =
+        "HEAD /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::vector<unique_fd> clients;
+    clients.reserve(connection_count);
+    bool connected = true;
+    for (std::size_t index = 0; index < connection_count; ++index) {
+        unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        if (!client ||
+            connect(client.get(), reinterpret_cast<sockaddr*>(&endpoint),
+                    endpoint_size) == -1 ||
+            send(client.get(), request.data(), request.size(), MSG_NOSIGNAL) !=
+                static_cast<ssize_t>(request.size())) {
+            connected = false;
+            break;
+        }
+        clients.push_back(std::move(client));
+    }
+
+    task_handle<void> stop_task;
+    const bool timer_started =
+        loop.spawn(stop_after(loop, std::chrono::milliseconds(500)), stop_task) ==
+        task_spawn_result::accepted;
+    if (timer_started) (void)loop.run();
+
+    const auto statistics = loop.coroutine_statistics();
+    bool responses_valid = connected && clients.size() == connection_count;
+    for (const auto& client : clients) {
+        std::array<char, 512> response {};
+        const auto received = recv(client.get(), response.data(), response.size(),
+                                   MSG_DONTWAIT);
+        responses_valid = responses_valid && received > 0 &&
+            std::string_view {response.data(),
+                              static_cast<std::size_t>(received)}
+                .find("HTTP/1.1 200 OK") != std::string_view::npos;
+    }
+    const bool valid = timer_started && responses_valid &&
+        statistics.active_roots == connection_count + 1 &&
+        statistics.allocation_failures == 0;
+
+    clients.clear();
+    active->close();
+    loop.shutdown(event_loop::clock::duration::zero());
+    (void)loop.run();
+    unlinkat(directory.get(), "index.html", 0);
+    directory.reset();
+    unlinkat(AT_FDCWD, directory_name, AT_REMOVEDIR);
+    return valid && loop.coroutine_statistics().live == 0;
+}
+
 auto invalid_configuration_test() -> bool
 {
     event_loop loop;
@@ -343,10 +532,20 @@ auto invalid_configuration_test() -> bool
 
 auto main() -> int
 {
-    if (!parser_and_mime_tests() || !session_tests() ||
-        !listener_removal_test() || !redirect_listener_removal_test() ||
-        !invalid_configuration_test()) {
-        std::cerr << "HTTP tests failed\n";
+    const bool parser = parser_and_mime_tests();
+    const bool session = session_tests();
+    const bool listener = listener_removal_test();
+    const bool redirect = redirect_listener_removal_test();
+    const bool pipeline = pipelined_sendfile_test();
+    const bool capacity = concurrent_connection_capacity_test();
+    const bool configuration = invalid_configuration_test();
+    if (!parser || !session || !listener || !redirect || !pipeline ||
+        !capacity || !configuration) {
+        std::cerr << "HTTP tests failed: parser=" << parser
+                  << " session=" << session << " listener=" << listener
+                  << " redirect=" << redirect << " pipeline=" << pipeline
+                  << " capacity=" << capacity
+                  << " configuration=" << configuration << '\n';
         return 1;
     }
     return 0;

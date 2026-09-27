@@ -1,8 +1,10 @@
 #pragma once
 
 #include "eventloop/tcp_stream.h"
+#include "eventloop/task.h"
 #include "eventloop/tls_context.h"
 
+#include <expected>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -41,21 +43,51 @@ public:
                tls_server_options options = {});
     ~tls_stream() override;
 
-    auto write(std::span<const std::byte> data) -> void override;
     auto close() -> void override;
-    [[nodiscard]] auto ready() const noexcept -> bool override;
     [[nodiscard]] auto application_protocol() const -> std::string;
 
-protected:
-    auto on_transport_data(std::span<const std::byte> data) -> void override;
-    auto on_transport_close() -> void override;
-    auto on_transport_error(std::error_code error) -> void override;
+    // One read and one write may be pending together. A second operation in
+    // either direction returns EBUSY. Handshake and close require an idle stream.
+    [[nodiscard]] auto async_handshake()
+        -> task<std::expected<void, std::error_code>>;
+    [[nodiscard]] auto async_read_some(std::span<std::byte> buffer)
+        -> task<std::expected<std::size_t, std::error_code>>;
+    [[nodiscard]] auto async_write_some(std::span<const std::byte> buffer)
+        -> task<std::expected<std::size_t, std::error_code>>;
+    // Flushes close_notify. Close the transport after this task completes.
+    [[nodiscard]] auto async_close()
+        -> task<std::expected<void, std::error_code>>;
 
 private:
+    class flush_waiter;
+    auto release_flush() noexcept -> void;
+    [[nodiscard]] static auto handshake_task(event_loop& loop, tls_stream& self)
+        -> task<std::expected<void, std::error_code>>;
+    [[nodiscard]] static auto read_task(event_loop& loop, tls_stream& self,
+                                        std::span<std::byte> buffer)
+        -> task<std::expected<std::size_t, std::error_code>>;
+    [[nodiscard]] static auto write_task(event_loop& loop, tls_stream& self,
+                                         std::span<const std::byte> buffer)
+        -> task<std::expected<std::size_t, std::error_code>>;
+    [[nodiscard]] static auto flush_task(event_loop& loop, tls_stream& self)
+        -> task<std::expected<void, std::error_code>>;
+    [[nodiscard]] static auto close_task(event_loop& loop, tls_stream& self)
+        -> task<std::expected<void, std::error_code>>;
+    [[nodiscard]] auto activate_async_tls() noexcept
+        -> std::expected<void, std::error_code>;
+    [[nodiscard]] auto receive_encrypted(std::span<const std::byte> data) noexcept
+        -> std::error_code;
+    auto take_plaintext(std::span<std::byte> buffer) noexcept -> std::size_t;
+
     class implementation;
     std::unique_ptr<implementation> implementation_;
+    bool async_tls_mode_ {false};
+    bool exclusive_operation_active_ {false};
+    bool read_operation_active_ {false};
+    bool write_operation_active_ {false};
+    bool flush_active_ {false};
+    flush_waiter* flush_waiter_ {nullptr};
     bool closing_ {false};
-    bool close_emitted_ {false};
 };
 
 template<>

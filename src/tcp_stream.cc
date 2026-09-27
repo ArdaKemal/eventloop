@@ -1,25 +1,44 @@
 #include "eventloop/tcp_stream.h"
+#include "eventloop/task.h"
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
-#include <csignal>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
 #include <sys/sendfile.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace {
-constexpr std::size_t max_read_per_event = 64 * 1024;
-constexpr std::size_t max_pending_output = 64 * 1024;
-
-[[nodiscard]] auto sigpipe_ignored() noexcept -> bool
+[[nodiscard]] auto code(int error) noexcept -> std::error_code
 {
-    static const bool ignored = std::signal(SIGPIPE, SIG_IGN) != SIG_ERR;
-    return ignored;
+    return {error, std::generic_category()};
+}
+
+[[nodiscard]] auto transfer(int descriptor, void* buffer, std::size_t size,
+                            bool read) noexcept
+    -> std::expected<std::size_t, std::error_code>
+{
+    if (size == 0) return 0;
+    if (buffer == nullptr ||
+        size > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
+        return std::unexpected(code(EINVAL));
+    }
+    for (;;) {
+        const auto result = read
+            ? ::recv(descriptor, buffer, size, 0)
+            : ::send(descriptor, buffer, size, MSG_NOSIGNAL);
+        if (result >= 0) return static_cast<std::size_t>(result);
+        if (errno == EINTR) continue;
+        return std::unexpected(code(errno));
+    }
 }
 
 } // namespace
@@ -37,9 +56,35 @@ tcp_stream::tcp_stream(event_loop& loop, unique_fd descriptor)
     }
 }
 
+tcp_stream::tcp_stream(event_loop& loop, std::string_view address,
+                       std::uint16_t port)
+    : loop_(loop), port_(port), connected_(false),
+      transport_activated_(true)
+{
+    if (address.empty() || address.size() > 15 ||
+        address.find('\0') != std::string_view::npos) {
+        throw std::invalid_argument("invalid IPv4 address");
+    }
+    std::array<char, 16> address_text {};
+    std::memcpy(address_text.data(), address.data(), address.size());
+    in_addr parsed {};
+    if (::inet_pton(AF_INET, address_text.data(), &parsed) != 1) {
+        throw std::invalid_argument("invalid IPv4 address");
+    }
+    address_ = parsed.s_addr;
+    descriptor_.reset(::socket(AF_INET,
+                               SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+    if (!descriptor_) {
+        throw std::system_error(errno, std::system_category(), "socket");
+    }
+}
+
 tcp_stream::~tcp_stream()
 {
-    close_file();
+    if (connector_ != nullptr || reader_ != nullptr || writer_ != nullptr ||
+        file_writer_ != nullptr) {
+        std::terminate();
+    }
 }
 
 auto tcp_stream::descriptor() const noexcept -> int
@@ -47,184 +92,65 @@ auto tcp_stream::descriptor() const noexcept -> int
     return descriptor_.get();
 }
 
-auto tcp_stream::write(std::span<const std::byte> data) -> void
+auto tcp_stream::activate_async_transport() noexcept
+    -> std::expected<void, std::error_code>
 {
-    if (closing_ || closed_) {
-        throw std::logic_error("cannot write to a closing TCP stream");
+    if (transport_activated_) return {};
+    if (closed_) return std::unexpected(code(EBADF));
+    if (!connected_) return std::unexpected(code(ENOTCONN));
+    const int flags = ::fcntl(descriptor_.get(), F_GETFL);
+    if (flags == -1 || ::fcntl(descriptor_.get(), F_SETFL,
+                               flags | O_NONBLOCK) == -1) {
+        return std::unexpected(code(errno));
     }
-    if (file_descriptor_) {
-        throw std::logic_error("cannot write during a file transfer");
+    try {
+        set_async_interest(false, false);
+    } catch (const std::system_error& error) {
+        return std::unexpected(error.code());
     }
-    if (data.empty()) return;
-    if (data.size() > max_pending_output) {
-        throw std::length_error("TCP write buffer capacity exceeded");
-    }
-
-    if (output_.empty()) {
-        std::size_t offset = 0;
-        while (offset < data.size()) {
-            const auto size = send(descriptor_.get(), data.data() + offset,
-                                   data.size() - offset, MSG_NOSIGNAL);
-            if (size > 0) {
-                offset += static_cast<std::size_t>(size);
-                continue;
-            }
-            if (size == -1 && errno == EINTR) continue;
-            if (size == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-            on_transport_error({errno, std::system_category()});
-            return;
-        }
-        if (offset == data.size()) {
-            notify_write_drained();
-            return;
-        }
-        data = data.subspan(offset);
-    }
-
-    if (written_ != 0) {
-        const auto remaining = output_.size() - written_;
-        std::memmove(output_.data(), output_.data() + written_, remaining);
-        output_.resize(remaining);
-        written_ = 0;
-    }
-    if (data.size() > max_pending_output - output_.size()) {
-        throw std::length_error("TCP write buffer capacity exceeded");
-    }
-    output_.insert(output_.end(), data.begin(), data.end());
-    watch_writes(true);
-}
-
-auto tcp_stream::send_file(std::span<const std::byte> header, int descriptor,
-                           std::size_t size) -> void
-{
-    send_file(header, unique_fd(descriptor), size);
-}
-
-auto tcp_stream::send_file(std::span<const std::byte> header,
-                           unique_fd descriptor, std::size_t size) -> void
-{
-    if (!descriptor) {
-        throw std::invalid_argument("file transfer descriptor is invalid");
-    }
-    if (descriptor.get() == descriptor_.get() ||
-        (file_descriptor_ && descriptor.get() == file_descriptor_.get())) {
-        (void)descriptor.release();
-        throw std::invalid_argument("file transfer descriptor is already owned");
-    }
-    if (!sigpipe_ignored()) {
-        const int error = errno;
-        throw std::system_error(error, std::system_category(),
-                                "ignore SIGPIPE");
-    }
-    if (closing_ || closed_) {
-        throw std::logic_error("cannot start a file transfer while closing");
-    }
-    if (written_ < output_.size()) {
-        throw std::logic_error("cannot start a file transfer with pending bytes");
-    }
-    if (file_descriptor_) {
-        throw std::logic_error("cannot start a concurrent file transfer");
-    }
-    if (header.size() > max_pending_output) {
-        throw std::length_error("TCP write buffer capacity exceeded");
-    }
-
-    file_descriptor_ = std::move(descriptor);
-    file_remaining_ = size;
-
-    std::size_t offset = 0;
-    while (offset < header.size()) {
-        const auto sent = send(descriptor_.get(), header.data() + offset,
-                               header.size() - offset,
-                               MSG_NOSIGNAL | (size != 0 ? MSG_MORE : 0));
-        if (sent > 0) {
-            offset += static_cast<std::size_t>(sent);
-            continue;
-        }
-        if (sent == -1 && errno == EINTR) continue;
-        if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-        on_transport_error({errno, std::system_category()});
-        return;
-    }
-    if (offset != header.size()) {
-        try {
-            output_.assign(header.begin() + static_cast<std::ptrdiff_t>(offset),
-                           header.end());
-        } catch (...) {
-            close_file();
-            throw;
-        }
-        written_ = 0;
-        watch_writes(true);
-        return;
-    }
-    flush();
+    transport_activated_ = true;
+    return {};
 }
 
 auto tcp_stream::close() -> void
 {
-    if (closing_ || closed_) {
-        return;
-    }
-    closing_ = true;
-    if (!write_pending()) {
-        abort();
-    } else {
-        watch_writes(true);
-    }
-}
-
-auto tcp_stream::ready() const noexcept -> bool
-{
-    return !closing_ && !closed_;
-}
-
-auto tcp_stream::write_pending() const noexcept -> bool
-{
-    return written_ < output_.size() || static_cast<bool>(file_descriptor_);
+    fail_and_close(code(ECANCELED));
 }
 
 auto tcp_stream::on_read() -> void
 {
-    std::array<std::byte, 4096> buffer {};
-    std::size_t received = 0;
-    while (received < max_read_per_event) {
-        const auto size = recv(descriptor_.get(), buffer.data(), buffer.size(), 0);
-        if (size > 0) {
-            received += static_cast<std::size_t>(size);
-            try {
-                on_transport_data(
-                    std::span {buffer}.first(static_cast<std::size_t>(size)));
-            } catch (...) {
-                abort();
-                throw;
-            }
-            if (closing_ || closed_) {
-                return;
-            }
-            continue;
-        }
-        if (size == 0) {
-            if (!peer_closed_) {
-                peer_closed_ = true;
-                on_transport_close();
-            }
-            return;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return;
-        }
-        on_transport_error({errno, std::system_category()});
-        return;
-    }
+    if (reader_ == nullptr || closed_) return;
+    auto result = transfer(descriptor_.get(), reader_->data_, reader_->size_, true);
+    if (!result && result.error().value() == EAGAIN) return;
+    if (result) complete_read(*result, {});
+    else complete_read(0, result.error());
 }
 
 auto tcp_stream::on_write() -> void
 {
-    flush();
+    if (connector_ != nullptr && !closed_) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (::getsockopt(descriptor_.get(), SOL_SOCKET, SO_ERROR, &error,
+                         &length) == -1) error = errno;
+        if (error != 0) fail_and_close(code(error));
+        else {
+            connected_ = true;
+            complete_connect({});
+        }
+        return;
+    }
+    if (file_writer_ != nullptr && !closed_) {
+        const auto error = file_writer_->advance();
+        if (error.value() == EAGAIN) return;
+        complete_file(error);
+        return;
+    }
+    if (writer_ == nullptr || closed_) return;
+    auto result = transfer(descriptor_.get(), writer_->data_, writer_->size_, false);
+    if (!result && result.error().value() == EAGAIN) return;
+    if (result) complete_write(*result, {});
+    else complete_write(0, result.error());
 }
 
 auto tcp_stream::on_error() -> void
@@ -236,7 +162,7 @@ auto tcp_stream::on_error() -> void
     } else if (error == 0) {
         error = ECONNRESET;
     }
-    on_transport_error({error, std::system_category()});
+    fail_and_close(code(error));
 }
 
 auto tcp_stream::on_shutdown() -> void
@@ -244,132 +170,401 @@ auto tcp_stream::on_shutdown() -> void
     close();
 }
 
-auto tcp_stream::flush() -> void
+auto tcp_stream::fail_and_close(std::error_code error) -> void
 {
-    const bool had_output = write_pending();
-    while (written_ < output_.size()) {
-        const int flags = MSG_NOSIGNAL |
-            (file_descriptor_ && file_remaining_ != 0 ? MSG_MORE : 0);
-        const auto size = send(descriptor_.get(), output_.data() + written_,
-                               output_.size() - written_, flags);
-        if (size > 0) {
-            written_ += static_cast<std::size_t>(size);
-            continue;
-        }
-        if (size == -1 && errno == EINTR) {
-            continue;
-        }
-        if (size == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            watch_writes(true);
-            return;
-        }
-        on_transport_error({errno, std::system_category()});
-        return;
-    }
-
-    std::vector<std::byte> {}.swap(output_);
-    written_ = 0;
-
-    while (file_descriptor_ && file_remaining_ != 0) {
-        constexpr std::size_t maximum_send = 0x7ffff000;
-        const auto requested = std::min(file_remaining_, maximum_send);
-        const auto size = sendfile(descriptor_.get(), file_descriptor_.get(), nullptr,
-                                   requested);
-        if (size > 0) {
-            file_remaining_ -= static_cast<std::size_t>(size);
-            continue;
-        }
-        if (size == -1 && errno == EINTR) {
-            continue;
-        }
-        if (size == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            watch_writes(true);
-            return;
-        }
-        const int error = size == 0 ? EIO : errno;
-        on_transport_error({error, std::system_category()});
-        return;
-    }
-    close_file();
-
-    watch_writes(false);
-    if (peer_closed_ || closing_) {
-        abort();
-        return;
-    }
-    if (had_output) notify_write_drained();
+    event_loop::handler_call_scope scope(loop_);
+    if (closed_) return;
+    closed_ = true;
+    complete_connect(error);
+    complete_read(0, error);
+    complete_write(0, error);
+    complete_file(error);
+    loop_.remove(descriptor_.get());
 }
 
-auto tcp_stream::notify_write_drained() -> void
+auto tcp_stream::set_async_interest(bool read_enabled,
+                                    bool write_enabled) -> void
 {
-    event_loop::handler_call_scope callback_scope(loop_);
-    if (notifying_write_drained_) {
-        write_drained_deferred_ = true;
-        return;
-    }
-    do {
-        write_drained_deferred_ = false;
-        notifying_write_drained_ = true;
-        try {
-            on_write_drained();
-        } catch (...) {
-            notifying_write_drained_ = false;
-            abort();
-            throw;
-        }
-        notifying_write_drained_ = false;
-    } while (write_drained_deferred_ && !write_pending() && !closing_ && !closed_);
+    if (read_interest_enabled_ == read_enabled &&
+        write_interest_enabled_ == write_enabled) return;
+    loop_.set_io_interest(descriptor_.get(), read_enabled, write_enabled);
+    read_interest_enabled_ = read_enabled;
+    write_interest_enabled_ = write_enabled;
 }
 
-auto tcp_stream::on_transport_data(std::span<const std::byte> data) -> void
-{
-    emit_data(data);
-}
-
-auto tcp_stream::on_transport_close() -> void
-{
-    event_loop::handler_call_scope callback_scope(loop_);
-    try {
-        emit_close();
-    } catch (...) {
-        abort();
-        throw;
-    }
-    close();
-}
-
-auto tcp_stream::on_transport_error(std::error_code error) -> void
-{
-    event_loop::handler_call_scope callback_scope(loop_);
-    try {
-        emit_error(error);
-    } catch (...) {
-        abort();
-        throw;
-    }
-    abort();
-}
-
-auto tcp_stream::abort() -> void
+auto tcp_stream::update_async_interest() noexcept -> void
 {
     if (!closed_) {
-        closed_ = true;
-        closing_ = true;
-        close_file();
-        loop_.remove(descriptor_.get());
+        try {
+            set_async_interest(reader_ != nullptr,
+                connector_ != nullptr || writer_ != nullptr ||
+                    file_writer_ != nullptr);
+        } catch (...) {
+            std::terminate();
+        }
     }
 }
 
-auto tcp_stream::close_file() noexcept -> void
+auto tcp_stream::complete_connect(std::error_code error) noexcept
+    -> void
 {
-    file_descriptor_.reset();
-    file_remaining_ = 0;
+    event_loop::handler_call_scope scope(loop_);
+    auto* waiter = std::exchange(connector_, nullptr);
+    if (waiter == nullptr) return;
+    eventloop_detail::coroutine_frame_access::detach_cancellation(
+        waiter->cancellation_);
+    update_async_interest();
+    waiter->finish(error);
 }
 
-auto tcp_stream::watch_writes(bool enabled) -> void
+auto tcp_stream::complete_read(std::size_t size,
+                                          std::error_code error) noexcept -> void
 {
-    if (watching_writes_ != enabled) {
-        loop_.set_write_interest(descriptor_.get(), enabled);
-        watching_writes_ = enabled;
+    event_loop::handler_call_scope scope(loop_);
+    auto* waiter = std::exchange(reader_, nullptr);
+    if (waiter == nullptr) return;
+    eventloop_detail::coroutine_frame_access::detach_cancellation(
+        waiter->cancellation_);
+    waiter->finish(size, error);
+    // The continuation often starts another read before returning. Keep the
+    // existing read interest if it did, avoiding a disable/re-enable pair.
+    update_async_interest();
+}
+
+auto tcp_stream::complete_write(std::size_t size,
+                                           std::error_code error) noexcept -> void
+{
+    event_loop::handler_call_scope scope(loop_);
+    auto* waiter = std::exchange(writer_, nullptr);
+    if (waiter == nullptr) return;
+    eventloop_detail::coroutine_frame_access::detach_cancellation(
+        waiter->cancellation_);
+    update_async_interest();
+    waiter->finish(size, error);
+}
+
+auto tcp_stream::complete_file(std::error_code error) noexcept -> void
+{
+    event_loop::handler_call_scope scope(loop_);
+    auto* waiter = std::exchange(file_writer_, nullptr);
+    if (waiter == nullptr) return;
+    eventloop_detail::coroutine_frame_access::detach_cancellation(
+        waiter->cancellation_);
+    update_async_interest();
+    waiter->finish(error);
+}
+
+tcp_stream::connect_awaiter::connect_awaiter(
+    tcp_stream& owner) noexcept : owner_(owner)
+{
+    cancellation_.operation = this;
+    cancellation_.cancel = &cancel;
+}
+
+tcp_stream::connect_awaiter::~connect_awaiter()
+{
+    if (owner_.connector_ == this) std::terminate();
+}
+
+auto tcp_stream::connect_awaiter::suspend(
+    std::coroutine_handle<> handle,
+    eventloop_detail::coroutine_cancellation_state& state) -> bool
+{
+    if (owner_.closed_) {
+        error_ = code(EBADF);
+        return false;
     }
+    if (owner_.connected_) {
+        error_ = code(EISCONN);
+        return false;
+    }
+    if (owner_.connect_started_) {
+        error_ = code(EALREADY);
+        return false;
+    }
+    if (state.requested) {
+        error_ = code(ECANCELED);
+        return false;
+    }
+    owner_.connect_started_ = true;
+    sockaddr_in endpoint {};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = owner_.address_;
+    endpoint.sin_port = htons(owner_.port_);
+    const int result = ::connect(owner_.descriptor_.get(),
+                                 reinterpret_cast<const sockaddr*>(&endpoint),
+                                 sizeof(endpoint));
+    if (result == 0 || (result == -1 && errno == EISCONN)) {
+        owner_.connected_ = true;
+        return false;
+    }
+    if (errno != EINPROGRESS && errno != EINTR) {
+        error_ = code(errno);
+        return false;
+    }
+
+    continuation_ = handle;
+    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+            state, cancellation_)) {
+        error_ = code(ECANCELED);
+        return false;
+    }
+    owner_.connector_ = this;
+    try {
+        owner_.set_async_interest(false, true);
+    } catch (const std::system_error& error) {
+        owner_.connector_ = nullptr;
+        eventloop_detail::coroutine_frame_access::detach_cancellation(
+            cancellation_);
+        error_ = error.code();
+        return false;
+    }
+    return true;
+}
+
+auto tcp_stream::connect_awaiter::cancel(
+    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+{
+    auto& self = *static_cast<connect_awaiter*>(node.operation);
+    self.owner_.fail_and_close(code(ECANCELED));
+}
+
+auto tcp_stream::connect_awaiter::finish(
+    std::error_code error) noexcept -> void
+{
+    error_ = error;
+    continuation_.resume();
+}
+
+auto tcp_stream::connect_awaiter::await_resume() const noexcept
+    -> std::expected<void, std::error_code>
+{
+    if (error_) return std::unexpected(error_);
+    return {};
+}
+
+template<bool Read>
+tcp_stream::io_awaiter<Read>::io_awaiter(
+    tcp_stream& owner, void* data, std::size_t size) noexcept
+    : owner_(owner), data_(data), size_(size)
+{
+    cancellation_.operation = this;
+    cancellation_.cancel = &cancel;
+}
+
+template<bool Read>
+tcp_stream::io_awaiter<Read>::~io_awaiter()
+{
+    if constexpr (Read) {
+        if (owner_.reader_ == this) std::terminate();
+    } else {
+        if (owner_.writer_ == this) std::terminate();
+    }
+}
+
+template<bool Read>
+auto tcp_stream::io_awaiter<Read>::suspend(
+    std::coroutine_handle<> handle,
+    eventloop_detail::coroutine_cancellation_state& state) -> bool
+{
+    if (auto activated = owner_.activate_async_transport(); !activated) {
+        error_ = activated.error();
+        return false;
+    }
+    if (owner_.closed_) {
+        error_ = code(EBADF);
+        return false;
+    }
+    if (!owner_.connected_) {
+        error_ = code(ENOTCONN);
+        return false;
+    }
+    if constexpr (Read) {
+        if (owner_.reader_ != nullptr) {
+            error_ = code(EBUSY);
+            return false;
+        }
+    } else {
+        if (owner_.writer_ != nullptr || owner_.file_writer_ != nullptr) {
+            error_ = code(EBUSY);
+            return false;
+        }
+    }
+    if (state.requested) {
+        error_ = code(ECANCELED);
+        return false;
+    }
+    auto result = transfer(owner_.descriptor_.get(), data_, size_, Read);
+    if (result) {
+        transferred_ = *result;
+        return false;
+    }
+    if (result.error().value() != EAGAIN) {
+        error_ = result.error();
+        return false;
+    }
+    continuation_ = handle;
+    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+            state, cancellation_)) {
+        error_ = code(ECANCELED);
+        return false;
+    }
+    if constexpr (Read) owner_.reader_ = this;
+    else owner_.writer_ = this;
+    try {
+        owner_.set_async_interest(owner_.reader_ != nullptr,
+                                  owner_.writer_ != nullptr);
+    } catch (const std::system_error& error) {
+        if constexpr (Read) owner_.reader_ = nullptr;
+        else owner_.writer_ = nullptr;
+        eventloop_detail::coroutine_frame_access::detach_cancellation(
+            cancellation_);
+        error_ = error.code();
+        return false;
+    }
+    return true;
+}
+
+template<bool Read>
+auto tcp_stream::io_awaiter<Read>::cancel(
+    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+{
+    auto& self = *static_cast<io_awaiter*>(node.operation);
+    if constexpr (Read) self.owner_.complete_read(0, code(ECANCELED));
+    else self.owner_.complete_write(0, code(ECANCELED));
+}
+
+template<bool Read>
+auto tcp_stream::io_awaiter<Read>::finish(
+    std::size_t size, std::error_code error) noexcept -> void
+{
+    transferred_ = size;
+    error_ = error;
+    continuation_.resume();
+}
+
+template<bool Read>
+auto tcp_stream::io_awaiter<Read>::await_resume() const noexcept
+    -> std::expected<std::size_t, std::error_code>
+{
+    if (error_) return std::unexpected(error_);
+    return transferred_;
+}
+
+template class tcp_stream::io_awaiter<true>;
+template class tcp_stream::io_awaiter<false>;
+
+tcp_stream::file_awaiter::file_awaiter(tcp_stream& owner, unique_fd file,
+                                       std::size_t size) noexcept
+    : owner_(owner), file_(std::move(file)), remaining_(size)
+{
+    cancellation_.operation = this;
+    cancellation_.cancel = &cancel;
+}
+
+tcp_stream::file_awaiter::~file_awaiter()
+{
+    if (owner_.file_writer_ == this) std::terminate();
+}
+
+auto tcp_stream::file_awaiter::advance() noexcept -> std::error_code
+{
+    while (remaining_ != 0) {
+        const auto requested = std::min(remaining_, std::size_t {0x7ffff000});
+        const auto result = ::sendfile(owner_.descriptor_.get(), file_.get(),
+                                       nullptr, requested);
+        if (result > 0) {
+            remaining_ -= static_cast<std::size_t>(result);
+            continue;
+        }
+        if (result == 0) return code(EIO);
+        if (errno == EINTR) continue;
+        return code(errno);
+    }
+    return {};
+}
+
+auto tcp_stream::file_awaiter::suspend(
+    std::coroutine_handle<> handle,
+    eventloop_detail::coroutine_cancellation_state& state) -> bool
+{
+    if (auto activated = owner_.activate_async_transport(); !activated) {
+        error_ = activated.error();
+        return false;
+    }
+    if (owner_.closed_ || !file_) {
+        error_ = code(EBADF);
+        return false;
+    }
+    if (owner_.writer_ != nullptr || owner_.file_writer_ != nullptr) {
+        error_ = code(EBUSY);
+        return false;
+    }
+    if (state.requested) {
+        error_ = code(ECANCELED);
+        return false;
+    }
+    error_ = advance();
+    if (error_.value() != EAGAIN) return false;
+    continuation_ = handle;
+    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+            state, cancellation_)) {
+        error_ = code(ECANCELED);
+        return false;
+    }
+    owner_.file_writer_ = this;
+    try {
+        owner_.set_async_interest(owner_.reader_ != nullptr, true);
+    } catch (const std::system_error& error) {
+        owner_.file_writer_ = nullptr;
+        eventloop_detail::coroutine_frame_access::detach_cancellation(
+            cancellation_);
+        error_ = error.code();
+        return false;
+    }
+    return true;
+}
+
+auto tcp_stream::file_awaiter::cancel(
+    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+{
+    auto& self = *static_cast<file_awaiter*>(node.operation);
+    self.owner_.complete_file(code(ECANCELED));
+}
+
+auto tcp_stream::file_awaiter::finish(std::error_code error) noexcept -> void
+{
+    error_ = error;
+    continuation_.resume();
+}
+
+auto tcp_stream::file_awaiter::await_resume() const noexcept
+    -> std::expected<void, std::error_code>
+{
+    if (error_) return std::unexpected(error_);
+    return {};
+}
+
+namespace {
+[[nodiscard]] auto send_file_task(event_loop& loop, tcp_stream& socket,
+                                  std::span<const std::byte> header,
+                                  unique_fd file, std::size_t size)
+    -> task<std::expected<void, std::error_code>>
+{
+    (void)loop;
+    while (!header.empty()) {
+        auto sent = co_await socket.async_write_some(header);
+        if (!sent) co_return std::unexpected(sent.error());
+        if (*sent == 0) co_return std::unexpected(code(EIO));
+        header = header.subspan(*sent);
+    }
+    co_return co_await tcp_stream::file_awaiter(socket, std::move(file), size);
+}
+} // namespace
+
+auto tcp_stream::async_send_file(std::span<const std::byte> header,
+                                  unique_fd file, std::size_t size)
+    -> task<std::expected<void, std::error_code>>
+{
+    return send_file_task(loop_, *this, header, std::move(file), size);
 }

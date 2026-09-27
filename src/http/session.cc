@@ -2,7 +2,6 @@
 
 #include "eventloop/http/directory_listing.h"
 #include "eventloop/http/mime_types.h"
-#include "eventloop/tcp_stream.h"
 
 #include <algorithm>
 #include <array>
@@ -45,7 +44,6 @@ constexpr std::string_view options_response =
     "HTTP/1.1 204 No Content\r\nAllow: GET, HEAD, OPTIONS\r\nContent-Length: 0\r\n\r\n";
 constexpr std::size_t buffer_size = 4096;
 constexpr std::size_t sendfile_min_size = 11 * 1024;
-constexpr std::size_t write_size = 16 * 1024;
 
 [[nodiscard]] constexpr auto hex_value(char value) noexcept -> int
 {
@@ -117,18 +115,16 @@ auto read_file(int descriptor, std::span<std::byte> output) noexcept -> bool
 
 } // namespace
 
-session::session(byte_stream& stream, int root_descriptor,
-                 bool directory_listing, tcp_stream* file_stream) noexcept
-    : stream_(stream), file_stream_(file_stream), root_descriptor_(root_descriptor),
-      directory_listing_(directory_listing)
+session::session(int root_descriptor, bool directory_listing) noexcept
+    : root_descriptor_(root_descriptor), directory_listing_(directory_listing)
 {
 }
 
 auto session::receive(std::span<const std::byte> data) -> void
 {
-    if (data.empty()) return;
+    if (data.empty() || closed_) return;
     if (data.size() > input_.size() - input_size_) {
-        if (responding_) stream_.close();
+        if (responding_) closed_ = true;
         else send_error(parse_status::payload_too_large);
         return;
     }
@@ -138,32 +134,26 @@ auto session::receive(std::span<const std::byte> data) -> void
     if (!responding_) process_requests();
 }
 
-auto session::write_drained() -> void
+auto session::commit_read(std::size_t size) -> void
 {
-    if (!responding_) return;
-    if (output_ && output_offset_ < output_size_) write_next();
-    else finish_response();
-}
-
-auto session::closed() -> void
-{
-    responding_ = false;
-    output_.reset();
-    output_size_ = 0;
-    output_offset_ = 0;
-}
-
-auto session::failed(std::error_code) -> void
-{
-    closed();
+    if (size > input_.size() - input_size_) {
+        closed_ = true;
+        return;
+    }
+    input_size_ += size;
+    if (!responding_) process_requests();
 }
 
 auto session::shutdown() -> void
 {
     close_after_response_ = true;
-    if (!responding_) {
-        stream_.close();
-    }
+    if (!responding_) closed_ = true;
+}
+
+auto session::response() const noexcept -> std::span<const char>
+{
+    if (!responding_ || !output_) return {};
+    return {output_.get(), output_size_};
 }
 
 auto session::process_requests() -> void
@@ -300,12 +290,10 @@ auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
     }
 
     const auto response_size = header_length + body_size;
-    if (!headers_only && file_stream_ != nullptr &&
-        body_size >= sendfile_min_size) {
-        responding_ = true;
-        file_stream_->send_file(
-            std::as_bytes(std::span {header}.first(header_length)),
-            std::move(descriptor), body_size);
+    if (!headers_only && body_size >= sendfile_min_size) {
+        send_response(std::span {header}.first(header_length));
+        file_ = std::move(descriptor);
+        file_size_ = body_size;
         return;
     }
 
@@ -457,32 +445,41 @@ auto session::send_response(std::string_view response) -> void
 
 auto session::send_response(std::span<const char> response) -> void
 {
+    if (response.empty()) {
+        output_.reset();
+        output_capacity_ = 0;
+        output_size_ = 0;
+        responding_ = true;
+        return;
+    }
+
+    if (!output_ || output_capacity_ < response.size()) {
+        auto storage = std::make_unique_for_overwrite<char[]>(response.size());
+        std::memcpy(storage.get(), response.data(), response.size());
+        output_ = std::move(storage);
+        output_capacity_ = response.size();
+    } else {
+        std::memmove(output_.get(), response.data(), response.size());
+    }
+    output_size_ = response.size();
     responding_ = true;
-    stream_.write(std::as_bytes(response));
 }
 
 auto session::start_large_response() -> void
 {
     responding_ = true;
-    write_next();
-}
-
-auto session::write_next() -> void
-{
-    const auto size = std::min(write_size, output_size_ - output_offset_);
-    const auto chunk = std::span {output_.get() + output_offset_, size};
-    output_offset_ += size;
-    stream_.write(std::as_bytes(chunk));
 }
 
 auto session::finish_response() -> void
 {
     responding_ = false;
     output_.reset();
+    output_capacity_ = 0;
     output_size_ = 0;
-    output_offset_ = 0;
+    file_.reset();
+    file_size_ = 0;
     if (close_after_response_) {
-        stream_.close();
+        closed_ = true;
         return;
     }
 
@@ -544,8 +541,8 @@ auto session::prepare_path(std::string_view target, std::span<char> output,
 auto session::allocate_response(std::size_t size) -> std::span<char>
 {
     output_ = std::make_unique_for_overwrite<char[]>(size);
+    output_capacity_ = size;
     output_size_ = size;
-    output_offset_ = 0;
     return {output_.get(), size};
 }
 

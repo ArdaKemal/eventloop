@@ -1,16 +1,18 @@
 #include "eventloop/event_loop.h"
+#include "eventloop/task.h"
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <iostream>
 #include <memory>
 #include <span>
 #include <stdexcept>
-#include <string>
+#include <string_view>
 #include <system_error>
 
 #include <arpa/inet.h>
@@ -36,311 +38,326 @@ auto make_nonblocking(int descriptor) -> void
 }
 
 struct connected_pair {
-    int client;
-    int server;
+    unique_fd client;
+    unique_fd server;
 };
 
 [[nodiscard]] auto connect_loopback() -> connected_pair
 {
-    const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (listener == -1) {
-        throw system_error("socket");
-    }
+    unique_fd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (!listener) throw system_error("socket");
 
     sockaddr_in address {};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    try {
-        if (bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == -1 ||
-            listen(listener, 1) == -1) {
-            throw system_error("bind/listen");
-        }
-
-        socklen_t address_size = sizeof(address);
-        if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size) == -1) {
-            throw system_error("getsockname");
-        }
-
-        const int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (client == -1) {
-            throw system_error("socket");
-        }
-        if (connect(client, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == -1) {
-            const auto error = system_error("connect");
-            ::close(client);
-            throw error;
-        }
-
-        const int server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (server == -1) {
-            const auto error = system_error("accept4");
-            ::close(client);
-            throw error;
-        }
-        make_nonblocking(client);
-        ::close(listener);
-        return {.client = client, .server = server};
-    } catch (...) {
-        ::close(listener);
-        throw;
+    if (bind(listener.get(), reinterpret_cast<const sockaddr*>(&address),
+             sizeof(address)) == -1 || listen(listener.get(), 1) == -1) {
+        throw system_error("bind/listen");
     }
+    socklen_t address_size = sizeof(address);
+    if (getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address),
+                    &address_size) == -1) {
+        throw system_error("getsockname");
+    }
+    unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (!client) throw system_error("socket");
+    if (connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
+                sizeof(address)) == -1) {
+        throw system_error("connect");
+    }
+    unique_fd server(accept4(listener.get(), nullptr, nullptr,
+                             SOCK_NONBLOCK | SOCK_CLOEXEC));
+    if (!server) throw system_error("accept4");
+    make_nonblocking(client.get());
+    return {std::move(client), std::move(server)};
 }
 
-class echo_server_stream final : public tls_stream {
-public:
-    echo_server_stream(event_loop& loop, int descriptor,
-                       std::shared_ptr<tls_context> context, bool& clean_close)
-        : tls_stream(loop, descriptor, std::move(context),
-                     tls_server_options {.application_protocols = {"echo"}}),
-          loop_(loop), clean_close_(clean_close)
+struct result_state {
+    event_loop& loop;
+    int completed {0};
+    bool server_ok {false};
+    bool client_ok {false};
+    bool server_ready {false};
+    std::size_t write_count {0};
+
+    auto finish() -> void
     {
+        if (++completed == 2) loop.stop();
     }
-
-private:
-    auto on_data(std::span<const std::byte> data) -> void override { write(data); }
-
-    auto on_close() -> void override
-    {
-        clean_close_ = true;
-        loop_.stop();
-    }
-
-    auto on_error(std::error_code error) -> void override
-    {
-        std::cerr << "TLS server error: " << error.message() << '\n';
-        loop_.stop();
-    }
-
-    event_loop& loop_;
-    bool& clean_close_;
 };
 
-class client_stream final : public tls_stream {
-public:
-    client_stream(event_loop& loop, int descriptor,
-                  std::shared_ptr<tls_context> context, bool& passed)
-        : tls_stream(loop, descriptor, std::move(context),
-                     tls_client_options {
-                         .hostname = "localhost",
-                         .application_protocols = {"echo"},
-                     }),
-          loop_(loop), passed_(passed)
-    {
-    }
+struct stream_pair {
+    tls_stream* server;
+    tls_stream* client;
+};
 
-private:
-    auto on_ready() -> void override
-    {
-        if (application_protocol() != "echo") {
-            loop_.stop();
-            return;
-        }
-        write(std::as_bytes(std::span {message}));
-    }
-
-    auto on_data(std::span<const std::byte> data) -> void override
-    {
-        received_.append(reinterpret_cast<const char*>(data.data()), data.size());
-        if (received_.size() >= message.size()) {
-            passed_ = received_ == message;
-            close();
+[[nodiscard]] auto add_streams(event_loop& loop,
+                               const std::filesystem::path& certificate,
+                               const std::filesystem::path& key,
+                               const std::filesystem::path& trusted_ca,
+                               std::string_view hostname = "localhost",
+                               bool small_send_buffer = false) -> stream_pair
+{
+    auto sockets = connect_loopback();
+    if (small_send_buffer) {
+        const int size = 4096;
+        if (setsockopt(sockets.client.get(), SOL_SOCKET, SO_SNDBUF,
+                       &size, sizeof(size)) == -1) {
+            throw system_error("setsockopt");
         }
     }
+    auto server = std::make_unique<tls_stream>(
+        loop, std::move(sockets.server), tls_context::make_server(certificate, key),
+        tls_server_options {.application_protocols = {"echo"}});
+    auto client = std::make_unique<tls_stream>(
+        loop, std::move(sockets.client), tls_context::make_client(trusted_ca),
+        tls_client_options {.hostname = std::string(hostname),
+                            .application_protocols = {"echo"}});
+    stream_pair pair {server.get(), client.get()};
+    loop.add(std::move(server));
+    loop.add(std::move(client));
+    return pair;
+}
 
-    auto on_error(std::error_code error) -> void override
-    {
-        std::cerr << "TLS client error: " << error.message() << '\n';
-        loop_.stop();
-    }
-
-    event_loop& loop_;
-    bool& passed_;
-    std::string received_;
-};
-
-class passive_server_stream final : public tls_stream {
-public:
-    using tls_stream::tls_stream;
-
-private:
-    auto on_data(std::span<const std::byte>) -> void override {}
-};
-
-class saturating_client_stream final : public tls_stream {
-public:
-    saturating_client_stream(event_loop& loop, unique_fd descriptor,
-                             std::shared_ptr<tls_context> context,
-                             bool& saturated, bool& retired)
-        : tls_stream(loop, std::move(descriptor), std::move(context),
-                     tls_client_options {
-                         .hostname = "localhost",
-                         .application_protocols = {},
-                     }),
-          loop_(loop), saturated_(saturated), retired_(retired)
-    {
-    }
-
-private:
-    auto on_ready() -> void override
-    {
-        constexpr std::array<std::byte, 8192> payload {};
-        try {
-            for (int index = 0; index < 4096; ++index) write(payload);
-        } catch (const std::length_error&) {
-            saturated_ = true;
-            retired_ = !ready();
+[[nodiscard]] auto echo_server(event_loop& loop, tls_stream& stream,
+                               result_state& result) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    std::array<std::byte, 64> buffer {};
+    if (handshake && *handshake) {
+        auto received = co_await stream.async_read_some(buffer);
+        if (received && *received && **received == message.size() &&
+            std::string_view(reinterpret_cast<const char*>(buffer.data()),
+                             **received) == message) {
+            auto written = co_await stream.async_write_some(
+                std::span<const std::byte>(buffer).first(**received));
+            if (written && *written && **written == **received) {
+                auto closed = co_await stream.async_close();
+                result.server_ok = closed && *closed;
+            }
         }
-        loop_.stop();
     }
-
-    auto on_data(std::span<const std::byte>) -> void override {}
-    auto on_error(std::error_code) -> void override { loop_.stop(); }
-
-    event_loop& loop_;
-    bool& saturated_;
-    bool& retired_;
-};
-
-class rejecting_client_stream final : public tls_stream {
-public:
-    rejecting_client_stream(event_loop& loop, int descriptor,
-                            std::shared_ptr<tls_context> context, bool& rejected)
-        : tls_stream(loop, descriptor, std::move(context),
-                     tls_client_options {
-                         .hostname = "wrong.example",
-                         .application_protocols = {},
-                     }),
-          loop_(loop), rejected_(rejected)
-    {
-    }
-
-private:
-    auto on_ready() -> void override { loop_.stop(); }
-    auto on_data(std::span<const std::byte>) -> void override {}
-    auto on_error(std::error_code) -> void override
-    {
-        rejected_ = true;
-        loop_.stop();
-    }
-
-    event_loop& loop_;
-    bool& rejected_;
-};
-
-class truncation_server_stream final : public tls_stream {
-public:
-    truncation_server_stream(event_loop& loop, int descriptor,
-                             std::shared_ptr<tls_context> context, bool& detected)
-        : tls_stream(loop, descriptor, std::move(context)),
-          loop_(loop), detected_(detected)
-    {
-    }
-
-private:
-    auto on_data(std::span<const std::byte>) -> void override {}
-    auto on_error(std::error_code error) -> void override
-    {
-        detected_ = error == make_error_code(tls_errc::truncated);
-        loop_.stop();
-    }
-
-    event_loop& loop_;
-    bool& detected_;
-};
-
-class truncating_client_stream final : public tls_stream {
-public:
-    using tls_stream::tls_stream;
-
-private:
-    auto on_ready() -> void override { abort(); }
-    auto on_data(std::span<const std::byte>) -> void override {}
-};
-
-[[nodiscard]] auto test_echo_and_close(const std::filesystem::path& certificate,
-                                       const std::filesystem::path& key) -> bool
-{
-    auto sockets = connect_loopback();
-    event_loop loop;
-    bool echoed = false;
-    bool clean_close = false;
-    loop.add(std::make_unique<echo_server_stream>(
-        loop, sockets.server, tls_context::make_server(certificate, key), clean_close));
-    loop.add(std::make_unique<client_stream>(
-        loop, sockets.client, tls_context::make_client(certificate), echoed));
-    loop.run();
-    return echoed && clean_close;
+    stream.close();
+    result.finish();
 }
 
-[[nodiscard]] auto test_hostname_rejection(const std::filesystem::path& certificate,
-                                           const std::filesystem::path& key) -> bool
+[[nodiscard]] auto echo_client(event_loop& loop, tls_stream& stream,
+                               result_state& result) -> task<void>
 {
-    auto sockets = connect_loopback();
-    event_loop loop;
-    bool rejected = false;
-    loop.add(std::make_unique<passive_server_stream>(
-        loop, sockets.server, tls_context::make_server(certificate, key)));
-    loop.add(std::make_unique<rejecting_client_stream>(
-        loop, sockets.client, tls_context::make_client(certificate), rejected));
-    loop.run();
-    return rejected;
-}
-
-[[nodiscard]] auto test_saturated_tls_write(const std::filesystem::path& certificate,
-                                            const std::filesystem::path& key) -> bool
-{
-    auto sockets = connect_loopback();
-    unique_fd client(sockets.client);
-    unique_fd server(sockets.server);
-    const int buffer_size = 4096;
-    if (setsockopt(client.get(), SOL_SOCKET, SO_SNDBUF, &buffer_size,
-                   sizeof(buffer_size)) == -1) {
-        return false;
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    std::array<std::byte, 64> buffer {};
+    if (handshake && *handshake && stream.application_protocol() == "echo") {
+        auto written = co_await stream.async_write_some(
+            std::as_bytes(std::span {message}));
+        if (written && *written && **written == message.size()) {
+            auto received = co_await stream.async_read_some(buffer);
+            if (received && *received && **received == message.size() &&
+                std::string_view(reinterpret_cast<const char*>(buffer.data()),
+                                 **received) == message) {
+                auto eof = co_await stream.async_read_some(buffer);
+                result.client_ok = eof && *eof && **eof == 0;
+            }
+        }
     }
-    event_loop loop;
-    bool saturated = false;
-    bool retired = false;
-    loop.add(std::make_unique<passive_server_stream>(
-        loop, std::move(server), tls_context::make_server(certificate, key)));
-    loop.add(std::make_unique<saturating_client_stream>(
-        loop, std::move(client), tls_context::make_client(certificate), saturated,
-        retired));
-    loop.run();
-    return saturated && retired;
+    stream.close();
+    result.finish();
 }
 
-[[nodiscard]] auto test_truncation(const std::filesystem::path& certificate,
-                                   const std::filesystem::path& key) -> bool
+[[nodiscard]] auto rejection_server(event_loop& loop, tls_stream& stream,
+                                    result_state& result) -> task<void>
 {
-    auto sockets = connect_loopback();
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    if (handshake && *handshake) {
+        std::array<std::byte, 1> buffer {};
+        auto received = co_await stream.async_read_some(buffer);
+        result.server_ok = received && !*received;
+    } else {
+        result.server_ok = handshake && !*handshake;
+    }
+    stream.close();
+    result.finish();
+}
+
+[[nodiscard]] auto rejection_client(event_loop& loop, tls_stream& stream,
+                                    result_state& result) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    result.client_ok = handshake && !*handshake &&
+                       handshake->error().category() == tls_error_category();
+    stream.close();
+    result.finish();
+}
+
+[[nodiscard]] auto truncation_server(event_loop& loop, tls_stream& stream,
+                                     result_state& result) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    if (handshake && *handshake) {
+        std::array<std::byte, 1> buffer {};
+        auto received = co_await stream.async_read_some(buffer);
+        result.server_ok = received && !*received &&
+                           received->error() == make_error_code(tls_errc::truncated);
+    }
+    stream.close();
+    result.finish();
+}
+
+[[nodiscard]] auto truncation_client(event_loop& loop, tls_stream& stream,
+                                     result_state& result) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    result.client_ok = handshake && *handshake;
+    stream.close(); // Abrupt transport close without TLS close_notify.
+    result.finish();
+}
+
+[[nodiscard]] auto blocked_write_server(event_loop& loop, tls_stream& stream,
+                                        tls_stream& client,
+                                        result_state& result) -> task<void>
+{
+    auto handshake = co_await stream.async_handshake();
+    if (handshake && *handshake) {
+        (void)co_await sleep_for(loop, std::chrono::milliseconds {100});
+        result.server_ok = result.write_count != 0;
+    }
+    client.close();
+    result.finish();
+}
+
+[[nodiscard]] auto blocked_write_client(event_loop& loop, tls_stream& stream,
+                                        result_state& result) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    if (handshake && *handshake) {
+        static constexpr std::array<std::byte, 4096> bytes {};
+        for (;;) {
+            auto written = co_await stream.async_write_some(bytes);
+            if (!written) break;
+            if (!*written) {
+                result.client_ok = result.write_count != 0 &&
+                                   written->error().value() == ECANCELED;
+                break;
+            }
+            ++result.write_count;
+        }
+    }
+    stream.close();
+    result.finish();
+}
+
+[[nodiscard]] auto busy_server(event_loop& loop, tls_stream& stream,
+                               result_state& result) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    result.server_ready = true;
+    if (handshake && *handshake) {
+        std::array<std::byte, 1> buffer {};
+        auto received = co_await stream.async_read_some(buffer);
+        result.server_ok = received && *received && **received == 1;
+    }
+    stream.close();
+    result.finish();
+}
+
+[[nodiscard]] auto busy_client(event_loop& loop, tls_stream& stream,
+                               tls_stream& server, result_state& result)
+    -> task<void>
+{
+    auto handshake = co_await stream.async_handshake();
+    if (handshake && *handshake) {
+        while (!result.server_ready) (void)co_await yield(loop);
+        (void)co_await yield(loop);
+        constexpr std::array<std::byte, 1> byte {};
+        std::array<std::byte, 1> duplicate_buffer {};
+        auto busy = co_await server.async_read_some(duplicate_buffer);
+        auto close_busy = co_await server.async_close();
+        auto sent = co_await server.async_write_some(byte);
+        std::array<std::byte, 1> response {};
+        auto received = co_await stream.async_read_some(response);
+        auto replied = co_await stream.async_write_some(byte);
+        result.client_ok = busy && !*busy && busy->error().value() == EBUSY &&
+                           close_busy && !*close_busy &&
+                           close_busy->error().value() == EBUSY &&
+                           sent && *sent && **sent == 1 &&
+                           received && *received && **received == 1 &&
+                           replied && *replied && **replied == 1;
+    }
+    stream.close();
+    result.finish();
+}
+
+[[nodiscard]] auto run_case(const std::filesystem::path& certificate,
+                            const std::filesystem::path& key,
+                            const std::filesystem::path& trusted_ca,
+                            int which) -> bool
+{
     event_loop loop;
-    bool detected = false;
-    loop.add(std::make_unique<truncation_server_stream>(
-        loop, sockets.server, tls_context::make_server(certificate, key), detected));
-    loop.add(std::make_unique<truncating_client_stream>(
-        loop, sockets.client, tls_context::make_client(certificate),
-        tls_client_options {
-            .hostname = "localhost",
-            .application_protocols = {},
-        }));
+    result_state result {loop};
+    auto streams = add_streams(loop, certificate, key, trusted_ca,
+                               which == 1 ? "wrong.example" : "localhost",
+                               which == 3);
+    task<void> server;
+    task<void> client;
+    switch (which) {
+    case 0:
+        server = echo_server(loop, *streams.server, result);
+        client = echo_client(loop, *streams.client, result);
+        break;
+    case 1:
+        server = rejection_server(loop, *streams.server, result);
+        client = rejection_client(loop, *streams.client, result);
+        break;
+    case 3:
+        server = blocked_write_server(loop, *streams.server, *streams.client,
+                                      result);
+        client = blocked_write_client(loop, *streams.client, result);
+        break;
+    case 4:
+        server = busy_server(loop, *streams.server, result);
+        client = busy_client(loop, *streams.client, *streams.server, result);
+        break;
+    default:
+        server = truncation_server(loop, *streams.server, result);
+        client = truncation_client(loop, *streams.client, result);
+        break;
+    }
+    if (server.state() == task_state::frame_allocation_failure ||
+        client.state() == task_state::frame_allocation_failure) {
+        throw std::runtime_error("cannot allocate TLS loopback tasks");
+    }
+    if (loop.spawn(std::move(server)) != task_spawn_result::accepted ||
+        loop.spawn(std::move(client)) != task_spawn_result::accepted) {
+        throw std::runtime_error("cannot start TLS loopback tasks");
+    }
     loop.run();
-    return detected;
+    if (!result.server_ok || !result.client_ok) {
+        std::cerr << "TLS case " << which << " failed: server=" << result.server_ok
+                  << " client=" << result.client_ok << '\n';
+    }
+    return result.server_ok && result.client_ok;
 }
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
 {
-    if (argc != 3) {
-        return 2;
-    }
-
+    if (argc != 4) return 2;
     try {
         const std::filesystem::path certificate = argv[1];
         const std::filesystem::path key = argv[2];
-        const bool passed = test_echo_and_close(certificate, key) &&
-                            test_saturated_tls_write(certificate, key) &&
-                            test_hostname_rejection(certificate, key) &&
-                            test_truncation(certificate, key);
+        const std::filesystem::path trusted_ca = argv[3];
+        const bool passed = run_case(certificate, key, trusted_ca, 0) &&
+                            run_case(certificate, key, trusted_ca, 1) &&
+                            run_case(certificate, key, trusted_ca, 2) &&
+                            run_case(certificate, key, trusted_ca, 3) &&
+                            run_case(certificate, key, trusted_ca, 4);
         return passed ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

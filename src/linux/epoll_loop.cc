@@ -74,17 +74,17 @@ epoll_loop::epoll_loop()
         CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
     if (!timer_descriptor_) throw system_error("timerfd_create");
 
-    update_descriptor(signal_descriptor_.get(), false, EPOLL_CTL_ADD);
-    update_descriptor(stop_descriptor_.get(), false, EPOLL_CTL_ADD);
-    update_descriptor(wake_descriptor_.get(), false, EPOLL_CTL_ADD);
-    update_descriptor(timer_descriptor_.get(), false, EPOLL_CTL_ADD);
+    update_descriptor(signal_descriptor_.get(), true, false, EPOLL_CTL_ADD);
+    update_descriptor(stop_descriptor_.get(), true, false, EPOLL_CTL_ADD);
+    update_descriptor(wake_descriptor_.get(), true, false, EPOLL_CTL_ADD);
+    update_descriptor(timer_descriptor_.get(), true, false, EPOLL_CTL_ADD);
 }
 
 epoll_loop::~epoll_loop() = default;
 
-auto epoll_loop::add_descriptor(int descriptor) -> void
+auto epoll_loop::add_descriptor(int descriptor, bool read_enabled) -> void
 {
-    update_descriptor(descriptor, false, EPOLL_CTL_ADD);
+    update_descriptor(descriptor, read_enabled, false, EPOLL_CTL_ADD);
 }
 
 auto epoll_loop::remove_descriptor(int descriptor) -> void
@@ -95,9 +95,15 @@ auto epoll_loop::remove_descriptor(int descriptor) -> void
     }
 }
 
+auto epoll_loop::set_io_interest(int descriptor, bool read_enabled,
+                                bool write_enabled) -> void
+{
+    update_descriptor(descriptor, read_enabled, write_enabled, EPOLL_CTL_MOD);
+}
+
 auto epoll_loop::set_write_interest(int descriptor, bool enabled) -> void
 {
-    update_descriptor(descriptor, enabled, EPOLL_CTL_MOD);
+    set_io_interest(descriptor, true, enabled);
 }
 
 auto epoll_loop::request_stop() -> void
@@ -203,10 +209,12 @@ auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
             .timer_requested = timer_requested};
 }
 
-auto epoll_loop::update_descriptor(int descriptor, bool write_enabled, int operation) -> void
+auto epoll_loop::update_descriptor(int descriptor, bool read_enabled,
+                                   bool write_enabled, int operation) -> void
 {
     epoll_event event {};
-    event.events = EPOLLIN | EPOLLRDHUP;
+    event.events = 0;
+    if (read_enabled) event.events |= EPOLLIN | EPOLLRDHUP;
     if (write_enabled) {
         event.events |= EPOLLOUT;
     }

@@ -8,15 +8,20 @@ Scope: the experimental coroutine file I/O slice and the subsequent ownership,
 error-path, bounded-resource, and performance review. The work spans 35 commits
 from `23108ee` through `01fb250`.
 
-Historical note: this report describes the audited revision. The optional
-io_uring backend documented below was removed on 2026-09-27; current file I/O
-uses the dedicated bounded worker executor only.
+Historical note: this report describes revision `01fb250`, before the
+coroutine-native TCP/TLS/HTTP/WebSocket migration in the working tree. Its
+callback interfaces, direct transport paths, and HTTP session-lifetime gap
+describe that older revision, not the current API. The optional io_uring
+backend documented below was removed on 2026-09-27; current file I/O uses the
+dedicated bounded worker executor only. Current shutdown requests cancellation
+of active coroutine roots immediately, and built-in handlers close on
+notification; its timeout does not drain HTTP responses.
 
 ## Outcome
 
 The planned audit is closed at this revision. The new file I/O API was committed
 as experimental infrastructure in `23108ee`. It was not integrated into HTTP:
-the current HTTP path still uses synchronous metadata and small-file reads and
+the HTTP file path used synchronous metadata and small-file reads and
 `sendfile` for larger plain HTTP responses. The review fixed concrete lifetime,
 error-path, and input-validation defects and added regression coverage. The
 library cannot be certified free of all defects by this audit or its tests.
@@ -87,8 +92,8 @@ raw pointers inside the ring, cancellation nodes, and callbacks were constrained
 by those lifetime rules; the default backend preferred io_uring when setup
 succeeded. The ring-specific concerns no longer apply after its removal. The
 HTTP file path still needs explicit session/coroutine lifetime ownership before
-using the awaiters. WebSocket application broadcast fan-out still needs a
-slow-client policy and workload-specific queue limits.
-
-The preexisting untracked `docs/executor-implementation-plan.md` was preserved
-and is outside this report's commit scope.
+using the awaiters. The WebSocket broadcast helpers use best-effort fan-out:
+they count a full recipient's dropped message and continue to other recipients
+without retaining a retry queue. Callers own recipient lifetimes and decide
+how to respond to drops. Message and queue limits still need workload-specific
+validation.

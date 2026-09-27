@@ -1,64 +1,183 @@
 #pragma once
 
-#include "eventloop/byte_stream.h"
 #include "eventloop/event_loop.h"
+#include "eventloop/detail/notifiable.h"
+#include "eventloop/task.h"
 #include "eventloop/unique_fd.h"
 
-#include <array>
 #include <cstddef>
+#include <coroutine>
+#include <cstdint>
+#include <exception>
+#include <expected>
 #include <span>
+#include <string_view>
 #include <system_error>
-#include <vector>
 
-class tcp_stream : public byte_stream, public notifiable {
+class tcp_stream : private eventloop_detail::notifiable {
 public:
     tcp_stream(event_loop& loop, int descriptor);
     tcp_stream(event_loop& loop, unique_fd descriptor);
+    tcp_stream(event_loop& loop, std::string_view address, std::uint16_t port);
     ~tcp_stream() override;
 
     tcp_stream(const tcp_stream&) = delete;
     auto operator=(const tcp_stream&) -> tcp_stream& = delete;
 
     [[nodiscard]] auto descriptor() const noexcept -> int override;
-    auto write(std::span<const std::byte> data) -> void override;
-    // Takes ownership of the file descriptor, including on failure.
-    auto send_file(std::span<const std::byte> header, unique_fd descriptor,
-                   std::size_t size) -> void;
-    // Compatibility overload: ownership of descriptor transfers on entry.
-    auto send_file(std::span<const std::byte> header, int descriptor,
-                   std::size_t size) -> void;
-    auto close() -> void override;
-    [[nodiscard]] auto ready() const noexcept -> bool override;
-    [[nodiscard]] auto write_pending() const noexcept -> bool override;
+    [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
+    {
+        return false;
+    }
+    class connect_awaiter {
+    public:
+        explicit connect_awaiter(tcp_stream& owner) noexcept;
+        ~connect_awaiter();
+        connect_awaiter(const connect_awaiter&) = delete;
+        auto operator=(const connect_awaiter&) -> connect_awaiter& = delete;
+        connect_awaiter(connect_awaiter&&) = delete;
+        [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+        template<typename Promise>
+        auto await_suspend(std::coroutine_handle<Promise> handle) -> bool
+        {
+            if (handle.promise().owner_loop() != &owner_.loop_) std::terminate();
+            return suspend(handle, *handle.promise().cancellation_state());
+        }
+        [[nodiscard]] auto await_resume() const noexcept
+            -> std::expected<void, std::error_code>;
+    private:
+        friend class tcp_stream;
+        static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+            noexcept -> void;
+        auto suspend(std::coroutine_handle<> handle,
+                     eventloop_detail::coroutine_cancellation_state& state) -> bool;
+        auto finish(std::error_code error) noexcept -> void;
+        tcp_stream& owner_;
+        eventloop_detail::coroutine_cancellation_node cancellation_ {};
+        std::coroutine_handle<> continuation_ {};
+        std::error_code error_ {};
+    };
+    [[nodiscard]] auto async_connect() noexcept -> connect_awaiter
+    {
+        return connect_awaiter(*this);
+    }
+
+    template<bool Read>
+    class io_awaiter {
+    public:
+        io_awaiter(tcp_stream& owner, void* data, std::size_t size) noexcept;
+        ~io_awaiter();
+        io_awaiter(const io_awaiter&) = delete;
+        auto operator=(const io_awaiter&) -> io_awaiter& = delete;
+        io_awaiter(io_awaiter&&) = delete;
+        [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+        template<typename Promise>
+        auto await_suspend(std::coroutine_handle<Promise> handle) -> bool
+        {
+            if (handle.promise().owner_loop() != &owner_.loop_) std::terminate();
+            return suspend(handle, *handle.promise().cancellation_state());
+        }
+        [[nodiscard]] auto await_resume() const noexcept
+            -> std::expected<std::size_t, std::error_code>;
+    private:
+        friend class tcp_stream;
+        static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+            noexcept -> void;
+        auto suspend(std::coroutine_handle<> handle,
+                     eventloop_detail::coroutine_cancellation_state& state) -> bool;
+        auto finish(std::size_t size, std::error_code error) noexcept -> void;
+        tcp_stream& owner_;
+        void* data_;
+        std::size_t size_;
+        eventloop_detail::coroutine_cancellation_node cancellation_ {};
+        std::coroutine_handle<> continuation_ {};
+        std::size_t transferred_ {0};
+        std::error_code error_ {};
+    };
+    // Buffers remain caller-owned until completion, including cancellation.
+    // One read and one write may be pending at a time. Operations return
+    // partial byte counts; zero from read means EOF.
+    [[nodiscard]] auto async_read_some(std::span<std::byte> buffer) noexcept
+        -> io_awaiter<true>
+    {
+        return {*this, buffer.data(), buffer.size()};
+    }
+    [[nodiscard]] auto async_write_some(std::span<const std::byte> buffer) noexcept
+        -> io_awaiter<false>
+    {
+        return {*this, const_cast<std::byte*>(buffer.data()), buffer.size()};
+    }
+    class file_awaiter {
+    public:
+        file_awaiter(tcp_stream& owner, unique_fd file,
+                     std::size_t size) noexcept;
+        ~file_awaiter();
+        file_awaiter(const file_awaiter&) = delete;
+        auto operator=(const file_awaiter&) -> file_awaiter& = delete;
+        file_awaiter(file_awaiter&&) = delete;
+        [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+        template<typename Promise>
+        auto await_suspend(std::coroutine_handle<Promise> handle) -> bool
+        {
+            if (handle.promise().owner_loop() != &owner_.loop_) std::terminate();
+            return suspend(handle, *handle.promise().cancellation_state());
+        }
+        [[nodiscard]] auto await_resume() const noexcept
+            -> std::expected<void, std::error_code>;
+    private:
+        friend class tcp_stream;
+        static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+            noexcept -> void;
+        auto suspend(std::coroutine_handle<> handle,
+                     eventloop_detail::coroutine_cancellation_state& state) -> bool;
+        auto advance() noexcept -> std::error_code;
+        auto finish(std::error_code error) noexcept -> void;
+        tcp_stream& owner_;
+        unique_fd file_;
+        std::size_t remaining_;
+        eventloop_detail::coroutine_cancellation_node cancellation_ {};
+        std::coroutine_handle<> continuation_ {};
+        std::error_code error_ {};
+    };
+    [[nodiscard]] auto async_send_file(std::span<const std::byte> header,
+                                       unique_fd file, std::size_t size)
+        -> task<std::expected<void, std::error_code>>;
+    virtual auto close() -> void;
 
 protected:
     [[nodiscard]] auto owner_loop() noexcept -> event_loop& { return loop_; }
-    virtual auto on_transport_data(std::span<const std::byte> data) -> void;
-    virtual auto on_transport_close() -> void;
-    virtual auto on_transport_error(std::error_code error) -> void;
-    virtual auto on_write_drained() -> void {}
-    auto abort() -> void;
+    // TLS activates its raw socket awaiters before driving encrypted records.
+    [[nodiscard]] auto activate_async_transport() noexcept
+        -> std::expected<void, std::error_code>;
+    [[nodiscard]] auto transport_closed() const noexcept -> bool { return closed_; }
 
 private:
+    friend class event_loop;
+
     auto on_read() -> void override;
     auto on_write() -> void override;
     auto on_error() -> void override;
     auto on_shutdown() -> void override;
-    auto flush() -> void;
-    auto notify_write_drained() -> void;
-    auto close_file() noexcept -> void;
-    auto watch_writes(bool enabled) -> void;
+    auto set_async_interest(bool read_enabled, bool write_enabled) -> void;
+    auto update_async_interest() noexcept -> void;
+    auto complete_connect(std::error_code error) noexcept -> void;
+    auto complete_read(std::size_t size, std::error_code error) noexcept -> void;
+    auto complete_write(std::size_t size, std::error_code error) noexcept -> void;
+    auto complete_file(std::error_code error) noexcept -> void;
+    auto fail_and_close(std::error_code error) -> void;
 
     event_loop& loop_;
     unique_fd descriptor_;
-    std::vector<std::byte> output_;
-    std::size_t written_ {0};
-    unique_fd file_descriptor_;
-    std::size_t file_remaining_ {0};
-    bool watching_writes_ {false};
-    bool peer_closed_ {false};
-    bool closing_ {false};
     bool closed_ {false};
-    bool notifying_write_drained_ {false};
-    bool write_drained_deferred_ {false};
+    std::uint32_t address_ {0};
+    std::uint16_t port_ {0};
+    connect_awaiter* connector_ {nullptr};
+    io_awaiter<true>* reader_ {nullptr};
+    io_awaiter<false>* writer_ {nullptr};
+    file_awaiter* file_writer_ {nullptr};
+    bool connected_ {true};
+    bool connect_started_ {false};
+    bool transport_activated_ {false};
+    bool read_interest_enabled_ {false};
+    bool write_interest_enabled_ {false};
 };

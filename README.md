@@ -1,7 +1,8 @@
 # Event loop
 
-A small C++23 event loop with an epoll backend and reusable asynchronous TCP
-transport classes. The echo protocol is implemented separately as a demo.
+A small C++23 coroutine-native networking library with a Linux epoll event
+loop, bounded coroutine runtime, TCP/TLS/UDP sockets, HTTP/1.1, and WebSocket
+support. The echo protocols are examples built on the public awaitable APIs.
 
 ## Layout
 
@@ -42,9 +43,11 @@ Run the HTTP/1.1 static-file server with a document root and TLS certificate:
 The HTTP listener redirects requests to HTTPS. The HTTPS listener serves files
 and uses `index.html` for directories. Pass `--directory-listing` to generate a
 listing when a directory has no index file. Run `http_server --help` for all
-options. `SIGINT` and `SIGTERM` stop the listeners, close idle connections, and
-allow active responses up to five seconds to finish. Use `--shutdown-timeout`
-to change that deadline; a second signal closes remaining connections at once.
+options. `SIGINT` and `SIGTERM` request event-loop shutdown. Active coroutine
+roots are cancelled and built-in socket handlers close immediately, including
+HTTP connections with unfinished responses. `--shutdown-timeout` bounds any
+handlers still registered after shutdown notification; a second signal forces
+their removal immediately.
 
 To serve plain HTTP without TLS or a redirect listener, certificate files are
 not required:
@@ -109,9 +112,44 @@ is requested. Cancellation does not abort an already-running syscall; the
 coroutine resumes with `ECANCELED` after that syscall completes. The current
 event-loop implementation itself remains Linux/epoll-only.
 
+## Coroutine socket I/O
+
+Include `eventloop/tcp_acceptor.h` and `eventloop/tcp_stream.h` for nonblocking
+IPv4 TCP, `eventloop/tls_stream.h` for TLS, or `eventloop/udp_socket.h` for
+IPv4 datagrams. `event_loop::add` takes ownership of supported socket objects.
+Await `async_accept`, `async_connect`, `async_read_some`, `async_write_some`,
+and the UDP send/receive operations. TCP reads and writes may complete
+partially; UDP operations preserve datagram boundaries. Buffers remain
+caller-owned through completion, including cancellation. Call `close()` to
+cancel pending operations and remove a socket from its loop.
+
+The public asynchronous I/O APIs are coroutine based. Readiness dispatch stays
+inside the event-loop implementation. `post()` remains available for bounded
+commands that cross into the loop thread.
+
+The HTTP server also uses connection coroutines. Its parser and response
+buffers live in a session owned by each connection task. Plain HTTP retains
+`sendfile` for larger files; metadata and small-file reads remain synchronous.
+
 `./build/file_io_benchmark` measures cached 4 KiB reads at 16-way concurrency
 and reports operation throughput/latency plus event-loop timer lateness. It is
 an executor and event-loop overhead probe, not a storage-device benchmark.
+
+`./build/coroutine_socket_benchmark both 10000 16` runs 16 concurrent clients
+through 64-byte TCP and UDP loopback echo workloads. Pass `tcp` or `udp` as the
+first argument to profile one transport. This measures coroutine, epoll,
+syscall, and local kernel networking costs; it does not measure NIC throughput.
+For a symbolized CPU profile, build with `RelWithDebInfo` and frame pointers,
+then record either transport with:
+
+```sh
+cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O2 -g -DNDEBUG -fno-omit-frame-pointer'
+cmake --build build-profile --target coroutine_socket_benchmark -j2
+perf record -F 997 -g --call-graph fp -o /tmp/eventloop-tcp.data -- \
+  ./build-profile/coroutine_socket_benchmark tcp 10000 16
+perf report --stdio -i /tmp/eventloop-tcp.data
+```
 
 ## HTTP throughput comparison
 

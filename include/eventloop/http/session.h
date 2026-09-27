@@ -1,6 +1,5 @@
 #pragma once
 
-#include "eventloop/byte_stream.h"
 #include "eventloop/http/request.h"
 #include "eventloop/unique_fd.h"
 
@@ -9,29 +8,32 @@
 #include <memory>
 #include <span>
 #include <string_view>
-#include <system_error>
 
 #include <sys/stat.h>
-
-class tcp_stream;
 
 namespace http {
 
 class session {
 public:
-    session(byte_stream& stream, int root_descriptor,
-            bool directory_listing = false,
-            tcp_stream* file_stream = nullptr) noexcept;
+    session(int root_descriptor, bool directory_listing = false) noexcept;
     ~session() = default;
 
     session(const session&) = delete;
     auto operator=(const session&) -> session& = delete;
 
     auto receive(std::span<const std::byte> data) -> void;
-    auto write_drained() -> void;
-    auto closed() -> void;
-    auto failed(std::error_code) -> void;
+    [[nodiscard]] auto read_space() noexcept -> std::span<std::byte>
+    {
+        return std::as_writable_bytes(std::span {input_}).subspan(input_size_);
+    }
+    auto commit_read(std::size_t size) -> void;
     auto shutdown() -> void;
+    [[nodiscard]] auto has_response() const noexcept -> bool { return responding_; }
+    [[nodiscard]] auto response() const noexcept -> std::span<const char>;
+    [[nodiscard]] auto file_size() const noexcept -> std::size_t { return file_size_; }
+    [[nodiscard]] auto take_file() noexcept -> unique_fd { return std::move(file_); }
+    [[nodiscard]] auto closed() const noexcept -> bool { return closed_; }
+    auto finish_response() -> void;
 
 private:
     enum class path_result { valid, invalid, too_long };
@@ -48,27 +50,26 @@ private:
     auto send_response(std::string_view response) -> void;
     auto send_response(std::span<const char> response) -> void;
     auto start_large_response() -> void;
-    auto write_next() -> void;
-    auto finish_response() -> void;
     auto consume_request(std::size_t size) -> void;
     [[nodiscard]] auto prepare_path(std::string_view target,
                                     std::span<char> output,
                                     std::size_t& size) const noexcept -> path_result;
     [[nodiscard]] auto allocate_response(std::size_t size) -> std::span<char>;
 
-    byte_stream& stream_;
-    tcp_stream* file_stream_;
     int root_descriptor_;
     std::array<char, 4096> input_ {};
     std::unique_ptr<char[]> output_;
+    unique_fd file_;
+    std::size_t file_size_ {0};
     std::size_t input_size_ {0};
     std::size_t request_size_ {0};
+    std::size_t output_capacity_ {0};
     std::size_t output_size_ {0};
-    std::size_t output_offset_ {0};
     request request_ {};
     bool directory_listing_ {false};
     bool responding_ {false};
     bool close_after_response_ {false};
+    bool closed_ {false};
 };
 
 } // namespace http
