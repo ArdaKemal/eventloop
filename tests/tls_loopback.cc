@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -26,6 +27,7 @@
 using namespace eventloop;
 
 namespace {
+
 constexpr std::string_view message = "Botan TLS loopback";
 
 [[nodiscard]] auto system_error(const char* operation) -> std::system_error
@@ -111,10 +113,12 @@ struct stream_pair {
         }
     }
     auto server = std::make_unique<tls_stream>(
-        loop, std::move(sockets.server), tls_context::make_server(certificate, key),
+        loop, std::move(sockets.server),
+        tls_context::make_server(certificate, key),
         tls_server_options {.application_protocols = {"echo"}});
     auto client = std::make_unique<tls_stream>(
-        loop, std::move(sockets.client), tls_context::make_client(trusted_ca),
+        loop, std::move(sockets.client),
+        tls_context::make_client(trusted_ca),
         tls_client_options {.hostname = std::string(hostname),
                             .application_protocols = {"echo"}});
     stream_pair pair {server.get(), client.get()};
@@ -362,7 +366,8 @@ struct stream_pair {
     }
     acceptor.close();
     auto stream = std::make_unique<tls_stream>(
-        loop, std::move(*accepted), tls_context::make_server(certificate, key),
+        loop, std::move(*accepted),
+        tls_context::make_server(certificate, key),
         tls_server_options {.application_protocols = {"echo"}});
     auto* server = stream.get();
     loop.add(std::move(stream));

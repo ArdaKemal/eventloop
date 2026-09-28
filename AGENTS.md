@@ -120,6 +120,14 @@ switching PCs; a fresh clone will not contain uncommitted work.
   and extended CONNECT are not supported. `tests/http2_hpack.cc` covers RFC
   HPACK vectors and bounds; `tests/run_http_server.sh` exercises TLS HTTP/2
   requests when the existing curl binary has HTTP/2 support.
+- `examples/tcp_echo.cc` uses a 512-byte frame-local buffer so its session fits
+  the default 1 KiB frame class. The default pool then serves 10,000 sessions;
+  a 10k-client probe completed 1,000,000 64-byte round trips without failures.
+- Coroutine pool blocks now use a 32-byte header; owner/class metadata lives
+  once per slab, and the free-list pointer shares storage with the allocated
+  magic value. Preserve the `max_align_t` payload alignment and ASAN poisoning
+  checks. `tests/task.cc` covers growth, exhaustion, and release for all six
+  frame classes.
 - `tests/tcp_coroutine.cc` and `tests/udp_coroutine.cc` cover loopback I/O,
   duplicate waiters, cancellation, shutdown, readiness rearming, and descriptor
   closure. The focused CTest run passed both on 2026-09-27 with local socket
@@ -199,6 +207,20 @@ build completed in `/tmp/eventloop-release-review` and the full CTest suite
 passed 12/12 with local loopback access. The HTTP client example also completed
 GETs against the example server over IPv4 and IPv6 loopback. These checks do
 not verify public-network DNS behavior or HTTPS against an external CA.
+
+After the 2026-09-28 load-report investigation, the integrated Release build
+and CTest passed 12/12 again. The stock TCP echo example held 10,000 default-
+pool clients and completed one million 64-byte round trips with zero failures
+(about 89.9k requests/s in that run). Its measured 10k idle RSS increase was
+about 1,217 bytes per connection; this is a separate run from the report's
+2,311-byte custom-pool baseline, so treat the difference as directional. A
+same-driver allocator check measured the 32-byte block-header reduction at
+32 bytes per connection. A separate Python-vs-C++ client comparison showed
+Python contributes to observed latency, but server CPU/request also rises
+slightly with concurrency. `perf` found no clear userspace hot spot and kernel
+symbols were unavailable, so no event-loop optimization was justified. Under
+Valgrind, `task_test` still hits an allocation-count assertion on both the
+patched and untouched builds; do not treat that as a new regression.
 
 After adding TLS HTTP/2 support on 2026-09-28, a Release build completed in
 `/tmp/eventloop-http2-tests` and CTest passed 13/13 with local loopback access.

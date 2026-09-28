@@ -44,7 +44,7 @@ namespace eventloop {
 namespace {
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
 constexpr std::size_t max_timers_per_iteration = 64;
-constexpr std::size_t coroutine_frame_alignment = 64;
+constexpr std::size_t coroutine_frame_alignment = alignof(std::max_align_t);
 static_assert(coroutine_frame_alignment >= alignof(std::max_align_t));
 
 auto poison_memory(void* pointer, std::size_t size) noexcept -> void
@@ -115,7 +115,7 @@ public:
             slab->free = block->next;
             --slab->free_count;
             if (slab->free_count == 0) remove_available(current, *slab);
-            block->next = nullptr;
+            block->magic = block_magic;
             block->allocated = true;
             block->requested_size = size;
             ++slab->live;
@@ -135,11 +135,11 @@ public:
         if (pointer == nullptr) return;
         auto* block = reinterpret_cast<block_header*>(
             static_cast<std::byte*>(pointer) - sizeof(block_header));
-        if (block->magic != block_magic || block->owner == nullptr ||
-            !block->allocated) {
+        if (!block->allocated || block->magic != block_magic ||
+            block->slab == nullptr || block->slab->owner == nullptr) {
             std::terminate();
         }
-        block->owner->release(*block, size);
+        block->slab->owner->release(*block, size);
     }
 
     [[nodiscard]] auto statistics() const noexcept
@@ -159,16 +159,16 @@ private:
     struct slab_header;
 
     struct alignas(coroutine_frame_alignment) block_header {
-        coroutine_frame_pool* owner;
-        block_header* next;
         slab_header* slab;
-        std::size_t class_index;
+        union {
+            block_header* next; // Active while the block is free.
+            std::uint64_t magic; // Active while the block is allocated.
+        };
         std::size_t requested_size;
-        std::uint64_t magic;
         bool allocated;
     };
 
-    static_assert(sizeof(block_header) == coroutine_frame_alignment);
+    static_assert(sizeof(block_header) == 2 * coroutine_frame_alignment);
 
     struct alignas(coroutine_frame_alignment) slab_header {
         slab_header* all_next;
@@ -178,10 +178,12 @@ private:
         std::size_t capacity;
         std::size_t live;
         std::size_t free_count;
+        coroutine_frame_pool* owner;
+        std::size_t class_index;
         bool retained;
     };
 
-    static_assert(sizeof(slab_header) == coroutine_frame_alignment);
+    static_assert(sizeof(slab_header) == 5 * coroutine_frame_alignment);
 
     struct size_class {
         ~size_class()
@@ -249,6 +251,8 @@ private:
                 .capacity = capacity,
                 .live = 0,
                 .free_count = capacity,
+                .owner = this,
+                .class_index = class_index,
                 .retained = retained,
             });
         current.slabs = slab;
@@ -257,12 +261,9 @@ private:
             auto* block = std::construct_at(
                 reinterpret_cast<block_header*>(storage + index * current.stride),
                 block_header {
-                    .owner = this,
-                    .next = slab->free,
                     .slab = slab,
-                    .class_index = class_index,
+                    .next = slab->free,
                     .requested_size = 0,
-                    .magic = block_magic,
                     .allocated = false,
                 });
             poison_memory(storage + index * current.stride +
@@ -292,10 +293,11 @@ private:
 
     auto release(block_header& block, std::size_t size) noexcept -> void
     {
-        if (block.class_index >= classes_.size()) std::terminate();
-        auto& current = classes_[block.class_index];
+        if (block.slab == nullptr || block.slab->owner != this ||
+            block.slab->class_index >= classes_.size()) std::terminate();
+        auto& current = classes_[block.slab->class_index];
         if ((size != 0 && size > current.payload_size) || live_ == 0 ||
-            block.slab == nullptr || block.slab->live == 0 ||
+            block.slab->live == 0 ||
             block.slab->free_count >= block.slab->capacity) {
             std::terminate();
         }
@@ -358,6 +360,7 @@ private:
     }
     return options;
 }
+
 } // namespace
 
 class event_loop::implementation {

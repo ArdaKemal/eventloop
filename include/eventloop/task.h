@@ -10,6 +10,7 @@
 #include <functional>
 #include <optional>
 #include <stdexcept>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 
@@ -20,6 +21,29 @@ enum class task_result {
     frame_allocation_failure,
     cancelled,
 };
+
+namespace detail {
+
+[[nodiscard]] inline auto task_error_code(task_result state) noexcept
+    -> std::error_code
+{
+    return std::make_error_code(
+        state == task_result::frame_allocation_failure
+            ? std::errc::not_enough_memory : std::errc::operation_canceled);
+}
+
+} // namespace detail
+
+// The outer result describes task infrastructure; the inner result describes
+// the operation. Moving the inner value also supports move-only I/O results.
+template<typename T>
+[[nodiscard]] auto flatten_result(
+    std::expected<std::expected<T, std::error_code>, task_result> value)
+    -> std::expected<T, std::error_code>
+{
+    if (!value) return std::unexpected(detail::task_error_code(value.error()));
+    return std::move(*value);
+}
 
 enum class task_state {
     not_started,

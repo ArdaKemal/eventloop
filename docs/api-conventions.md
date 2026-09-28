@@ -18,8 +18,9 @@ and result rules when changing a signature.
   not need to use internal readiness callbacks.
 - Use `eventloop::ip_endpoint` for shared numeric IPv4 and IPv6 addresses.
   Address octets are in display order; ports and IPv6 scope IDs are host order.
-  Any HTTP text-address convenience constructor delegates to
-  `eventloop::ip_endpoint::parse()`. The socket API does not resolve DNS names.
+  HTTP text-address listener constructors delegate to
+  `eventloop::ip_endpoint::parse()`. The
+  socket API does not resolve DNS names.
   AF_INET6 sockets are v6-only.
 - Export the CMake consumer target as `eventloop::eventloop`.
 

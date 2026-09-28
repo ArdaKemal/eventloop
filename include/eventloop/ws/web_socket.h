@@ -345,7 +345,7 @@ private:
 
     auto close_transport() noexcept -> void
     {
-        try { stream_.close(); } catch (...) {}
+        try { stream_.close(); } catch (...) { std::terminate(); }
     }
 
     event_loop& loop_;

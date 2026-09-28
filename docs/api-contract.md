@@ -42,6 +42,11 @@ submissions remain bounded command and background-work APIs.
   `eventloop::task<void>` yields `eventloop::task_result`. A task whose value
   is itself an `std::expected` preserves that inner result; the outer result
   describes task infrastructure such as frame exhaustion.
+  `eventloop::flatten_result` turns an
+  `std::expected<std::expected<T, std::error_code>, task_result>` into the
+  inner expected without allocating. It maps frame exhaustion to
+  `not_enough_memory` and cancellation to `operation_canceled`, including for
+  `void` and move-only values.
 - Syscall-like socket and file operations return
   `std::expected<T, std::error_code>`. A cancelled pending I/O operation
   reports `ECANCELED`, equivalent to `std::errc::operation_canceled` in the
@@ -137,8 +142,7 @@ submissions remain bounded command and background-work APIs.
 - Include `eventloop/task_composition.h` for fixed-arity `eventloop::when_all`,
   `eventloop::race`, and `eventloop::with_timeout`. Operands must be unstarted
   tasks belonging to the same loop. Large combinations may exceed the largest
-  frame class and report
-  `frame_allocation_failure`.
+  frame class and report `frame_allocation_failure`.
 - Include `eventloop/file_io.h` for `eventloop::async_openat`,
   `eventloop::async_read_at`, and `eventloop::async_write_at`.
   `eventloop::async_openat` returns an owning `eventloop::unique_fd` on success.

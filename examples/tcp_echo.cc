@@ -20,7 +20,7 @@ namespace {
 [[nodiscard]] auto echo_session(event_loop& loop, tcp_stream& stream) -> task<void>
 {
     (void)loop;
-    std::array<std::byte, 1024> buffer {};
+    std::array<std::byte, 512> buffer {};
     for (;;) {
         const auto received = co_await stream.async_read_some(buffer);
         if (!received || *received == 0) break;

@@ -11,6 +11,7 @@
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 #include <vector>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -295,9 +296,10 @@ auto send_error_cases() -> bool
 auto parser_rejects_invalid_address() -> bool
 {
     const auto scoped = ip_endpoint::parse("fe80::1%7", 42);
+    const auto loopback = ip_endpoint::parse("::1", 1);
     if (scoped.address_family != ip_endpoint::family::ipv6 ||
         scoped.scope_id != 7 || scoped.port != 42 ||
-        ip_endpoint::parse("::1", 1).address !=
+        loopback.address !=
             ip_endpoint::loopback_v6(1).address) return false;
     try {
         (void)ip_endpoint::parse("not-an-ipv4-address", 0);

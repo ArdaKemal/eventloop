@@ -357,6 +357,38 @@ auto bounded_growth_and_release_test() -> bool
     return statistics.live == 0 && statistics.backed_capacity == 1;
 }
 
+auto frame_class_lifecycle_test() -> bool
+{
+    for (std::size_t index = 0; index < coroutine_frame_sizes.size(); ++index) {
+        event_loop_options options;
+        options.coroutine_frame_capacities.fill(0);
+        options.coroutine_frame_initial_capacities.fill(0);
+        options.coroutine_frame_capacities[index] = 3;
+        options.coroutine_frame_initial_capacities[index] = 1;
+        event_loop loop(options);
+        const auto size = coroutine_frame_sizes[index];
+        auto* first = detail::coroutine_frame_access::allocate(loop, size);
+        auto* second = detail::coroutine_frame_access::allocate(loop, size);
+        auto* third = detail::coroutine_frame_access::allocate(loop, size);
+        if (first == nullptr || second == nullptr || third == nullptr ||
+            detail::coroutine_frame_access::allocate(loop, size) != nullptr) {
+            return false;
+        }
+        static_cast<std::byte*>(first)[size - 1] = std::byte {1};
+        static_cast<std::byte*>(second)[size - 1] = std::byte {2};
+        static_cast<std::byte*>(third)[size - 1] = std::byte {3};
+        const auto full = loop.coroutine_statistics();
+        if (full.live != 3 || full.backed_capacity != 3 ||
+            full.allocation_failures != 1) return false;
+        detail::coroutine_frame_access::deallocate(third, size);
+        detail::coroutine_frame_access::deallocate(second, size);
+        detail::coroutine_frame_access::deallocate(first, size);
+        const auto released = loop.coroutine_statistics();
+        if (released.live != 0 || released.backed_capacity != 1) return false;
+    }
+    return true;
+}
+
 auto alignment_and_oversize_test() -> bool
 {
     event_loop loop;
@@ -643,6 +675,10 @@ auto main() -> int
     }
     if (!bounded_growth_and_release_test()) {
         std::cerr << "task frame-pool bounded growth/release test failed\n";
+        return 1;
+    }
+    if (!frame_class_lifecycle_test()) {
+        std::cerr << "task frame-pool class lifecycle test failed\n";
         return 1;
     }
     if (!alignment_and_oversize_test()) {
