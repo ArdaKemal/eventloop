@@ -1,11 +1,11 @@
 #include "eventloop/udp_socket.h"
 
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <stdexcept>
-#include <string>
 #include <utility>
 
 #include <arpa/inet.h>
@@ -111,14 +111,16 @@ udp_socket::udp_socket(event_loop& loop, std::uint16_t port,
                      sizeof(enabled)) == -1) {
         throw system_error("setsockopt(SO_REUSEPORT)");
     }
-    if (address.find('\0') != std::string_view::npos) {
+    if (address.empty() || address.size() >= INET_ADDRSTRLEN ||
+        address.find('\0') != std::string_view::npos) {
         throw std::invalid_argument("invalid IPv4 address");
     }
-    const std::string address_text {address};
+    std::array<char, INET_ADDRSTRLEN> address_text {};
+    std::memcpy(address_text.data(), address.data(), address.size());
     sockaddr_in native {};
     native.sin_family = AF_INET;
     native.sin_port = htons(port);
-    if (::inet_pton(AF_INET, address_text.c_str(), &native.sin_addr) != 1) {
+    if (::inet_pton(AF_INET, address_text.data(), &native.sin_addr) != 1) {
         throw std::invalid_argument("invalid IPv4 address");
     }
     if (::bind(descriptor_.get(), reinterpret_cast<const sockaddr*>(&native),

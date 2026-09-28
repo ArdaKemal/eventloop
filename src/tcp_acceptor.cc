@@ -1,10 +1,11 @@
 #include "eventloop/tcp_acceptor.h"
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstring>
 #include <exception>
 #include <stdexcept>
-#include <string>
 #include <system_error>
 #include <utility>
 
@@ -89,11 +90,13 @@ tcp_acceptor::tcp_acceptor(event_loop& loop, std::uint16_t port,
     sockaddr_in endpoint {};
     endpoint.sin_family = AF_INET;
     endpoint.sin_port = htons(port);
-    if (address.find('\0') != std::string_view::npos) {
+    if (address.empty() || address.size() >= INET_ADDRSTRLEN ||
+        address.find('\0') != std::string_view::npos) {
         throw std::invalid_argument("invalid IPv4 address");
     }
-    const std::string address_text {address};
-    if (inet_pton(AF_INET, address_text.c_str(), &endpoint.sin_addr) != 1) {
+    std::array<char, INET_ADDRSTRLEN> address_text {};
+    std::memcpy(address_text.data(), address.data(), address.size());
+    if (inet_pton(AF_INET, address_text.data(), &endpoint.sin_addr) != 1) {
         throw std::invalid_argument("invalid IPv4 address");
     }
     if (bind(descriptor_.get(), reinterpret_cast<const sockaddr*>(&endpoint),
@@ -134,6 +137,13 @@ auto tcp_acceptor::fail_and_close(std::error_code error) -> void
     loop_.remove(descriptor_.get());
 }
 
+auto tcp_acceptor::set_read_interest(bool enabled) -> void
+{
+    if (read_interest_enabled_ == enabled) return;
+    loop_.set_io_interest(descriptor_.get(), enabled, false);
+    read_interest_enabled_ = enabled;
+}
+
 auto tcp_acceptor::complete_accept(unique_fd descriptor,
                                    std::error_code error) noexcept -> void
 {
@@ -142,14 +152,17 @@ auto tcp_acceptor::complete_accept(unique_fd descriptor,
     if (waiter == nullptr) return;
     eventloop_detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
+    waiter->finish(std::move(descriptor), error);
     if (!closed_) {
         try {
-            loop_.set_io_interest(descriptor_.get(), false, false);
+            // Resumption may immediately wait for another connection. Keep
+            // the listener armed in that case and avoid a disable/re-enable
+            // pair on every accepted connection.
+            set_read_interest(waiter_ != nullptr);
         } catch (...) {
             std::terminate();
         }
     }
-    waiter->finish(std::move(descriptor), error);
 }
 
 auto tcp_acceptor::on_read() -> void
@@ -221,7 +234,7 @@ auto tcp_acceptor::accept_awaiter::suspend(
     }
     owner_.waiter_ = this;
     try {
-        owner_.loop_.set_io_interest(owner_.descriptor_.get(), true, false);
+        owner_.set_read_interest(true);
     } catch (const std::system_error& error) {
         owner_.waiter_ = nullptr;
         eventloop_detail::coroutine_frame_access::detach_cancellation(

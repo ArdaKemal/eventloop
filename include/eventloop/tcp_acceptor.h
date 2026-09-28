@@ -73,6 +73,7 @@ private:
     auto on_write() -> void override {}
     auto on_error() -> void override;
     auto on_shutdown() -> void override;
+    auto set_read_interest(bool enabled) -> void;
     auto complete_accept(unique_fd descriptor, std::error_code error) noexcept
         -> void;
     auto fail_and_close(std::error_code error) -> void;
@@ -80,5 +81,6 @@ private:
     event_loop& loop_;
     unique_fd descriptor_;
     accept_awaiter* waiter_ {nullptr};
+    bool read_interest_enabled_ {false};
     bool closed_ {false};
 };

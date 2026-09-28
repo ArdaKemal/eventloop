@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include <sys/stat.h>
 
@@ -39,15 +40,15 @@ private:
     enum class path_result { valid, invalid, too_long };
 
     auto process_requests() -> void;
-    auto handle_request() -> void;
-    auto serve_resource(bool headers_only) -> void;
+    auto handle_request(const request& parsed) -> void;
+    auto serve_resource(const request& parsed, bool headers_only) -> void;
     auto serve_file(unique_fd descriptor, const struct ::stat& info,
                     bool headers_only, std::string_view mime_path) -> void;
     auto serve_directory(unique_fd descriptor, bool headers_only) -> void;
-    auto send_directory_redirect() -> void;
+    auto send_directory_redirect(std::string_view target) -> void;
     auto send_options() -> void;
     auto send_error(parse_status status) -> void;
-    auto send_response(std::string_view response) -> void;
+    auto send_static_response(std::string_view response) -> void;
     auto send_response(std::span<const char> response) -> void;
     auto start_large_response() -> void;
     auto consume_request(std::size_t size) -> void;
@@ -58,14 +59,14 @@ private:
 
     int root_descriptor_;
     std::array<char, 4096> input_ {};
-    std::unique_ptr<char[]> output_;
+    std::vector<char> output_;
+    std::unique_ptr<char[]> file_output_;
+    std::size_t file_output_size_ {0};
+    std::string_view static_response_;
     unique_fd file_;
     std::size_t file_size_ {0};
     std::size_t input_size_ {0};
     std::size_t request_size_ {0};
-    std::size_t output_capacity_ {0};
-    std::size_t output_size_ {0};
-    request request_ {};
     bool directory_listing_ {false};
     bool responding_ {false};
     bool close_after_response_ {false};

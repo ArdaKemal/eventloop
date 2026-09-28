@@ -3,7 +3,6 @@
 #include <cerrno>
 #include <cstring>
 #include <memory>
-#include <span>
 #include <string_view>
 
 #include <dirent.h>
@@ -23,15 +22,14 @@ struct directory_closer {
 
 using directory_ptr = std::unique_ptr<DIR, directory_closer>;
 
-auto append(std::vector<std::byte>& output, std::string_view value) -> void
+auto append(std::vector<char>& output, std::string_view value) -> void
 {
-    const auto bytes = std::as_bytes(std::span {value.data(), value.size()});
-    output.insert(output.end(), bytes.begin(), bytes.end());
+    output.insert(output.end(), value.begin(), value.end());
 }
 
-auto append(std::vector<std::byte>& output, char value) -> void
+auto append(std::vector<char>& output, char value) -> void
 {
-    output.push_back(static_cast<std::byte>(value));
+    output.push_back(value);
 }
 
 [[nodiscard]] constexpr auto url_safe(unsigned char value) noexcept -> bool
@@ -42,7 +40,7 @@ auto append(std::vector<std::byte>& output, char value) -> void
            value == '_' || value == '~';
 }
 
-auto append_url_encoded(std::vector<std::byte>& output,
+auto append_url_encoded(std::vector<char>& output,
                         std::string_view value) -> void
 {
     constexpr char hex[] = "0123456789ABCDEF";
@@ -57,7 +55,7 @@ auto append_url_encoded(std::vector<std::byte>& output,
     }
 }
 
-auto append_html_escaped(std::vector<std::byte>& output,
+auto append_html_escaped(std::vector<char>& output,
                          std::string_view value) -> void
 {
     for (const char byte : value) {
@@ -75,7 +73,7 @@ auto append_html_escaped(std::vector<std::byte>& output,
 } // namespace
 
 auto make_directory_listing(int descriptor)
-    -> std::optional<std::vector<std::byte>>
+    -> std::optional<std::vector<char>>
 {
     directory_ptr directory(fdopendir(descriptor));
     if (!directory) {
@@ -83,7 +81,7 @@ auto make_directory_listing(int descriptor)
         return std::nullopt;
     }
 
-    std::vector<std::byte> output;
+    std::vector<char> output;
     output.reserve(4096);
     append(output,
            "<!doctype html><html><head><meta charset=\"utf-8\">"

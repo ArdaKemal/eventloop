@@ -4,12 +4,12 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <stdexcept>
 
 namespace ws {
 namespace {
 
-constexpr std::size_t write_size = 16 * 1024;
 constexpr std::size_t retained_buffer_size = 64 * 1024;
 
 auto clear_buffer(std::vector<std::byte>& buffer) -> void
@@ -129,6 +129,17 @@ auto web_socket_core::prepare_next_receive() -> void
         input_.erase(input_.begin(), input_.begin() +
                     static_cast<std::ptrdiff_t>(pending_consumed_));
         pending_consumed_ = 0;
+        if (input_.empty()) {
+            clear_buffer(input_);
+        } else if (input_.capacity() > retained_buffer_size &&
+                   input_.size() <= retained_buffer_size) {
+            try {
+                std::vector<std::byte> remaining(input_.begin(), input_.end());
+                input_.swap(remaining);
+            } catch (const std::bad_alloc&) {
+                // Keep the valid pipelined bytes when compaction cannot allocate.
+            }
+        }
     }
     if (clear_fragment_on_next_receive_) {
         clear_buffer(fragmented_message_);
