@@ -17,7 +17,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-namespace http {
+namespace eventloop::http {
 namespace {
 
 constexpr std::string_view bad_request =
@@ -543,4 +543,4 @@ auto session::allocate_response(std::size_t size) -> std::span<char>
     return {file_output_.get(), size};
 }
 
-} // namespace http
+} // namespace eventloop::http

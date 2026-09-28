@@ -4,6 +4,8 @@
 
 #include <unistd.h>
 
+namespace eventloop {
+
 // Owns one descriptor. Moving transfers ownership without allocating.
 class unique_fd {
 public:
@@ -44,3 +46,5 @@ public:
 private:
     int descriptor_ {-1};
 };
+
+} // namespace eventloop

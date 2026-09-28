@@ -15,6 +15,8 @@
 #include <netinet/in.h>
 #include <unistd.h>
 
+using namespace eventloop;
+
 using namespace std::chrono_literals;
 
 namespace {
@@ -108,7 +110,7 @@ auto server(event_loop& loop, tcp_acceptor& listener,
 auto client(event_loop& loop, std::uint16_t port, int& completed,
             bool& passed, int& descriptor) -> task<void>
 {
-    auto socket = std::make_unique<tcp_stream>(loop, "127.0.0.1", port);
+    auto socket = std::make_unique<tcp_stream>(loop, ipv4_endpoint::loopback(port));
     auto* peer = socket.get();
     descriptor = peer->descriptor();
     loop.add(std::move(socket));
@@ -141,7 +143,7 @@ auto client(event_loop& loop, std::uint16_t port, int& completed,
 auto roundtrip() -> bool
 {
     event_loop loop;
-    auto listener = std::make_unique<tcp_acceptor>(loop, 0);
+    auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback());
     auto* accepting = listener.get();
     const int listener_descriptor = accepting->descriptor();
     const auto port = local_port(accepting->descriptor());
@@ -239,7 +241,7 @@ auto connect_result(event_loop& loop, tcp_stream& socket,
 auto duplicate_accept_and_close() -> bool
 {
     event_loop loop;
-    auto listener = std::make_unique<tcp_acceptor>(loop, 0);
+    auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback());
     auto* owner = listener.get();
     const int descriptor = owner->descriptor();
     loop.add(std::move(listener));
@@ -327,7 +329,7 @@ auto immediate_error_cases() -> bool
     auto connected = std::make_unique<tcp_stream>(
         loop, std::move(pair.client));
     auto disconnected = std::make_unique<tcp_stream>(
-        loop, "127.0.0.1", 1);
+        loop, ipv4_endpoint::loopback(1));
     auto* ready = connected.get();
     auto* idle = disconnected.get();
     loop.add(std::move(connected));
@@ -346,7 +348,7 @@ auto refused_connect() -> bool
     if (port == 0) return false;
     event_loop loop;
     auto socket = std::make_unique<tcp_stream>(
-        loop, "127.0.0.1", port);
+        loop, ipv4_endpoint::loopback(port));
     auto* owner = socket.get();
     const int descriptor = owner->descriptor();
     loop.add(std::move(socket));
@@ -374,7 +376,7 @@ auto shutdown_pending() -> bool
     auto pair = connected_pair();
     if (!pair.client || !pair.server) return false;
     event_loop loop;
-    auto listener = std::make_unique<tcp_acceptor>(loop, 0);
+    auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback());
     auto socket = std::make_unique<tcp_stream>(
         loop, std::move(pair.client));
     auto* accepting = listener.get();

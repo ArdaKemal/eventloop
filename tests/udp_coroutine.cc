@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <vector>
 
+using namespace eventloop;
+
 using namespace std::chrono_literals;
 
 namespace {
@@ -25,14 +27,14 @@ auto shutdown_after(event_loop& loop, std::chrono::seconds delay) -> task<void>
 
 auto add_socket(event_loop& loop) -> udp_socket*
 {
-    auto socket = std::make_unique<udp_socket>(loop, 0);
+    auto socket = std::make_unique<udp_socket>(loop, ipv4_endpoint::loopback());
     auto* result = socket.get();
     loop.add(std::move(socket));
     return result;
 }
 
 auto receive_two(event_loop& loop, udp_socket& receiver,
-                 udp_endpoint expected_source, bool& passed) -> task<void>
+                 ipv4_endpoint expected_source, bool& passed) -> task<void>
 {
     std::array<std::byte, 3> buffer {};
     const auto first = co_await receiver.async_receive_from(buffer);
@@ -52,7 +54,7 @@ auto receive_two(event_loop& loop, udp_socket& receiver,
 }
 
 auto send_two(event_loop& loop, udp_socket& sender,
-              udp_endpoint destination, bool& passed) -> task<void>
+              ipv4_endpoint destination, bool& passed) -> task<void>
 {
     const std::array<std::byte, 3> payload {
         std::byte {'u'}, std::byte {'d'}, std::byte {'p'}};
@@ -117,7 +119,7 @@ auto receive_truncated(event_loop& loop, udp_socket& receiver,
     loop.stop();
 }
 
-auto send_payload(event_loop&, udp_socket& sender, udp_endpoint destination,
+auto send_payload(event_loop&, udp_socket& sender, ipv4_endpoint destination,
                   bool& passed) -> task<void>
 {
     const std::array<std::byte, 3> payload {
@@ -173,7 +175,7 @@ auto duplicate_receive(event_loop&, udp_socket& socket, bool& rejected)
 }
 
 auto send_when_cancelled(event_loop& loop, udp_socket& socket,
-                         udp_endpoint destination, bool& cancelled)
+                         ipv4_endpoint destination, bool& cancelled)
     -> task<void>
 {
     (void)co_await sleep_for(loop, 1h);
@@ -228,14 +230,14 @@ auto shutdown_cancels_receive() -> bool
            loop.coroutine_statistics().live == 0;
 }
 
-auto send_errors(event_loop&, udp_socket& socket, udp_endpoint destination,
+auto send_errors(event_loop&, udp_socket& socket, ipv4_endpoint destination,
                  std::span<const std::byte> oversized, bool& passed)
     -> task<void>
 {
     const auto too_large = co_await socket.async_send_to(oversized, destination);
     const auto invalid = co_await socket.async_send_to(
         std::array<std::byte, 1> {std::byte {'x'}},
-        udp_endpoint {{127, 0, 0, 1}, 0});
+        ipv4_endpoint {{127, 0, 0, 1}, 0});
     passed = !too_large && too_large.error().value() == EMSGSIZE &&
              !invalid && invalid.error().value() == EINVAL;
 }
@@ -253,11 +255,10 @@ auto send_error_cases() -> bool
     return passed && loop.coroutine_statistics().live == 0;
 }
 
-auto constructor_rejects_invalid_address() -> bool
+auto parser_rejects_invalid_address() -> bool
 {
-    event_loop loop;
     try {
-        udp_socket socket(loop, 0, "not-an-ipv4-address");
+        (void)ipv4_endpoint::parse("not-an-ipv4-address", 0);
     } catch (const std::invalid_argument&) {
         return true;
     }
@@ -272,7 +273,7 @@ int main()
         const bool passed = roundtrip_and_rearm() && truncated_receive() &&
                             duplicate_and_close() &&
                             shutdown_cancels_receive() && send_error_cases() &&
-                            constructor_rejects_invalid_address();
+                            parser_rejects_invalid_address();
         if (!passed) std::cerr << "UDP coroutine test failed\n";
         return passed ? 0 : 1;
     } catch (const std::exception& error) {

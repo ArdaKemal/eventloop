@@ -12,6 +12,8 @@
 #include <string>
 #include <string_view>
 
+using namespace eventloop;
+
 namespace {
 template<typename Listener>
 [[nodiscard]] auto serve_listener(event_loop& loop, Listener& listener)

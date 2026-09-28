@@ -39,6 +39,8 @@
 #include <sanitizer/asan_interface.h>
 #endif
 
+namespace eventloop {
+
 namespace {
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
 constexpr std::size_t max_timers_per_iteration = 64;
@@ -391,9 +393,9 @@ public:
     }
 
     [[nodiscard]] static auto perform_file_operation(
-        eventloop_detail::file_io_operation& operation) noexcept -> int
+        detail::file_io_operation& operation) noexcept -> int
     {
-        using eventloop_detail::file_opcode;
+        using detail::file_opcode;
         if (operation.cancelled.load(std::memory_order_acquire)) {
             return -ECANCELED;
         }
@@ -423,7 +425,7 @@ public:
         }
     }
 
-    [[nodiscard]] auto submit_file(eventloop_detail::file_io_operation& operation)
+    [[nodiscard]] auto submit_file(detail::file_io_operation& operation)
         noexcept -> int
     {
         if (shutting_down) return -ECANCELED;
@@ -442,7 +444,7 @@ public:
             return -EAGAIN;
         }
         if (reserve_coroutine_completion() !=
-            eventloop_detail::completion_reservation_result::accepted) {
+            detail::completion_reservation_result::accepted) {
             return -EAGAIN;
         }
         execution_task work([this, &operation]() noexcept {
@@ -460,7 +462,7 @@ public:
         return 0;
     }
 
-    auto complete_file(eventloop_detail::file_io_operation& operation,
+    auto complete_file(detail::file_io_operation& operation,
                        int result) noexcept -> void
     {
         if (file_io_inflight == 0) std::terminate();
@@ -496,10 +498,10 @@ public:
     }
 
     [[nodiscard]] auto reserve_coroutine_completion() noexcept
-        -> eventloop_detail::completion_reservation_result
+        -> detail::completion_reservation_result
     {
         if (shutting_down) {
-            return eventloop_detail::completion_reservation_result::shutting_down;
+            return detail::completion_reservation_result::shutting_down;
         }
         auto reserved = reserved_coroutine_completions.load(
             std::memory_order_relaxed);
@@ -507,10 +509,10 @@ public:
             if (reserved_coroutine_completions.compare_exchange_weak(
                     reserved, reserved + 1, std::memory_order_acq_rel,
                     std::memory_order_relaxed)) {
-                return eventloop_detail::completion_reservation_result::accepted;
+                return detail::completion_reservation_result::accepted;
             }
         }
-        return eventloop_detail::completion_reservation_result::capacity_exhausted;
+        return detail::completion_reservation_result::capacity_exhausted;
     }
 
     auto release_coroutine_completion() noexcept -> void
@@ -529,14 +531,14 @@ public:
     }
 
     [[nodiscard]] auto submit_blocking(execution_task&& work) noexcept
-        -> eventloop_detail::blocking_submission_result
+        -> detail::blocking_submission_result
     {
         if (!blocking_executor_available) {
-            return eventloop_detail::blocking_submission_result::no_worker_threads;
+            return detail::blocking_submission_result::no_worker_threads;
         }
         return task_executor->execute(std::move(work))
-                   ? eventloop_detail::blocking_submission_result::accepted
-                   : eventloop_detail::blocking_submission_result::queue_full;
+                   ? detail::blocking_submission_result::accepted
+                   : detail::blocking_submission_result::queue_full;
     }
 
     auto erase_pending() -> void
@@ -607,7 +609,7 @@ public:
                coroutine_timers->deadline <= event_loop::clock::now()) {
             auto* timer = coroutine_timers;
             unlink_coroutine_timer(*timer);
-            eventloop_detail::coroutine_frame_access::detach_cancellation(
+            detail::coroutine_frame_access::detach_cancellation(
                 timer->cancellation);
             const auto handle = timer->handle;
             handle.resume();
@@ -617,14 +619,14 @@ public:
     }
 
     auto register_coroutine_timer(
-        eventloop_detail::coroutine_timer_node& timer) -> void
+        detail::coroutine_timer_node& timer) -> void
     {
         if (timer.owner != owner || timer.previous != nullptr ||
             timer.next != nullptr) {
             std::terminate();
         }
         auto** position = &coroutine_timers;
-        eventloop_detail::coroutine_timer_node* previous = nullptr;
+        detail::coroutine_timer_node* previous = nullptr;
         while (*position != nullptr &&
                (*position)->deadline <= timer.deadline) {
             previous = *position;
@@ -643,11 +645,11 @@ public:
     }
 
     auto cancel_coroutine_timer(
-        eventloop_detail::coroutine_timer_node& timer) noexcept -> void
+        detail::coroutine_timer_node& timer) noexcept -> void
     {
         if (timer.owner != owner) std::terminate();
         unlink_coroutine_timer(timer);
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             timer.cancellation);
         try {
             arm_next_timer();
@@ -671,7 +673,7 @@ public:
         return shutting_down && handlers.empty() && active_roots == nullptr;
     }
 
-    auto attach_root(eventloop_detail::coroutine_root_node& root) noexcept -> void
+    auto attach_root(detail::coroutine_root_node& root) noexcept -> void
     {
         if (root.owner != nullptr) std::terminate();
         root.owner = owner;
@@ -682,7 +684,7 @@ public:
         ++active_root_count;
     }
 
-    auto complete_root(eventloop_detail::coroutine_root_node& root) noexcept -> void
+    auto complete_root(detail::coroutine_root_node& root) noexcept -> void
     {
         if (root.owner != owner || active_root_count == 0) std::terminate();
         if (root.cancellation.head != nullptr) std::terminate();
@@ -714,7 +716,7 @@ public:
             root->cancellation.requested = true;
         }
         for (;;) {
-            eventloop_detail::coroutine_cancellation_node* cancellation = nullptr;
+            detail::coroutine_cancellation_node* cancellation = nullptr;
             for (auto* root = active_roots; root != nullptr; root = root->next) {
                 if (root->cancellation.head != nullptr) {
                     cancellation = root->cancellation.head;
@@ -730,7 +732,7 @@ public:
 
 private:
     auto unlink_coroutine_timer(
-        eventloop_detail::coroutine_timer_node& timer) noexcept -> void
+        detail::coroutine_timer_node& timer) noexcept -> void
     {
         if (timer.previous != nullptr) timer.previous->next = timer.next;
         else coroutine_timers = timer.next;
@@ -760,7 +762,7 @@ public:
     const std::size_t file_io_depth;
     std::unique_ptr<executor> file_executor;
     std::size_t file_io_inflight {0};
-    std::unordered_map<int, std::unique_ptr<eventloop_detail::notifiable>> handlers;
+    std::unordered_map<int, std::unique_ptr<detail::notifiable>> handlers;
     std::unordered_set<int> pending_removals;
     std::map<timer_key, execution_task> timers;
     std::uint64_t next_timer {1};
@@ -768,9 +770,9 @@ public:
     bool force_shutdown_pending {false};
     bool shutting_down {false};
     event_loop* owner {nullptr};
-    eventloop_detail::coroutine_root_node* active_roots {nullptr};
-    eventloop_detail::coroutine_root_node* completed_roots {nullptr};
-    eventloop_detail::coroutine_timer_node* coroutine_timers {nullptr};
+    detail::coroutine_root_node* active_roots {nullptr};
+    detail::coroutine_root_node* completed_roots {nullptr};
+    detail::coroutine_timer_node* coroutine_timers {nullptr};
     std::size_t active_root_count {0};
 };
 
@@ -911,7 +913,7 @@ auto event_loop::shutdown(clock::duration timeout) -> void
     auto* const state = implementation_.get();
     try {
         implementation_->add_timer(
-            eventloop_detail::deadline_after(timeout),
+            detail::deadline_after(timeout),
             execution_task([state]() noexcept { state->force_shutdown(); }));
     } catch (...) {
         implementation_->force_shutdown();
@@ -923,27 +925,27 @@ auto event_loop::shutdown(clock::duration timeout) -> void
 
 auto event_loop::add(std::unique_ptr<tcp_acceptor> handler) -> void
 {
-    auto base = std::unique_ptr<eventloop_detail::notifiable>(
-        static_cast<eventloop_detail::notifiable*>(handler.release()));
+    auto base = std::unique_ptr<detail::notifiable>(
+        static_cast<detail::notifiable*>(handler.release()));
     add_handler(std::move(base));
 }
 
 auto event_loop::add(std::unique_ptr<tcp_stream> handler) -> void
 {
-    auto base = std::unique_ptr<eventloop_detail::notifiable>(
-        static_cast<eventloop_detail::notifiable*>(handler.release()));
+    auto base = std::unique_ptr<detail::notifiable>(
+        static_cast<detail::notifiable*>(handler.release()));
     add_handler(std::move(base));
 }
 
 auto event_loop::add(std::unique_ptr<udp_socket> handler) -> void
 {
-    auto base = std::unique_ptr<eventloop_detail::notifiable>(
-        static_cast<eventloop_detail::notifiable*>(handler.release()));
+    auto base = std::unique_ptr<detail::notifiable>(
+        static_cast<detail::notifiable*>(handler.release()));
     add_handler(std::move(base));
 }
 
 auto event_loop::add_handler(
-    std::unique_ptr<eventloop_detail::notifiable> handler) -> void
+    std::unique_ptr<detail::notifiable> handler) -> void
 {
     if (!handler) {
         throw std::invalid_argument("cannot add an empty handler");
@@ -1049,7 +1051,7 @@ auto event_loop::can_spawn() const noexcept -> bool
     return !implementation_->shutting_down;
 }
 
-auto event_loop::spawn_root(eventloop_detail::coroutine_root_node& root,
+auto event_loop::spawn_root(detail::coroutine_root_node& root,
                             std::coroutine_handle<> handle,
                             bool started) -> task_spawn_result
 {
@@ -1074,39 +1076,39 @@ auto event_loop::coroutine_statistics() const noexcept
     return statistics;
 }
 
-auto eventloop_detail::coroutine_frame_access::allocate(
+auto detail::coroutine_frame_access::allocate(
     event_loop& loop, std::size_t size) noexcept -> void*
 {
     return loop.implementation_->coroutine_frames.try_allocate(size);
 }
 
-auto eventloop_detail::coroutine_frame_access::deallocate(
+auto detail::coroutine_frame_access::deallocate(
     void* pointer, std::size_t size) noexcept -> void
 {
     coroutine_frame_pool::deallocate(pointer, size);
 }
 
-auto eventloop_detail::coroutine_frame_access::complete_root(
+auto detail::coroutine_frame_access::complete_root(
     coroutine_root_node& root) noexcept -> void
 {
     if (root.owner == nullptr) std::terminate();
     root.owner->implementation_->complete_root(root);
 }
 
-auto eventloop_detail::coroutine_frame_access::register_timer(
+auto detail::coroutine_frame_access::register_timer(
     event_loop& loop, coroutine_timer_node& timer) -> void
 {
     loop.implementation_->register_coroutine_timer(timer);
 }
 
-auto eventloop_detail::coroutine_frame_access::cancel_timer(
+auto detail::coroutine_frame_access::cancel_timer(
     coroutine_timer_node& timer) noexcept -> void
 {
     if (timer.owner == nullptr) std::terminate();
     timer.owner->implementation_->cancel_coroutine_timer(timer);
 }
 
-auto eventloop_detail::coroutine_frame_access::attach_cancellation(
+auto detail::coroutine_frame_access::attach_cancellation(
     coroutine_cancellation_state& state,
     coroutine_cancellation_node& node) noexcept -> bool
 {
@@ -1121,7 +1123,7 @@ auto eventloop_detail::coroutine_frame_access::attach_cancellation(
     return true;
 }
 
-auto eventloop_detail::coroutine_frame_access::detach_cancellation(
+auto detail::coroutine_frame_access::detach_cancellation(
     coroutine_cancellation_node& node) noexcept -> void
 {
     if (node.state == nullptr) return;
@@ -1134,7 +1136,7 @@ auto eventloop_detail::coroutine_frame_access::detach_cancellation(
     node.state = nullptr;
 }
 
-auto eventloop_detail::coroutine_frame_access::request_cancellation(
+auto detail::coroutine_frame_access::request_cancellation(
     coroutine_cancellation_state& state) noexcept -> void
 {
     state.requested = true;
@@ -1145,34 +1147,36 @@ auto eventloop_detail::coroutine_frame_access::request_cancellation(
     }
 }
 
-auto eventloop_detail::coroutine_frame_access::reserve_completion(
+auto detail::coroutine_frame_access::reserve_completion(
     event_loop& loop) noexcept -> completion_reservation_result
 {
     return loop.implementation_->reserve_coroutine_completion();
 }
 
-auto eventloop_detail::coroutine_frame_access::release_completion(
+auto detail::coroutine_frame_access::release_completion(
     event_loop& loop) noexcept -> void
 {
     loop.implementation_->release_coroutine_completion();
 }
 
-auto eventloop_detail::coroutine_frame_access::post_completion(
+auto detail::coroutine_frame_access::post_completion(
     event_loop& loop, execution_task&& completion) noexcept -> void
 {
     loop.implementation_->post_coroutine_completion(std::move(completion));
 }
 
-auto eventloop_detail::coroutine_frame_access::submit_blocking(
+auto detail::coroutine_frame_access::submit_blocking(
     event_loop& loop, execution_task&& work) noexcept
     -> blocking_submission_result
 {
     return loop.implementation_->submit_blocking(std::move(work));
 }
 
-auto eventloop_detail::coroutine_frame_access::submit_file(
+auto detail::coroutine_frame_access::submit_file(
     event_loop& loop, file_io_operation& operation) noexcept
     -> int
 {
     return loop.implementation_->submit_file(operation);
 }
+
+} // namespace eventloop

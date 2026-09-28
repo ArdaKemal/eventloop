@@ -20,6 +20,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+using namespace eventloop;
+
 namespace {
 
 constexpr std::size_t message_size = 64;
@@ -165,7 +167,7 @@ auto run_tcp(std::size_t transactions, std::size_t clients) -> bool
     event_loop_options options;
     options.coroutine_frame_capacities.fill(64);
     event_loop loop(options);
-    auto listener = std::make_unique<tcp_acceptor>(loop, 0);
+    auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback());
     auto* listener_ptr = listener.get();
     const auto port = bound_port(listener_ptr->descriptor());
     loop.add(std::move(listener));
@@ -174,7 +176,7 @@ auto run_tcp(std::size_t transactions, std::size_t clients) -> bool
     sockets.reserve(clients);
     for (std::size_t index = 0; index < clients; ++index) {
         auto socket = std::make_unique<tcp_stream>(
-            loop, "127.0.0.1", port);
+            loop, ipv4_endpoint::loopback(port));
         sockets.push_back(socket.get());
         loop.add(std::move(socket));
     }
@@ -237,7 +239,7 @@ auto udp_echo_server(event_loop&, udp_socket& socket, std::size_t datagrams,
     state.finish();
 }
 
-auto udp_client(event_loop&, udp_socket& socket, udp_endpoint destination,
+auto udp_client(event_loop&, udp_socket& socket, ipv4_endpoint destination,
                 std::size_t transactions, benchmark_state& state) -> task<void>
 {
     message sent {};
@@ -267,7 +269,7 @@ auto run_udp(std::size_t transactions, std::size_t clients) -> bool
     event_loop_options options;
     options.coroutine_frame_capacities.fill(64);
     event_loop loop(options);
-    auto server = std::make_unique<udp_socket>(loop, 0);
+    auto server = std::make_unique<udp_socket>(loop, ipv4_endpoint::loopback());
     auto* server_ptr = server.get();
     const auto endpoint = server_ptr->local_endpoint();
     loop.add(std::move(server));
@@ -275,7 +277,7 @@ auto run_udp(std::size_t transactions, std::size_t clients) -> bool
     std::vector<udp_socket*> sockets;
     sockets.reserve(clients);
     for (std::size_t index = 0; index < clients; ++index) {
-        auto socket = std::make_unique<udp_socket>(loop, 0);
+        auto socket = std::make_unique<udp_socket>(loop, ipv4_endpoint::loopback());
         sockets.push_back(socket.get());
         loop.add(std::move(socket));
     }

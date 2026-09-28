@@ -15,6 +15,8 @@
 #include <string_view>
 #include <utility>
 
+using namespace eventloop;
+
 namespace {
 
 [[nodiscard]] auto echo_session(event_loop& loop, tls_stream& stream) -> task<void>
@@ -92,7 +94,7 @@ auto main(int argc, char* argv[]) -> int
         const auto port = argc == 4 ? parse_port(argv[3]) : std::uint16_t {7443};
         auto context = tls_context::make_server(argv[1], argv[2]);
         event_loop loop;
-        auto listener = std::make_unique<tcp_acceptor>(loop, port);
+        auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback(port));
         auto* accepting = listener.get();
         loop.add(std::move(listener));
         if (loop.spawn(serve(loop, *accepting, std::move(context))) !=

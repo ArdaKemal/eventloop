@@ -21,6 +21,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+using namespace eventloop;
+
 namespace {
 constexpr std::string_view message = "Botan TLS loopback";
 

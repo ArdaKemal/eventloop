@@ -1,6 +1,6 @@
 #include "eventloop/http/mime_types.h"
 
-namespace http {
+namespace eventloop::http {
 namespace {
 [[nodiscard]] constexpr auto ascii_lower(char value) noexcept -> char
 {
@@ -59,4 +59,4 @@ auto mime_type_from_path(std::string_view path) noexcept -> std::string_view
     return "application/octet-stream";
 }
 
-} // namespace http
+} // namespace eventloop::http

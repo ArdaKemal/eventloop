@@ -2,6 +2,8 @@
 
 #include <memory>
 
+namespace eventloop {
+
 namespace {
 
 class single_thread_executor final : public executor {
@@ -20,3 +22,5 @@ auto make_single_thread_executor() -> std::unique_ptr<executor>
 {
     return std::make_unique<single_thread_executor>();
 }
+
+} // namespace eventloop

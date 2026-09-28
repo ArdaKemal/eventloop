@@ -70,8 +70,9 @@ ctest --test-dir build --output-on-failure
 
 The [coroutine API contract](docs/api-contract.md) describes ownership,
 results, cancellation, and capacity rules for new coroutine-facing APIs.
-Use `task_handle<T>` with `event_loop::spawn(task<T>, handle)` to observe a
-root task's result. The handle can be awaited once or queried with `done()`
+Use `eventloop::task_handle<T>` with
+`eventloop::event_loop::spawn(task<T>, handle)` to observe a root task's result.
+The handle can be awaited once or queried with `done()`
 and `take_result()`. Its `cancel()` method requests cancellation on the owning
 loop thread; keep the handle alive until completion, including when worker or
 file I/O must retire. An active handle cannot be moved or destroyed.
@@ -118,7 +119,10 @@ The current event-loop implementation itself remains Linux/epoll-only.
 
 Include `eventloop/tcp_acceptor.h` and `eventloop/tcp_stream.h` for nonblocking
 IPv4 TCP, `eventloop/tls_stream.h` for TLS, or `eventloop/udp_socket.h` for
-IPv4 datagrams. `event_loop::add` takes ownership of supported socket objects.
+IPv4 datagrams. Public types live in `eventloop`; HTTP and WebSocket types
+live in `eventloop::http` and `eventloop::ws`. TCP and UDP addresses use
+`eventloop::ipv4_endpoint`, with address octets and a host-order port.
+`eventloop::event_loop::add` takes ownership of supported socket objects.
 Await `async_accept`, `async_connect`, `async_read_some`, `async_write_some`,
 and the UDP send/receive operations. TCP reads and writes may complete
 partially; UDP operations preserve datagram boundaries. Buffers remain

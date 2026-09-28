@@ -5,6 +5,8 @@
 #include <iostream>
 #include <thread>
 
+using namespace eventloop;
+
 using namespace std::chrono_literals;
 
 namespace {

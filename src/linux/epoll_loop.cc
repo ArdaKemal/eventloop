@@ -15,6 +15,8 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
+namespace eventloop {
+
 namespace {
 [[nodiscard]] auto system_error(const char* operation) -> std::system_error
 {
@@ -223,3 +225,5 @@ auto epoll_loop::update_descriptor(int descriptor, bool read_enabled,
         throw system_error("epoll_ctl");
     }
 }
+
+} // namespace eventloop

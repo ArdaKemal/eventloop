@@ -15,6 +15,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+namespace eventloop {
+
 namespace {
 constexpr std::size_t max_accepts_per_event = 64;
 
@@ -67,8 +69,8 @@ constexpr std::size_t max_accepts_per_event = 64;
 }
 } // namespace
 
-tcp_acceptor::tcp_acceptor(event_loop& loop, std::uint16_t port,
-                           std::string_view address, bool reuse_port)
+tcp_acceptor::tcp_acceptor(event_loop& loop, ipv4_endpoint bind_endpoint,
+                           bool reuse_port)
     : loop_(loop)
 {
     descriptor_.reset(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
@@ -89,16 +91,9 @@ tcp_acceptor::tcp_acceptor(event_loop& loop, std::uint16_t port,
 
     sockaddr_in endpoint {};
     endpoint.sin_family = AF_INET;
-    endpoint.sin_port = htons(port);
-    if (address.empty() || address.size() >= INET_ADDRSTRLEN ||
-        address.find('\0') != std::string_view::npos) {
-        throw std::invalid_argument("invalid IPv4 address");
-    }
-    std::array<char, INET_ADDRSTRLEN> address_text {};
-    std::memcpy(address_text.data(), address.data(), address.size());
-    if (inet_pton(AF_INET, address_text.data(), &endpoint.sin_addr) != 1) {
-        throw std::invalid_argument("invalid IPv4 address");
-    }
+    endpoint.sin_port = htons(bind_endpoint.port);
+    std::memcpy(&endpoint.sin_addr, bind_endpoint.address.data(),
+                bind_endpoint.address.size());
     if (bind(descriptor_.get(), reinterpret_cast<const sockaddr*>(&endpoint),
              sizeof(endpoint)) == -1) {
         throw system_error("bind");
@@ -150,7 +145,7 @@ auto tcp_acceptor::complete_accept(unique_fd descriptor,
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(waiter_, nullptr);
     if (waiter == nullptr) return;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(
+    detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
     waiter->finish(std::move(descriptor), error);
     if (!closed_) {
@@ -203,7 +198,7 @@ tcp_acceptor::accept_awaiter::~accept_awaiter()
 
 auto tcp_acceptor::accept_awaiter::suspend(
     std::coroutine_handle<> handle,
-    eventloop_detail::coroutine_cancellation_state& state) -> bool
+    detail::coroutine_cancellation_state& state) -> bool
 {
     if (owner_.closed_) {
         result_ = std::unexpected(code(EBADF));
@@ -227,7 +222,7 @@ auto tcp_acceptor::accept_awaiter::suspend(
         return false;
     }
     continuation_ = handle;
-    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+    if (!detail::coroutine_frame_access::attach_cancellation(
             state, cancellation_)) {
         result_ = std::unexpected(code(ECANCELED));
         return false;
@@ -237,7 +232,7 @@ auto tcp_acceptor::accept_awaiter::suspend(
         owner_.set_read_interest(true);
     } catch (const std::system_error& error) {
         owner_.waiter_ = nullptr;
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             cancellation_);
         result_ = std::unexpected(error.code());
         return false;
@@ -246,7 +241,7 @@ auto tcp_acceptor::accept_awaiter::suspend(
 }
 
 auto tcp_acceptor::accept_awaiter::cancel(
-    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+    detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<accept_awaiter*>(node.operation);
     self.owner_.complete_accept({}, code(ECANCELED));
@@ -265,3 +260,5 @@ auto tcp_acceptor::accept_awaiter::await_resume() noexcept
 {
     return std::move(result_);
 }
+
+} // namespace eventloop

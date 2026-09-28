@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <memory>
 
+namespace eventloop {
+
 class event_loop;
 class tcp_acceptor;
 class tcp_stream;
@@ -18,7 +20,7 @@ class task;
 template<typename T>
 class task_handle;
 
-namespace eventloop_detail {
+namespace detail {
 
 struct file_io_operation;
 class notifiable;
@@ -96,7 +98,7 @@ struct coroutine_frame_access {
         -> int;
 };
 
-} // namespace eventloop_detail
+} // namespace detail
 
 enum class event_loop_result { stopped, interrupted };
 
@@ -149,7 +151,7 @@ struct coroutine_pool_statistics {
     std::size_t backed_capacity {0};
 };
 
-namespace eventloop_detail {
+namespace detail {
 [[nodiscard]] inline auto deadline_after(
     std::chrono::steady_clock::duration delay) noexcept
     -> std::chrono::steady_clock::time_point
@@ -160,7 +162,7 @@ namespace eventloop_detail {
     const auto latest = clock::time_point::max();
     return now >= latest - delay ? latest : now + delay;
 }
-} // namespace eventloop_detail
+} // namespace detail
 
 class event_loop {
 public:
@@ -204,7 +206,7 @@ public:
         -> coroutine_pool_statistics;
 
 private:
-    friend struct eventloop_detail::coroutine_frame_access;
+    friend struct detail::coroutine_frame_access;
     friend class event_loop_yield_awaiter;
     friend class tcp_acceptor;
     friend class udp_socket;
@@ -223,12 +225,12 @@ private:
         event_loop* loop_ {nullptr};
     };
 
-    [[nodiscard]] auto spawn_root(eventloop_detail::coroutine_root_node& root,
+    [[nodiscard]] auto spawn_root(detail::coroutine_root_node& root,
                                   std::coroutine_handle<> handle,
                                   bool started) -> task_spawn_result;
     [[nodiscard]] auto can_spawn() const noexcept -> bool;
     [[nodiscard]] auto post_local(execution_task&& task) noexcept -> bool;
-    auto add_handler(std::unique_ptr<eventloop_detail::notifiable> handler) -> void;
+    auto add_handler(std::unique_ptr<detail::notifiable> handler) -> void;
     auto remove(int descriptor) -> void;
     auto set_io_interest(int descriptor, bool read_enabled,
                          bool write_enabled) -> void;
@@ -237,3 +239,5 @@ private:
     class implementation;
     std::unique_ptr<implementation> implementation_;
 };
+
+} // namespace eventloop

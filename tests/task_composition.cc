@@ -12,6 +12,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+using namespace eventloop;
+
 using namespace std::chrono_literals;
 
 namespace {

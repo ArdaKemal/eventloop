@@ -11,6 +11,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+using namespace eventloop;
+
 namespace {
 
 struct temporary_file {

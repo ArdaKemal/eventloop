@@ -12,6 +12,8 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
+using namespace eventloop;
+
 #if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
 namespace {
 int injected_timer_arm_errors = 0;
@@ -149,7 +151,7 @@ auto timer_tests() -> bool
     return first == timer_wait_result::expired &&
            second == timer_wait_result::expired &&
            event_loop::clock::now() >= deadline &&
-           eventloop_detail::deadline_after(event_loop::clock::duration::max()) ==
+           eventloop::detail::deadline_after(event_loop::clock::duration::max()) ==
                event_loop::clock::time_point::max();
 }
 

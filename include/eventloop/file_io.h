@@ -21,7 +21,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-namespace eventloop_detail {
+namespace eventloop {
+
+namespace detail {
 
 enum class file_opcode { openat, read_at, write_at };
 
@@ -49,12 +51,12 @@ template<file_opcode Kind>
 class file_io_awaiter {
 public:
     using value_type = std::conditional_t<
-        Kind == eventloop_detail::file_opcode::openat, unique_fd, std::size_t>;
+        Kind == detail::file_opcode::openat, unique_fd, std::size_t>;
     using result_type = std::expected<value_type, std::error_code>;
 
     file_io_awaiter(event_loop& loop, int directory, std::string_view path,
                     int flags, unsigned mode) noexcept
-        requires (Kind == eventloop_detail::file_opcode::openat)
+        requires (Kind == detail::file_opcode::openat)
         : loop_(loop), operation_(Kind)
     {
         operation_.descriptor = directory;
@@ -74,7 +76,7 @@ public:
 
     file_io_awaiter(event_loop& loop, int descriptor, void* buffer,
                     std::size_t length, std::int64_t offset) noexcept
-        requires (Kind != eventloop_detail::file_opcode::openat)
+        requires (Kind != detail::file_opcode::openat)
         : loop_(loop), operation_(Kind)
     {
         operation_.descriptor = descriptor;
@@ -107,15 +109,15 @@ public:
             return false;
         }
         operation_.continuation = handle;
-        if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+        if (!detail::coroutine_frame_access::attach_cancellation(
                 cancellation, operation_.cancellation)) {
             result_ = -ECANCELED;
             return false;
         }
         const int submitted =
-            eventloop_detail::coroutine_frame_access::submit_file(loop_, operation_);
+            detail::coroutine_frame_access::submit_file(loop_, operation_);
         if (submitted < 0) {
-            eventloop_detail::coroutine_frame_access::detach_cancellation(
+            detail::coroutine_frame_access::detach_cancellation(
                 operation_.cancellation);
             result_ = submitted;
             return false;
@@ -129,7 +131,7 @@ public:
             return std::unexpected(std::error_code(-result_,
                                                     std::generic_category()));
         }
-        if constexpr (Kind == eventloop_detail::file_opcode::openat) {
+        if constexpr (Kind == detail::file_opcode::openat) {
             return unique_fd(std::exchange(result_, -1));
         } else {
             return static_cast<value_type>(result_);
@@ -137,25 +139,25 @@ public:
     }
 
 private:
-    template<typename> friend class ::task;
+    template<typename> friend class ::eventloop::task;
 
-    static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+    static auto cancel(detail::coroutine_cancellation_node& node)
         noexcept -> void
     {
-        auto& operation = *static_cast<eventloop_detail::file_io_operation*>(
+        auto& operation = *static_cast<detail::file_io_operation*>(
             node.operation);
         operation.cancelled.store(true, std::memory_order_release);
-        eventloop_detail::coroutine_frame_access::detach_cancellation(node);
+        detail::coroutine_frame_access::detach_cancellation(node);
     }
 
-    static auto complete(eventloop_detail::file_io_operation& operation,
+    static auto complete(detail::file_io_operation& operation,
                          int result) noexcept -> void
     {
         auto& self = *static_cast<file_io_awaiter*>(operation.context);
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             operation.cancellation);
         if (operation.cancelled.load(std::memory_order_acquire)) {
-            if constexpr (Kind == eventloop_detail::file_opcode::openat) {
+            if constexpr (Kind == detail::file_opcode::openat) {
                 if (result >= 0) (void)::close(result);
             }
             result = -ECANCELED;
@@ -174,13 +176,13 @@ private:
     }
 
     event_loop& loop_;
-    eventloop_detail::file_io_operation operation_;
-    std::array<char, Kind == eventloop_detail::file_opcode::openat ? 256 : 1>
+    detail::file_io_operation operation_;
+    std::array<char, Kind == detail::file_opcode::openat ? 256 : 1>
         path_ {};
     int result_ {0};
 };
 
-} // namespace eventloop_detail
+} // namespace detail
 
 // Paths are copied into the awaiter and limited to 255 bytes. Descriptors are
 // borrowed and must remain open and unreused until completion, including after
@@ -189,7 +191,7 @@ private:
 [[nodiscard]] inline auto async_openat(event_loop& loop, int directory,
                                        std::string_view path, int flags,
                                        unsigned mode = 0) noexcept
-    -> eventloop_detail::file_io_awaiter<eventloop_detail::file_opcode::openat>
+    -> detail::file_io_awaiter<detail::file_opcode::openat>
 {
     return {loop, directory, path, flags, mode};
 }
@@ -197,7 +199,7 @@ private:
 [[nodiscard]] inline auto async_read_at(event_loop& loop, int descriptor,
                                         std::span<std::byte> buffer,
                                         std::int64_t offset) noexcept
-    -> eventloop_detail::file_io_awaiter<eventloop_detail::file_opcode::read_at>
+    -> detail::file_io_awaiter<detail::file_opcode::read_at>
 {
     return {loop, descriptor, buffer.data(), buffer.size(), offset};
 }
@@ -205,8 +207,10 @@ private:
 [[nodiscard]] inline auto async_write_at(event_loop& loop, int descriptor,
                                          std::span<const std::byte> buffer,
                                          std::int64_t offset) noexcept
-    -> eventloop_detail::file_io_awaiter<eventloop_detail::file_opcode::write_at>
+    -> detail::file_io_awaiter<detail::file_opcode::write_at>
 {
     return {loop, descriptor, const_cast<std::byte*>(buffer.data()),
             buffer.size(), offset};
 }
+
+} // namespace eventloop

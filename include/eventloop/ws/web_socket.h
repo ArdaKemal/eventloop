@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace ws {
+namespace eventloop::ws {
 
 enum class errc {
     protocol_error = 1,
@@ -358,7 +358,9 @@ private:
 template<typename Stream>
 web_socket(event_loop&, Stream&, std::size_t = 1024 * 1024) -> web_socket<Stream>;
 
-} // namespace ws
+} // namespace eventloop::ws
 
+namespace std {
 template<>
-struct std::is_error_code_enum<ws::errc> : std::true_type {};
+struct is_error_code_enum<eventloop::ws::errc> : true_type {};
+}

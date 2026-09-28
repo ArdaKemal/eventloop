@@ -9,6 +9,8 @@
 #include <span>
 #include <thread>
 
+namespace eventloop {
+
 struct ready_event {
     int descriptor;
     bool readable;
@@ -73,3 +75,5 @@ private:
     unique_fd timer_descriptor_;
     unique_fd epoll_descriptor_;
 };
+
+} // namespace eventloop

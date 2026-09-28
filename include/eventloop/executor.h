@@ -12,7 +12,9 @@
 // be noexcept to invoke and to move construct. Callables that do not fit the
 // inline storage or exceed its alignment are rejected at compile time. The
 // wrapper itself never allocates.
-namespace executor_detail {
+namespace eventloop {
+
+namespace detail {
 
 inline constexpr std::size_t task_storage_size = 64;
 inline constexpr std::size_t task_storage_alignment = alignof(std::max_align_t);
@@ -27,7 +29,7 @@ concept inline_callable =
     (sizeof(Callable) <= task_storage_size) &&
     (alignof(Callable) <= task_storage_alignment);
 
-} // namespace executor_detail
+} // namespace detail
 
 class execution_task {
 public:
@@ -35,7 +37,7 @@ public:
 
     template<typename Function>
     execution_task(Function&& function)
-        requires executor_detail::inline_callable<std::decay_t<Function>>
+        requires detail::inline_callable<std::decay_t<Function>>
     {
         using callable = std::decay_t<Function>;
 
@@ -108,8 +110,8 @@ private:
         }
     }
 
-    alignas(executor_detail::task_storage_alignment)
-        std::byte storage_[executor_detail::task_storage_size];
+    alignas(detail::task_storage_alignment)
+        std::byte storage_[detail::task_storage_size];
     const operations* operations_ {nullptr};
 };
 
@@ -146,3 +148,5 @@ auto make_single_thread_executor() -> std::unique_ptr<executor>;
 // drains accepted work and waits for it to finish.
 auto make_multi_thread_executor(multi_thread_executor_options options)
     -> std::unique_ptr<executor>;
+
+} // namespace eventloop

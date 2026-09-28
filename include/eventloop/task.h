@@ -13,6 +13,8 @@
 #include <type_traits>
 #include <utility>
 
+namespace eventloop {
+
 enum class task_result {
     success,
     frame_allocation_failure,
@@ -41,9 +43,9 @@ enum class blocking_error {
 
 template<typename T>
 class task;
-namespace eventloop_detail { struct composition_task_access; }
+namespace detail { struct composition_task_access; }
 
-namespace eventloop_detail {
+namespace detail {
 
 struct task_promise_base {
     template<typename... Arguments>
@@ -169,7 +171,7 @@ auto suspend_on_task(Handle handle,
     return handle;
 }
 
-} // namespace eventloop_detail
+} // namespace detail
 
 // Coroutine functions returning task must take their owning event_loop as the
 // first argument. Started tasks and their frames remain loop-affine. Root
@@ -211,12 +213,12 @@ public:
 
     [[nodiscard]] auto state() const noexcept -> task_state
     {
-        return eventloop_detail::task_state_of(handle_, allocation_failed_);
+        return detail::task_state_of(handle_, allocation_failed_);
     }
 
     auto start() -> task_state
     {
-        return eventloop_detail::start_task(handle_, allocation_failed_);
+        return detail::start_task(handle_, allocation_failed_);
     }
 
     [[nodiscard]] auto result() const -> task_result
@@ -259,7 +261,7 @@ public:
         auto await_suspend(std::coroutine_handle<Promise> continuation) noexcept
             -> std::coroutine_handle<>
         {
-            return eventloop_detail::suspend_on_task(handle_, continuation);
+            return detail::suspend_on_task(handle_, continuation);
         }
 
         auto await_resume() noexcept -> task_result
@@ -275,7 +277,7 @@ public:
     private:
         auto reset() noexcept -> void
         {
-            eventloop_detail::destroy_task(handle_);
+            detail::destroy_task(handle_);
         }
 
         handle_type handle_ {};
@@ -287,10 +289,10 @@ public:
         return awaiter(std::move(*this));
     }
 
-    struct promise_type : eventloop_detail::task_promise_base {
-        using eventloop_detail::task_promise_base::task_promise_base;
-        using eventloop_detail::task_promise_base::operator new;
-        using eventloop_detail::task_promise_base::operator delete;
+    struct promise_type : detail::task_promise_base {
+        using detail::task_promise_base::task_promise_base;
+        using detail::task_promise_base::operator new;
+        using detail::task_promise_base::operator delete;
 
         [[nodiscard]] static auto get_return_object_on_allocation_failure() noexcept
             -> task
@@ -310,7 +312,7 @@ public:
 private:
     friend class event_loop;
     template<typename> friend class task_handle;
-    friend struct eventloop_detail::composition_task_access;
+    friend struct detail::composition_task_access;
 
     explicit task(handle_type handle, bool allocation_failed) noexcept
         : handle_(handle), allocation_failed_(allocation_failed)
@@ -364,12 +366,12 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept { return handle_ != nullptr; }
     [[nodiscard]] auto state() const noexcept -> task_state
     {
-        return eventloop_detail::task_state_of(handle_, allocation_failed_);
+        return detail::task_state_of(handle_, allocation_failed_);
     }
 
     auto start() -> task_state
     {
-        return eventloop_detail::start_task(handle_, allocation_failed_);
+        return detail::start_task(handle_, allocation_failed_);
     }
 
     [[nodiscard]] auto result() -> result_type
@@ -404,7 +406,7 @@ public:
         auto await_suspend(std::coroutine_handle<Promise> continuation) noexcept
             -> std::coroutine_handle<>
         {
-            return eventloop_detail::suspend_on_task(handle_, continuation);
+            return detail::suspend_on_task(handle_, continuation);
         }
 
         auto await_resume() -> result_type
@@ -420,17 +422,17 @@ public:
     private:
         auto reset() noexcept -> void
         {
-            eventloop_detail::destroy_task(handle_);
+            detail::destroy_task(handle_);
         }
         handle_type handle_ {};
         bool allocation_failed_ {false};
     };
     auto operator co_await() && noexcept -> awaiter { return awaiter(std::move(*this)); }
 
-    struct promise_type : eventloop_detail::task_promise_base {
-        using eventloop_detail::task_promise_base::task_promise_base;
-        using eventloop_detail::task_promise_base::operator new;
-        using eventloop_detail::task_promise_base::operator delete;
+    struct promise_type : detail::task_promise_base {
+        using detail::task_promise_base::task_promise_base;
+        using detail::task_promise_base::operator new;
+        using detail::task_promise_base::operator delete;
 
         [[nodiscard]] static auto get_return_object_on_allocation_failure() noexcept
             -> task
@@ -455,7 +457,7 @@ public:
 private:
     friend class event_loop;
     template<typename> friend class task_handle;
-    friend struct eventloop_detail::composition_task_access;
+    friend struct detail::composition_task_access;
     explicit task(handle_type handle, bool allocation_failed) noexcept
         : handle_(handle), allocation_failed_(allocation_failed) {}
     auto reset() noexcept -> void
@@ -503,7 +505,7 @@ public:
     [[nodiscard]] auto cancel() noexcept -> bool
     {
         if (root_ == nullptr) return false;
-        eventloop_detail::coroutine_frame_access::request_cancellation(
+        detail::coroutine_frame_access::request_cancellation(
             root_->cancellation);
         return true;
     }
@@ -547,7 +549,7 @@ public:
             continuation_ = continuation;
             arming_ = true;
             owner_.waiter_ = this;
-            if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+            if (!detail::coroutine_frame_access::attach_cancellation(
                     *continuation.promise().cancellation_state(), cancellation_)) {
                 (void)owner_.cancel();
             }
@@ -559,20 +561,20 @@ public:
     private:
         friend class task_handle;
         static auto cancel_wait(
-            eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+            detail::coroutine_cancellation_node& node) noexcept -> void
         {
             auto& self = *static_cast<awaiter*>(node.operation);
-            eventloop_detail::coroutine_frame_access::detach_cancellation(node);
+            detail::coroutine_frame_access::detach_cancellation(node);
             (void)self.owner_.cancel();
         }
         auto complete() noexcept -> std::coroutine_handle<>
         {
-            eventloop_detail::coroutine_frame_access::detach_cancellation(
+            detail::coroutine_frame_access::detach_cancellation(
                 cancellation_);
             return arming_ ? std::noop_coroutine() : continuation_;
         }
         task_handle& owner_;
-        eventloop_detail::coroutine_cancellation_node cancellation_ {};
+        detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         bool arming_ {false};
     };
@@ -599,7 +601,7 @@ private:
     }
 
     event_loop* loop_ {nullptr};
-    eventloop_detail::coroutine_root_node* root_ {nullptr};
+    detail::coroutine_root_node* root_ {nullptr};
     std::optional<result_type> result_;
     awaiter* waiter_ {nullptr};
 };
@@ -655,7 +657,7 @@ private:
     return {};
 }
 
-namespace eventloop_detail {
+namespace detail {
 
 template<typename Result>
 class blocking_result_storage {
@@ -690,7 +692,7 @@ public:
     }
 };
 
-} // namespace eventloop_detail
+} // namespace detail
 
 template<typename Function>
 class event_loop_blocking_awaiter {
@@ -724,19 +726,19 @@ public:
         }
 
         const auto reservation =
-            eventloop_detail::coroutine_frame_access::reserve_completion(loop_);
+            detail::coroutine_frame_access::reserve_completion(loop_);
         if (reservation !=
-            eventloop_detail::completion_reservation_result::accepted) {
+            detail::completion_reservation_result::accepted) {
             error_ = reservation ==
-                             eventloop_detail::completion_reservation_result::shutting_down
+                             detail::completion_reservation_result::shutting_down
                          ? blocking_error::shutting_down
                          : blocking_error::completion_capacity_exhausted;
             return false;
         }
 
-        if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+        if (!detail::coroutine_frame_access::attach_cancellation(
                 cancellation, cancellation_)) {
-            eventloop_detail::coroutine_frame_access::release_completion(loop_);
+            detail::coroutine_frame_access::release_completion(loop_);
             error_ = blocking_error::cancelled;
             return false;
         }
@@ -744,15 +746,15 @@ public:
         handle_ = handle;
         execution_task work([this]() noexcept { execute(); });
         const auto submission =
-            eventloop_detail::coroutine_frame_access::submit_blocking(
+            detail::coroutine_frame_access::submit_blocking(
                 loop_, std::move(work));
         if (submission !=
-            eventloop_detail::blocking_submission_result::accepted) {
-            eventloop_detail::coroutine_frame_access::detach_cancellation(
+            detail::blocking_submission_result::accepted) {
+            detail::coroutine_frame_access::detach_cancellation(
                 cancellation_);
-            eventloop_detail::coroutine_frame_access::release_completion(loop_);
+            detail::coroutine_frame_access::release_completion(loop_);
             error_ = submission ==
-                             eventloop_detail::blocking_submission_result::no_worker_threads
+                             detail::blocking_submission_result::no_worker_threads
                          ? blocking_error::no_worker_threads
                          : blocking_error::executor_queue_full;
             return false;
@@ -768,13 +770,13 @@ public:
 
 private:
     static auto cancel(
-        eventloop_detail::coroutine_cancellation_node& cancellation) noexcept
+        detail::coroutine_cancellation_node& cancellation) noexcept
         -> void
     {
         auto* operation = static_cast<event_loop_blocking_awaiter*>(
             cancellation.operation);
         operation->cancelled_.store(true, std::memory_order_release);
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             cancellation);
     }
 
@@ -784,13 +786,13 @@ private:
             storage_.invoke(function_);
         }
         execution_task completion([this]() noexcept { complete(); });
-        eventloop_detail::coroutine_frame_access::post_completion(
+        detail::coroutine_frame_access::post_completion(
             loop_, std::move(completion));
     }
 
     auto complete() noexcept -> void
     {
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             cancellation_);
         if (cancelled_.load(std::memory_order_acquire)) {
             error_ = blocking_error::cancelled;
@@ -801,8 +803,8 @@ private:
 
     event_loop& loop_;
     function_type function_;
-    eventloop_detail::blocking_result_storage<value_type> storage_;
-    eventloop_detail::coroutine_cancellation_node cancellation_;
+    detail::blocking_result_storage<value_type> storage_;
+    detail::coroutine_cancellation_node cancellation_;
     std::coroutine_handle<> handle_ {};
     std::atomic<bool> cancelled_ {false};
     std::optional<blocking_error> error_;
@@ -859,16 +861,16 @@ public:
         timer_.owner = &loop_;
         timer_.cancellation.operation = this;
         timer_.cancellation.cancel = &cancel;
-        if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+        if (!detail::coroutine_frame_access::attach_cancellation(
                 cancellation, timer_.cancellation)) {
             timer_.owner = nullptr;
             result_ = timer_wait_result::cancelled;
             return false;
         }
         try {
-            eventloop_detail::coroutine_frame_access::register_timer(loop_, timer_);
+            detail::coroutine_frame_access::register_timer(loop_, timer_);
         } catch (...) {
-            eventloop_detail::coroutine_frame_access::detach_cancellation(
+            detail::coroutine_frame_access::detach_cancellation(
                 timer_.cancellation);
             timer_.owner = nullptr;
             throw;
@@ -882,23 +884,23 @@ public:
     }
 
 private:
-    friend struct eventloop_detail::coroutine_frame_access;
+    friend struct detail::coroutine_frame_access;
 
     static auto cancel(
-        eventloop_detail::coroutine_cancellation_node& cancellation) noexcept
+        detail::coroutine_cancellation_node& cancellation) noexcept
         -> void
     {
         auto* awaiter = static_cast<event_loop_timer_awaiter*>(
             cancellation.operation);
         auto& timer = awaiter->timer_;
-        eventloop_detail::coroutine_frame_access::cancel_timer(timer);
+        detail::coroutine_frame_access::cancel_timer(timer);
         awaiter->result_ = timer_wait_result::cancelled;
         const auto handle = timer.handle;
         handle.resume();
     }
 
     event_loop& loop_;
-    eventloop_detail::coroutine_timer_node timer_;
+    detail::coroutine_timer_node timer_;
     timer_wait_result result_ {timer_wait_result::expired};
 };
 
@@ -913,7 +915,7 @@ private:
     event_loop& loop, event_loop::clock::duration delay) noexcept
     -> event_loop_timer_awaiter
 {
-    return sleep_until(loop, eventloop_detail::deadline_after(delay));
+    return sleep_until(loop, detail::deadline_after(delay));
 }
 
 class event_loop_yield_awaiter {
@@ -947,3 +949,5 @@ private:
 {
     return event_loop_yield_awaiter(loop);
 }
+
+} // namespace eventloop

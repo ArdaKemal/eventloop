@@ -14,6 +14,8 @@
 #include <string_view>
 #include <utility>
 
+using namespace eventloop;
+
 namespace {
 [[nodiscard]] auto echo_session(event_loop& loop, tcp_stream& stream) -> task<void>
 {
@@ -69,7 +71,7 @@ auto main(int argc, char* argv[]) -> int
     try {
         const auto port = argc > 1 ? parse_port(argv[1]) : std::uint16_t {7000};
         event_loop loop;
-        auto listener = std::make_unique<tcp_acceptor>(loop, port);
+        auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback(port));
         auto* accepting = listener.get();
         loop.add(std::move(listener));
         if (loop.spawn(serve(loop, *accepting)) != task_spawn_result::accepted) {

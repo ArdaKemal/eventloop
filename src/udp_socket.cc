@@ -12,13 +12,15 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+namespace eventloop {
+
 namespace {
 [[nodiscard]] auto system_error(const char* operation) -> std::system_error
 {
     return {errno, std::system_category(), operation};
 }
 
-[[nodiscard]] auto native_endpoint(udp_endpoint endpoint) noexcept -> sockaddr_in
+[[nodiscard]] auto native_endpoint(ipv4_endpoint endpoint) noexcept -> sockaddr_in
 {
     sockaddr_in native {};
     native.sin_family = AF_INET;
@@ -29,9 +31,9 @@ namespace {
 }
 
 [[nodiscard]] auto public_endpoint(const sockaddr_in& native) noexcept
-    -> udp_endpoint
+    -> ipv4_endpoint
 {
-    udp_endpoint endpoint;
+    ipv4_endpoint endpoint;
     std::memcpy(endpoint.address.data(), &native.sin_addr,
                 endpoint.address.size());
     endpoint.port = ntohs(native.sin_port);
@@ -44,7 +46,7 @@ namespace {
 }
 
 [[nodiscard]] auto try_receive(int descriptor, std::span<std::byte> buffer,
-                               udp_endpoint& source) noexcept -> int
+                               ipv4_endpoint& source) noexcept -> int
 {
     if (buffer.size() > static_cast<std::size_t>(
                             std::numeric_limits<int>::max())) {
@@ -72,7 +74,7 @@ namespace {
 }
 
 [[nodiscard]] auto try_send(int descriptor, std::span<const std::byte> buffer,
-                            udp_endpoint destination) noexcept -> int
+                            ipv4_endpoint destination) noexcept -> int
 {
     if (buffer.size() > 65507) return -EMSGSIZE;
     const auto native_destination = native_endpoint(destination);
@@ -93,8 +95,8 @@ namespace {
 }
 } // namespace
 
-udp_socket::udp_socket(event_loop& loop, std::uint16_t port,
-                       std::string_view address, bool reuse_port)
+udp_socket::udp_socket(event_loop& loop, ipv4_endpoint endpoint,
+                       bool reuse_port)
     : loop_(loop)
 {
     descriptor_.reset(::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
@@ -111,18 +113,7 @@ udp_socket::udp_socket(event_loop& loop, std::uint16_t port,
                      sizeof(enabled)) == -1) {
         throw system_error("setsockopt(SO_REUSEPORT)");
     }
-    if (address.empty() || address.size() >= INET_ADDRSTRLEN ||
-        address.find('\0') != std::string_view::npos) {
-        throw std::invalid_argument("invalid IPv4 address");
-    }
-    std::array<char, INET_ADDRSTRLEN> address_text {};
-    std::memcpy(address_text.data(), address.data(), address.size());
-    sockaddr_in native {};
-    native.sin_family = AF_INET;
-    native.sin_port = htons(port);
-    if (::inet_pton(AF_INET, address_text.data(), &native.sin_addr) != 1) {
-        throw std::invalid_argument("invalid IPv4 address");
-    }
+    const auto native = native_endpoint(endpoint);
     if (::bind(descriptor_.get(), reinterpret_cast<const sockaddr*>(&native),
                sizeof(native)) == -1) {
         throw system_error("bind");
@@ -141,7 +132,7 @@ auto udp_socket::descriptor() const noexcept -> int
     return descriptor_.get();
 }
 
-auto udp_socket::local_endpoint() const -> udp_endpoint
+auto udp_socket::local_endpoint() const -> ipv4_endpoint
 {
     sockaddr_in native {};
     socklen_t length = sizeof(native);
@@ -168,7 +159,7 @@ auto udp_socket::async_receive_from(std::span<std::byte> buffer) noexcept
 }
 
 auto udp_socket::async_send_to(std::span<const std::byte> buffer,
-                               udp_endpoint destination) noexcept -> send_awaiter
+                               ipv4_endpoint destination) noexcept -> send_awaiter
 {
     return {*this, buffer, destination};
 }
@@ -183,7 +174,7 @@ udp_socket::receive_awaiter::receive_awaiter(
 
 auto udp_socket::receive_awaiter::start(
     std::coroutine_handle<> continuation,
-    eventloop_detail::coroutine_cancellation_state& cancellation) noexcept -> bool
+    detail::coroutine_cancellation_state& cancellation) noexcept -> bool
 {
     if (cancellation.requested || socket_.closing_) {
         result_ = -ECANCELED;
@@ -197,7 +188,7 @@ auto udp_socket::receive_awaiter::start(
     if (!retryable(-result_)) return false;
 
     continuation_ = continuation;
-    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+    if (!detail::coroutine_frame_access::attach_cancellation(
             cancellation, cancellation_)) {
         result_ = -ECANCELED;
         return false;
@@ -214,7 +205,7 @@ auto udp_socket::receive_awaiter::start(
     }
     if (armed) return true;
     socket_.receive_ = nullptr;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(cancellation_);
+    detail::coroutine_frame_access::detach_cancellation(cancellation_);
     return false;
 }
 
@@ -226,7 +217,7 @@ auto udp_socket::receive_awaiter::await_resume() const noexcept
 }
 
 auto udp_socket::receive_awaiter::cancel(
-    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+    detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<receive_awaiter*>(node.operation);
     self.socket_.complete_receive(-ECANCELED);
@@ -234,7 +225,7 @@ auto udp_socket::receive_awaiter::cancel(
 
 udp_socket::send_awaiter::send_awaiter(
     udp_socket& socket, std::span<const std::byte> buffer,
-    udp_endpoint destination) noexcept
+    ipv4_endpoint destination) noexcept
     : socket_(socket), buffer_(buffer), destination_(destination)
 {
     cancellation_.operation = this;
@@ -243,7 +234,7 @@ udp_socket::send_awaiter::send_awaiter(
 
 auto udp_socket::send_awaiter::start(
     std::coroutine_handle<> continuation,
-    eventloop_detail::coroutine_cancellation_state& cancellation) noexcept -> bool
+    detail::coroutine_cancellation_state& cancellation) noexcept -> bool
 {
     if (cancellation.requested || socket_.closing_) {
         result_ = -ECANCELED;
@@ -257,7 +248,7 @@ auto udp_socket::send_awaiter::start(
     if (!retryable(-result_)) return false;
 
     continuation_ = continuation;
-    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+    if (!detail::coroutine_frame_access::attach_cancellation(
             cancellation, cancellation_)) {
         result_ = -ECANCELED;
         return false;
@@ -274,7 +265,7 @@ auto udp_socket::send_awaiter::start(
     }
     if (armed) return true;
     socket_.send_ = nullptr;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(cancellation_);
+    detail::coroutine_frame_access::detach_cancellation(cancellation_);
     return false;
 }
 
@@ -286,7 +277,7 @@ auto udp_socket::send_awaiter::await_resume() const noexcept
 }
 
 auto udp_socket::send_awaiter::cancel(
-    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+    detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<send_awaiter*>(node.operation);
     self.socket_.complete_send(-ECANCELED);
@@ -298,13 +289,13 @@ auto udp_socket::update_interest() -> void
                           send_ != nullptr);
 }
 
-auto udp_socket::complete_receive(int result, udp_endpoint source) noexcept
+auto udp_socket::complete_receive(int result, ipv4_endpoint source) noexcept
     -> void
 {
     event_loop::handler_call_scope scope(loop_);
     auto* operation = std::exchange(receive_, nullptr);
     if (operation == nullptr) return;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(
+    detail::coroutine_frame_access::detach_cancellation(
         operation->cancellation_);
     operation->result_ = result;
     operation->source_ = source;
@@ -322,7 +313,7 @@ auto udp_socket::complete_send(int result) noexcept -> void
     event_loop::handler_call_scope scope(loop_);
     auto* operation = std::exchange(send_, nullptr);
     if (operation == nullptr) return;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(
+    detail::coroutine_frame_access::detach_cancellation(
         operation->cancellation_);
     operation->result_ = result;
     try {
@@ -343,13 +334,13 @@ auto udp_socket::complete_pending(int result) noexcept -> void
     std::coroutine_handle<> receive_continuation;
     std::coroutine_handle<> send_continuation;
     if (receiving != nullptr) {
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             receiving->cancellation_);
         receiving->result_ = result;
         receive_continuation = receiving->continuation_;
     }
     if (sending != nullptr) {
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             sending->cancellation_);
         sending->result_ = result;
         send_continuation = sending->continuation_;
@@ -366,7 +357,7 @@ auto udp_socket::complete_pending(int result) noexcept -> void
 auto udp_socket::on_read() -> void
 {
     if (receive_ == nullptr) return;
-    udp_endpoint source;
+    ipv4_endpoint source;
     const int result = try_receive(descriptor_.get(), receive_->buffer_, source);
     if (!retryable(-result)) complete_receive(result, source);
 }
@@ -396,3 +387,5 @@ auto udp_socket::on_shutdown() -> void
     event_loop::handler_call_scope scope(loop_);
     close();
 }
+
+} // namespace eventloop

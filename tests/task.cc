@@ -14,6 +14,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+using namespace eventloop;
+
 namespace {
 std::size_t allocations = 0;
 }

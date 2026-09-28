@@ -2,7 +2,7 @@
 
 #include <charconv>
 
-namespace http {
+namespace eventloop::http {
 namespace {
 
 [[nodiscard]] constexpr auto ascii_lower(char value) noexcept -> char
@@ -214,4 +214,4 @@ auto parse_request(std::string_view input, request& output) noexcept -> parse_re
             .consumed = body_start + content_length};
 }
 
-} // namespace http
+} // namespace eventloop::http

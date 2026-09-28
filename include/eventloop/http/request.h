@@ -5,7 +5,7 @@
 #include <optional>
 #include <string_view>
 
-namespace http {
+namespace eventloop::http {
 
 inline constexpr std::size_t max_headers = 32;
 inline constexpr std::size_t max_target_size = 2048;
@@ -60,4 +60,4 @@ struct parse_result {
 [[nodiscard]] auto parse_request(std::string_view input, request& output) noexcept
     -> parse_result;
 
-} // namespace http
+} // namespace eventloop::http

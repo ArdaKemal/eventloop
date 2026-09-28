@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+namespace eventloop {
+
 namespace {
 
 [[nodiscard]] auto is_power_of_two(std::size_t value) noexcept -> bool
@@ -142,3 +144,5 @@ auto make_multi_thread_executor(multi_thread_executor_options options)
     }
     return std::make_unique<multi_thread_executor>(options);
 }
+
+} // namespace eventloop

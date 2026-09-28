@@ -1,6 +1,8 @@
 #pragma once
 
-namespace eventloop_detail {
+namespace eventloop {
+
+namespace detail {
 
 class notifiable {
 public:
@@ -16,4 +18,6 @@ public:
     }
 };
 
-} // namespace eventloop_detail
+} // namespace detail
+
+} // namespace eventloop

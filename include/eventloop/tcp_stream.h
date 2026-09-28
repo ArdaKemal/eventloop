@@ -2,6 +2,7 @@
 
 #include "eventloop/event_loop.h"
 #include "eventloop/detail/notifiable.h"
+#include "eventloop/ipv4_endpoint.h"
 #include "eventloop/task.h"
 #include "eventloop/unique_fd.h"
 
@@ -11,14 +12,15 @@
 #include <exception>
 #include <expected>
 #include <span>
-#include <string_view>
 #include <system_error>
 
-class tcp_stream : private eventloop_detail::notifiable {
+namespace eventloop {
+
+class tcp_stream : private detail::notifiable {
 public:
     // Takes ownership of the accepted descriptor, including on failure.
     tcp_stream(event_loop& loop, unique_fd descriptor);
-    tcp_stream(event_loop& loop, std::string_view address, std::uint16_t port);
+    tcp_stream(event_loop& loop, ipv4_endpoint endpoint);
     ~tcp_stream() override;
 
     tcp_stream(const tcp_stream&) = delete;
@@ -26,10 +28,6 @@ public:
 
     [[nodiscard]] auto descriptor() const noexcept -> int override;
     [[nodiscard]] auto owning_loop() const noexcept -> event_loop& { return loop_; }
-    [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
-    {
-        return false;
-    }
     class connect_awaiter {
     public:
         explicit connect_awaiter(tcp_stream& owner) noexcept;
@@ -48,13 +46,13 @@ public:
             -> std::expected<void, std::error_code>;
     private:
         friend class tcp_stream;
-        static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+        static auto cancel(detail::coroutine_cancellation_node& node)
             noexcept -> void;
         auto suspend(std::coroutine_handle<> handle,
-                     eventloop_detail::coroutine_cancellation_state& state) -> bool;
+                     detail::coroutine_cancellation_state& state) -> bool;
         auto finish(std::error_code error) noexcept -> void;
         tcp_stream& owner_;
-        eventloop_detail::coroutine_cancellation_node cancellation_ {};
+        detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::error_code error_ {};
     };
@@ -82,15 +80,15 @@ public:
             -> std::expected<std::size_t, std::error_code>;
     private:
         friend class tcp_stream;
-        static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+        static auto cancel(detail::coroutine_cancellation_node& node)
             noexcept -> void;
         auto suspend(std::coroutine_handle<> handle,
-                     eventloop_detail::coroutine_cancellation_state& state) -> bool;
+                     detail::coroutine_cancellation_state& state) -> bool;
         auto finish(std::size_t size, std::error_code error) noexcept -> void;
         tcp_stream& owner_;
         void* data_;
         std::size_t size_;
-        eventloop_detail::coroutine_cancellation_node cancellation_ {};
+        detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::size_t transferred_ {0};
         std::error_code error_ {};
@@ -131,16 +129,16 @@ private:
             -> std::expected<void, std::error_code>;
     private:
         friend class tcp_stream;
-        static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+        static auto cancel(detail::coroutine_cancellation_node& node)
             noexcept -> void;
         auto suspend(std::coroutine_handle<> handle,
-                     eventloop_detail::coroutine_cancellation_state& state) -> bool;
+                     detail::coroutine_cancellation_state& state) -> bool;
         auto advance() noexcept -> std::error_code;
         auto finish(std::error_code error) noexcept -> void;
         tcp_stream& owner_;
         unique_fd file_;
         std::size_t remaining_;
-        eventloop_detail::coroutine_cancellation_node cancellation_ {};
+        detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::error_code error_ {};
     };
@@ -165,6 +163,11 @@ protected:
 
 private:
     friend class event_loop;
+
+    [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
+    {
+        return false;
+    }
 
     auto on_read() -> void override;
     auto on_write() -> void override;
@@ -193,3 +196,5 @@ private:
     bool read_interest_enabled_ {false};
     bool write_interest_enabled_ {false};
 };
+
+} // namespace eventloop

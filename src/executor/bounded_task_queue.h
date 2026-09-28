@@ -13,6 +13,8 @@
 // Bounded, fully preallocated MPMC ring buffer. Positions grow monotonically;
 // `mask_` only maps a position onto a slot. Each slot's sequence number states
 // whether the slot belongs to the next producer or the next consumer cycle.
+namespace eventloop {
+
 class bounded_task_queue {
 public:
     explicit bounded_task_queue(std::size_t capacity)
@@ -112,3 +114,5 @@ private:
     alignas(64) std::atomic<std::size_t> enqueue_position_ {0};
     alignas(64) std::atomic<std::size_t> dequeue_position_ {0};
 };
+
+} // namespace eventloop

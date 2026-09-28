@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <functional>
 
+namespace eventloop {
+
 using namespace std::string_view_literals;
 
 auto arg_parser::exit_with_usage() -> void
@@ -96,3 +98,5 @@ auto arg_parser::parse(int argc, char *argv[]) -> void
         }
     }
 }
+
+} // namespace eventloop

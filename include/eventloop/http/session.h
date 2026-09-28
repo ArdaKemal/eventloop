@@ -12,7 +12,7 @@
 
 #include <sys/stat.h>
 
-namespace http {
+namespace eventloop::http {
 
 class session {
 public:
@@ -73,4 +73,4 @@ private:
     bool closed_ {false};
 };
 
-} // namespace http
+} // namespace eventloop::http

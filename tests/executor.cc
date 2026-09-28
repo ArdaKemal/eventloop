@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+using namespace eventloop;
+
 namespace {
 std::atomic<std::size_t> allocations {0};
 }
@@ -95,12 +97,12 @@ struct throwing_callable {
 
 struct not_callable {};
 
-static_assert(executor_detail::inline_callable<decltype([]() noexcept {})>);
-static_assert(!executor_detail::inline_callable<large_callable>);
-static_assert(!executor_detail::inline_callable<over_aligned_callable>);
-static_assert(!executor_detail::inline_callable<throwing_callable>);
-static_assert(!executor_detail::inline_callable<not_callable>);
-static_assert(executor_detail::inline_callable<lifetime_callable>);
+static_assert(eventloop::detail::inline_callable<decltype([]() noexcept {})>);
+static_assert(!eventloop::detail::inline_callable<large_callable>);
+static_assert(!eventloop::detail::inline_callable<over_aligned_callable>);
+static_assert(!eventloop::detail::inline_callable<throwing_callable>);
+static_assert(!eventloop::detail::inline_callable<not_callable>);
+static_assert(eventloop::detail::inline_callable<lifetime_callable>);
 static_assert(std::is_nothrow_move_constructible_v<execution_task>);
 static_assert(std::is_nothrow_destructible_v<execution_task>);
 static_assert(!std::is_copy_constructible_v<execution_task>);

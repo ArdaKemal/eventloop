@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace http {
+namespace eventloop::http {
 namespace {
 
 struct directory_closer {
@@ -121,4 +121,4 @@ auto make_directory_listing(int descriptor)
     return output;
 }
 
-} // namespace http
+} // namespace eventloop::http

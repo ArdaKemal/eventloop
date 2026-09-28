@@ -9,7 +9,7 @@
 #include <string>
 #include <string_view>
 
-namespace http {
+namespace eventloop::http {
 
 struct server_options {
     bool directory_listing {false};
@@ -72,4 +72,4 @@ private:
     std::uint16_t https_port_;
 };
 
-} // namespace http
+} // namespace eventloop::http

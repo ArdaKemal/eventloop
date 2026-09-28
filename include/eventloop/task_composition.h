@@ -14,7 +14,9 @@
 #include <utility>
 #include <variant>
 
-namespace eventloop_detail {
+namespace eventloop {
+
+namespace detail {
 
 struct composition_task_access {
     template<typename T>
@@ -75,15 +77,15 @@ template<typename T>
     else return std::unexpected(task_result::cancelled);
 }
 
-} // namespace eventloop_detail
+} // namespace detail
 
 template<typename... T>
 struct race_winner {
     std::size_t index;
-    std::variant<eventloop_detail::composition_result_t<T>...> result;
+    std::variant<detail::composition_result_t<T>...> result;
 };
 
-namespace eventloop_detail {
+namespace detail {
 
 // Fixed-arity composition. Every branch owns one task and an independent
 // cancellation state. The parent's cancellation node fans out to all branches.
@@ -112,7 +114,7 @@ public:
         parent_ = parent;
         auto& promise = parent.promise();
         validate(promise.owner_loop(), std::index_sequence_for<T...> {});
-        if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+        if (!detail::coroutine_frame_access::attach_cancellation(
                 *promise.cancellation_state(), parent_node_)) {
             parent_cancelled_ = true;
             return false;
@@ -147,10 +149,10 @@ private:
     auto validate(event_loop* loop, std::index_sequence<I...>) -> void
     {
         auto check = [loop](auto& operation) {
-            if (eventloop_detail::composition_task_access::started(operation)) {
+            if (detail::composition_task_access::started(operation)) {
                 throw std::logic_error("composition operand already started");
             }
-            auto* child_loop = eventloop_detail::composition_task_access::loop(operation);
+            auto* child_loop = detail::composition_task_access::loop(operation);
             if (child_loop != nullptr && child_loop != loop) {
                 throw std::logic_error("composition operand belongs to another event loop");
             }
@@ -168,11 +170,11 @@ private:
     auto start_one() -> void
     {
         auto& operation = std::get<I>(operations_);
-        if (eventloop_detail::composition_task_access::done(operation)) {
+        if (detail::composition_task_access::done(operation)) {
             finish(I);
             return;
         }
-        eventloop_detail::composition_task_access::start(
+        detail::composition_task_access::start(
             operation, branches_[I], this, &complete_branch<I>);
     }
 
@@ -194,7 +196,7 @@ private:
                 driving_ = true;
                 for (std::size_t i = 0; i < count; ++i) {
                     if (i != index && !finished_[i]) {
-                        eventloop_detail::composition_task_access::request_cancel(branches_[i]);
+                        detail::composition_task_access::request_cancel(branches_[i]);
                     }
                 }
                 driving_ = was_driving;
@@ -207,7 +209,7 @@ private:
         return std::noop_coroutine();
     }
 
-    static auto cancel_parent(eventloop_detail::coroutine_cancellation_node& node)
+    static auto cancel_parent(detail::coroutine_cancellation_node& node)
         noexcept -> void
     {
         auto& self = *static_cast<task_composition_awaiter*>(node.operation);
@@ -216,7 +218,7 @@ private:
         self.driving_ = true;
         for (std::size_t i = 0; i < count; ++i) {
             if (!self.finished_[i]) {
-                eventloop_detail::composition_task_access::request_cancel(
+                detail::composition_task_access::request_cancel(
                     self.branches_[i]);
             }
         }
@@ -230,23 +232,23 @@ private:
 
     auto detach_parent() noexcept -> void
     {
-        eventloop_detail::coroutine_frame_access::detach_cancellation(parent_node_);
+        detail::coroutine_frame_access::detach_cancellation(parent_node_);
     }
 
     template<std::size_t... I>
     auto take_all(std::index_sequence<I...>)
     {
-        return std::tuple<eventloop_detail::composition_result_t<T>...> {
+        return std::tuple<detail::composition_result_t<T>...> {
             take_one<I>()...
         };
     }
 
     template<std::size_t I>
-    auto take_one() -> eventloop_detail::composition_result_t<std::tuple_element_t<I, std::tuple<T...>>>
+    auto take_one() -> detail::composition_result_t<std::tuple_element_t<I, std::tuple<T...>>>
     {
         using value_type = std::tuple_element_t<I, std::tuple<T...>>;
-        if (!finished_[I]) return eventloop_detail::cancelled_result<value_type>();
-        return eventloop_detail::composition_task_access::result(
+        if (!finished_[I]) return detail::cancelled_result<value_type>();
+        return detail::composition_task_access::result(
             std::get<I>(operations_));
     }
 
@@ -257,7 +259,7 @@ private:
             std::terminate();
         } else {
             if (winner_ == I) {
-                return {I, std::variant<eventloop_detail::composition_result_t<T>...>(
+                return {I, std::variant<detail::composition_result_t<T>...>(
                     std::in_place_index<I>, take_one<I>())};
             }
             return make_winner<I + 1>();
@@ -265,9 +267,9 @@ private:
     }
 
     std::tuple<task<T>...> operations_;
-    std::array<eventloop_detail::coroutine_cancellation_state, count> branches_ {};
+    std::array<detail::coroutine_cancellation_state, count> branches_ {};
     std::array<bool, count> finished_ {};
-    eventloop_detail::coroutine_cancellation_node parent_node_ {};
+    detail::coroutine_cancellation_node parent_node_ {};
     std::coroutine_handle<> parent_ {};
     std::size_t completed_ {0};
     std::size_t winner_ {count};
@@ -275,35 +277,35 @@ private:
     bool parent_cancelled_ {false};
 };
 
-} // namespace eventloop_detail
+} // namespace detail
 
 template<typename... T>
 [[nodiscard]] auto when_all(task<T>&&... operations)
 {
-    return eventloop_detail::task_composition_awaiter<false, T...>(
+    return detail::task_composition_awaiter<false, T...>(
         std::move(operations)...);
 }
 
 template<typename... T>
 [[nodiscard]] auto race(task<T>&&... operations)
 {
-    return eventloop_detail::task_composition_awaiter<true, T...>(
+    return detail::task_composition_awaiter<true, T...>(
         std::move(operations)...);
 }
 
 template<typename T>
 struct timeout_result {
     enum class outcome { completed, timed_out, cancelled } state;
-    std::optional<eventloop_detail::composition_result_t<T>> result;
+    std::optional<detail::composition_result_t<T>> result;
 };
 
-namespace eventloop_detail {
+namespace detail {
 inline auto timeout_timer(event_loop& loop, event_loop::clock::duration duration)
     -> task<void>
 {
     (void)co_await sleep_for(loop, duration);
 }
-} // namespace eventloop_detail
+} // namespace detail
 
 template<typename T>
 [[nodiscard]] auto with_timeout(event_loop& loop, task<T> operation,
@@ -311,15 +313,15 @@ template<typename T>
     -> task<timeout_result<T>>
 {
     if (duration <= event_loop::clock::duration::zero()) {
-        const auto* child_loop = eventloop_detail::composition_task_access::loop(operation);
-        if (eventloop_detail::composition_task_access::started(operation) ||
+        const auto* child_loop = detail::composition_task_access::loop(operation);
+        if (detail::composition_task_access::started(operation) ||
             (child_loop != nullptr && child_loop != &loop)) {
             throw std::logic_error("timeout operand is not an unstarted task on this loop");
         }
         co_return timeout_result<T> {timeout_result<T>::outcome::timed_out, {}};
     }
     auto winner = co_await race(std::move(operation),
-                                eventloop_detail::timeout_timer(loop, duration));
+                                detail::timeout_timer(loop, duration));
     if (!winner) co_return timeout_result<T> {timeout_result<T>::outcome::cancelled, {}};
     if (winner->index == 1) {
         co_return timeout_result<T> {timeout_result<T>::outcome::timed_out, {}};
@@ -329,3 +331,5 @@ template<typename T>
         std::get<0>(std::move(winner->result))
     };
 }
+
+} // namespace eventloop

@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <iostream>
 
+using namespace eventloop;
+
 namespace {
 
 constexpr std::size_t construction_iterations = 20'000;

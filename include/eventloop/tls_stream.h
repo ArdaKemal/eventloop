@@ -11,6 +11,8 @@
 #include <type_traits>
 #include <vector>
 
+namespace eventloop {
+
 enum class tls_errc {
     truncated = 1000,
     handshake_failed,
@@ -89,5 +91,9 @@ private:
     bool closing_ {false};
 };
 
+} // namespace eventloop
+
+namespace std {
 template<>
-struct std::is_error_code_enum<tls_errc> : true_type {};
+struct is_error_code_enum<eventloop::tls_errc> : true_type {};
+}

@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+using namespace eventloop;
+
 namespace {
 
 constexpr std::size_t immediate_iterations = 20'000'000;

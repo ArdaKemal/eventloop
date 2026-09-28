@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <vector>
 
+using namespace eventloop;
+
 namespace {
 
 using clock = std::chrono::steady_clock;

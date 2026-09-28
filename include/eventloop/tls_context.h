@@ -4,6 +4,8 @@
 #include <memory>
 #include <string_view>
 
+namespace eventloop {
+
 class tls_context {
 public:
     ~tls_context();
@@ -27,3 +29,5 @@ private:
 
     friend class tls_stream;
 };
+
+} // namespace eventloop

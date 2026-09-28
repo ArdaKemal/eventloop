@@ -7,7 +7,7 @@
 #include <new>
 #include <stdexcept>
 
-namespace ws {
+namespace eventloop::ws {
 namespace {
 
 constexpr std::size_t retained_buffer_size = 64 * 1024;
@@ -404,4 +404,4 @@ auto web_socket_core::validate_close(std::uint16_t code,
 
 } // namespace detail
 
-} // namespace ws
+} // namespace eventloop::ws

@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
-project(event_loop LANGUAGES CXX)
+project(event_loop VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 find_package(Botan 3 REQUIRED)
 find_package(Threads REQUIRED)
 include(CTest)
@@ -15,6 +17,7 @@ add_library(eventloop
     include/eventloop/http/request.h
     include/eventloop/http/server.h
     include/eventloop/http/session.h
+    include/eventloop/ipv4_endpoint.h
     include/eventloop/tcp_acceptor.h
     include/eventloop/tcp_stream.h
     include/eventloop/task.h
@@ -47,10 +50,41 @@ add_library(eventloop::eventloop ALIAS eventloop)
 target_include_directories(eventloop
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_compile_features(eventloop PUBLIC cxx_std_23)
 target_link_libraries(eventloop PUBLIC botan::botan Threads::Threads)
 target_compile_options(eventloop PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+set(eventloop_package_dir "${CMAKE_INSTALL_LIBDIR}/cmake/eventloop")
+
+install(TARGETS eventloop EXPORT eventloopTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+install(DIRECTORY include/eventloop DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+install(EXPORT eventloopTargets
+    FILE eventloopTargets.cmake
+    NAMESPACE eventloop::
+    DESTINATION "${eventloop_package_dir}"
+)
+
+configure_package_config_file(
+    cmake/eventloopConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfig.cmake"
+    INSTALL_DESTINATION "${eventloop_package_dir}"
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfigVersion.cmake"
+    DESTINATION "${eventloop_package_dir}"
+)
 
 add_executable(tcp_echo examples/tcp_echo.cc)
 target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)

@@ -11,6 +11,8 @@
 #include <thread>
 #include <vector>
 
+using namespace eventloop;
+
 namespace {
 [[nodiscard]] auto parse_port(std::string_view text) -> std::uint16_t
 {

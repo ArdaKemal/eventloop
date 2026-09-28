@@ -25,6 +25,8 @@
 #include <botan/x509cert.h>
 #include <botan/x509_crl.h>
 
+namespace eventloop {
+
 namespace {
 
 [[nodiscard]] auto system_code(int value) noexcept -> std::error_code
@@ -482,7 +484,7 @@ public:
     {
         auto& state = *handle.promise().cancellation_state();
         if (state.requested ||
-            !eventloop_detail::coroutine_frame_access::attach_cancellation(
+            !detail::coroutine_frame_access::attach_cancellation(
                 state, cancellation_)) {
             error_ = system_code(ECANCELED);
             return false;
@@ -507,19 +509,19 @@ public:
     }
 
 private:
-    static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
+    static auto cancel(detail::coroutine_cancellation_node& node)
         noexcept -> void
     {
         auto& self = *static_cast<flush_waiter*>(node.operation);
         self.owner_.flush_waiter_ = nullptr;
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             self.cancellation_);
         self.finish(system_code(ECANCELED));
     }
 
     tls_stream& owner_;
     std::coroutine_handle<> continuation_ {};
-    eventloop_detail::coroutine_cancellation_node cancellation_;
+    detail::coroutine_cancellation_node cancellation_;
     std::error_code error_;
 };
 
@@ -530,7 +532,7 @@ auto tls_stream::release_flush() noexcept -> void
         flush_active_ = false;
         return;
     }
-    eventloop_detail::coroutine_frame_access::detach_cancellation(
+    detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
     // Ownership passes directly to the resumed coroutine. No other flusher
     // can enter between the current write and its continuation.
@@ -704,3 +706,5 @@ auto tls_stream::close_task(event_loop& loop, tls_stream& self)
     if (!flushed) co_return std::unexpected(task_code(flushed.error()));
     co_return *flushed;
 }
+
+} // namespace eventloop

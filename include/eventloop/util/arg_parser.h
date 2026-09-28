@@ -4,6 +4,8 @@
 #include <string>
 #include <variant>
 
+namespace eventloop {
+
 class arg_parser {
 public:
     using value_t = std::variant<bool*, int*, std::string*>;
@@ -32,3 +34,5 @@ private:
     std::string_view usage_;
     std::vector<option> options_;
 };
+
+} // namespace eventloop

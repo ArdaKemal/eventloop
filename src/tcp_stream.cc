@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+namespace eventloop {
+
 namespace {
 [[nodiscard]] auto code(int error) noexcept -> std::error_code
 {
@@ -51,22 +53,11 @@ tcp_stream::tcp_stream(event_loop& loop, unique_fd descriptor)
     }
 }
 
-tcp_stream::tcp_stream(event_loop& loop, std::string_view address,
-                       std::uint16_t port)
-    : loop_(loop), port_(port), connected_(false),
+tcp_stream::tcp_stream(event_loop& loop, ipv4_endpoint remote)
+    : loop_(loop), port_(remote.port), connected_(false),
       transport_activated_(true)
 {
-    if (address.empty() || address.size() > 15 ||
-        address.find('\0') != std::string_view::npos) {
-        throw std::invalid_argument("invalid IPv4 address");
-    }
-    std::array<char, 16> address_text {};
-    std::memcpy(address_text.data(), address.data(), address.size());
-    in_addr parsed {};
-    if (::inet_pton(AF_INET, address_text.data(), &parsed) != 1) {
-        throw std::invalid_argument("invalid IPv4 address");
-    }
-    address_ = parsed.s_addr;
+    std::memcpy(&address_, remote.address.data(), remote.address.size());
     descriptor_.reset(::socket(AF_INET,
                                SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (!descriptor_) {
@@ -206,7 +197,7 @@ auto tcp_stream::complete_connect(std::error_code error) noexcept
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(connector_, nullptr);
     if (waiter == nullptr) return;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(
+    detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
     update_async_interest();
     waiter->finish(error);
@@ -218,7 +209,7 @@ auto tcp_stream::complete_read(std::size_t size,
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(reader_, nullptr);
     if (waiter == nullptr) return;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(
+    detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
     waiter->finish(size, error);
     // The continuation often starts another read before returning. Keep the
@@ -232,7 +223,7 @@ auto tcp_stream::complete_write(std::size_t size,
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(writer_, nullptr);
     if (waiter == nullptr) return;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(
+    detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
     update_async_interest();
     waiter->finish(size, error);
@@ -243,7 +234,7 @@ auto tcp_stream::complete_file(std::error_code error) noexcept -> void
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(file_writer_, nullptr);
     if (waiter == nullptr) return;
-    eventloop_detail::coroutine_frame_access::detach_cancellation(
+    detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
     update_async_interest();
     waiter->finish(error);
@@ -263,7 +254,7 @@ tcp_stream::connect_awaiter::~connect_awaiter()
 
 auto tcp_stream::connect_awaiter::suspend(
     std::coroutine_handle<> handle,
-    eventloop_detail::coroutine_cancellation_state& state) -> bool
+    detail::coroutine_cancellation_state& state) -> bool
 {
     if (owner_.closed_) {
         error_ = code(EBADF);
@@ -299,7 +290,7 @@ auto tcp_stream::connect_awaiter::suspend(
     }
 
     continuation_ = handle;
-    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+    if (!detail::coroutine_frame_access::attach_cancellation(
             state, cancellation_)) {
         error_ = code(ECANCELED);
         return false;
@@ -309,7 +300,7 @@ auto tcp_stream::connect_awaiter::suspend(
         owner_.set_async_interest(false, true);
     } catch (const std::system_error& error) {
         owner_.connector_ = nullptr;
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             cancellation_);
         error_ = error.code();
         return false;
@@ -318,7 +309,7 @@ auto tcp_stream::connect_awaiter::suspend(
 }
 
 auto tcp_stream::connect_awaiter::cancel(
-    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+    detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<connect_awaiter*>(node.operation);
     self.owner_.fail_and_close(code(ECANCELED));
@@ -360,7 +351,7 @@ tcp_stream::io_awaiter<Read>::~io_awaiter()
 template<bool Read>
 auto tcp_stream::io_awaiter<Read>::suspend(
     std::coroutine_handle<> handle,
-    eventloop_detail::coroutine_cancellation_state& state) -> bool
+    detail::coroutine_cancellation_state& state) -> bool
 {
     if (auto activated = owner_.activate_async_transport(); !activated) {
         error_ = activated.error();
@@ -399,7 +390,7 @@ auto tcp_stream::io_awaiter<Read>::suspend(
         return false;
     }
     continuation_ = handle;
-    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+    if (!detail::coroutine_frame_access::attach_cancellation(
             state, cancellation_)) {
         error_ = code(ECANCELED);
         return false;
@@ -412,7 +403,7 @@ auto tcp_stream::io_awaiter<Read>::suspend(
     } catch (const std::system_error& error) {
         if constexpr (Read) owner_.reader_ = nullptr;
         else owner_.writer_ = nullptr;
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             cancellation_);
         error_ = error.code();
         return false;
@@ -422,7 +413,7 @@ auto tcp_stream::io_awaiter<Read>::suspend(
 
 template<bool Read>
 auto tcp_stream::io_awaiter<Read>::cancel(
-    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+    detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<io_awaiter*>(node.operation);
     if constexpr (Read) self.owner_.complete_read(0, code(ECANCELED));
@@ -481,7 +472,7 @@ auto tcp_stream::file_awaiter::advance() noexcept -> std::error_code
 
 auto tcp_stream::file_awaiter::suspend(
     std::coroutine_handle<> handle,
-    eventloop_detail::coroutine_cancellation_state& state) -> bool
+    detail::coroutine_cancellation_state& state) -> bool
 {
     if (auto activated = owner_.activate_async_transport(); !activated) {
         error_ = activated.error();
@@ -502,7 +493,7 @@ auto tcp_stream::file_awaiter::suspend(
     error_ = advance();
     if (error_.value() != EAGAIN) return false;
     continuation_ = handle;
-    if (!eventloop_detail::coroutine_frame_access::attach_cancellation(
+    if (!detail::coroutine_frame_access::attach_cancellation(
             state, cancellation_)) {
         error_ = code(ECANCELED);
         return false;
@@ -512,7 +503,7 @@ auto tcp_stream::file_awaiter::suspend(
         owner_.set_async_interest(owner_.reader_ != nullptr, true);
     } catch (const std::system_error& error) {
         owner_.file_writer_ = nullptr;
-        eventloop_detail::coroutine_frame_access::detach_cancellation(
+        detail::coroutine_frame_access::detach_cancellation(
             cancellation_);
         error_ = error.code();
         return false;
@@ -521,7 +512,7 @@ auto tcp_stream::file_awaiter::suspend(
 }
 
 auto tcp_stream::file_awaiter::cancel(
-    eventloop_detail::coroutine_cancellation_node& node) noexcept -> void
+    detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<file_awaiter*>(node.operation);
     self.owner_.complete_file(code(ECANCELED));
@@ -560,3 +551,5 @@ auto tcp_stream::async_send_file(std::span<const std::byte> header,
 {
     return send_file_task(loop_, *this, header, std::move(file), size);
 }
+
+} // namespace eventloop
