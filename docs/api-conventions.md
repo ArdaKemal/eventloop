@@ -16,12 +16,11 @@ and result rules when changing a signature.
   awaiter helpers, and other implementation machinery in `eventloop::detail`.
   A public awaitable may have a concrete awaiter return type, but callers must
   not need to use internal readiness callbacks.
-- Use `eventloop::ipv4_endpoint` for the shared numeric IPv4 address: four
-  address octets and a host-order port. Do not invent a second endpoint type
-  for another transport. Any HTTP text-address convenience constructor must
-  delegate to `eventloop::ipv4_endpoint::parse()` instead of adding another
-  parser. The
-  socket API has no DNS or IPv6 support.
+- Use `eventloop::ip_endpoint` for shared numeric IPv4 and IPv6 addresses.
+  Address octets are in display order; ports and IPv6 scope IDs are host order.
+  Any HTTP text-address convenience constructor delegates to
+  `eventloop::ip_endpoint::parse()`. The socket API does not resolve DNS names.
+  AF_INET6 sockets are v6-only.
 - Export the CMake consumer target as `eventloop::eventloop`.
 
 ## Ownership, affinity, and errors

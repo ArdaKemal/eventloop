@@ -1,5 +1,6 @@
 #include "eventloop/tcp_stream.h"
 #include "eventloop/task.h"
+#include "ip_endpoint_native.h"
 
 #include <algorithm>
 #include <array>
@@ -53,15 +54,18 @@ tcp_stream::tcp_stream(event_loop& loop, unique_fd descriptor)
     }
 }
 
-tcp_stream::tcp_stream(event_loop& loop, ipv4_endpoint remote)
-    : loop_(loop), port_(remote.port), connected_(false),
+tcp_stream::tcp_stream(event_loop& loop, ip_endpoint remote)
+    : loop_(loop), remote_(remote), connected_(false),
       transport_activated_(true)
 {
-    std::memcpy(&address_, remote.address.data(), remote.address.size());
-    descriptor_.reset(::socket(AF_INET,
+    descriptor_.reset(::socket(detail::socket_family(remote),
                                SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (!descriptor_) {
         throw std::system_error(errno, std::system_category(), "socket");
+    }
+    if (detail::set_ipv6_only(descriptor_.get(), remote) == -1) {
+        throw std::system_error(errno, std::system_category(),
+                                "setsockopt(IPV6_V6ONLY)");
     }
 }
 
@@ -273,13 +277,9 @@ auto tcp_stream::connect_awaiter::suspend(
         return false;
     }
     owner_.connect_started_ = true;
-    sockaddr_in endpoint {};
-    endpoint.sin_family = AF_INET;
-    endpoint.sin_addr.s_addr = owner_.address_;
-    endpoint.sin_port = htons(owner_.port_);
+    const auto endpoint = detail::native_endpoint(owner_.remote_);
     const int result = ::connect(owner_.descriptor_.get(),
-                                 reinterpret_cast<const sockaddr*>(&endpoint),
-                                 sizeof(endpoint));
+                                 endpoint.address(), endpoint.length);
     if (result == 0 || (result == -1 && errno == EISCONN)) {
         owner_.connected_ = true;
         return false;

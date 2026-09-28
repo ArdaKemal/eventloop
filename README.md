@@ -56,6 +56,16 @@ not required:
 ./build/http_server --root ./public --http-only --http-port 8080
 ```
 
+The standalone HTTP client example sends one HTTP/1.1 GET request and writes
+the complete response to standard output. It accepts `http://` and `https://`
+URLs, including bracketed IPv6 addresses; HTTPS verifies the server using the
+system trust store:
+
+```sh
+./build/http_client https://example.com/path
+./build/http_client 'http://[::1]:8080/'
+```
+
 The HTTP parser and request/response path use fixed-capacity buffers. Requests
 larger than those limits receive an appropriate 4xx response instead of
 growing buffers dynamically.
@@ -118,10 +128,12 @@ The current event-loop implementation itself remains Linux/epoll-only.
 ## Coroutine socket I/O
 
 Include `eventloop/tcp_acceptor.h` and `eventloop/tcp_stream.h` for nonblocking
-IPv4 TCP, `eventloop/tls_stream.h` for TLS, or `eventloop/udp_socket.h` for
-IPv4 datagrams. Public types live in `eventloop`; HTTP and WebSocket types
+IPv4 or IPv6 TCP, `eventloop/tls_stream.h` for TLS, or `eventloop/udp_socket.h`
+for datagrams. Public types live in `eventloop`; HTTP and WebSocket types
 live in `eventloop::http` and `eventloop::ws`. TCP and UDP addresses use
-`eventloop::ipv4_endpoint`, with address octets and a host-order port.
+`eventloop::ip_endpoint`, with address octets, a host-order port, and an IPv6
+scope ID. Use its `from_ipv4`/`from_ipv6`, `loopback_v4`/`loopback_v6`,
+`any_v4`/`any_v6`, or numeric `parse` factories. IPv6 sockets are v6-only.
 `eventloop::event_loop::add` takes ownership of supported socket objects.
 Await `async_accept`, `async_connect`, `async_read_some`, `async_write_some`,
 and the UDP send/receive operations. TCP reads and writes may complete

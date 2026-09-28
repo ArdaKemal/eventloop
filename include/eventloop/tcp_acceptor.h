@@ -2,7 +2,7 @@
 
 #include "eventloop/event_loop.h"
 #include "eventloop/detail/notifiable.h"
-#include "eventloop/ipv4_endpoint.h"
+#include "eventloop/ip_endpoint.h"
 #include "eventloop/unique_fd.h"
 
 #include <cstdint>
@@ -15,7 +15,7 @@ namespace eventloop {
 
 class tcp_acceptor : private detail::notifiable {
 public:
-    tcp_acceptor(event_loop& loop, ipv4_endpoint endpoint,
+    tcp_acceptor(event_loop& loop, ip_endpoint endpoint,
                  bool reuse_port = false);
     ~tcp_acceptor() override;
 

@@ -25,6 +25,8 @@
 #include <botan/x509cert.h>
 #include <botan/x509_crl.h>
 
+#include <sys/socket.h>
+
 namespace eventloop {
 
 namespace {
@@ -356,6 +358,15 @@ tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
 {
 }
 
+tls_stream::tls_stream(event_loop& loop, ip_endpoint endpoint,
+                       std::shared_ptr<tls_context> context,
+                       tls_client_options options)
+    : tcp_stream(loop, endpoint),
+      implementation_(std::make_unique<implementation>(
+          std::move(context), std::move(options)))
+{
+}
+
 tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
                        std::shared_ptr<tls_context> context,
                        tls_server_options options)
@@ -574,6 +585,14 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
     active_operation_guard guard {self.exclusive_operation_active_};
     if (co_await cancellation_requested()) {
         co_return std::unexpected(system_code(ECANCELED));
+    }
+    // Outbound TCP streams activate their transport before they connect.
+    // Check the actual peer before sending the client's TLS handshake.
+    sockaddr_storage peer {};
+    socklen_t peer_size = sizeof(peer);
+    if (::getpeername(self.descriptor(), reinterpret_cast<sockaddr*>(&peer),
+                      &peer_size) == -1) {
+        co_return std::unexpected(system_code(errno));
     }
     if (auto activated = self.activate_async_tls(); !activated) {
         co_return std::unexpected(activated.error());

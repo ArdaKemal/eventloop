@@ -17,7 +17,7 @@ add_library(eventloop
     include/eventloop/http/request.h
     include/eventloop/http/server.h
     include/eventloop/http/session.h
-    include/eventloop/ipv4_endpoint.h
+    include/eventloop/ip_endpoint.h
     include/eventloop/tcp_acceptor.h
     include/eventloop/tcp_stream.h
     include/eventloop/task.h
@@ -97,6 +97,14 @@ target_compile_options(tls_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 add_executable(http_server examples/http_server.cc)
 target_link_libraries(http_server PRIVATE eventloop::eventloop)
 target_compile_options(http_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(http_client
+    examples/http_client.cc
+    examples/http_client_url.cc
+    examples/http_client_resolve.cc
+)
+target_link_libraries(http_client PRIVATE eventloop::eventloop)
+target_compile_options(http_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(http_benchmark_server examples/http_benchmark_server.cc)
 target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)

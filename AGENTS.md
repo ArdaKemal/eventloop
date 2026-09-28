@@ -85,10 +85,12 @@ switching PCs; a fresh clone will not contain uncommitted work.
 ## Current coroutine socket I/O slice
 
 - `include/eventloop/tcp_acceptor.h` and `tcp_stream.h` provide loop-owned TCP
-  acceptors/streams with awaitable accept, numeric IPv4 connect, partial
+  acceptors/streams with awaitable accept, numeric IPv4 and IPv6 connect, partial
   read/write, and sendfile. `tls_stream.h` adds awaitable TLS operations.
   Accepted descriptors remain `unique_fd` until moved into a registered stream.
-- `include/eventloop/udp_socket.h` provides loop-owned numeric IPv4 datagram
+- `include/eventloop/ip_endpoint.h` provides the shared fixed-size IPv4/IPv6
+  endpoint, including IPv6 scope IDs. IPv6 sockets are explicitly v6-only.
+- `include/eventloop/udp_socket.h` provides loop-owned IPv4/IPv6 datagram
   send/receive operations. Datagrams remain atomic; oversized receives return
   `EMSGSIZE`, and zero-length datagrams succeed.
 - Socket awaiters keep one pending operation per direction, use caller-owned
@@ -102,7 +104,12 @@ switching PCs; a fresh clone will not contain uncommitted work.
   `async_close()` require an idle stream. The shared encrypted-output buffer
   uses one bounded flusher with one waiting operation.
 - The epoll backend supports independently enabled read/write readiness. The
-  socket APIs do not add DNS or IPv6.
+  socket APIs accept numeric endpoints and do not resolve DNS names.
+- `examples/http_client` is a standalone HTTP/1.1 GET example. It resolves on
+  the bounded blocking worker, uses system trust and hostname verification for
+  HTTPS, and supports IPv4/IPv6 URLs. DNS candidates are tried sequentially;
+  it does not implement Happy Eyeballs, response parsing, redirects, or a
+  reusable client library API.
 - `tests/tcp_coroutine.cc` and `tests/udp_coroutine.cc` cover loopback I/O,
   duplicate waiters, cancellation, shutdown, readiness rearming, and descriptor
   closure. The focused CTest run passed both on 2026-09-27 with local socket
@@ -176,6 +183,12 @@ connections and one client
 thread measured about 13.7k requests/s before and after the ownership change;
 this is evidence of no detectable regression on this host, not a broader
 performance claim, and predates the current coroutine-native API migration.
+
+After adding IPv6 endpoints and outbound TLS on 2026-09-28, a clean Release
+build completed in `/tmp/eventloop-release-review` and the full CTest suite
+passed 12/12 with local loopback access. The HTTP client example also completed
+GETs against the example server over IPv4 and IPv6 loopback. These checks do
+not verify public-network DNS behavior or HTTPS against an external CA.
 
 Use build directories ignored by Git or outside the repository on the new
 machine. Recheck warnings, `git diff --check`, and test results after changes.

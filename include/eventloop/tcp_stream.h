@@ -2,7 +2,7 @@
 
 #include "eventloop/event_loop.h"
 #include "eventloop/detail/notifiable.h"
-#include "eventloop/ipv4_endpoint.h"
+#include "eventloop/ip_endpoint.h"
 #include "eventloop/task.h"
 #include "eventloop/unique_fd.h"
 
@@ -20,7 +20,7 @@ class tcp_stream : private detail::notifiable {
 public:
     // Takes ownership of the accepted descriptor, including on failure.
     tcp_stream(event_loop& loop, unique_fd descriptor);
-    tcp_stream(event_loop& loop, ipv4_endpoint endpoint);
+    tcp_stream(event_loop& loop, ip_endpoint endpoint);
     ~tcp_stream() override;
 
     tcp_stream(const tcp_stream&) = delete;
@@ -184,8 +184,7 @@ private:
     event_loop& loop_;
     unique_fd descriptor_;
     bool closed_ {false};
-    std::uint32_t address_ {0};
-    std::uint16_t port_ {0};
+    ip_endpoint remote_ {};
     connect_awaiter* connector_ {nullptr};
     io_awaiter<true>* reader_ {nullptr};
     io_awaiter<false>* writer_ {nullptr};

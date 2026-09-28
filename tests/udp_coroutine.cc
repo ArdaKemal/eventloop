@@ -10,13 +10,40 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <system_error>
 #include <vector>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 using namespace eventloop;
 
 using namespace std::chrono_literals;
 
 namespace {
+
+[[nodiscard]] auto ipv6_loopback_available() -> bool
+{
+    unique_fd descriptor(::socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    if (!descriptor) {
+        if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) return false;
+        throw std::system_error(errno, std::system_category(), "IPv6 socket probe");
+    }
+    sockaddr_in6 address {};
+    address.sin6_family = AF_INET6;
+    address.sin6_addr = in6addr_loopback;
+    if (::bind(descriptor.get(), reinterpret_cast<sockaddr*>(&address),
+               sizeof(address)) == 0) return true;
+    if (errno == EADDRNOTAVAIL || errno == ENODEV) return false;
+    throw std::system_error(errno, std::system_category(), "IPv6 loopback probe");
+}
+
+[[nodiscard]] auto ipv6_only(int descriptor) -> bool
+{
+    int value = 0;
+    socklen_t size = sizeof(value);
+    return ::getsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &value, &size) == 0 &&
+           value == 1;
+}
 
 auto shutdown_after(event_loop& loop, std::chrono::seconds delay) -> task<void>
 {
@@ -25,21 +52,24 @@ auto shutdown_after(event_loop& loop, std::chrono::seconds delay) -> task<void>
     }
 }
 
-auto add_socket(event_loop& loop) -> udp_socket*
+auto add_socket(event_loop& loop,
+                ip_endpoint endpoint = ip_endpoint::loopback_v4()) -> udp_socket*
 {
-    auto socket = std::make_unique<udp_socket>(loop, ipv4_endpoint::loopback());
+    auto socket = std::make_unique<udp_socket>(loop, endpoint);
     auto* result = socket.get();
     loop.add(std::move(socket));
     return result;
 }
 
 auto receive_two(event_loop& loop, udp_socket& receiver,
-                 ipv4_endpoint expected_source, bool& passed) -> task<void>
+                 ip_endpoint expected_source, bool& passed) -> task<void>
 {
     std::array<std::byte, 3> buffer {};
     const auto first = co_await receiver.async_receive_from(buffer);
     const bool first_ok = first && first->size == buffer.size() &&
                           first->source.address == expected_source.address &&
+                          first->source.address_family == expected_source.address_family &&
+                          first->source.scope_id == expected_source.scope_id &&
                           first->source.port == expected_source.port &&
                           buffer == std::array<std::byte, 3> {
                               std::byte {'u'}, std::byte {'d'}, std::byte {'p'}};
@@ -49,12 +79,14 @@ auto receive_two(event_loop& loop, udp_socket& receiver,
     const auto second = co_await receiver.async_receive_from(buffer);
     passed = first_ok && second && second->size == 0 &&
              second->source.address == expected_source.address &&
+             second->source.address_family == expected_source.address_family &&
+             second->source.scope_id == expected_source.scope_id &&
              second->source.port == expected_source.port;
     loop.stop();
 }
 
 auto send_two(event_loop& loop, udp_socket& sender,
-              ipv4_endpoint destination, bool& passed) -> task<void>
+              ip_endpoint destination, bool& passed) -> task<void>
 {
     const std::array<std::byte, 3> payload {
         std::byte {'u'}, std::byte {'d'}, std::byte {'p'}};
@@ -75,11 +107,16 @@ auto send_two(event_loop& loop, udp_socket& sender,
     if (!passed) loop.stop();
 }
 
-auto roundtrip_and_rearm() -> bool
+auto roundtrip_and_rearm(
+    ip_endpoint endpoint = ip_endpoint::loopback_v4()) -> bool
 {
     event_loop loop;
-    auto* receiver = add_socket(loop);
-    auto* sender = add_socket(loop);
+    auto* receiver = add_socket(loop, endpoint);
+    auto* sender = add_socket(loop, endpoint);
+    if (endpoint.address_family == ip_endpoint::family::ipv6 &&
+        (!ipv6_only(receiver->descriptor()) || !ipv6_only(sender->descriptor()))) {
+        return false;
+    }
     const auto source = sender->local_endpoint();
     const auto destination = receiver->local_endpoint();
     bool received = false;
@@ -119,7 +156,7 @@ auto receive_truncated(event_loop& loop, udp_socket& receiver,
     loop.stop();
 }
 
-auto send_payload(event_loop&, udp_socket& sender, ipv4_endpoint destination,
+auto send_payload(event_loop&, udp_socket& sender, ip_endpoint destination,
                   bool& passed) -> task<void>
 {
     const std::array<std::byte, 3> payload {
@@ -175,7 +212,7 @@ auto duplicate_receive(event_loop&, udp_socket& socket, bool& rejected)
 }
 
 auto send_when_cancelled(event_loop& loop, udp_socket& socket,
-                         ipv4_endpoint destination, bool& cancelled)
+                         ip_endpoint destination, bool& cancelled)
     -> task<void>
 {
     (void)co_await sleep_for(loop, 1h);
@@ -230,14 +267,14 @@ auto shutdown_cancels_receive() -> bool
            loop.coroutine_statistics().live == 0;
 }
 
-auto send_errors(event_loop&, udp_socket& socket, ipv4_endpoint destination,
+auto send_errors(event_loop&, udp_socket& socket, ip_endpoint destination,
                  std::span<const std::byte> oversized, bool& passed)
     -> task<void>
 {
     const auto too_large = co_await socket.async_send_to(oversized, destination);
     const auto invalid = co_await socket.async_send_to(
         std::array<std::byte, 1> {std::byte {'x'}},
-        ipv4_endpoint {{127, 0, 0, 1}, 0});
+        ip_endpoint::loopback_v4());
     passed = !too_large && too_large.error().value() == EMSGSIZE &&
              !invalid && invalid.error().value() == EINVAL;
 }
@@ -257,8 +294,13 @@ auto send_error_cases() -> bool
 
 auto parser_rejects_invalid_address() -> bool
 {
+    const auto scoped = ip_endpoint::parse("fe80::1%7", 42);
+    if (scoped.address_family != ip_endpoint::family::ipv6 ||
+        scoped.scope_id != 7 || scoped.port != 42 ||
+        ip_endpoint::parse("::1", 1).address !=
+            ip_endpoint::loopback_v6(1).address) return false;
     try {
-        (void)ipv4_endpoint::parse("not-an-ipv4-address", 0);
+        (void)ip_endpoint::parse("not-an-ipv4-address", 0);
     } catch (const std::invalid_argument&) {
         return true;
     }
@@ -270,7 +312,10 @@ auto parser_rejects_invalid_address() -> bool
 int main()
 {
     try {
-        const bool passed = roundtrip_and_rearm() && truncated_receive() &&
+        const bool passed = roundtrip_and_rearm() &&
+                            (!ipv6_loopback_available() ||
+                             roundtrip_and_rearm(ip_endpoint::loopback_v6())) &&
+                            truncated_receive() &&
                             duplicate_and_close() &&
                             shutdown_cancels_receive() && send_error_cases() &&
                             parser_rejects_invalid_address();

@@ -289,7 +289,7 @@ struct redirect_state {
 
 server::server(event_loop& loop, std::uint16_t port, std::string_view root,
                std::string_view address, server_options options)
-    : tcp_acceptor(loop, ipv4_endpoint::parse(address, port), options.reuse_port), options_(options)
+    : tcp_acceptor(loop, ip_endpoint::parse(address, port), options.reuse_port), options_(options)
 {
     root_descriptor_ = std::make_shared<unique_fd>(open_root(root));
 }
@@ -321,7 +321,7 @@ https_server::https_server(event_loop& loop, std::uint16_t port,
                            std::shared_ptr<tls_context> context,
                            std::string_view root, std::string_view address,
                            server_options options)
-    : tcp_acceptor(loop, ipv4_endpoint::parse(address, port), options.reuse_port),
+    : tcp_acceptor(loop, ip_endpoint::parse(address, port), options.reuse_port),
       root_descriptor_(std::make_shared<unique_fd>(open_root(root))),
       context_(std::move(context)), options_(options)
 {
@@ -351,7 +351,7 @@ redirect_server::redirect_server(event_loop& loop, std::uint16_t port,
                                  std::string_view hostname,
                                  std::uint16_t https_port,
                                  std::string_view address)
-    : tcp_acceptor(loop, ipv4_endpoint::parse(address, port)), https_port_(https_port)
+    : tcp_acceptor(loop, ip_endpoint::parse(address, port)), https_port_(https_port)
 {
     validate_hostname(hostname);
     hostname_ = std::make_shared<const std::string>(hostname);

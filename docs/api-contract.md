@@ -83,7 +83,9 @@ submissions remain bounded command and background-work APIs.
 ## TCP and TLS
 
 - Include `eventloop/tcp_acceptor.h` and `eventloop/tcp_stream.h` for
-  nonblocking IPv4 TCP. Use `eventloop::ipv4_endpoint` for numeric addresses.
+  nonblocking IPv4 or IPv6 TCP. Use `eventloop::ip_endpoint` for numeric
+  addresses. IPv6 sockets are v6-only; `parse()` accepts numeric IPv6 scope
+  IDs after `%`.
   Add each object to its loop before awaiting it.
   `eventloop::tcp_acceptor::async_accept()` returns an owned
   `eventloop::unique_fd`; `eventloop::tcp_stream::async_connect()`,
@@ -106,11 +108,17 @@ submissions remain bounded command and background-work APIs.
   cancels operations and closes the transport. One TLS read and one TLS write
   may be pending together. A second read or second write returns `EBUSY`.
   Handshake and `async_close()` require all other TLS operations to be idle.
+  For outbound TLS, construct with an `ip_endpoint`, a client context, and
+  `tls_client_options` containing the verification hostname; await inherited
+  `async_connect()` before `async_handshake()`. The hostname also supplies SNI,
+  and `application_protocols` configures ALPN. A handshake on an unconnected
+  socket returns `ENOTCONN`. Raw TCP `async_send_file()` is hidden from
+  `tls_stream` because it would bypass TLS framing.
 
 ## UDP and WebSocket
 
-- Include `eventloop/udp_socket.h` for IPv4 datagrams using
-  `eventloop::ipv4_endpoint`. Datagrams stay atomic:
+- Include `eventloop/udp_socket.h` for IPv4 or IPv6 datagrams using
+  `eventloop::ip_endpoint`. Datagrams stay atomic:
   empty datagrams succeed with size zero, and a truncated receive consumes the
   datagram and reports `EMSGSIZE`. At most one receive and one send may be
   pending per socket; a duplicate same-direction operation reports `EBUSY`.

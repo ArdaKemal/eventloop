@@ -1,4 +1,5 @@
 #include "eventloop/tcp_acceptor.h"
+#include "ip_endpoint_native.h"
 
 #include <array>
 #include <cerrno>
@@ -69,16 +70,20 @@ constexpr std::size_t max_accepts_per_event = 64;
 }
 } // namespace
 
-tcp_acceptor::tcp_acceptor(event_loop& loop, ipv4_endpoint bind_endpoint,
+tcp_acceptor::tcp_acceptor(event_loop& loop, ip_endpoint bind_endpoint,
                            bool reuse_port)
     : loop_(loop)
 {
-    descriptor_.reset(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+    descriptor_.reset(socket(detail::socket_family(bind_endpoint),
+                             SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (!descriptor_) {
         throw system_error("socket");
     }
 
     const int enabled = 1;
+    if (detail::set_ipv6_only(descriptor_.get(), bind_endpoint) == -1) {
+        throw system_error("setsockopt(IPV6_V6ONLY)");
+    }
     if (setsockopt(descriptor_.get(), SOL_SOCKET, SO_REUSEADDR, &enabled,
                    sizeof(enabled)) == -1) {
         throw system_error("setsockopt");
@@ -89,13 +94,8 @@ tcp_acceptor::tcp_acceptor(event_loop& loop, ipv4_endpoint bind_endpoint,
         throw system_error("setsockopt(SO_REUSEPORT)");
     }
 
-    sockaddr_in endpoint {};
-    endpoint.sin_family = AF_INET;
-    endpoint.sin_port = htons(bind_endpoint.port);
-    std::memcpy(&endpoint.sin_addr, bind_endpoint.address.data(),
-                bind_endpoint.address.size());
-    if (bind(descriptor_.get(), reinterpret_cast<const sockaddr*>(&endpoint),
-             sizeof(endpoint)) == -1) {
+    const auto endpoint = detail::native_endpoint(bind_endpoint);
+    if (bind(descriptor_.get(), endpoint.address(), endpoint.length) == -1) {
         throw system_error("bind");
     }
     if (listen(descriptor_.get(), SOMAXCONN) == -1) {

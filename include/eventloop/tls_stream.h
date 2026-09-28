@@ -37,6 +37,11 @@ public:
     tls_stream(event_loop& loop, unique_fd descriptor,
                std::shared_ptr<tls_context> context,
                tls_client_options options);
+    // Connect with async_connect() before async_handshake(). The hostname is
+    // used for certificate verification and SNI.
+    tls_stream(event_loop& loop, ip_endpoint endpoint,
+               std::shared_ptr<tls_context> context,
+               tls_client_options options);
     tls_stream(event_loop& loop, unique_fd descriptor,
                std::shared_ptr<tls_context> context,
                tls_server_options options = {});
@@ -60,6 +65,8 @@ public:
         -> task<std::expected<void, std::error_code>>;
 
 private:
+    // Raw sendfile would put unencrypted bytes on the TLS transport.
+    using tcp_stream::async_send_file;
     class flush_waiter;
     auto release_flush() noexcept -> void;
     [[nodiscard]] static auto handshake_task(event_loop& loop, tls_stream& self)

@@ -1,4 +1,5 @@
 #include "eventloop/udp_socket.h"
+#include "ip_endpoint_native.h"
 
 #include <array>
 #include <cerrno>
@@ -20,39 +21,19 @@ namespace {
     return {errno, std::system_category(), operation};
 }
 
-[[nodiscard]] auto native_endpoint(ipv4_endpoint endpoint) noexcept -> sockaddr_in
-{
-    sockaddr_in native {};
-    native.sin_family = AF_INET;
-    native.sin_port = htons(endpoint.port);
-    std::memcpy(&native.sin_addr, endpoint.address.data(),
-                endpoint.address.size());
-    return native;
-}
-
-[[nodiscard]] auto public_endpoint(const sockaddr_in& native) noexcept
-    -> ipv4_endpoint
-{
-    ipv4_endpoint endpoint;
-    std::memcpy(endpoint.address.data(), &native.sin_addr,
-                endpoint.address.size());
-    endpoint.port = ntohs(native.sin_port);
-    return endpoint;
-}
-
 [[nodiscard]] auto retryable(int error) noexcept -> bool
 {
     return error == EAGAIN || error == EWOULDBLOCK;
 }
 
 [[nodiscard]] auto try_receive(int descriptor, std::span<std::byte> buffer,
-                               ipv4_endpoint& source) noexcept -> int
+                               ip_endpoint& source) noexcept -> int
 {
     if (buffer.size() > static_cast<std::size_t>(
                             std::numeric_limits<int>::max())) {
         return -EINVAL;
     }
-    sockaddr_in native_source {};
+    sockaddr_storage native_source {};
     iovec iov {.iov_base = buffer.data(), .iov_len = buffer.size()};
     msghdr message {};
     message.msg_name = &native_source;
@@ -66,7 +47,7 @@ namespace {
                 static_cast<std::size_t>(received) > buffer.size()) {
                 return -EMSGSIZE;
             }
-            source = public_endpoint(native_source);
+            source = detail::public_endpoint(native_source);
             return static_cast<int>(received);
         }
         if (errno != EINTR) return -errno;
@@ -74,16 +55,16 @@ namespace {
 }
 
 [[nodiscard]] auto try_send(int descriptor, std::span<const std::byte> buffer,
-                            ipv4_endpoint destination) noexcept -> int
+                            ip_endpoint destination) noexcept -> int
 {
-    if (buffer.size() > 65507) return -EMSGSIZE;
-    const auto native_destination = native_endpoint(destination);
+    const bool ipv6 = destination.address_family == ip_endpoint::family::ipv6;
+    if (buffer.size() > (ipv6 ? 65527U : 65507U)) return -EMSGSIZE;
+    const auto native_destination = detail::native_endpoint(destination);
     for (;;) {
         const auto sent = ::sendto(descriptor, buffer.data(), buffer.size(),
                                    MSG_NOSIGNAL,
-                                   reinterpret_cast<const sockaddr*>(
-                                       &native_destination),
-                                   sizeof(native_destination));
+                                   native_destination.address(),
+                                   native_destination.length);
         if (sent >= 0) return static_cast<int>(sent);
         if (errno != EINTR) return -errno;
     }
@@ -95,15 +76,19 @@ namespace {
 }
 } // namespace
 
-udp_socket::udp_socket(event_loop& loop, ipv4_endpoint endpoint,
+udp_socket::udp_socket(event_loop& loop, ip_endpoint endpoint,
                        bool reuse_port)
     : loop_(loop)
 {
-    descriptor_.reset(::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+    descriptor_.reset(::socket(detail::socket_family(endpoint),
+                               SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
                                0));
     if (!descriptor_) throw system_error("socket");
 
     const int enabled = 1;
+    if (detail::set_ipv6_only(descriptor_.get(), endpoint) == -1) {
+        throw system_error("setsockopt(IPV6_V6ONLY)");
+    }
     if (::setsockopt(descriptor_.get(), SOL_SOCKET, SO_REUSEADDR, &enabled,
                      sizeof(enabled)) == -1) {
         throw system_error("setsockopt(SO_REUSEADDR)");
@@ -113,9 +98,8 @@ udp_socket::udp_socket(event_loop& loop, ipv4_endpoint endpoint,
                      sizeof(enabled)) == -1) {
         throw system_error("setsockopt(SO_REUSEPORT)");
     }
-    const auto native = native_endpoint(endpoint);
-    if (::bind(descriptor_.get(), reinterpret_cast<const sockaddr*>(&native),
-               sizeof(native)) == -1) {
+    const auto native = detail::native_endpoint(endpoint);
+    if (::bind(descriptor_.get(), native.address(), native.length) == -1) {
         throw system_error("bind");
     }
 }
@@ -132,15 +116,15 @@ auto udp_socket::descriptor() const noexcept -> int
     return descriptor_.get();
 }
 
-auto udp_socket::local_endpoint() const -> ipv4_endpoint
+auto udp_socket::local_endpoint() const -> ip_endpoint
 {
-    sockaddr_in native {};
+    sockaddr_storage native {};
     socklen_t length = sizeof(native);
     if (::getsockname(descriptor_.get(), reinterpret_cast<sockaddr*>(&native),
                       &length) == -1) {
         throw system_error("getsockname");
     }
-    return public_endpoint(native);
+    return detail::public_endpoint(native);
 }
 
 auto udp_socket::close() -> void
@@ -159,7 +143,7 @@ auto udp_socket::async_receive_from(std::span<std::byte> buffer) noexcept
 }
 
 auto udp_socket::async_send_to(std::span<const std::byte> buffer,
-                               ipv4_endpoint destination) noexcept -> send_awaiter
+                               ip_endpoint destination) noexcept -> send_awaiter
 {
     return {*this, buffer, destination};
 }
@@ -225,7 +209,7 @@ auto udp_socket::receive_awaiter::cancel(
 
 udp_socket::send_awaiter::send_awaiter(
     udp_socket& socket, std::span<const std::byte> buffer,
-    ipv4_endpoint destination) noexcept
+    ip_endpoint destination) noexcept
     : socket_(socket), buffer_(buffer), destination_(destination)
 {
     cancellation_.operation = this;
@@ -289,7 +273,7 @@ auto udp_socket::update_interest() -> void
                           send_ != nullptr);
 }
 
-auto udp_socket::complete_receive(int result, ipv4_endpoint source) noexcept
+auto udp_socket::complete_receive(int result, ip_endpoint source) noexcept
     -> void
 {
     event_loop::handler_call_scope scope(loop_);
@@ -357,7 +341,7 @@ auto udp_socket::complete_pending(int result) noexcept -> void
 auto udp_socket::on_read() -> void
 {
     if (receive_ == nullptr) return;
-    ipv4_endpoint source;
+    ip_endpoint source;
     const int result = try_receive(descriptor_.get(), receive_->buffer_, source);
     if (!retryable(-result)) complete_receive(result, source);
 }

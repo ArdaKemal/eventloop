@@ -1,5 +1,7 @@
 #include "eventloop/event_loop.h"
+#include "eventloop/ip_endpoint.h"
 #include "eventloop/task.h"
+#include "eventloop/tcp_acceptor.h"
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
 
@@ -346,6 +348,94 @@ struct stream_pair {
     }
     return result.server_ok && result.client_ok;
 }
+
+[[nodiscard]] auto outbound_server(event_loop& loop, tcp_acceptor& acceptor,
+                                   const std::filesystem::path& certificate,
+                                   const std::filesystem::path& key,
+                                   result_state& result, bool reject)
+    -> task<void>
+{
+    auto accepted = co_await acceptor.async_accept();
+    if (!accepted) {
+        result.finish();
+        co_return;
+    }
+    acceptor.close();
+    auto stream = std::make_unique<tls_stream>(
+        loop, std::move(*accepted), tls_context::make_server(certificate, key),
+        tls_server_options {.application_protocols = {"echo"}});
+    auto* server = stream.get();
+    loop.add(std::move(stream));
+    if (reject) (void)co_await rejection_server(loop, *server, result);
+    else (void)co_await echo_server(loop, *server, result);
+}
+
+[[nodiscard]] auto outbound_client(event_loop& loop, tls_stream& stream,
+                                   result_state& result, bool reject)
+    -> task<void>
+{
+    auto early = co_await stream.async_handshake();
+    const bool early_rejected = early && !*early &&
+        early->error().value() == ENOTCONN;
+    auto connected = co_await stream.async_connect();
+    if (!early_rejected || !connected) {
+        stream.close();
+        result.finish();
+        co_return;
+    }
+    if (reject) (void)co_await rejection_client(loop, stream, result);
+    else (void)co_await echo_client(loop, stream, result);
+}
+
+[[nodiscard]] auto run_outbound_case(const std::filesystem::path& certificate,
+                                     const std::filesystem::path& key,
+                                     const std::filesystem::path& trusted_ca,
+                                     bool ipv6, bool reject) -> bool
+{
+    event_loop loop;
+    result_state result {loop};
+    auto listener = std::make_unique<tcp_acceptor>(
+        loop, ipv6 ? ip_endpoint::loopback_v6(0)
+                   : ip_endpoint::loopback_v4(0));
+    auto* acceptor = listener.get();
+    sockaddr_storage local {};
+    socklen_t local_size = sizeof(local);
+    if (getsockname(acceptor->descriptor(),
+                    reinterpret_cast<sockaddr*>(&local), &local_size) == -1) {
+        throw system_error("getsockname");
+    }
+    const auto port = ipv6
+        ? ntohs(reinterpret_cast<const sockaddr_in6*>(&local)->sin6_port)
+        : ntohs(reinterpret_cast<const sockaddr_in*>(&local)->sin_port);
+    loop.add(std::move(listener));
+    auto client = std::make_unique<tls_stream>(
+        loop, ipv6 ? ip_endpoint::loopback_v6(port)
+                   : ip_endpoint::loopback_v4(port),
+        tls_context::make_client(trusted_ca),
+        tls_client_options {.hostname = reject ? "wrong.example" : "localhost",
+                            .application_protocols = {"echo"}});
+    auto* client_stream = client.get();
+    loop.add(std::move(client));
+    auto server_task = outbound_server(loop, *acceptor, certificate, key,
+                                       result, reject);
+    auto client_task = outbound_client(loop, *client_stream, result, reject);
+    if (server_task.state() == task_state::frame_allocation_failure ||
+        client_task.state() == task_state::frame_allocation_failure) {
+        throw std::runtime_error("cannot allocate outbound TLS tasks");
+    }
+    if (loop.spawn(std::move(server_task)) != task_spawn_result::accepted ||
+        loop.spawn(std::move(client_task)) != task_spawn_result::accepted) {
+        throw std::runtime_error("cannot start outbound TLS tasks");
+    }
+    loop.run();
+    if (!result.server_ok || !result.client_ok) {
+        std::cerr << "outbound TLS " << (ipv6 ? "IPv6" : "IPv4")
+                  << (reject ? " verification" : " echo")
+                  << " failed: server=" << result.server_ok
+                  << " client=" << result.client_ok << '\n';
+    }
+    return result.server_ok && result.client_ok;
+}
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
@@ -359,8 +449,22 @@ auto main(int argc, char* argv[]) -> int
                             run_case(certificate, key, trusted_ca, 1) &&
                             run_case(certificate, key, trusted_ca, 2) &&
                             run_case(certificate, key, trusted_ca, 3) &&
-                            run_case(certificate, key, trusted_ca, 4);
-        return passed ? 0 : 1;
+                            run_case(certificate, key, trusted_ca, 4) &&
+                            run_outbound_case(certificate, key, trusted_ca,
+                                              false, false) &&
+                            run_outbound_case(certificate, key, trusted_ca,
+                                              false, true);
+        if (!passed) return 1;
+        try {
+            if (!run_outbound_case(certificate, key, trusted_ca, true, false) ||
+                !run_outbound_case(certificate, key, trusted_ca, true, true)) {
+                return 1;
+            }
+        } catch (const std::system_error& error) {
+            if (error.code().value() != EAFNOSUPPORT &&
+                error.code().value() != EADDRNOTAVAIL) throw;
+        }
+        return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

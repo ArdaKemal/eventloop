@@ -9,6 +9,7 @@
 #include <iostream>
 #include <memory>
 #include <span>
+#include <system_error>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -23,17 +24,44 @@ namespace {
 
 [[nodiscard]] auto local_port(int descriptor) -> std::uint16_t
 {
-    sockaddr_in address {};
+    sockaddr_storage address {};
     socklen_t length = sizeof(address);
     if (::getsockname(descriptor, reinterpret_cast<sockaddr*>(&address),
                       &length) == -1) return 0;
-    return ntohs(address.sin_port);
+    if (address.ss_family == AF_INET6) {
+        return ntohs(reinterpret_cast<const sockaddr_in6&>(address).sin6_port);
+    }
+    return ntohs(reinterpret_cast<const sockaddr_in&>(address).sin_port);
 }
 
 [[nodiscard]] auto closed_descriptor(int descriptor) -> bool
 {
     errno = 0;
     return ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
+}
+
+[[nodiscard]] auto ipv6_loopback_available() -> bool
+{
+    unique_fd descriptor(::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (!descriptor) {
+        if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) return false;
+        throw std::system_error(errno, std::system_category(), "IPv6 socket probe");
+    }
+    sockaddr_in6 address {};
+    address.sin6_family = AF_INET6;
+    address.sin6_addr = in6addr_loopback;
+    if (::bind(descriptor.get(), reinterpret_cast<sockaddr*>(&address),
+               sizeof(address)) == 0) return true;
+    if (errno == EADDRNOTAVAIL || errno == ENODEV) return false;
+    throw std::system_error(errno, std::system_category(), "IPv6 loopback probe");
+}
+
+[[nodiscard]] auto ipv6_only(int descriptor) -> bool
+{
+    int value = 0;
+    socklen_t size = sizeof(value);
+    return ::getsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &value, &size) == 0 &&
+           value == 1;
 }
 
 [[nodiscard]] auto unused_port() -> std::uint16_t
@@ -107,10 +135,10 @@ auto server(event_loop& loop, tcp_acceptor& listener,
     stop_after_two(loop, completed);
 }
 
-auto client(event_loop& loop, std::uint16_t port, int& completed,
+auto client(event_loop& loop, ip_endpoint endpoint, int& completed,
             bool& passed, int& descriptor) -> task<void>
 {
-    auto socket = std::make_unique<tcp_stream>(loop, ipv4_endpoint::loopback(port));
+    auto socket = std::make_unique<tcp_stream>(loop, endpoint);
     auto* peer = socket.get();
     descriptor = peer->descriptor();
     loop.add(std::move(socket));
@@ -140,12 +168,14 @@ auto client(event_loop& loop, std::uint16_t port, int& completed,
     stop_after_two(loop, completed);
 }
 
-auto roundtrip() -> bool
+auto roundtrip(ip_endpoint endpoint = ip_endpoint::loopback_v4()) -> bool
 {
     event_loop loop;
-    auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback());
+    auto listener = std::make_unique<tcp_acceptor>(loop, endpoint);
     auto* accepting = listener.get();
     const int listener_descriptor = accepting->descriptor();
+    if (endpoint.address_family == ip_endpoint::family::ipv6 &&
+        !ipv6_only(listener_descriptor)) return false;
     const auto port = local_port(accepting->descriptor());
     if (port == 0) return false;
     loop.add(std::move(listener));
@@ -156,7 +186,10 @@ auto roundtrip() -> bool
     bool client_passed = false;
     if (loop.spawn(server(loop, *accepting, completed, server_passed,
                           accepted_descriptor)) != task_spawn_result::accepted ||
-        loop.spawn(client(loop, port, completed, client_passed,
+        loop.spawn(client(loop, endpoint.address_family == ip_endpoint::family::ipv6
+                                    ? ip_endpoint::loopback_v6(port)
+                                    : ip_endpoint::loopback_v4(port),
+                          completed, client_passed,
                           client_descriptor)) != task_spawn_result::accepted) {
         loop.shutdown(0s);
         (void)loop.run();
@@ -241,7 +274,7 @@ auto connect_result(event_loop& loop, tcp_stream& socket,
 auto duplicate_accept_and_close() -> bool
 {
     event_loop loop;
-    auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback());
+    auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4());
     auto* owner = listener.get();
     const int descriptor = owner->descriptor();
     loop.add(std::move(listener));
@@ -329,7 +362,7 @@ auto immediate_error_cases() -> bool
     auto connected = std::make_unique<tcp_stream>(
         loop, std::move(pair.client));
     auto disconnected = std::make_unique<tcp_stream>(
-        loop, ipv4_endpoint::loopback(1));
+        loop, ip_endpoint::loopback_v4(1));
     auto* ready = connected.get();
     auto* idle = disconnected.get();
     loop.add(std::move(connected));
@@ -348,7 +381,7 @@ auto refused_connect() -> bool
     if (port == 0) return false;
     event_loop loop;
     auto socket = std::make_unique<tcp_stream>(
-        loop, ipv4_endpoint::loopback(port));
+        loop, ip_endpoint::loopback_v4(port));
     auto* owner = socket.get();
     const int descriptor = owner->descriptor();
     loop.add(std::move(socket));
@@ -376,7 +409,7 @@ auto shutdown_pending() -> bool
     auto pair = connected_pair();
     if (!pair.client || !pair.server) return false;
     event_loop loop;
-    auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback());
+    auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4());
     auto socket = std::make_unique<tcp_stream>(
         loop, std::move(pair.client));
     auto* accepting = listener.get();
@@ -407,7 +440,9 @@ auto shutdown_pending() -> bool
 
 int main()
 {
-    if (!roundtrip() || !duplicate_accept_and_close() ||
+    if (!roundtrip() || (ipv6_loopback_available() &&
+                         !roundtrip(ip_endpoint::loopback_v6())) ||
+        !duplicate_accept_and_close() ||
         !duplicate_io_and_close() || !immediate_error_cases() ||
         !refused_connect() ||
         !shutdown_pending()) {

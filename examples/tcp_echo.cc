@@ -71,7 +71,7 @@ auto main(int argc, char* argv[]) -> int
     try {
         const auto port = argc > 1 ? parse_port(argv[1]) : std::uint16_t {7000};
         event_loop loop;
-        auto listener = std::make_unique<tcp_acceptor>(loop, ipv4_endpoint::loopback(port));
+        auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4(port));
         auto* accepting = listener.get();
         loop.add(std::move(listener));
         if (loop.spawn(serve(loop, *accepting)) != task_spawn_result::accepted) {
