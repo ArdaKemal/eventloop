@@ -1,5 +1,6 @@
 #include "eventloop/http/server.h"
 
+#include "../http2/connection.h"
 #include "eventloop/http/session.h"
 #include "eventloop/tcp_stream.h"
 #include "eventloop/tls_stream.h"
@@ -17,6 +18,7 @@
 #include <system_error>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -96,7 +98,9 @@ template<typename Stream>
         if constexpr (std::is_same_v<Stream, tls_stream>) {
             socket = std::make_unique<tls_stream>(
                 loop, std::move(descriptor), std::move(context),
-                tls_server_options {.application_protocols = {"http/1.1"}});
+                tls_server_options {.application_protocols = options.enable_http2
+                    ? std::vector<std::string> {"h2", "http/1.1"}
+                    : std::vector<std::string> {"http/1.1"}});
         } else {
             socket = std::make_unique<tcp_stream>(loop, std::move(descriptor));
         }
@@ -106,6 +110,16 @@ template<typename Stream>
         if constexpr (std::is_same_v<Stream, tls_stream>) {
             const auto handshake = co_await peer->async_handshake();
             if (!operation_succeeded(handshake)) {
+                peer->close();
+                co_return;
+            }
+            if (options.enable_http2 && peer->application_protocol() == "h2") {
+                const auto served = co_await http2::detail::serve(
+                    loop, *peer, root, options.directory_listing);
+                if (served && *served) {
+                    const auto closed = co_await peer->async_close();
+                    (void)closed;
+                }
                 peer->close();
                 co_return;
             }

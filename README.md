@@ -1,8 +1,9 @@
 # Event loop
 
 A small C++23 coroutine-native networking library with a Linux epoll event
-loop, bounded coroutine runtime, TCP/TLS/UDP sockets, HTTP/1.1, and WebSocket
-support. The echo protocols are examples built on the public awaitable APIs.
+loop, bounded coroutine runtime, TCP/TLS/UDP sockets, HTTP/1.1, TLS HTTP/2, and
+WebSocket support. The echo protocols are examples built on the public
+awaitable APIs.
 
 ## Layout
 
@@ -48,6 +49,12 @@ roots are cancelled and built-in socket handlers close immediately, including
 HTTP connections with unfinished responses. `--shutdown-timeout` bounds any
 handlers still registered after shutdown notification; a second signal forces
 their removal immediately.
+
+HTTPS advertises HTTP/2 (`h2`) and HTTP/1.1 through ALPN by default. HTTP/2
+serves GET, HEAD, and OPTIONS requests, supports concurrent streams, and keeps
+request frames, HPACK tables, streams, and queued inline bodies bounded. Large
+regular files stream within HTTP/2 flow control. Cleartext HTTP and HTTP/1.1
+Upgrade to h2c are not supported; the plain HTTP listener remains HTTP/1.1.
 
 To serve plain HTTP without TLS or a redirect listener, certificate files are
 not required:

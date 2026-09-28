@@ -14,6 +14,8 @@ namespace eventloop::http {
 struct server_options {
     bool directory_listing {false};
     bool reuse_port {false};
+    // HTTPS advertises h2 and http/1.1 by default. Plain HTTP remains HTTP/1.1.
+    bool enable_http2 {true};
 };
 
 class server final : public tcp_acceptor {

@@ -330,6 +330,7 @@ public:
         }
         for (const auto& protocol : server_protocols_) {
             if (std::ranges::find(client_protocols, protocol) != client_protocols.end()) {
+                selected_protocol_ = protocol;
                 return protocol;
             }
         }
@@ -338,6 +339,7 @@ public:
 
     std::shared_ptr<tls_context> context_;
     std::vector<std::string> server_protocols_;
+    std::string selected_protocol_;
     std::shared_ptr<Botan::TLS::Callbacks> callback_;
     std::unique_ptr<Botan::TLS::Channel> channel_;
     std::error_code fatal_error_;
@@ -395,6 +397,9 @@ auto tls_stream::application_protocol() const -> std::string
 {
     if (!implementation_ || !implementation_->channel_->is_active()) {
         return {};
+    }
+    if (implementation_->context_->implementation_->role == context_role::server) {
+        return implementation_->selected_protocol_;
     }
     return implementation_->channel_->application_protocol();
 }

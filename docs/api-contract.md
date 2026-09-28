@@ -153,3 +153,14 @@ submissions remain bounded command and background-work APIs.
   document-root descriptor with the listener. Small file reads and metadata
   calls remain synchronous; large plain HTTP files use `sendfile`. Preserve
   the component-by-component `O_NOFOLLOW` path walk.
+- `eventloop::http::https_server` advertises `h2` and `http/1.1` with ALPN by
+  default. Set `eventloop::http::server_options::enable_http2` to `false` to
+  disable HTTP/2. The
+  HTTP/2 path serves GET, HEAD, and OPTIONS over TLS, supports up to 32 active
+  streams per connection, decodes bounded HPACK header blocks, and observes
+  connection and stream DATA flow control. Request bodies are discarded and
+  limited to 1 MiB. File responses stream from their owned descriptors; inline
+  response bodies are bounded to 4 MiB per connection. Directory-root traversal
+  shares HTTP/1.1's component-by-component `O_NOFOLLOW` checks. Cleartext
+  prior-knowledge HTTP/2, h2c upgrade, CONNECT tunnels, and extended CONNECT are
+  not supported. Plain `http::server` continues to serve HTTP/1.1.

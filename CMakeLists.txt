@@ -35,8 +35,16 @@ add_library(eventloop
     src/http/directory_listing.cc
     src/http/mime_types.cc
     src/http/request.cc
+    src/http/resource.h
+    src/http/resource.cc
     src/http/server.cc
     src/http/session.cc
+    src/http2/connection.h
+    src/http2/connection.cc
+    src/http2/hpack.h
+    src/http2/hpack.cc
+    src/http2/session.h
+    src/http2/session.cc
     src/tcp_acceptor.cc
     src/tcp_stream.cc
     src/tls_stream.cc
@@ -158,6 +166,12 @@ if(BUILD_TESTING)
     target_link_libraries(http_test PRIVATE eventloop::eventloop)
     target_compile_options(http_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http COMMAND http_test)
+
+    add_executable(http2_hpack_test tests/http2_hpack.cc)
+    target_include_directories(http2_hpack_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http2_hpack_test PRIVATE eventloop::eventloop)
+    target_compile_options(http2_hpack_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http2_hpack COMMAND http2_hpack_test)
 
     add_executable(executor_test tests/executor.cc)
     target_include_directories(executor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

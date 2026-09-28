@@ -1,0 +1,1081 @@
+#include "session.h"
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstring>
+#include <limits>
+#include <string_view>
+#include <utility>
+
+#include <unistd.h>
+
+namespace eventloop::http2::detail {
+namespace {
+
+constexpr std::string_view client_preface =
+    "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+constexpr std::size_t max_output_size = 256 * 1024;
+constexpr std::uint8_t data_frame = 0;
+constexpr std::uint8_t headers_frame = 1;
+constexpr std::uint8_t priority_frame = 2;
+constexpr std::uint8_t reset_frame = 3;
+constexpr std::uint8_t settings_frame = 4;
+constexpr std::uint8_t push_promise_frame = 5;
+constexpr std::uint8_t ping_frame = 6;
+constexpr std::uint8_t goaway_frame = 7;
+constexpr std::uint8_t window_update_frame = 8;
+constexpr std::uint8_t continuation_frame = 9;
+constexpr std::uint8_t flag_end_stream = 0x1;
+constexpr std::uint8_t flag_ack = 0x1;
+constexpr std::uint8_t flag_end_headers = 0x4;
+constexpr std::uint8_t flag_padded = 0x8;
+constexpr std::uint8_t flag_priority = 0x20;
+constexpr std::uint32_t protocol_error = 1;
+constexpr std::uint32_t internal_error = 2;
+constexpr std::uint32_t flow_control_error = 3;
+constexpr std::uint32_t stream_closed_error = 5;
+constexpr std::uint32_t frame_size_error = 6;
+constexpr std::uint32_t refused_stream_error = 7;
+constexpr std::uint32_t cancel_error = 8;
+constexpr std::uint32_t compression_error = 9;
+constexpr std::uint32_t enhance_your_calm_error = 11;
+constexpr std::uint32_t max_window_size = 0x7fffffff;
+
+[[nodiscard]] auto byte_value(std::byte value) noexcept -> std::uint8_t
+{
+    return std::to_integer<std::uint8_t>(value);
+}
+
+[[nodiscard]] auto read_u32(const std::byte* input) noexcept -> std::uint32_t
+{
+    return (static_cast<std::uint32_t>(byte_value(input[0])) << 24) |
+           (static_cast<std::uint32_t>(byte_value(input[1])) << 16) |
+           (static_cast<std::uint32_t>(byte_value(input[2])) << 8) |
+           static_cast<std::uint32_t>(byte_value(input[3]));
+}
+
+auto write_u32(std::byte* output, std::uint32_t value) noexcept -> void
+{
+    output[0] = static_cast<std::byte>((value >> 24) & 0xff);
+    output[1] = static_cast<std::byte>((value >> 16) & 0xff);
+    output[2] = static_cast<std::byte>((value >> 8) & 0xff);
+    output[3] = static_cast<std::byte>(value & 0xff);
+}
+
+[[nodiscard]] auto is_token_char(unsigned char value) noexcept -> bool
+{
+    if ((value >= '0' && value <= '9') ||
+        (value >= 'a' && value <= 'z') ||
+        (value >= 'A' && value <= 'Z')) return true;
+    constexpr std::string_view punctuation = "!#$%&'*+-.^_`|~";
+    return punctuation.find(static_cast<char>(value)) != std::string_view::npos;
+}
+
+[[nodiscard]] auto valid_header_name(std::string_view name) noexcept -> bool
+{
+    if (name.empty()) return false;
+    if (name.front() == ':') name.remove_prefix(1);
+    if (name.empty()) return false;
+    for (const unsigned char value : name) {
+        if (value >= 'A' && value <= 'Z') return false;
+        if (!is_token_char(value)) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] auto valid_header_value(std::string_view value) noexcept -> bool
+{
+    if (!value.empty() && (value.front() == ' ' || value.front() == '\t' ||
+                           value.back() == ' ' || value.back() == '\t')) {
+        return false;
+    }
+    for (const unsigned char byte : value) {
+        if (byte == 0x7f || (byte < 0x20 && byte != '\t')) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] constexpr auto hex_digit(unsigned char value) noexcept -> bool
+{
+    return (value >= '0' && value <= '9') ||
+           (value >= 'a' && value <= 'f') ||
+           (value >= 'A' && value <= 'F');
+}
+
+[[nodiscard]] auto valid_request_target(std::string_view target) noexcept -> bool
+{
+    for (std::size_t index = 0; index < target.size(); ++index) {
+        const auto value = static_cast<unsigned char>(target[index]);
+        if (value == '%') {
+            if (index + 2 >= target.size() ||
+                !hex_digit(static_cast<unsigned char>(target[index + 1])) ||
+                !hex_digit(static_cast<unsigned char>(target[index + 2]))) {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        const bool unreserved = (value >= 'a' && value <= 'z') ||
+            (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') ||
+            value == '-' || value == '.' || value == '_' || value == '~';
+        constexpr std::string_view sub_delimiters = "!$&'()*+,;=";
+        const bool pchar = unreserved || sub_delimiters.find(
+            static_cast<char>(value)) != std::string_view::npos ||
+            value == ':' || value == '@';
+        if (!pchar && value != '/' && value != '?') return false;
+    }
+    return true;
+}
+
+[[nodiscard]] auto ascii_equal(std::string_view left,
+                               std::string_view right) noexcept -> bool
+{
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        auto a = static_cast<unsigned char>(left[index]);
+        auto b = static_cast<unsigned char>(right[index]);
+        if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = static_cast<unsigned char>(b + ('a' - 'A'));
+        if (a != b) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] auto forbidden_connection_header(std::string_view name) noexcept
+    -> bool
+{
+    return name == "connection" || name == "proxy-connection" ||
+           name == "keep-alive" || name == "transfer-encoding" ||
+           name == "upgrade";
+}
+
+[[nodiscard]] auto parse_decimal(std::string_view input,
+                                 std::uint64_t& value) noexcept -> bool
+{
+    if (input.empty()) return false;
+    std::uint64_t parsed = 0;
+    for (const unsigned char digit : input) {
+        if (digit < '0' || digit > '9') return false;
+        const auto number = static_cast<std::uint64_t>(digit - '0');
+        if (parsed > (std::numeric_limits<std::uint64_t>::max() - number) / 10) {
+            return false;
+        }
+        parsed = parsed * 10 + number;
+    }
+    value = parsed;
+    return true;
+}
+
+[[nodiscard]] auto valid_method(std::string_view value) noexcept -> bool
+{
+    if (value.empty()) return false;
+    for (const unsigned char byte : value) {
+        if (!is_token_char(byte)) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+session::session()
+{
+    requests_.reserve(8);
+    header_block_.reserve(4096);
+    output_.reserve(4096);
+    decoded_fields_.reserve(16);
+
+    std::array<std::byte, 24> settings {};
+    auto setting = [&](std::size_t offset, std::uint16_t id,
+                       std::uint32_t value) {
+        settings[offset] = static_cast<std::byte>(id >> 8);
+        settings[offset + 1] = static_cast<std::byte>(id & 0xff);
+        write_u32(settings.data() + offset + 2, value);
+    };
+    setting(0, 1, static_cast<std::uint32_t>(hpack_max_table_size));
+    setting(6, 2, 0); // This server does not implement push.
+    setting(12, 3, static_cast<std::uint32_t>(max_concurrent_streams));
+    setting(18, 6, static_cast<std::uint32_t>(hpack_max_field_list_size));
+    if (!append_frame(settings_frame, 0, 0, settings)) fatal_ = true;
+}
+
+auto session::read_buffer() noexcept -> std::span<std::byte>
+{
+    return read_buffer_;
+}
+
+auto session::commit_read(std::size_t size) -> void
+{
+    if (size > read_buffer_.size()) {
+        connection_error(internal_error);
+        return;
+    }
+    consume_input(std::span {read_buffer_}.first(size));
+    pump_responses();
+}
+
+auto session::output() const noexcept -> std::span<const std::byte>
+{
+    if (output_offset_ >= output_.size()) return {};
+    return std::span {output_}.subspan(output_offset_);
+}
+
+auto session::consume_output(std::size_t size) -> void
+{
+    if (size > output_.size() - output_offset_) {
+        connection_error(internal_error);
+        return;
+    }
+    output_offset_ += size;
+    if (output_offset_ == output_.size()) {
+        output_.clear();
+        output_offset_ = 0;
+    }
+    pump_responses();
+}
+
+auto session::pop_request(request& value) -> bool
+{
+    if (requests_.empty()) return false;
+    value = std::move(requests_.front());
+    requests_.erase(requests_.begin());
+    return true;
+}
+
+auto session::respond(std::uint32_t stream_id, unsigned status,
+                      std::span<const field> headers,
+                      std::vector<std::byte> body) -> bool
+{
+    auto* value = find_stream(stream_id);
+    if (value == nullptr || value->response_started || fatal_) return false;
+    if (body.size() > max_queued_response_body - inline_response_bytes_) {
+        return false;
+    }
+    value->response_size = body.size();
+    value->response_accounted = body.size();
+    inline_response_bytes_ += body.size();
+    value->response_body = std::move(body);
+    if (!append_response_headers(*value, status, headers)) {
+        reset_stream(*value);
+        return false;
+    }
+    pump_responses();
+    return true;
+}
+
+auto session::respond_file(std::uint32_t stream_id, unsigned status,
+                           std::span<const field> headers, unique_fd file,
+                           std::uint64_t size, bool send_body) -> bool
+{
+    auto* value = find_stream(stream_id);
+    if (value == nullptr || value->response_started || fatal_) return false;
+    value->response_size = send_body ? size : 0;
+    value->response_offset = 0;
+    if (send_body) value->response_file = std::move(file);
+    if (!append_response_headers(*value, status, headers)) {
+        reset_stream(*value);
+        return false;
+    }
+    pump_responses();
+    return true;
+}
+
+auto session::closed() const noexcept -> bool
+{
+    if (!output().empty()) return false;
+    if (fatal_) return true;
+    if (!peer_goaway_) return false;
+    return std::none_of(streams_.begin(), streams_.end(),
+                        [](const stream& value) { return value.active; });
+}
+
+auto session::consume_input(std::span<const std::byte> input) -> void
+{
+    while (!input.empty() && !fatal_) {
+        if (preface_size_ < client_preface.size()) {
+            const auto expected = static_cast<unsigned char>(
+                client_preface[preface_size_]);
+            if (byte_value(input.front()) != expected) {
+                connection_error(protocol_error);
+                return;
+            }
+            ++preface_size_;
+            input = input.subspan(1);
+            continue;
+        }
+
+        if (frame_header_size_ < frame_header_.size()) {
+            const auto count = std::min(input.size(),
+                frame_header_.size() - frame_header_size_);
+            std::memcpy(frame_header_.data() + frame_header_size_,
+                        input.data(), count);
+            frame_header_size_ += count;
+            input = input.subspan(count);
+            if (frame_header_size_ != frame_header_.size()) continue;
+
+            expected_payload_size_ =
+                (static_cast<std::size_t>(byte_value(frame_header_[0])) << 16) |
+                (static_cast<std::size_t>(byte_value(frame_header_[1])) << 8) |
+                static_cast<std::size_t>(byte_value(frame_header_[2]));
+            frame_type_ = byte_value(frame_header_[3]);
+            frame_flags_ = byte_value(frame_header_[4]);
+            const auto raw_stream = read_u32(frame_header_.data() + 5);
+            frame_stream_id_ = raw_stream & 0x7fffffffu;
+            frame_payload_size_ = 0;
+            if (expected_payload_size_ > max_frame_payload) {
+                connection_error(frame_size_error);
+                return;
+            }
+            if (continuation_stream_id_ != 0 &&
+                (frame_type_ != continuation_frame ||
+                 frame_stream_id_ != continuation_stream_id_)) {
+                connection_error(protocol_error);
+                return;
+            }
+            if (!got_first_settings_ &&
+                (frame_type_ != settings_frame || frame_stream_id_ != 0 ||
+                 (frame_flags_ & flag_ack) != 0)) {
+                connection_error(protocol_error);
+                return;
+            }
+        }
+
+        const auto remaining = expected_payload_size_ - frame_payload_size_;
+        const auto count = std::min(input.size(), remaining);
+        if (count != 0) {
+            std::memcpy(frame_payload_.data() + frame_payload_size_,
+                        input.data(), count);
+            frame_payload_size_ += count;
+            input = input.subspan(count);
+        }
+        if (frame_payload_size_ == expected_payload_size_) {
+            dispatch_frame();
+            frame_header_size_ = 0;
+            frame_payload_size_ = 0;
+            expected_payload_size_ = 0;
+        }
+    }
+}
+
+auto session::dispatch_frame() -> void
+{
+    switch (frame_type_) {
+    case data_frame: dispatch_data(); break;
+    case headers_frame: dispatch_headers(); break;
+    case priority_frame: {
+        if (frame_stream_id_ == 0) {
+            connection_error(protocol_error);
+            return;
+        }
+        if (frame_payload_size_ != 5) {
+            connection_error(frame_size_error);
+            return;
+        }
+        const auto dependency = read_u32(frame_payload_.data()) & 0x7fffffffu;
+        if (dependency == frame_stream_id_) {
+            stream_error(frame_stream_id_, protocol_error);
+        }
+        break;
+    }
+    case reset_frame: {
+        if (frame_stream_id_ == 0) {
+            connection_error(protocol_error);
+            return;
+        }
+        if (frame_payload_size_ != 4) {
+            connection_error(frame_size_error);
+            return;
+        }
+        if ((frame_stream_id_ & 1u) == 0) {
+            connection_error(protocol_error);
+            return;
+        }
+        if (auto* value = find_stream(frame_stream_id_)) {
+            reset_stream(*value);
+        } else if (frame_stream_id_ > last_stream_id_) {
+            connection_error(protocol_error);
+        }
+        break;
+    }
+    case settings_frame: dispatch_settings(); break;
+    case push_promise_frame:
+        connection_error(protocol_error);
+        break;
+    case ping_frame:
+        if (frame_stream_id_ != 0) {
+            connection_error(protocol_error);
+        } else if (frame_payload_size_ != 8) {
+            connection_error(frame_size_error);
+        } else if ((frame_flags_ & flag_ack) == 0 &&
+                   !append_frame(ping_frame, flag_ack, 0,
+                                 std::span {frame_payload_}.first(8))) {
+            connection_error(internal_error);
+        }
+        break;
+    case goaway_frame:
+        if (frame_stream_id_ != 0) {
+            connection_error(protocol_error);
+        } else if (frame_payload_size_ < 8) {
+            connection_error(frame_size_error);
+        } else {
+            peer_goaway_ = true;
+        }
+        break;
+    case window_update_frame: dispatch_window_update(); break;
+    case continuation_frame:
+        if (continuation_stream_id_ == 0 ||
+            frame_stream_id_ != continuation_stream_id_) {
+            connection_error(protocol_error);
+            return;
+        }
+        if (frame_payload_size_ > hpack_max_block_size - header_block_.size()) {
+            connection_error(enhance_your_calm_error);
+            return;
+        }
+        header_block_.insert(header_block_.end(), frame_payload_.begin(),
+            frame_payload_.begin() + static_cast<std::ptrdiff_t>(frame_payload_size_));
+        if ((frame_flags_ & flag_end_headers) != 0) finish_header_block();
+        break;
+    default:
+        // Unknown extension frames are ignored as required by RFC 9113.
+        break;
+    }
+}
+
+auto session::dispatch_headers() -> void
+{
+    if (frame_stream_id_ == 0) {
+        connection_error(protocol_error);
+        return;
+    }
+    auto* value = find_stream(frame_stream_id_);
+    header_refused_ = false;
+    header_trailers_ = false;
+    header_reject_error_ = refused_stream_error;
+    if (value == nullptr) {
+        if ((frame_stream_id_ & 1u) == 0) {
+            connection_error(protocol_error);
+            return;
+        }
+        if (frame_stream_id_ <= last_stream_id_) {
+            header_refused_ = true;
+            header_reject_error_ = stream_closed_error;
+        } else {
+            last_stream_id_ = frame_stream_id_;
+            value = peer_goaway_ ? nullptr : allocate_stream(frame_stream_id_);
+            if (value == nullptr) header_refused_ = true;
+        }
+    } else if (!value->initial_headers || value->remote_closed ||
+               value->request_ready) {
+        header_refused_ = true;
+        header_reject_error_ = stream_closed_error;
+    } else {
+        header_trailers_ = true;
+    }
+
+    std::size_t offset = 0;
+    std::size_t padding = 0;
+    if ((frame_flags_ & flag_padded) != 0) {
+        if (frame_payload_size_ == 0) {
+            connection_error(protocol_error);
+            return;
+        }
+        padding = byte_value(frame_payload_[offset++]);
+    }
+    if ((frame_flags_ & flag_priority) != 0) {
+        if (frame_payload_size_ - offset < 5) {
+            connection_error(frame_size_error);
+            return;
+        }
+        const auto dependency = read_u32(frame_payload_.data() + offset) & 0x7fffffffu;
+        if (dependency == frame_stream_id_) {
+            header_refused_ = true;
+            header_reject_error_ = protocol_error;
+        }
+        offset += 5;
+    }
+    if (padding > frame_payload_size_ - offset) {
+        connection_error(protocol_error);
+        return;
+    }
+
+    header_stream_id_ = frame_stream_id_;
+    header_end_stream_ = (frame_flags_ & flag_end_stream) != 0;
+    const auto fragment_size = frame_payload_size_ - offset - padding;
+    header_block_.clear();
+    if (fragment_size > hpack_max_block_size) {
+        connection_error(enhance_your_calm_error);
+        return;
+    }
+    header_block_.insert(header_block_.end(),
+        frame_payload_.begin() + static_cast<std::ptrdiff_t>(offset),
+        frame_payload_.begin() + static_cast<std::ptrdiff_t>(offset + fragment_size));
+    if ((frame_flags_ & flag_end_headers) != 0) {
+        finish_header_block();
+    } else {
+        continuation_stream_id_ = frame_stream_id_;
+    }
+}
+
+auto session::dispatch_data() -> void
+{
+    if (frame_stream_id_ == 0) {
+        connection_error(protocol_error);
+        return;
+    }
+    if ((frame_stream_id_ & 1u) == 0) {
+        connection_error(protocol_error);
+        return;
+    }
+    const auto flow_size = static_cast<std::int64_t>(frame_payload_size_);
+    const auto return_connection_credit = [&] {
+        connection_receive_window_ += flow_size;
+        if (flow_size != 0) {
+            send_window_update(0, static_cast<std::uint32_t>(flow_size));
+        }
+    };
+    auto* value = find_stream(frame_stream_id_);
+    if (value == nullptr) {
+        if (frame_stream_id_ > last_stream_id_) {
+            connection_error(protocol_error);
+            return;
+        }
+        connection_receive_window_ -= flow_size;
+        if (connection_receive_window_ < 0) {
+            connection_error(flow_control_error);
+            return;
+        }
+        return_connection_credit();
+        stream_error(frame_stream_id_, stream_closed_error);
+        return;
+    }
+    connection_receive_window_ -= flow_size;
+    if (connection_receive_window_ < 0) {
+        connection_error(flow_control_error);
+        return;
+    }
+    if (!value->initial_headers || value->remote_closed || value->request_ready) {
+        return_connection_credit();
+        stream_error(frame_stream_id_, stream_closed_error);
+        return;
+    }
+    value->receive_window -= flow_size;
+    if (value->receive_window < 0) {
+        return_connection_credit();
+        stream_error(frame_stream_id_, flow_control_error);
+        return;
+    }
+
+    std::size_t offset = 0;
+    std::size_t padding = 0;
+    if ((frame_flags_ & flag_padded) != 0) {
+        if (frame_payload_size_ == 0) {
+            connection_error(protocol_error);
+            return;
+        }
+        padding = byte_value(frame_payload_[offset++]);
+    }
+    if (padding > frame_payload_size_ - offset) {
+        connection_error(protocol_error);
+        return;
+    }
+    const auto data_size = frame_payload_size_ - offset - padding;
+    if (data_size > std::numeric_limits<std::uint64_t>::max() -
+                        value->request_body_size) {
+        return_connection_credit();
+        stream_error(frame_stream_id_, enhance_your_calm_error);
+        return;
+    }
+    value->request_body_size += data_size;
+    if (value->request_body_size > max_request_body ||
+        (value->content_length &&
+         value->request_body_size > *value->content_length)) {
+        return_connection_credit();
+        stream_error(frame_stream_id_, enhance_your_calm_error);
+        return;
+    }
+
+    if (flow_size != 0) {
+        return_connection_credit();
+        value->receive_window += flow_size;
+        send_window_update(frame_stream_id_, static_cast<std::uint32_t>(flow_size));
+    }
+    if ((frame_flags_ & flag_end_stream) != 0) finish_request(*value);
+}
+
+auto session::dispatch_settings() -> void
+{
+    if (frame_stream_id_ != 0) {
+        connection_error(protocol_error);
+        return;
+    }
+    const bool ack = (frame_flags_ & flag_ack) != 0;
+    if (ack) {
+        if (frame_payload_size_ != 0) {
+            connection_error(frame_size_error);
+        } else if (server_settings_acked_) {
+            connection_error(protocol_error);
+        } else {
+            server_settings_acked_ = true;
+        }
+        return;
+    }
+    if (frame_payload_size_ % 6 != 0) {
+        connection_error(frame_size_error);
+        return;
+    }
+    got_first_settings_ = true;
+    for (std::size_t offset = 0; offset < frame_payload_size_; offset += 6) {
+        const auto id = static_cast<std::uint16_t>(
+            (byte_value(frame_payload_[offset]) << 8) |
+             byte_value(frame_payload_[offset + 1]));
+        const auto value = read_u32(frame_payload_.data() + offset + 2);
+        if (id == 2 && value > 1) {
+            connection_error(protocol_error);
+            return;
+        }
+        if (id == 4) {
+            if (value > max_window_size) {
+                connection_error(flow_control_error);
+                return;
+            }
+            const auto delta = static_cast<std::int64_t>(value) -
+                               static_cast<std::int64_t>(peer_initial_window_);
+            peer_initial_window_ = value;
+            for (auto& stream_value : streams_) {
+                if (!stream_value.active) continue;
+                stream_value.send_window += delta;
+                if (stream_value.send_window > max_window_size) {
+                    stream_error(stream_value.id, flow_control_error);
+                }
+            }
+        } else if (id == 5 &&
+                   (value < max_frame_payload || value > 0x00ffffffu)) {
+            connection_error(protocol_error);
+            return;
+        }
+    }
+    if (!append_frame(settings_frame, flag_ack, 0)) {
+        connection_error(internal_error);
+    }
+}
+
+auto session::dispatch_window_update() -> void
+{
+    if (frame_payload_size_ != 4) {
+        connection_error(frame_size_error);
+        return;
+    }
+    const auto increment = read_u32(frame_payload_.data()) & 0x7fffffffu;
+    if (increment == 0) {
+        if (frame_stream_id_ == 0) connection_error(protocol_error);
+        else stream_error(frame_stream_id_, protocol_error);
+        return;
+    }
+    if (frame_stream_id_ == 0) {
+        if (connection_send_window_ + increment > max_window_size) {
+            connection_error(flow_control_error);
+            return;
+        }
+        connection_send_window_ += increment;
+        pump_responses();
+        return;
+    }
+    if ((frame_stream_id_ & 1u) == 0) {
+        connection_error(protocol_error);
+        return;
+    }
+    if (auto* value = find_stream(frame_stream_id_)) {
+        if (value->send_window + increment > max_window_size) {
+            stream_error(frame_stream_id_, flow_control_error);
+            return;
+        }
+        value->send_window += increment;
+        pump_responses();
+    } else if (frame_stream_id_ > last_stream_id_) {
+        connection_error(protocol_error);
+    }
+}
+
+auto session::finish_header_block() -> void
+{
+    continuation_stream_id_ = 0;
+    const auto decoded = decoder_.decode(header_block_, decoded_fields_);
+    if (decoded != hpack_error::none) {
+        connection_error(decoded == hpack_error::invalid
+            ? compression_error : enhance_your_calm_error);
+        return;
+    }
+    if (header_refused_) {
+        stream_error(header_stream_id_, header_reject_error_);
+        header_block_.clear();
+        return;
+    }
+    auto* value = find_stream(header_stream_id_);
+    if (value == nullptr) {
+        stream_error(header_stream_id_, stream_closed_error);
+        header_block_.clear();
+        return;
+    }
+    if (header_trailers_) {
+        if (!header_end_stream_ || !validate_trailers(decoded_fields_)) {
+            stream_error(header_stream_id_, protocol_error);
+        } else {
+            finish_request(*value);
+        }
+    } else if (value->initial_headers ||
+               !validate_initial_headers(*value, decoded_fields_)) {
+        stream_error(header_stream_id_, protocol_error);
+    } else {
+        value->initial_headers = true;
+        if (header_end_stream_) finish_request(*value);
+    }
+    header_block_.clear();
+}
+
+auto session::finish_request(stream& value) -> void
+{
+    if (value.remote_closed) {
+        stream_error(value.id, stream_closed_error);
+        return;
+    }
+    if (value.content_length && value.request_body_size != *value.content_length) {
+        stream_error(value.id, protocol_error);
+        return;
+    }
+    value.remote_closed = true;
+    value.request_ready = true;
+    requests_.push_back(request {
+        .stream_id = value.id,
+        .method = std::move(value.method),
+        .target = std::move(value.target),
+        .body_size = value.request_body_size,
+    });
+}
+
+auto session::validate_initial_headers(stream& value,
+                                       std::span<const field> fields) -> bool
+{
+    std::string_view method;
+    std::string_view scheme;
+    std::string_view target;
+    std::string_view authority;
+    std::string_view host;
+    std::optional<std::uint64_t> content_length;
+    bool regular_field_seen = false;
+    bool method_seen = false;
+    bool scheme_seen = false;
+    bool target_seen = false;
+    bool authority_seen = false;
+    bool host_seen = false;
+
+    for (const auto& entry : fields) {
+        if (!valid_header_name(entry.name) || !valid_header_value(entry.value)) {
+            return false;
+        }
+        const bool pseudo = entry.name.front() == ':';
+        if (pseudo && regular_field_seen) return false;
+        if (!pseudo) regular_field_seen = true;
+
+        if (pseudo) {
+            if (entry.name == ":method") {
+                if (method_seen) return false;
+                method_seen = true;
+                method = entry.value;
+            } else if (entry.name == ":scheme") {
+                if (scheme_seen) return false;
+                scheme_seen = true;
+                scheme = entry.value;
+            } else if (entry.name == ":path") {
+                if (target_seen) return false;
+                target_seen = true;
+                target = entry.value;
+            } else if (entry.name == ":authority") {
+                if (authority_seen) return false;
+                authority_seen = true;
+                authority = entry.value;
+            } else {
+                // :protocol needs extended CONNECT negotiation, which is not
+                // enabled by this server.
+                return false;
+            }
+            continue;
+        }
+        if (forbidden_connection_header(entry.name)) return false;
+        if (entry.name == "te" && !ascii_equal(entry.value, "trailers")) return false;
+        if (entry.name == "host") {
+            if (host_seen) return false;
+            host_seen = true;
+            host = entry.value;
+        }
+        if (entry.name == "content-length") {
+            std::uint64_t parsed = 0;
+            if (!parse_decimal(entry.value, parsed) ||
+                (content_length && *content_length != parsed)) return false;
+            content_length = parsed;
+        }
+    }
+
+    if (!method_seen || !valid_method(method)) return false;
+    const bool connect = method == "CONNECT";
+    if (connect) {
+        if (!authority_seen || authority.empty() || scheme_seen || target_seen) {
+            return false;
+        }
+        target = authority;
+    } else if (!scheme_seen || scheme.empty() || !target_seen || target.empty()) {
+        return false;
+    } else if (target != "*" && target.front() != '/') {
+        return false;
+    } else if (target == "*" && method != "OPTIONS") {
+        return false;
+    }
+    if (!connect) {
+        const auto alpha = [](unsigned char byte) {
+            return (byte >= 'a' && byte <= 'z') ||
+                   (byte >= 'A' && byte <= 'Z');
+        };
+        if (!alpha(static_cast<unsigned char>(scheme.front()))) return false;
+        for (const unsigned char byte : scheme) {
+            if (!alpha(byte) && !(byte >= '0' && byte <= '9') &&
+                byte != '+' && byte != '-' && byte != '.') return false;
+        }
+        if (target.find('#') != std::string_view::npos) return false;
+        if (!valid_request_target(target)) return false;
+        if ((ascii_equal(scheme, "http") || ascii_equal(scheme, "https")) &&
+            authority_seen && authority.find('@') != std::string_view::npos) {
+            return false;
+        }
+    }
+    if (authority_seen && authority.empty()) return false;
+    if (authority_seen && host_seen && !ascii_equal(authority, host)) return false;
+    value.method.assign(method);
+    value.target.assign(target);
+    value.content_length = content_length;
+    return true;
+}
+
+auto session::validate_trailers(std::span<const field> fields) const -> bool
+{
+    for (const auto& entry : fields) {
+        if (entry.name.empty() || entry.name.front() == ':' ||
+            !valid_header_name(entry.name) || !valid_header_value(entry.value) ||
+            forbidden_connection_header(entry.name) || entry.name == "content-length" ||
+            entry.name == "host" || entry.name == "te") return false;
+    }
+    return true;
+}
+
+auto session::find_stream(std::uint32_t id) noexcept -> stream*
+{
+    const auto found = std::find_if(streams_.begin(), streams_.end(),
+        [id](const stream& value) { return value.active && value.id == id; });
+    return found == streams_.end() ? nullptr : &*found;
+}
+
+auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
+{
+    const auto found = std::find_if(streams_.begin(), streams_.end(),
+        [](const stream& value) { return !value.active; });
+    if (found == streams_.end()) return nullptr;
+    found->id = id;
+    found->receive_window = 65535;
+    found->send_window = peer_initial_window_;
+    found->request_body_size = 0;
+    found->content_length.reset();
+    found->method.clear();
+    found->target.clear();
+    found->response_body.clear();
+    found->response_file.reset();
+    found->response_size = 0;
+    found->response_offset = 0;
+    found->response_accounted = 0;
+    found->active = true;
+    found->initial_headers = false;
+    found->remote_closed = false;
+    found->request_ready = false;
+    found->response_started = false;
+    return &*found;
+}
+
+auto session::reset_stream(stream& value) noexcept -> void
+{
+    if (value.response_accounted <= inline_response_bytes_) {
+        inline_response_bytes_ -= value.response_accounted;
+    } else {
+        inline_response_bytes_ = 0;
+    }
+    std::erase_if(requests_, [&value](const request& pending) {
+        return pending.stream_id == value.id;
+    });
+    value = stream {};
+}
+
+auto session::stream_error(std::uint32_t id, std::uint32_t error) -> void
+{
+    std::array<std::byte, 4> payload {};
+    write_u32(payload.data(), error);
+    if (!append_frame(reset_frame, 0, id, payload)) {
+        fatal_ = true;
+        return;
+    }
+    if (auto* value = find_stream(id)) reset_stream(*value);
+}
+
+auto session::connection_error(std::uint32_t error) -> void
+{
+    if (fatal_) return;
+    std::array<std::byte, 8> payload {};
+    write_u32(payload.data(), last_stream_id_ & 0x7fffffffu);
+    write_u32(payload.data() + 4, error);
+    (void)append_frame(goaway_frame, 0, 0, payload);
+    requests_.clear();
+    fatal_ = true;
+}
+
+auto session::send_window_update(std::uint32_t id,
+                                 std::uint32_t increment) -> void
+{
+    if (increment == 0 || increment > max_window_size) return;
+    std::array<std::byte, 4> payload {};
+    write_u32(payload.data(), increment);
+    if (!append_frame(window_update_frame, 0, id, payload)) {
+        connection_error(internal_error);
+    }
+}
+
+auto session::append_frame(std::uint8_t type, std::uint8_t flags,
+                           std::uint32_t stream_id,
+                           std::span<const std::byte> payload) -> bool
+{
+    if (payload.size() > max_frame_payload || payload.size() > 0x00ffffffu) {
+        return false;
+    }
+    const auto pending = output_.size() - output_offset_;
+    if (payload.size() + 9 > max_output_size - std::min(pending, max_output_size)) {
+        return false;
+    }
+    if (output_offset_ != 0 &&
+        (output_offset_ > output_.size() / 2 || output_.size() + payload.size() + 9 >
+                                               max_output_size)) {
+        std::move(output_.begin() + static_cast<std::ptrdiff_t>(output_offset_),
+                  output_.end(), output_.begin());
+        output_.resize(pending);
+        output_offset_ = 0;
+    }
+    const auto old_size = output_.size();
+    output_.resize(old_size + 9 + payload.size());
+    auto* header = output_.data() + old_size;
+    header[0] = static_cast<std::byte>((payload.size() >> 16) & 0xff);
+    header[1] = static_cast<std::byte>((payload.size() >> 8) & 0xff);
+    header[2] = static_cast<std::byte>(payload.size() & 0xff);
+    header[3] = static_cast<std::byte>(type);
+    header[4] = static_cast<std::byte>(flags);
+    write_u32(header + 5, stream_id & 0x7fffffffu);
+    if (!payload.empty()) std::memcpy(header + 9, payload.data(), payload.size());
+    return true;
+}
+
+auto session::append_response_headers(stream& value, unsigned status,
+                                      std::span<const field> headers) -> bool
+{
+    std::array<char, 3> status_text {
+        static_cast<char>('0' + (status / 100) % 10),
+        static_cast<char>('0' + (status / 10) % 10),
+        static_cast<char>('0' + status % 10),
+    };
+    std::vector<field> fields;
+    fields.reserve(headers.size() + 1);
+    fields.push_back(field {":status", std::string(status_text.data(), status_text.size())});
+    fields.insert(fields.end(), headers.begin(), headers.end());
+    std::vector<std::byte> block;
+    const auto encoded = hpack_encode(fields, block);
+    if (encoded != hpack_error::none) return false;
+    const auto frames = (block.size() + max_frame_payload - 1) / max_frame_payload;
+    const auto needed = block.size() + 9 * std::max<std::size_t>(frames, 1);
+    if (needed > max_output_size - (output_.size() - output_offset_)) return false;
+
+    std::size_t offset = 0;
+    bool first = true;
+    do {
+        const auto count = std::min<std::size_t>(max_frame_payload,
+                                                  block.size() - offset);
+        const bool last = offset + count == block.size();
+        std::uint8_t flags = last ? flag_end_headers : 0;
+        if (first && value.response_size == 0) flags |= flag_end_stream;
+        const auto type = first ? headers_frame : continuation_frame;
+        if (!append_frame(type, flags, value.id,
+                std::span {block}.subspan(offset, count))) return false;
+        first = false;
+        offset += count;
+    } while (offset < block.size());
+    value.response_started = true;
+    return true;
+}
+
+auto session::pump_responses() -> void
+{
+    if (fatal_) return;
+    bool progressed = true;
+    while (progressed) {
+        progressed = false;
+        for (auto& value : streams_) {
+            if (!value.active) continue;
+            if (value.request_ready && !value.response_started) continue;
+            if (!value.response_started) continue;
+            if (value.response_size == 0) {
+                reset_stream(value);
+                progressed = true;
+                continue;
+            }
+            if (value.response_offset >= value.response_size ||
+                connection_send_window_ <= 0 || value.send_window <= 0) continue;
+
+            const auto available = std::min<std::uint64_t>({
+                value.response_size - value.response_offset,
+                static_cast<std::uint64_t>(max_frame_payload),
+                static_cast<std::uint64_t>(connection_send_window_),
+                static_cast<std::uint64_t>(value.send_window),
+            });
+            if (available == 0) continue;
+            const auto count = static_cast<std::size_t>(available);
+            std::span<const std::byte> body;
+            if (value.response_file) {
+                std::size_t read_size = 0;
+                while (read_size < count) {
+                    const auto result = ::pread(value.response_file.get(),
+                        frame_payload_.data() + read_size, count - read_size,
+                        static_cast<off_t>(value.response_offset + read_size));
+                    if (result > 0) {
+                        read_size += static_cast<std::size_t>(result);
+                    } else if (result == -1 && errno == EINTR) {
+                        continue;
+                    } else {
+                        stream_error(value.id, internal_error);
+                        progressed = true;
+                        break;
+                    }
+                }
+                if (read_size != count) continue;
+                body = std::span {frame_payload_}.first(count);
+            } else {
+                body = std::span {value.response_body}.subspan(
+                    static_cast<std::size_t>(value.response_offset), count);
+            }
+            const bool last = value.response_offset + count == value.response_size;
+            if (!append_frame(data_frame, last ? flag_end_stream : 0,
+                              value.id, body)) {
+                // The bounded output queue is full. consume_output() resumes
+                // pumping after the transport drains it.
+                return;
+            }
+            value.response_offset += count;
+            connection_send_window_ -= static_cast<std::int64_t>(count);
+            value.send_window -= static_cast<std::int64_t>(count);
+            progressed = true;
+            if (last) reset_stream(value);
+        }
+    }
+}
+
+} // namespace eventloop::http2::detail

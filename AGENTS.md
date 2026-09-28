@@ -110,6 +110,16 @@ switching PCs; a fresh clone will not contain uncommitted work.
   HTTPS, and supports IPv4/IPv6 URLs. DNS candidates are tried sequentially;
   it does not implement Happy Eyeballs, response parsing, redirects, or a
   reusable client library API.
+- HTTPS advertises HTTP/2 (`h2`) and HTTP/1.1 through ALPN by default;
+  `http::server_options::enable_http2` disables HTTP/2. The bounded HTTP/2
+  implementation lives under `src/http2`, shares HTTP/1.1's secure resource
+  traversal, supports GET/HEAD/OPTIONS, and streams regular files within
+  connection and stream flow control. It caps active streams at 32, request
+  bodies at 1 MiB, HPACK blocks and header lists at 64 KiB, and queued inline
+  responses at 4 MiB per connection. Cleartext HTTP/2, h2c, CONNECT tunnels,
+  and extended CONNECT are not supported. `tests/http2_hpack.cc` covers RFC
+  HPACK vectors and bounds; `tests/run_http_server.sh` exercises TLS HTTP/2
+  requests when the existing curl binary has HTTP/2 support.
 - `tests/tcp_coroutine.cc` and `tests/udp_coroutine.cc` cover loopback I/O,
   duplicate waiters, cancellation, shutdown, readiness rearming, and descriptor
   closure. The focused CTest run passed both on 2026-09-27 with local socket
@@ -189,6 +199,15 @@ build completed in `/tmp/eventloop-release-review` and the full CTest suite
 passed 12/12 with local loopback access. The HTTP client example also completed
 GETs against the example server over IPv4 and IPv6 loopback. These checks do
 not verify public-network DNS behavior or HTTPS against an external CA.
+
+After adding TLS HTTP/2 support on 2026-09-28, a Release build completed in
+`/tmp/eventloop-http2-tests` and CTest passed 13/13 with local loopback access.
+`http2_hpack` covers RFC Huffman and dynamic-table vectors, invalid encodings,
+configured size limits, and the response encoder. `http_server` verifies ALPN
+negotiation and GET/HEAD/OPTIONS, parallel same-host requests, and a 256 KiB
+file response that exercises DATA flow-control updates. Its HTTP/2 checks are
+skipped if the existing curl binary lacks HTTP/2 support. The HTTP/2 path
+shares the secure resource walk with HTTP/1.1 and remains TLS-only.
 
 Use build directories ignored by Git or outside the repository on the new
 machine. Recheck warnings, `git diff --check`, and test results after changes.

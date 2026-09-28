@@ -34,8 +34,6 @@ public:
     auto finish_response() -> void;
 
 private:
-    enum class path_result { valid, invalid, too_long };
-
     auto process_requests() -> void;
     auto handle_request(const request& parsed) -> void;
     auto serve_resource(const request& parsed, bool headers_only) -> void;
@@ -51,9 +49,6 @@ private:
     auto consume_request(std::size_t size) -> void;
     auto expand_input() -> void;
     [[nodiscard]] auto input_data() noexcept -> char*;
-    [[nodiscard]] auto prepare_path(std::string_view target,
-                                    std::span<char> output,
-                                    std::size_t& size) const noexcept -> path_result;
     [[nodiscard]] auto allocate_response(std::size_t size) -> std::span<char>;
 
     int root_descriptor_;

@@ -2,6 +2,7 @@
 
 #include "eventloop/http/directory_listing.h"
 #include "eventloop/http/mime_types.h"
+#include "resource.h"
 
 #include <algorithm>
 #include <array>
@@ -44,14 +45,6 @@ constexpr std::string_view options_response =
     "HTTP/1.1 204 No Content\r\nAllow: GET, HEAD, OPTIONS\r\nContent-Length: 0\r\n\r\n";
 constexpr std::size_t sendfile_min_size = 11 * 1024;
 
-[[nodiscard]] constexpr auto hex_value(char value) noexcept -> int
-{
-    if (value >= '0' && value <= '9') return value - '0';
-    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-    return -1;
-}
-
 auto format_http_time(std::time_t value, std::span<char> output) noexcept
     -> std::size_t
 {
@@ -59,40 +52,6 @@ auto format_http_time(std::time_t value, std::span<char> output) noexcept
     if (gmtime_r(&value, &time) == nullptr) return 0;
     return std::strftime(output.data(), output.size(),
                          "%a, %d %b %Y %H:%M:%S GMT", &time);
-}
-
-[[nodiscard]] auto open_beneath(int root, std::span<char> path) noexcept
-    -> unique_fd
-{
-    std::size_t start = 0;
-    int parent = root;
-    unique_fd owned_parent;
-
-    while (start < path.size()) {
-        while (start < path.size() && path[start] == '/') ++start;
-        if (start == path.size()) break;
-
-        auto end = start;
-        while (end < path.size() && path[end] != '/') ++end;
-        const char saved = end < path.size() ? path[end] : '\0';
-        if (end < path.size()) path[end] = '\0';
-        const int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
-                          (end < path.size() ? O_DIRECTORY : 0);
-        unique_fd next(openat(parent, path.data() + start, flags));
-        if (end < path.size()) path[end] = saved;
-        if (!next) {
-            const int error = errno;
-            owned_parent.reset();
-            errno = error;
-            return {};
-        }
-        owned_parent = std::move(next);
-        parent = owned_parent.get();
-        start = end + 1;
-    }
-
-    if (owned_parent) return owned_parent;
-    return unique_fd(openat(root, ".", O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
 }
 
 auto read_file(int descriptor, std::span<std::byte> output) noexcept -> bool
@@ -213,20 +172,16 @@ auto session::handle_request(const request& parsed) -> void
 
 auto session::serve_resource(const request& parsed, bool headers_only) -> void
 {
-    std::array<char, 4096> path {};
-    std::size_t path_size = 0;
-    const auto result = prepare_path(parsed.target, path, path_size);
-    if (result == path_result::too_long) {
+    auto opened = detail::open_resource(root_descriptor_, parsed.target);
+    if (!opened && opened.error() == detail::resource_error::target_too_long) {
         send_error(parse_status::target_too_long);
         return;
     }
-    if (result == path_result::invalid) {
+    if (!opened && opened.error() == detail::resource_error::invalid_target) {
         send_error(parse_status::bad_request);
         return;
     }
-
-    auto descriptor = open_beneath(root_descriptor_,
-                                   std::span {path}.first(path_size));
+    auto descriptor = opened ? std::move(*opened) : unique_fd {};
     if (!descriptor) {
         send_static_response(not_found);
         return;
@@ -491,48 +446,6 @@ auto session::consume_request(std::size_t size) -> void
         std::memcpy(input_.data(), expanded_input_.get(), remaining);
         expanded_input_.reset();
     }
-}
-
-auto session::prepare_path(std::string_view target, std::span<char> output,
-                           std::size_t& size) const noexcept -> path_result
-{
-    target = target.substr(0, target.find_first_of("?#"));
-    if (target.empty() || target.front() != '/') return path_result::invalid;
-
-    size = 0;
-    for (std::size_t input = 1; input < target.size(); ++input) {
-        char value = target[input];
-        if (value == '%') {
-            if (input + 2 >= target.size()) return path_result::invalid;
-            const int high = hex_value(target[input + 1]);
-            const int low = hex_value(target[input + 2]);
-            if (high < 0 || low < 0) return path_result::invalid;
-            value = static_cast<char>((high << 4) | low);
-            input += 2;
-        }
-        if (value == '\0' || value == '\\' ||
-            static_cast<unsigned char>(value) < 0x20) {
-            return path_result::invalid;
-        }
-        if (size == output.size()) return path_result::too_long;
-        output[size++] = value;
-    }
-
-    const std::string_view decoded {output.data(), size};
-    std::size_t segment_start = 0;
-    while (segment_start <= decoded.size()) {
-        const auto slash = decoded.find('/', segment_start);
-        const auto segment = decoded.substr(
-            segment_start, slash == std::string_view::npos
-                ? decoded.size() - segment_start
-                : slash - segment_start);
-        if (segment == "..") return path_result::invalid;
-        if (slash == std::string_view::npos) break;
-        segment_start = slash + 1;
-    }
-
-    if (size == 0) output[size++] = '.';
-    return path_result::valid;
 }
 
 auto session::allocate_response(std::size_t size) -> std::span<char>
