@@ -325,6 +325,36 @@ auto nested_exhaustion_test() -> bool
            statistics.allocation_failures == 1;
 }
 
+auto bounded_growth_and_release_test() -> bool
+{
+    event_loop_options options;
+    options.coroutine_frame_capacities.fill(0);
+    options.coroutine_frame_initial_capacities.fill(0);
+    options.coroutine_frame_capacities.back() = 3;
+    options.coroutine_frame_initial_capacities.back() = 1;
+    event_loop loop(options);
+    const auto before_growth = allocations;
+    int value = 0;
+    {
+        auto first = increment(loop, value);
+        auto second = increment(loop, value);
+        auto third = increment(loop, value);
+        auto rejected = increment(loop, value);
+        const auto statistics = loop.coroutine_statistics();
+        if (first.state() != task_state::not_started ||
+            second.state() != task_state::not_started ||
+            third.state() != task_state::not_started ||
+            rejected.state() != task_state::frame_allocation_failure ||
+            statistics.capacity != 3 || statistics.backed_capacity != 3 ||
+            statistics.live != 3 || statistics.allocation_failures != 1 ||
+            allocations != before_growth + 2) {
+            return false;
+        }
+    }
+    const auto statistics = loop.coroutine_statistics();
+    return statistics.live == 0 && statistics.backed_capacity == 1;
+}
+
 auto alignment_and_oversize_test() -> bool
 {
     event_loop loop;
@@ -607,6 +637,10 @@ auto main() -> int
     }
     if (!nested_exhaustion_test()) {
         std::cerr << "nested task frame-pool exhaustion test failed\n";
+        return 1;
+    }
+    if (!bounded_growth_and_release_test()) {
+        std::cerr << "task frame-pool bounded growth/release test failed\n";
         return 1;
     }
     if (!alignment_and_oversize_test()) {

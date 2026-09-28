@@ -68,12 +68,25 @@ auto unpoison_memory(void* pointer, std::size_t size) noexcept -> void
 class coroutine_frame_pool {
 public:
     explicit coroutine_frame_pool(
-        const std::array<std::size_t, coroutine_frame_sizes.size()>& capacities)
+        const std::array<std::size_t, coroutine_frame_sizes.size()>& capacities,
+        const std::array<std::size_t, coroutine_frame_sizes.size()>&
+            initial_capacities)
     {
         for (std::size_t index = 0; index < classes_.size(); ++index) {
-            initialize(classes_[index], index, coroutine_frame_sizes[index],
-                       capacities[index]);
+            auto& current = classes_[index];
+            current.payload_size = coroutine_frame_sizes[index];
+            current.stride = sizeof(block_header) + current.payload_size;
+            current.maximum_capacity = capacities[index];
+            if (capacities[index] >
+                (std::numeric_limits<std::size_t>::max() - sizeof(slab_header)) /
+                    current.stride ||
+                capacity_ >
+                    std::numeric_limits<std::size_t>::max() - capacities[index]) {
+                throw std::length_error("coroutine frame pool capacity is too large");
+            }
             capacity_ += capacities[index];
+            const auto initial = std::min(initial_capacities[index], capacities[index]);
+            if (initial != 0) create_slab(current, index, initial, true);
         }
     }
 
@@ -89,12 +102,21 @@ public:
     {
         for (std::size_t index = 0; index < classes_.size(); ++index) {
             auto& current = classes_[index];
-            if (size > current.payload_size || current.free == nullptr) continue;
-            auto* block = current.free;
-            current.free = block->next;
+            if (size > current.payload_size) continue;
+            if (current.available == nullptr && !grow(current, index)) continue;
+
+            auto* slab = current.available;
+            if (slab == nullptr || slab->free == nullptr || slab->free_count == 0) {
+                std::terminate();
+            }
+            auto* block = slab->free;
+            slab->free = block->next;
+            --slab->free_count;
+            if (slab->free_count == 0) remove_available(current, *slab);
             block->next = nullptr;
             block->allocated = true;
             block->requested_size = size;
+            ++slab->live;
             unpoison_memory(reinterpret_cast<std::byte*>(block) +
                                 sizeof(block_header),
                             size);
@@ -127,13 +149,17 @@ public:
             .high_watermark = high_watermark_,
             .allocation_failures = allocation_failures_,
             .active_roots = 0,
+            .backed_capacity = backed_capacity_,
         };
     }
 
 private:
+    struct slab_header;
+
     struct alignas(coroutine_frame_alignment) block_header {
         coroutine_frame_pool* owner;
         block_header* next;
+        slab_header* slab;
         std::size_t class_index;
         std::size_t requested_size;
         std::uint64_t magic;
@@ -142,12 +168,28 @@ private:
 
     static_assert(sizeof(block_header) == coroutine_frame_alignment);
 
+    struct alignas(coroutine_frame_alignment) slab_header {
+        slab_header* all_next;
+        slab_header* available_previous;
+        slab_header* available_next;
+        block_header* free;
+        std::size_t capacity;
+        std::size_t live;
+        std::size_t free_count;
+        bool retained;
+    };
+
+    static_assert(sizeof(slab_header) == coroutine_frame_alignment);
+
     struct size_class {
         ~size_class()
         {
-            if (storage != nullptr) {
-                ::operator delete(storage,
+            auto* slab = slabs;
+            while (slab != nullptr) {
+                auto* next = slab->all_next;
+                ::operator delete(slab,
                                   std::align_val_t {coroutine_frame_alignment});
+                slab = next;
             }
         }
 
@@ -155,65 +197,138 @@ private:
         size_class(const size_class&) = delete;
         auto operator=(const size_class&) -> size_class& = delete;
 
-        void* storage {nullptr};
-        block_header* free {nullptr};
+        slab_header* slabs {nullptr};
+        slab_header* available {nullptr};
         std::size_t payload_size {0};
         std::size_t stride {0};
+        std::size_t maximum_capacity {0};
+        std::size_t backed_capacity {0};
     };
 
     static constexpr std::uint64_t block_magic = 0xc07a4e5f4a4d4501ULL;
 
-    auto initialize(size_class& output, std::size_t class_index,
-                    std::size_t payload_size, std::size_t capacity) -> void
+    static auto remove_available(size_class& current, slab_header& slab) noexcept
+        -> void
     {
-        output.payload_size = payload_size;
-        output.stride = sizeof(block_header) + payload_size;
-        if (capacity == 0) return;
-        if (capacity > std::numeric_limits<std::size_t>::max() / output.stride) {
-            throw std::length_error("coroutine frame pool capacity is too large");
+        if (slab.available_previous != nullptr) {
+            slab.available_previous->available_next = slab.available_next;
+        } else {
+            current.available = slab.available_next;
         }
+        if (slab.available_next != nullptr) {
+            slab.available_next->available_previous = slab.available_previous;
+        }
+        slab.available_previous = nullptr;
+        slab.available_next = nullptr;
+    }
 
-        output.storage = ::operator new(
-            output.stride * capacity,
-            std::align_val_t {coroutine_frame_alignment});
-        auto* storage = static_cast<std::byte*>(output.storage);
+    static auto add_available(size_class& current, slab_header& slab) noexcept
+        -> void
+    {
+        slab.available_previous = nullptr;
+        slab.available_next = current.available;
+        if (current.available != nullptr) {
+            current.available->available_previous = &slab;
+        }
+        current.available = &slab;
+    }
+
+    auto create_slab(size_class& current, std::size_t class_index,
+                     std::size_t capacity, bool retained) -> void
+    {
+        const auto bytes = sizeof(slab_header) + current.stride * capacity;
+        auto* slab = std::construct_at(static_cast<slab_header*>(::operator new(
+            bytes, std::align_val_t {coroutine_frame_alignment})),
+            slab_header {
+                .all_next = current.slabs,
+                .available_previous = nullptr,
+                .available_next = nullptr,
+                .free = nullptr,
+                .capacity = capacity,
+                .live = 0,
+                .free_count = capacity,
+                .retained = retained,
+            });
+        current.slabs = slab;
+        auto* storage = reinterpret_cast<std::byte*>(slab) + sizeof(slab_header);
         for (std::size_t index = 0; index < capacity; ++index) {
             auto* block = std::construct_at(
-                reinterpret_cast<block_header*>(storage + index * output.stride),
+                reinterpret_cast<block_header*>(storage + index * current.stride),
                 block_header {
                     .owner = this,
-                    .next = output.free,
+                    .next = slab->free,
+                    .slab = slab,
                     .class_index = class_index,
                     .requested_size = 0,
                     .magic = block_magic,
                     .allocated = false,
                 });
-            poison_memory(storage + index * output.stride +
+            poison_memory(storage + index * current.stride +
                               sizeof(block_header),
-                          payload_size);
-            output.free = block;
+                          current.payload_size);
+            slab->free = block;
         }
+        current.backed_capacity += capacity;
+        backed_capacity_ += capacity;
+        add_available(current, *slab);
+    }
+
+    auto grow(size_class& current, std::size_t class_index) noexcept -> bool
+    {
+        if (current.backed_capacity >= current.maximum_capacity) return false;
+        const auto remaining = current.maximum_capacity - current.backed_capacity;
+        const auto growth = current.backed_capacity == 0
+            ? std::min<std::size_t>(64, remaining)
+            : std::min(current.backed_capacity, remaining);
+        try {
+            create_slab(current, class_index, growth, false);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        return true;
     }
 
     auto release(block_header& block, std::size_t size) noexcept -> void
     {
         if (block.class_index >= classes_.size()) std::terminate();
         auto& current = classes_[block.class_index];
-        if ((size != 0 && size > current.payload_size) || live_ == 0) {
+        if ((size != 0 && size > current.payload_size) || live_ == 0 ||
+            block.slab == nullptr || block.slab->live == 0 ||
+            block.slab->free_count >= block.slab->capacity) {
             std::terminate();
         }
+        auto& slab = *block.slab;
         poison_memory(reinterpret_cast<std::byte*>(&block) +
                           sizeof(block_header),
                       block.requested_size);
         block.requested_size = 0;
         block.allocated = false;
-        block.next = current.free;
-        current.free = &block;
+        const bool was_full = slab.free_count == 0;
+        block.next = slab.free;
+        slab.free = &block;
+        ++slab.free_count;
+        --slab.live;
         --live_;
+        if (was_full) add_available(current, slab);
+
+        if (slab.live == 0 && !slab.retained) {
+            remove_available(current, slab);
+            auto** link = &current.slabs;
+            while (*link != &slab) {
+                if (*link == nullptr) std::terminate();
+                link = &(*link)->all_next;
+            }
+            *link = slab.all_next;
+            current.backed_capacity -= slab.capacity;
+            backed_capacity_ -= slab.capacity;
+            ::operator delete(&slab,
+                              std::align_val_t {coroutine_frame_alignment});
+        }
     }
 
     std::array<size_class, coroutine_frame_sizes.size()> classes_;
     std::size_t capacity_ {0};
+    std::size_t backed_capacity_ {0};
     std::size_t live_ {0};
     std::size_t high_watermark_ {0};
     std::size_t allocation_failures_ {0};
@@ -246,7 +361,8 @@ private:
 class event_loop::implementation {
 public:
     explicit implementation(event_loop_options options)
-        : coroutine_frames(options.coroutine_frame_capacities),
+        : coroutine_frames(options.coroutine_frame_capacities,
+                           options.coroutine_frame_initial_capacities),
           posted_tasks(options.post_capacity),
           coroutine_completions(options.coroutine_completion_capacity),
           coroutine_completion_capacity(options.coroutine_completion_capacity),

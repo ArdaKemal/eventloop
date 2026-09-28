@@ -119,13 +119,20 @@ struct event_loop_options {
     std::size_t coroutine_completion_capacity {128};
     // File operations are bounded independently of the existing post queue.
     std::size_t file_io_depth {128};
-    // Coroutine frames are preallocated from fixed, per-loop size classes.
-    // Defaults reserve 278 frames (222,592 bytes including pool headers).
-    // A zero capacity disables a class. Exhaustion never falls back to the heap.
-    // Frame-resident state must not require alignment beyond max_align_t.
+    // Per-loop maximum coroutine-frame slots by payload size class. Growth is
+    // bounded by these limits; a zero capacity disables a class. The 1 KiB
+    // class defaults to 10,240 slots so one loop can serve the 10k-connection
+    // target without reserving those slots at startup.
     std::array<std::size_t, 6> coroutine_frame_capacities {
+        64, 32, 16, 10240, 4, 2,
+    };
+    // Warm slots allocated when the loop is constructed. Further slots are
+    // added in bounded slabs as needed and empty growth slabs are released.
+    // Values above their corresponding maximum are clamped to that maximum.
+    std::array<std::size_t, 6> coroutine_frame_initial_capacities {
         64, 32, 16, 160, 4, 2,
     };
+    // Frame-resident state must not require alignment beyond max_align_t.
 };
 
 inline constexpr std::array<std::size_t, 6> coroutine_frame_sizes {
@@ -133,11 +140,13 @@ inline constexpr std::array<std::size_t, 6> coroutine_frame_sizes {
 };
 
 struct coroutine_pool_statistics {
+    // Configured hard limit and currently backed slots across all classes.
     std::size_t capacity {0};
     std::size_t live {0};
     std::size_t high_watermark {0};
     std::size_t allocation_failures {0};
     std::size_t active_roots {0};
+    std::size_t backed_capacity {0};
 };
 
 namespace eventloop_detail {

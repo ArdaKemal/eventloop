@@ -12,7 +12,9 @@ and executor submissions remain bounded command and background-work APIs.
   resumption stay on that loop's thread.
 - A task is move-only. Start it once by awaiting or spawning it. Destroying an
   unfinished started task is a programming error. Coroutine frames come from
-  fixed per-loop size classes and never fall back to the general heap.
+  bounded per-loop size classes. Each class has a warm reserve and a hard slot
+  limit; the pool adds backing slabs on demand and releases growth slabs when
+  they become empty. Individual frames never fall back to the general heap.
 - `event_loop::add` accepts owning pointers to `tcp_acceptor`, `tcp_stream`
   (including `tls_stream`), and `udp_socket`. It does not accept application
   readiness handlers. Call an object's `close()` to cancel its pending socket
