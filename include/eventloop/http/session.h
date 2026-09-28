@@ -23,10 +23,7 @@ public:
     auto operator=(const session&) -> session& = delete;
 
     auto receive(std::span<const std::byte> data) -> void;
-    [[nodiscard]] auto read_space() noexcept -> std::span<std::byte>
-    {
-        return std::as_writable_bytes(std::span {input_}).subspan(input_size_);
-    }
+    [[nodiscard]] auto read_space() -> std::span<std::byte>;
     auto commit_read(std::size_t size) -> void;
     auto shutdown() -> void;
     [[nodiscard]] auto has_response() const noexcept -> bool { return responding_; }
@@ -52,13 +49,16 @@ private:
     auto send_response(std::span<const char> response) -> void;
     auto start_large_response() -> void;
     auto consume_request(std::size_t size) -> void;
+    auto expand_input() -> void;
+    [[nodiscard]] auto input_data() noexcept -> char*;
     [[nodiscard]] auto prepare_path(std::string_view target,
                                     std::span<char> output,
                                     std::size_t& size) const noexcept -> path_result;
     [[nodiscard]] auto allocate_response(std::size_t size) -> std::span<char>;
 
     int root_descriptor_;
-    std::array<char, 4096> input_ {};
+    std::array<char, 256> input_ {};
+    std::unique_ptr<char[]> expanded_input_;
     std::vector<char> output_;
     std::unique_ptr<char[]> file_output_;
     std::size_t file_output_size_ {0};

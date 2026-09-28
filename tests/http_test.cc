@@ -15,6 +15,7 @@
 #include <new>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -144,6 +145,57 @@ auto parser_and_mime_tests() -> bool
             "GET / HTTP/1.1\r\nHost: local\nInjected:yes\r\n\r\n",
             control).status != http::parse_status::bad_request) return false;
     return true;
+}
+
+auto session_input_growth_tests() -> bool
+{
+    if (sizeof(http::session) > 512) return false;
+
+    const std::string long_request =
+        "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nX-Pad: " +
+        std::string(500, 'x') + "\r\n\r\n";
+    http::session session(-1);
+    std::size_t offset = 0;
+    const auto before = allocations;
+    while (offset < long_request.size()) {
+        auto space = session.read_space();
+        if (space.empty()) return false;
+        const auto size = std::min({space.size(), std::size_t {73},
+                                    long_request.size() - offset});
+        std::memcpy(space.data(), long_request.data() + offset, size);
+        session.commit_read(size);
+        offset += size;
+    }
+    if (!session.has_response() || allocations != before + 1) return false;
+    capture response;
+    collect(session, response);
+    if (!contains(response, "204 No Content") || !response.open ||
+        session.read_space().size() != 256) return false;
+
+    constexpr std::string_view short_request =
+        "OPTIONS / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const auto idle_allocations = allocations;
+    session.receive(std::as_bytes(std::span {short_request}));
+    collect(session, response);
+    if (!response.open || allocations != idle_allocations ||
+        session.read_space().size() != 256) return false;
+
+    http::session direct(-1);
+    const std::string pipelined = long_request + std::string(short_request);
+    direct.receive(std::as_bytes(std::span {pipelined}));
+    if (!direct.has_response()) return false;
+    direct.finish_response();
+    if (!direct.has_response()) return false;
+    direct.finish_response();
+    if (direct.closed() || direct.read_space().size() != 256) return false;
+
+    http::session oversized(-1);
+    std::array<char, http::max_message_size> unterminated_headers {};
+    unterminated_headers.fill('x');
+    oversized.receive(std::as_bytes(std::span {unterminated_headers}));
+    return oversized.has_response() &&
+        std::string_view {oversized.response().data(), oversized.response().size()}
+            .find("431 Request Header Fields Too Large") != std::string_view::npos;
 }
 
 auto session_tests() -> bool
@@ -534,15 +586,17 @@ auto main() -> int
 {
     const bool parser = parser_and_mime_tests();
     const bool session = session_tests();
+    const bool input_growth = session_input_growth_tests();
     const bool listener = listener_removal_test();
     const bool redirect = redirect_listener_removal_test();
     const bool pipeline = pipelined_sendfile_test();
     const bool capacity = concurrent_connection_capacity_test();
     const bool configuration = invalid_configuration_test();
-    if (!parser || !session || !listener || !redirect || !pipeline ||
+    if (!parser || !session || !input_growth || !listener || !redirect || !pipeline ||
         !capacity || !configuration) {
         std::cerr << "HTTP tests failed: parser=" << parser
                   << " session=" << session << " listener=" << listener
+                  << " input_growth=" << input_growth
                   << " redirect=" << redirect << " pipeline=" << pipeline
                   << " capacity=" << capacity
                   << " configuration=" << configuration << '\n';

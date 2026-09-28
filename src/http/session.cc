@@ -119,23 +119,47 @@ session::session(int root_descriptor, bool directory_listing) noexcept
 {
 }
 
+auto session::input_data() noexcept -> char*
+{
+    return expanded_input_ ? expanded_input_.get() : input_.data();
+}
+
+auto session::expand_input() -> void
+{
+    auto expanded = std::make_unique<char[]>(max_message_size);
+    std::memcpy(expanded.get(), input_.data(), input_size_);
+    expanded_input_ = std::move(expanded);
+}
+
+auto session::read_space() -> std::span<std::byte>
+{
+    if (!expanded_input_ && input_size_ == input_.size()) expand_input();
+    const auto capacity = expanded_input_ ? max_message_size : input_.size();
+    return std::as_writable_bytes(
+        std::span {input_data() + input_size_, capacity - input_size_});
+}
+
 auto session::receive(std::span<const std::byte> data) -> void
 {
     if (data.empty() || closed_) return;
-    if (data.size() > input_.size() - input_size_) {
+    if (data.size() > max_message_size - input_size_) {
         if (responding_) closed_ = true;
         else send_error(parse_status::payload_too_large);
         return;
     }
 
-    std::memcpy(input_.data() + input_size_, data.data(), data.size());
+    if (!expanded_input_ && data.size() > input_.size() - input_size_) {
+        expand_input();
+    }
+    std::memcpy(input_data() + input_size_, data.data(), data.size());
     input_size_ += data.size();
     if (!responding_) process_requests();
 }
 
 auto session::commit_read(std::size_t size) -> void
 {
-    if (size > input_.size() - input_size_) {
+    const auto capacity = expanded_input_ ? max_message_size : input_.size();
+    if (size > capacity - input_size_) {
         closed_ = true;
         return;
     }
@@ -163,7 +187,7 @@ auto session::process_requests() -> void
 
     request parsed;
     const auto result = parse_request(
-        std::string_view {input_.data(), input_size_}, parsed);
+        std::string_view {input_data(), input_size_}, parsed);
     if (result.status == parse_status::incomplete) return;
     if (result.status != parse_status::complete) {
         request_size_ = 0;
@@ -461,8 +485,12 @@ auto session::finish_response() -> void
 auto session::consume_request(std::size_t size) -> void
 {
     const auto remaining = input_size_ - size;
-    std::memmove(input_.data(), input_.data() + size, remaining);
+    std::memmove(input_data(), input_data() + size, remaining);
     input_size_ = remaining;
+    if (expanded_input_ && remaining <= input_.size()) {
+        std::memcpy(input_.data(), expanded_input_.get(), remaining);
+        expanded_input_.reset();
+    }
 }
 
 auto session::prepare_path(std::string_view target, std::span<char> output,
