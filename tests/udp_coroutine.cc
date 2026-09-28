@@ -169,7 +169,7 @@ auto duplicate_receive(event_loop&, udp_socket& socket, bool& rejected)
 {
     std::array<std::byte, 8> buffer {};
     const auto result = co_await socket.async_receive_from(buffer);
-    rejected = !result && result.error().value() == EAGAIN;
+    rejected = !result && result.error().value() == EBUSY;
 }
 
 auto send_when_cancelled(event_loop& loop, udp_socket& socket,

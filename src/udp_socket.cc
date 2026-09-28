@@ -190,7 +190,7 @@ auto udp_socket::receive_awaiter::start(
         return false;
     }
     if (socket_.receive_ != nullptr) {
-        result_ = -EAGAIN;
+        result_ = -EBUSY;
         return false;
     }
     result_ = try_receive(socket_.descriptor_.get(), buffer_, source_);
@@ -250,7 +250,7 @@ auto udp_socket::send_awaiter::start(
         return false;
     }
     if (socket_.send_ != nullptr) {
-        result_ = -EAGAIN;
+        result_ = -EBUSY;
         return false;
     }
     result_ = try_send(socket_.descriptor_.get(), buffer_, destination_);

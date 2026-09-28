@@ -83,6 +83,8 @@ struct race_winner {
     std::variant<eventloop_detail::composition_result_t<T>...> result;
 };
 
+namespace eventloop_detail {
+
 // Fixed-arity composition. Every branch owns one task and an independent
 // cancellation state. The parent's cancellation node fans out to all branches.
 // A completed branch transfers to the parent only after every branch has
@@ -273,16 +275,20 @@ private:
     bool parent_cancelled_ {false};
 };
 
+} // namespace eventloop_detail
+
 template<typename... T>
 [[nodiscard]] auto when_all(task<T>&&... operations)
 {
-    return task_composition_awaiter<false, T...>(std::move(operations)...);
+    return eventloop_detail::task_composition_awaiter<false, T...>(
+        std::move(operations)...);
 }
 
 template<typename... T>
 [[nodiscard]] auto race(task<T>&&... operations)
 {
-    return task_composition_awaiter<true, T...>(std::move(operations)...);
+    return eventloop_detail::task_composition_awaiter<true, T...>(
+        std::move(operations)...);
 }
 
 template<typename T>

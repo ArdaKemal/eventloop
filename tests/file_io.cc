@@ -35,22 +35,26 @@ struct temporary_file {
 auto roundtrip(event_loop& loop, std::string_view path, bool& passed)
     -> task<void>
 {
-    const auto opened = co_await async_openat(loop, AT_FDCWD, path, O_RDWR);
-    if (!opened) {
-        loop.stop();
-        co_return;
-    }
+    int descriptor = -1;
+    {
+        const auto opened = co_await async_openat(loop, AT_FDCWD, path, O_RDWR);
+        if (!opened) {
+            loop.stop();
+            co_return;
+        }
 
-    constexpr std::array<std::byte, 5> input {
-        std::byte {'h'}, std::byte {'e'}, std::byte {'l'}, std::byte {'l'},
-        std::byte {'o'},
-    };
-    std::array<std::byte, 5> output {};
-    const auto written = co_await async_write_at(loop, *opened, input, 0);
-    const auto read = co_await async_read_at(loop, *opened, output, 0);
-    passed = written && *written == input.size() && read &&
-             *read == output.size() && input == output;
-    (void)::close(*opened);
+        descriptor = opened->get();
+        constexpr std::array<std::byte, 5> input {
+            std::byte {'h'}, std::byte {'e'}, std::byte {'l'}, std::byte {'l'},
+            std::byte {'o'},
+        };
+        std::array<std::byte, 5> output {};
+        const auto written = co_await async_write_at(loop, descriptor, input, 0);
+        const auto read = co_await async_read_at(loop, descriptor, output, 0);
+        passed = written && *written == input.size() && read &&
+                 *read == output.size() && input == output;
+    }
+    passed = passed && ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
     loop.stop();
 }
 
@@ -66,7 +70,6 @@ auto depth_probe(event_loop& loop, std::string_view path, int& completed,
                  int& rejected) -> task<void>
 {
     const auto opened = co_await async_openat(loop, AT_FDCWD, path, O_RDONLY);
-    if (opened) (void)::close(*opened);
     if (!opened && opened.error().value() == EAGAIN) ++rejected;
     if (++completed == 3) loop.stop();
 }
@@ -75,7 +78,6 @@ auto cancelled_open(event_loop& loop, std::string_view path, bool& passed)
     -> task<void>
 {
     const auto opened = co_await async_openat(loop, AT_FDCWD, path, O_RDONLY);
-    if (opened) (void)::close(*opened);
     passed = !opened && opened.error().value() == ECANCELED;
 }
 

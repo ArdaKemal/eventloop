@@ -38,10 +38,11 @@ and executor submissions remain bounded command and background-work APIs.
   `std::expected` preserves that inner result; the outer result describes task
   infrastructure such as frame exhaustion.
 - Syscall-like socket and file operations return
-  `std::expected<T, std::error_code>`. Cancellation is reported as
-  `operation_canceled` (some older focused APIs use `ECANCELED`). A full
-  bounded queue or operation pool returns an error rather than allocating an
-  unbounded replacement.
+  `std::expected<T, std::error_code>`. A cancelled pending I/O operation
+  reports `ECANCELED`, equivalent to `std::errc::operation_canceled` in the
+  generic error category. This is separate from `task_result::cancelled`,
+  which describes a task result. A full bounded queue or operation pool
+  returns an error rather than allocating an unbounded replacement.
 - `task<T>::result()` and `task_handle<T>::take_result()` consume stored
   values once. Unhandled exceptions in a task currently terminate the
   process; return anticipated application errors as values.
@@ -100,7 +101,7 @@ and executor submissions remain bounded command and background-work APIs.
 - Include `eventloop/udp_socket.h` for IPv4 datagrams. Datagrams stay atomic:
   empty datagrams succeed with size zero, and a truncated receive consumes the
   datagram and reports `EMSGSIZE`. At most one receive and one send may be
-  pending per socket; a duplicate same-direction operation reports `EAGAIN`.
+  pending per socket; a duplicate same-direction operation reports `EBUSY`.
 - The WebSocket API is `ws::web_socket<Stream>` over a stream with coroutine
   read/write operations. Use `async_receive`, `async_send_text`,
   `async_send_binary`, and `async_close`. One receive and one send may run
@@ -118,10 +119,13 @@ and executor submissions remain bounded command and background-work APIs.
   loop. Large combinations may exceed the largest frame class and report
   `frame_allocation_failure`.
 - Include `eventloop/file_io.h` for `async_openat`, `async_read_at`, and
-  `async_write_at`. Paths are copied into a bounded awaiter buffer. Read and
-  write buffers remain caller-owned until completion, including after
-  cancellation. Operations run on a dedicated bounded worker; a full
-  `file_io_depth` returns an error.
+  `async_write_at`. `async_openat` returns an owning `unique_fd` on success.
+  Paths are copied into a bounded awaiter buffer. The directory descriptor
+  passed to `async_openat` and file descriptors passed to `async_read_at` and
+  `async_write_at` are borrowed; callers must keep them open and unreused until
+  completion, including after cancellation. Read and write buffers remain
+  caller-owned and valid for the same period. Operations run on a dedicated
+  bounded worker; a full `file_io_depth` returns an error.
 - HTTP accept loops spawn connection tasks. Each task owns its session and I/O
   buffers while suspended; accepted connections share ownership of the
   document-root descriptor with the listener. Small file reads and metadata

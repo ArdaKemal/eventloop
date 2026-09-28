@@ -31,13 +31,10 @@ struct tls_server_options {
 
 class tls_stream : public tcp_stream {
 public:
-    tls_stream(event_loop& loop, int descriptor, std::shared_ptr<tls_context> context,
-               tls_client_options options);
+    // Takes ownership of the accepted descriptor, including on failure.
     tls_stream(event_loop& loop, unique_fd descriptor,
                std::shared_ptr<tls_context> context,
                tls_client_options options);
-    tls_stream(event_loop& loop, int descriptor, std::shared_ptr<tls_context> context,
-               tls_server_options options = {});
     tls_stream(event_loop& loop, unique_fd descriptor,
                std::shared_ptr<tls_context> context,
                tls_server_options options = {});
@@ -48,6 +45,8 @@ public:
 
     // One read and one write may be pending together. A second operation in
     // either direction returns EBUSY. Handshake and close require an idle stream.
+    // Cancellation or close of a pending operation returns ECANCELED. TLS tasks
+    // drive the encrypted transport and require coroutine frames.
     [[nodiscard]] auto async_handshake()
         -> task<std::expected<void, std::error_code>>;
     [[nodiscard]] auto async_read_some(std::span<std::byte> buffer)

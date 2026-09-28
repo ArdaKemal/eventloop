@@ -1,6 +1,7 @@
 #pragma once
 
 #include "eventloop/task.h"
+#include "eventloop/unique_fd.h"
 
 #include <array>
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <utility>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -43,13 +45,11 @@ struct file_io_operation {
     void (*finish)(file_io_operation&, int) noexcept {nullptr};
 };
 
-} // namespace eventloop_detail
-
-template<eventloop_detail::file_opcode Kind>
+template<file_opcode Kind>
 class file_io_awaiter {
 public:
     using value_type = std::conditional_t<
-        Kind == eventloop_detail::file_opcode::openat, int, std::size_t>;
+        Kind == eventloop_detail::file_opcode::openat, unique_fd, std::size_t>;
     using result_type = std::expected<value_type, std::error_code>;
 
     file_io_awaiter(event_loop& loop, int directory, std::string_view path,
@@ -123,17 +123,21 @@ public:
         return true;
     }
 
-    [[nodiscard]] auto await_resume() const noexcept -> result_type
+    [[nodiscard]] auto await_resume() noexcept -> result_type
     {
         if (result_ < 0) {
             return std::unexpected(std::error_code(-result_,
                                                     std::generic_category()));
         }
-        return static_cast<value_type>(result_);
+        if constexpr (Kind == eventloop_detail::file_opcode::openat) {
+            return unique_fd(std::exchange(result_, -1));
+        } else {
+            return static_cast<value_type>(result_);
+        }
     }
 
 private:
-    template<typename> friend class task;
+    template<typename> friend class ::task;
 
     static auto cancel(eventloop_detail::coroutine_cancellation_node& node)
         noexcept -> void
@@ -176,12 +180,16 @@ private:
     int result_ {0};
 };
 
-// Paths are copied into the awaiter and limited to 255 bytes. Read and write
-// buffers belong to the caller and must remain valid until completion.
+} // namespace eventloop_detail
+
+// Paths are copied into the awaiter and limited to 255 bytes. Descriptors are
+// borrowed and must remain open and unreused until completion, including after
+// cancellation. Read and write buffers must also remain valid until completion.
+// A successful open returns ownership of the new descriptor in a unique_fd.
 [[nodiscard]] inline auto async_openat(event_loop& loop, int directory,
                                        std::string_view path, int flags,
                                        unsigned mode = 0) noexcept
-    -> file_io_awaiter<eventloop_detail::file_opcode::openat>
+    -> eventloop_detail::file_io_awaiter<eventloop_detail::file_opcode::openat>
 {
     return {loop, directory, path, flags, mode};
 }
@@ -189,7 +197,7 @@ private:
 [[nodiscard]] inline auto async_read_at(event_loop& loop, int descriptor,
                                         std::span<std::byte> buffer,
                                         std::int64_t offset) noexcept
-    -> file_io_awaiter<eventloop_detail::file_opcode::read_at>
+    -> eventloop_detail::file_io_awaiter<eventloop_detail::file_opcode::read_at>
 {
     return {loop, descriptor, buffer.data(), buffer.size(), offset};
 }
@@ -197,7 +205,7 @@ private:
 [[nodiscard]] inline auto async_write_at(event_loop& loop, int descriptor,
                                          std::span<const std::byte> buffer,
                                          std::int64_t offset) noexcept
-    -> file_io_awaiter<eventloop_detail::file_opcode::write_at>
+    -> eventloop_detail::file_io_awaiter<eventloop_detail::file_opcode::write_at>
 {
     return {loop, descriptor, const_cast<std::byte*>(buffer.data()),
             buffer.size(), offset};

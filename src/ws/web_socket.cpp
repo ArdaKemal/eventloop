@@ -110,6 +110,8 @@ auto make_error_code(errc error) noexcept -> std::error_code
     return {static_cast<int>(error), error_category()};
 }
 
+namespace detail {
+
 web_socket_core::web_socket_core(std::size_t maximum_message_size)
     : maximum_message_size_(maximum_message_size),
       maximum_pending_output_(maximum_message_size)
@@ -399,5 +401,7 @@ auto web_socket_core::validate_close(std::uint16_t code,
     return valid_close_code(code) && reason.size() <= 123 &&
            valid_utf8(as_bytes(reason));
 }
+
+} // namespace detail
 
 } // namespace ws

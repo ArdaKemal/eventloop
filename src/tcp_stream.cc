@@ -43,11 +43,6 @@ namespace {
 
 } // namespace
 
-tcp_stream::tcp_stream(event_loop& loop, int descriptor)
-    : tcp_stream(loop, unique_fd(descriptor))
-{
-}
-
 tcp_stream::tcp_stream(event_loop& loop, unique_fd descriptor)
     : loop_(loop), descriptor_(std::move(descriptor))
 {
@@ -545,10 +540,9 @@ auto tcp_stream::file_awaiter::await_resume() const noexcept
     return {};
 }
 
-namespace {
-[[nodiscard]] auto send_file_task(event_loop& loop, tcp_stream& socket,
-                                  std::span<const std::byte> header,
-                                  unique_fd file, std::size_t size)
+auto tcp_stream::send_file_task(event_loop& loop, tcp_stream& socket,
+                                std::span<const std::byte> header,
+                                unique_fd file, std::size_t size)
     -> task<std::expected<void, std::error_code>>
 {
     (void)loop;
@@ -560,8 +554,6 @@ namespace {
     }
     co_return co_await tcp_stream::file_awaiter(socket, std::move(file), size);
 }
-} // namespace
-
 auto tcp_stream::async_send_file(std::span<const std::byte> header,
                                   unique_fd file, std::size_t size)
     -> task<std::expected<void, std::error_code>>

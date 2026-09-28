@@ -106,11 +106,13 @@ dedicated bounded worker and post completion back to the same event loop.
 `EAGAIN`.
 
 The operations return `std::expected` with `std::error_code` on failure.
-`async_openat` copies paths up to 255 bytes into the coroutine frame. Read and
-write buffers must remain valid until completion, including after cancellation
-is requested. Cancellation does not abort an already-running syscall; the
-coroutine resumes with `ECANCELED` after that syscall completes. The current
-event-loop implementation itself remains Linux/epoll-only.
+`async_openat` returns an owning `unique_fd` and copies paths up to 255 bytes
+into the coroutine frame. The directory and file descriptors passed to these
+operations are borrowed and must remain open and unreused until completion,
+including after cancellation is requested. Read and write buffers must remain
+valid for the same period. Cancellation does not abort an already-running
+syscall; the coroutine resumes with `ECANCELED` after that syscall completes.
+The current event-loop implementation itself remains Linux/epoll-only.
 
 ## Coroutine socket I/O
 

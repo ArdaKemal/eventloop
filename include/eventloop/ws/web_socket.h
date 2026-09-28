@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <expected>
 #include <optional>
 #include <span>
@@ -37,11 +38,9 @@ struct message_view {
     std::optional<std::uint16_t> close_code;
 };
 
-// Framing and buffers are owned by this object. It does not own the transport.
-// A returned payload view remains valid until the next async_receive call or
-// destruction. Framing permits one receive and one send concurrently on the
-// same loop when the underlying stream permits concurrent reads and writes.
-// Send buffers remain caller-owned and valid until their tasks complete.
+namespace detail {
+
+// Shared bounded framing implementation for all transports.
 class web_socket_core {
 public:
     explicit web_socket_core(std::size_t maximum_message_size = 1024 * 1024);
@@ -108,12 +107,26 @@ private:
     std::error_code error_ {};
 };
 
+} // namespace detail
+
+// Framing and buffers are owned by this object. It does not own the transport.
+// A returned payload view remains valid until the next async_receive call or
+// destruction. Framing permits one receive and one send concurrently on the
+// same loop when the underlying stream permits concurrent reads and writes.
+// Send buffers remain caller-owned and valid until their tasks complete.
+// Operations use tasks because framing and TLS may require nested awaits and
+// bounded coroutine frames. Streams exposing owning_loop() must match loop.
 template<typename Stream>
-class web_socket final : private web_socket_core {
+class web_socket final : private detail::web_socket_core {
 public:
     web_socket(event_loop& loop, Stream& stream,
                std::size_t maximum_message_size = 1024 * 1024)
-        : web_socket_core(maximum_message_size), loop_(loop), stream_(stream) {}
+        : detail::web_socket_core(maximum_message_size), loop_(loop), stream_(stream)
+    {
+        if constexpr (requires { stream.owning_loop(); }) {
+            if (&stream.owning_loop() != &loop) std::terminate();
+        }
+    }
 
     // The returned view is invalidated by the next receive or socket destruction.
     // The caller must keep this socket and its transport alive until tasks finish.

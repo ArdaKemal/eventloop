@@ -16,7 +16,7 @@
 
 class tcp_stream : private eventloop_detail::notifiable {
 public:
-    tcp_stream(event_loop& loop, int descriptor);
+    // Takes ownership of the accepted descriptor, including on failure.
     tcp_stream(event_loop& loop, unique_fd descriptor);
     tcp_stream(event_loop& loop, std::string_view address, std::uint16_t port);
     ~tcp_stream() override;
@@ -25,6 +25,7 @@ public:
     auto operator=(const tcp_stream&) -> tcp_stream& = delete;
 
     [[nodiscard]] auto descriptor() const noexcept -> int override;
+    [[nodiscard]] auto owning_loop() const noexcept -> event_loop& { return loop_; }
     [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
     {
         return false;
@@ -96,7 +97,10 @@ public:
     };
     // Buffers remain caller-owned until completion, including cancellation.
     // One read and one write may be pending at a time. Operations return
-    // partial byte counts; zero from read means EOF.
+    // partial byte counts; zero from read means EOF. A duplicate operation in
+    // the same direction returns EBUSY. Cancellation or close of a pending
+    // operation returns ECANCELED.
+    // These direct awaiters store state in the caller's coroutine frame.
     [[nodiscard]] auto async_read_some(std::span<std::byte> buffer) noexcept
         -> io_awaiter<true>
     {
@@ -107,6 +111,7 @@ public:
     {
         return {*this, const_cast<std::byte*>(buffer.data()), buffer.size()};
     }
+private:
     class file_awaiter {
     public:
         file_awaiter(tcp_stream& owner, unique_fd file,
@@ -139,6 +144,13 @@ public:
         std::coroutine_handle<> continuation_ {};
         std::error_code error_ {};
     };
+    [[nodiscard]] static auto send_file_task(
+        event_loop& loop, tcp_stream& socket, std::span<const std::byte> header,
+        unique_fd file, std::size_t size)
+        -> task<std::expected<void, std::error_code>>;
+public:
+    // Owns file through completion, including cancellation. This task wraps
+    // the internal sendfile awaiter and requires a coroutine frame.
     [[nodiscard]] auto async_send_file(std::span<const std::byte> header,
                                        unique_fd file, std::size_t size)
         -> task<std::expected<void, std::error_code>>;

@@ -44,7 +44,9 @@ public:
 
     // A buffer remains caller-owned and valid until the await completes.
     // At most one receive and one send may be pending per socket. A second
-    // operation in the same direction completes with EAGAIN.
+    // operation in the same direction completes with EBUSY; cancellation or
+    // close completes with ECANCELED. These direct awaiters store state in the
+    // caller's coroutine frame.
     class receive_awaiter {
     public:
         receive_awaiter(udp_socket& socket, std::span<std::byte> buffer) noexcept;

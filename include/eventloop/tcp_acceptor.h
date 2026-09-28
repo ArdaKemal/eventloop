@@ -58,6 +58,9 @@ public:
         std::expected<unique_fd, std::error_code> result_ {unique_fd {}};
     };
 
+    // Returns an owned descriptor. A duplicate accept returns EBUSY;
+    // cancellation or close of a pending accept returns ECANCELED. This
+    // awaiter stores state in the caller's coroutine frame.
     [[nodiscard]] auto async_accept() noexcept -> accept_awaiter
     {
         return accept_awaiter(*this);

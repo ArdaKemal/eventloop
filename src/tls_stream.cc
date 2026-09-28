@@ -345,28 +345,12 @@ public:
     std::array<std::byte, 4096> input_ {};
 };
 
-tls_stream::tls_stream(event_loop& loop, int descriptor,
-                       std::shared_ptr<tls_context> context,
-                       tls_client_options options)
-    : tls_stream(loop, unique_fd(descriptor), std::move(context),
-                 std::move(options))
-{
-}
-
 tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
                        std::shared_ptr<tls_context> context,
                        tls_client_options options)
     : tcp_stream(loop, std::move(descriptor)),
       implementation_(std::make_unique<implementation>(
           std::move(context), std::move(options)))
-{
-}
-
-tls_stream::tls_stream(event_loop& loop, int descriptor,
-                       std::shared_ptr<tls_context> context,
-                       tls_server_options options)
-    : tls_stream(loop, unique_fd(descriptor), std::move(context),
-                 std::move(options))
 {
 }
 
