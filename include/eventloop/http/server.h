@@ -18,12 +18,7 @@ namespace eventloop::http {
 struct server_options {
     bool directory_listing {false};
     bool reuse_port {false};
-    // HTTPS advertises h2 on Linux; Windows currently serves HTTP/1.1 only.
-#ifdef _WIN32
-    bool enable_http2 {false};
-#else
     bool enable_http2 {true};
-#endif
 };
 
 class server final : public tcp_acceptor {

@@ -4,6 +4,7 @@
 #include <climits>
 #include <ctime>
 #include <cwchar>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 
@@ -165,6 +166,29 @@ auto read_file(native_socket file, std::span<std::byte> output) noexcept -> bool
         if (!ReadFile(as_handle(file), output.data() + offset, amount,
                       &received, nullptr) || received == 0) return false;
         offset += received;
+    }
+    return true;
+}
+
+auto read_file_at(native_socket file, std::uint64_t offset,
+                  std::span<std::byte> output) noexcept -> bool
+{
+    constexpr auto max_offset = static_cast<std::uint64_t>(
+        std::numeric_limits<std::int64_t>::max());
+    if (offset > max_offset || output.size() > max_offset - offset)
+        return false;
+    LARGE_INTEGER position {};
+    position.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(as_handle(file), position, nullptr, FILE_BEGIN))
+        return false;
+    std::size_t read_size = 0;
+    while (read_size < output.size()) {
+        DWORD received = 0;
+        const DWORD amount = static_cast<DWORD>(std::min<std::size_t>(
+            output.size() - read_size, 1U << 20));
+        if (!ReadFile(as_handle(file), output.data() + read_size, amount,
+                      &received, nullptr) || received == 0) return false;
+        read_size += received;
     }
     return true;
 }

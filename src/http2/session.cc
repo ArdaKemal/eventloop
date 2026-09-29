@@ -1,14 +1,12 @@
 #include "session.h"
+#include "../http/file_operations.h"
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstring>
 #include <limits>
 #include <string_view>
 #include <utility>
-
-#include <unistd.h>
 
 namespace eventloop::http2::detail {
 namespace {
@@ -1041,22 +1039,13 @@ auto session::pump_responses() -> void
             const auto count = static_cast<std::size_t>(available);
             std::span<const std::byte> body;
             if (value.response_file) {
-                std::size_t read_size = 0;
-                while (read_size < count) {
-                    const auto result = ::pread(value.response_file.get(),
-                        frame_payload_.data() + read_size, count - read_size,
-                        static_cast<off_t>(value.response_offset + read_size));
-                    if (result > 0) {
-                        read_size += static_cast<std::size_t>(result);
-                    } else if (result == -1 && errno == EINTR) {
-                        continue;
-                    } else {
-                        stream_error(value.id, internal_error);
-                        progressed = true;
-                        break;
-                    }
+                if (!http::detail::read_file_at(value.response_file.get(),
+                        value.response_offset,
+                        std::span {frame_payload_}.first(count))) {
+                    stream_error(value.id, internal_error);
+                    progressed = true;
+                    continue;
                 }
-                if (read_size != count) continue;
                 body = std::span {frame_payload_}.first(count);
             } else {
                 body = std::span {value.response_body}.subspan(

@@ -32,7 +32,16 @@ if(WIN32)
         src/windows/socket_operations.cc
     )
     if(EVENTLOOP_WINDOWS_TLS)
-        target_sources(eventloop PRIVATE src/tls_stream.cc src/ws/web_socket.cpp)
+        target_sources(eventloop PRIVATE
+            src/tls_stream.cc
+            src/ws/web_socket.cpp
+            src/http2/connection.h
+            src/http2/connection.cc
+            src/http2/hpack.h
+            src/http2/hpack.cc
+            src/http2/session.h
+            src/http2/session.cc
+        )
         target_link_libraries(eventloop PUBLIC botan::botan)
         target_compile_definitions(eventloop PUBLIC EVENTLOOP_WINDOWS_TLS=1)
     endif()

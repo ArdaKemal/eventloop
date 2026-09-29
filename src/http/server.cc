@@ -1,6 +1,6 @@
 #include "eventloop/http/server.h"
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 #include "../http2/connection.h"
 #endif
 #include "file_operations.h"
@@ -83,13 +83,9 @@ template<typename Stream>
             socket = std::make_unique<tls_stream>(
                 loop, std::move(descriptor), std::move(context),
                 tls_server_options {.application_protocols =
-#ifdef _WIN32
-                    std::vector<std::string> {"http/1.1"}
-#else
                     options.enable_http2
                     ? std::vector<std::string> {"h2", "http/1.1"}
                     : std::vector<std::string> {"http/1.1"}
-#endif
                 });
         } else {
 #endif
@@ -107,7 +103,6 @@ template<typename Stream>
                 peer->close();
                 co_return;
             }
-#ifndef _WIN32
             if (options.enable_http2 && peer->application_protocol() == "h2") {
                 const auto served = co_await http2::detail::serve(
                     loop, *peer, root, options.directory_listing);
@@ -118,7 +113,6 @@ template<typename Stream>
                 peer->close();
                 co_return;
             }
-#endif
         }
 #endif
 

@@ -243,6 +243,224 @@ auto secure_request_client(event_loop& loop, tls_stream& peer,
     loop.stop();
 }
 
+auto append_h2_frame(std::string& output, std::uint8_t type,
+                     std::uint8_t flags, std::uint32_t stream_id,
+                     std::string_view payload) -> void
+{
+    const auto length = payload.size();
+    require(length <= 0xffffff, "HTTP/2 test frame too large");
+    output.push_back(static_cast<char>((length >> 16) & 0xff));
+    output.push_back(static_cast<char>((length >> 8) & 0xff));
+    output.push_back(static_cast<char>(length & 0xff));
+    output.push_back(static_cast<char>(type));
+    output.push_back(static_cast<char>(flags));
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        output.push_back(static_cast<char>((stream_id >> shift) & 0xff));
+    }
+    output.append(payload);
+}
+
+[[nodiscard]] auto h2_response_complete(std::string_view response) -> bool
+{
+    std::size_t offset = 0;
+    while (response.size() - offset >= 9) {
+        const auto byte = [&](std::size_t index) {
+            return static_cast<std::uint8_t>(response[offset + index]);
+        };
+        const auto length = (static_cast<std::size_t>(byte(0)) << 16) |
+                            (static_cast<std::size_t>(byte(1)) << 8) | byte(2);
+        if (response.size() - offset - 9 < length) return false;
+        const auto type = byte(3);
+        const auto flags = byte(4);
+        const auto stream_id = (static_cast<std::uint32_t>(byte(5) & 0x7f) << 24) |
+                               (static_cast<std::uint32_t>(byte(6)) << 16) |
+                               (static_cast<std::uint32_t>(byte(7)) << 8) | byte(8);
+        offset += 9 + length;
+        if (stream_id == 1 && (type == 0 || type == 1) && (flags & 1) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] auto h2_stream_data_bytes(std::string_view response) -> std::size_t
+{
+    std::size_t offset = 0;
+    std::size_t total = 0;
+    while (response.size() - offset >= 9) {
+        const auto byte = [&](std::size_t index) {
+            return static_cast<std::uint8_t>(response[offset + index]);
+        };
+        const auto length = (static_cast<std::size_t>(byte(0)) << 16) |
+                            (static_cast<std::size_t>(byte(1)) << 8) | byte(2);
+        if (response.size() - offset - 9 < length) break;
+        const auto type = byte(3);
+        const auto stream_id = (static_cast<std::uint32_t>(byte(5) & 0x7f) << 24) |
+                               (static_cast<std::uint32_t>(byte(6)) << 16) |
+                               (static_cast<std::uint32_t>(byte(7)) << 8) | byte(8);
+        if (type == 0 && stream_id == 1) total += length;
+        offset += 9 + length;
+    }
+    return total;
+}
+
+auto h2_request_client(event_loop& loop, tls_stream& peer,
+                       std::string& response, std::string& protocol,
+                       bool& completed, std::string& failure) -> task<void>
+{
+    const auto connected = co_await peer.async_connect();
+    if (!connected) failure = "HTTP/2 TCP connect failed";
+    else {
+        const auto handshake = flatten_result(co_await peer.async_handshake());
+        if (!handshake) failure = "HTTP/2 TLS handshake failed";
+        else {
+            protocol = peer.application_protocol();
+            std::string request = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+            append_h2_frame(request, 4, 0, 0, {}); // SETTINGS
+            const std::string_view headers =
+                "\x82\x87\x44\x0a/large.bin\x41\x09localhost";
+            append_h2_frame(request, 1, 0x5, 1, headers); // HEADERS, END_HEADERS | END_STREAM
+            auto pending = std::as_bytes(std::span {request.data(), request.size()});
+            while (!pending.empty()) {
+                const auto written = flatten_result(co_await peer.async_write_some(pending));
+                if (!written || *written == 0) {
+                    failure = "HTTP/2 request write failed";
+                    break;
+                }
+                pending = pending.subspan(*written);
+            }
+            if (pending.empty()) {
+                std::array<std::byte, 1024> buffer {};
+                bool window_updated = false;
+                while (!h2_response_complete(response)) {
+                    const auto received = flatten_result(
+                        co_await peer.async_read_some(buffer));
+                    if (!received || *received == 0) {
+                        failure = "HTTP/2 response read failed";
+                        break;
+                    }
+                    response.append(reinterpret_cast<const char*>(buffer.data()),
+                                    *received);
+                    if (!window_updated &&
+                        h2_stream_data_bytes(response) >= 65535) {
+                        constexpr char increment[] = "\0\x02\0\0";
+                        std::string updates;
+                        append_h2_frame(updates, 8, 0, 0,
+                                        std::string_view(increment, 4));
+                        append_h2_frame(updates, 8, 0, 1,
+                                        std::string_view(increment, 4));
+                        auto pending_update = std::as_bytes(
+                            std::span {updates.data(), updates.size()});
+                        while (!pending_update.empty()) {
+                            const auto written = flatten_result(
+                                co_await peer.async_write_some(pending_update));
+                            if (!written || *written == 0) {
+                                failure = "HTTP/2 WINDOW_UPDATE write failed";
+                                break;
+                            }
+                            pending_update = pending_update.subspan(*written);
+                        }
+                        if (!failure.empty()) break;
+                        window_updated = true;
+                    }
+                    if (response.size() > 128 * 1024) {
+                        failure = "HTTP/2 response exceeded test limit";
+                        break;
+                    }
+                }
+                completed = h2_response_complete(response);
+            }
+        }
+    }
+    peer.close();
+    loop.stop();
+}
+
+[[nodiscard]] auto send_h2_request(const std::filesystem::path& root,
+                                   const std::filesystem::path& certificate,
+                                   const std::filesystem::path& key)
+    -> std::pair<std::string, std::string>
+{
+    auto server_context = tls_context::make_server(certificate, key);
+    auto client_context = tls_context::make_client(certificate);
+    event_loop loop;
+    auto listener = std::make_unique<http::https_server>(
+        loop, 0, std::move(server_context), root.string(), "127.0.0.1");
+    auto* server = listener.get();
+    const auto port = listener_port(*server);
+    auto client = std::make_unique<tls_stream>(
+        loop, ip_endpoint::loopback_v4(port), std::move(client_context),
+        tls_client_options {.hostname = "localhost",
+                            .application_protocols = {"h2"}});
+    auto* peer = client.get();
+    loop.add(std::move(listener));
+    loop.add(std::move(client));
+    require(loop.spawn(server->run()) == task_spawn_result::accepted,
+            "spawn HTTP/2 server");
+    std::string response;
+    std::string protocol;
+    std::string failure;
+    bool completed = false;
+    bool timed_out = false;
+    require(loop.spawn(h2_request_client(loop, *peer, response, protocol,
+                                         completed, failure)) == task_spawn_result::accepted,
+            "spawn HTTP/2 client");
+    task_handle<void> timer;
+    require(loop.spawn(watchdog(loop, timed_out), timer) ==
+                task_spawn_result::accepted, "spawn HTTP/2 watchdog");
+    (void)loop.run();
+    if (!timer.done()) (void)timer.cancel();
+    loop.shutdown(0ms);
+    (void)loop.run();
+    require(!timed_out, "HTTP/2 request timed out");
+    if (!failure.empty()) throw std::runtime_error(failure);
+    require(completed, "HTTP/2 response did not complete");
+    require(loop.coroutine_statistics().live == 0, "HTTP/2 tasks remain live");
+    return {std::move(response), std::move(protocol)};
+}
+
+auto check_h2_response(std::string_view response, std::string_view expected_body)
+    -> void
+{
+    std::size_t offset = 0;
+    bool saw_headers = false;
+    bool ended = false;
+    std::string body;
+    while (response.size() - offset >= 9) {
+        const auto byte = [&](std::size_t index) {
+            return static_cast<std::uint8_t>(response[offset + index]);
+        };
+        const auto length = (static_cast<std::size_t>(byte(0)) << 16) |
+                            (static_cast<std::size_t>(byte(1)) << 8) | byte(2);
+        require(response.size() - offset - 9 >= length, "truncated HTTP/2 frame");
+        const auto type = byte(3);
+        const auto flags = byte(4);
+        const auto stream_id = (static_cast<std::uint32_t>(byte(5) & 0x7f) << 24) |
+                               (static_cast<std::uint32_t>(byte(6)) << 16) |
+                               (static_cast<std::uint32_t>(byte(7)) << 8) | byte(8);
+        const auto payload = response.substr(offset + 9, length);
+        if (type == 1 && stream_id == 1) {
+            require(!saw_headers, "duplicate HTTP/2 response headers");
+            require((flags & 0x4) != 0, "unfinished HTTP/2 response headers");
+            require(payload.starts_with(std::string_view("\0\x07:status\x03", 10)),
+                    "missing HTTP/2 response status");
+            require(payload.substr(10, 3) == "200", "unexpected HTTP/2 status");
+            saw_headers = true;
+        } else if (type == 0 && stream_id == 1) {
+            require(saw_headers, "HTTP/2 DATA before HEADERS");
+            body.append(payload);
+        } else if (type == 3 || type == 7) {
+            throw std::runtime_error("HTTP/2 stream or connection reset");
+        }
+        if (stream_id == 1 && (type == 0 || type == 1) && (flags & 1) != 0) {
+            ended = true;
+        }
+        offset += 9 + length;
+    }
+    require(saw_headers && ended, "incomplete HTTP/2 response");
+    require(body == expected_body, "unexpected HTTP/2 body");
+}
+
 [[nodiscard]] auto send_secure_request(const std::filesystem::path& root,
                                        const std::filesystem::path& certificate,
                                        const std::filesystem::path& key,
@@ -377,6 +595,11 @@ auto main() -> int
         check_response(secure_large_response, "HTTP/1.1 200 OK", large);
         require(secure_large_response.find("Content-Length: 71680\r\n") !=
                     std::string::npos, "HTTPS large response length");
+
+        const auto [h2_response, h2_protocol] = send_h2_request(
+            root.path(), certificate, key);
+        require(h2_protocol == "h2", "HTTP/2 ALPN protocol");
+        check_h2_response(h2_response, large);
 #endif
     } catch (const std::exception& error) {
         std::cerr << "HTTP API test failed: " << error.what() << '\n';

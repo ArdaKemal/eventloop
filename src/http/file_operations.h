@@ -30,6 +30,8 @@ struct directory_entry {
     -> std::optional<file_info>;
 [[nodiscard]] auto read_file(native_socket file, std::span<std::byte> output) noexcept
     -> bool;
+[[nodiscard]] auto read_file_at(native_socket file, std::uint64_t offset,
+                                std::span<std::byte> output) noexcept -> bool;
 [[nodiscard]] auto list_directory(native_socket directory)
     -> std::optional<std::vector<directory_entry>>;
 [[nodiscard]] auto format_http_time(std::int64_t unix_seconds,

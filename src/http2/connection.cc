@@ -3,6 +3,7 @@
 #include "eventloop/http/directory_listing.h"
 #include "eventloop/http/mime_types.h"
 #include "../http/resource.h"
+#include "../http/file_operations.h"
 #include "session.h"
 
 #include <algorithm>
@@ -16,10 +17,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace eventloop::http2::detail {
 namespace {
@@ -66,7 +63,7 @@ auto respond_empty(session& state, std::uint32_t stream_id,
     return location;
 }
 
-auto serve_request(session& state, request incoming, int root,
+auto serve_request(session& state, request incoming, native_socket root,
                    bool directory_listing) -> void
 {
     if (incoming.method == "OPTIONS") {
@@ -90,19 +87,15 @@ auto serve_request(session& state, request incoming, int root,
         return;
     }
     auto descriptor = std::move(*opened);
-    struct stat info {};
-    if (fstat(descriptor.get(), &info) == -1 ||
-        (!S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode))) {
+    auto info = http::detail::get_file_info(descriptor.get());
+    if (!info || (info->kind != http::detail::file_info::type::regular &&
+                  info->kind != http::detail::file_info::type::directory)) {
         respond_empty(state, incoming.stream_id, 404);
         return;
     }
 
-    if (S_ISREG(info.st_mode)) {
-        if (info.st_size < 0) {
-            respond_empty(state, incoming.stream_id, 500);
-            return;
-        }
-        const auto size = static_cast<std::uint64_t>(info.st_size);
+    if (info->kind == http::detail::file_info::type::regular) {
+        const auto size = info->size;
         const auto fields = status_fields(size,
             http::mime_type_from_path(incoming.target));
         (void)state.respond_file(incoming.stream_id, 200, fields,
@@ -119,16 +112,10 @@ auto serve_request(session& state, request incoming, int root,
         return;
     }
 
-    unique_fd index(openat(descriptor.get(), "index.html",
-                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-    struct stat index_info {};
-    if (index && fstat(index.get(), &index_info) == 0 &&
-        S_ISREG(index_info.st_mode)) {
-        if (index_info.st_size < 0) {
-            respond_empty(state, incoming.stream_id, 500);
-            return;
-        }
-        const auto size = static_cast<std::uint64_t>(index_info.st_size);
+    unique_fd index = http::detail::open_child(descriptor.get(), "index.html", false);
+    auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
+    if (index_info && index_info->kind == http::detail::file_info::type::regular) {
+        const auto size = index_info->size;
         const auto fields = status_fields(size,
             http::mime_type_from_path("index.html"));
         (void)state.respond_file(incoming.stream_id, 200, fields,

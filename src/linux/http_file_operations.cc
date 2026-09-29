@@ -6,6 +6,7 @@
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 
@@ -59,6 +60,26 @@ auto read_file(native_socket file, std::span<std::byte> output) noexcept -> bool
                                   std::min(output.size() - offset,
                                            static_cast<std::size_t>(SSIZE_MAX)));
         if (count > 0) offset += static_cast<std::size_t>(count);
+        else if (count == -1 && errno == EINTR) continue;
+        else return false;
+    }
+    return true;
+}
+
+auto read_file_at(native_socket file, std::uint64_t position,
+                  std::span<std::byte> output) noexcept -> bool
+{
+    constexpr auto max_offset = static_cast<std::uint64_t>(
+        std::numeric_limits<off_t>::max());
+    if (position > max_offset || output.size() > max_offset - position)
+        return false;
+    std::size_t read_size = 0;
+    while (read_size < output.size()) {
+        const auto count = ::pread(file, output.data() + read_size,
+            std::min(output.size() - read_size,
+                     static_cast<std::size_t>(SSIZE_MAX)),
+            static_cast<off_t>(position + read_size));
+        if (count > 0) read_size += static_cast<std::size_t>(count);
         else if (count == -1 && errno == EINTR) continue;
         else return false;
     }
