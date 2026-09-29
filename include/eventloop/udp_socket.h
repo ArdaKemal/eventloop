@@ -4,9 +4,7 @@
 #include "eventloop/detail/notifiable.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/unique_fd.h"
-#ifdef _WIN32
 #include "eventloop/detail/socket_operation.h"
-#endif
 
 #include <array>
 #include <coroutine>
@@ -18,6 +16,7 @@
 #include <system_error>
 
 namespace eventloop {
+namespace detail { class socket_operations; }
 
 struct udp_datagram {
     std::size_t size {0};
@@ -33,11 +32,7 @@ public:
     udp_socket(const udp_socket&) = delete;
     auto operator=(const udp_socket&) -> udp_socket& = delete;
 
-#ifdef _WIN32
     [[nodiscard]] auto descriptor() const noexcept -> native_socket override;
-#else
-    [[nodiscard]] auto descriptor() const noexcept -> int override;
-#endif
     [[nodiscard]] auto local_endpoint() const -> ip_endpoint;
     auto close() -> void;
 
@@ -68,6 +63,7 @@ public:
 
     private:
         friend class udp_socket;
+        friend class detail::socket_operations;
         [[nodiscard]] auto start(
             std::coroutine_handle<> continuation,
             detail::coroutine_cancellation_state& cancellation) noexcept
@@ -81,10 +77,7 @@ public:
         detail::coroutine_cancellation_node cancellation_ {};
         ip_endpoint source_;
         int result_ {0};
-#ifdef _WIN32
-        detail::socket_operation operation_ {};
-        bool cancelled_ {false};
-#endif
+        [[no_unique_address]] detail::socket_operation operation_ {};
     };
 
     class send_awaiter {
@@ -110,6 +103,7 @@ public:
 
     private:
         friend class udp_socket;
+        friend class detail::socket_operations;
         [[nodiscard]] auto start(
             std::coroutine_handle<> continuation,
             detail::coroutine_cancellation_state& cancellation) noexcept
@@ -123,10 +117,7 @@ public:
         std::coroutine_handle<> continuation_ {};
         detail::coroutine_cancellation_node cancellation_ {};
         int result_ {0};
-#ifdef _WIN32
-        detail::socket_operation operation_ {};
-        bool cancelled_ {false};
-#endif
+        [[no_unique_address]] detail::socket_operation operation_ {};
     };
 
     [[nodiscard]] auto async_receive_from(std::span<std::byte> buffer) noexcept
@@ -139,6 +130,7 @@ private:
     friend class event_loop;
     friend class receive_awaiter;
     friend class send_awaiter;
+    friend class detail::socket_operations;
 
     [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
     {
@@ -159,10 +151,7 @@ private:
     receive_awaiter* receive_ {nullptr};
     send_awaiter* send_ {nullptr};
     bool closing_ {false};
-#ifdef _WIN32
-    native_socket registered_descriptor_ {static_cast<native_socket>(-1)};
-    std::size_t pending_operations_ {0};
-#endif
+    [[no_unique_address]] detail::socket_datagram_state backend_state_ {};
 };
 
 } // namespace eventloop

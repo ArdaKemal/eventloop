@@ -1,16 +1,22 @@
 #include "eventloop/tcp_acceptor.h"
 #include "eventloop/tcp_stream.h"
 #include "eventloop/task.h"
+#include "eventloop/file_io.h"
 
 #include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <span>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
+#include <fcntl.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -530,6 +536,91 @@ auto shutdown_pending() -> bool
            loop.coroutine_statistics().live == 0;
 }
 
+auto send_opened_file(event_loop& loop, tcp_stream& socket,
+                      std::string_view path, int& completed, bool& passed)
+    -> task<void>
+{
+    auto opened = co_await async_openat(loop, AT_FDCWD, path, O_RDONLY);
+    if (opened) {
+        constexpr std::array<std::byte, 1> header {std::byte {'#'}};
+        const auto sent = co_await socket.async_send_file(
+            header, std::move(*opened), sizeof("file payload") - 1);
+        passed = sent.has_value();
+    }
+    socket.close();
+    stop_after_two(loop, completed);
+}
+
+auto receive_opened_file(event_loop& loop, tcp_stream& socket,
+                         int& completed, bool& passed) -> task<void>
+{
+    constexpr std::string_view expected = "#file payload";
+    std::array<std::byte, expected.size()> buffer {};
+    std::size_t received = 0;
+    while (received < buffer.size()) {
+        const auto result = co_await socket.async_read_some(
+            std::span(buffer).subspan(received));
+        if (!result || *result == 0) break;
+        received += *result;
+    }
+    passed = received == buffer.size();
+    for (std::size_t i = 0; passed && i < buffer.size(); ++i)
+        passed = std::to_integer<char>(buffer[i]) == expected[i];
+    socket.close();
+    stop_after_two(loop, completed);
+}
+
+auto opened_file_send() -> bool
+{
+    struct temporary_path {
+        std::filesystem::path value;
+        ~temporary_path()
+        {
+            std::error_code ignored;
+            std::filesystem::remove(value, ignored);
+        }
+    } file {"eventloop-tcp-send-file-" + std::to_string(
+                 event_loop::clock::now().time_since_epoch().count())};
+    {
+        std::ofstream output(file.value, std::ios::binary);
+        if (!output || !(output << "file payload")) return false;
+    }
+    auto pair = connected_pair();
+    if (!pair.client || !pair.server) return false;
+    event_loop loop;
+    auto sender = std::make_unique<tcp_stream>(loop, std::move(pair.client));
+    auto receiver = std::make_unique<tcp_stream>(loop, std::move(pair.server));
+    auto* sending = sender.get();
+    auto* receiving = receiver.get();
+    const auto path = file.value.string();
+    loop.add(std::move(sender));
+    loop.add(std::move(receiver));
+    int completed = 0;
+    bool sent = false;
+    bool received = false;
+    if (loop.spawn(send_opened_file(loop, *sending, path,
+                                   completed, sent)) != task_spawn_result::accepted ||
+        loop.spawn(receive_opened_file(loop, *receiving, completed, received)) !=
+            task_spawn_result::accepted) {
+        loop.shutdown(0s);
+        (void)loop.run();
+        return false;
+    }
+    task_handle<void> watchdog;
+    if (loop.spawn(stop_after(loop, 2s), watchdog) !=
+        task_spawn_result::accepted) {
+        loop.shutdown(0s);
+        (void)loop.run();
+        return false;
+    }
+    const auto result = loop.run();
+    if (!watchdog.done()) (void)watchdog.cancel();
+    loop.shutdown(0s);
+    (void)loop.run();
+    return result == event_loop_result::stopped && completed == 2 &&
+           sent && received && loop.coroutine_statistics().live == 0;
+}
+
 } // namespace
 
 int main()
@@ -548,5 +639,6 @@ int main()
         !check(duplicate_io_and_close(), "duplicate I/O and close") ||
         !check(immediate_error_cases(), "immediate errors") ||
         !check(refused_connect(), "refused connect") ||
+        !check(opened_file_send(), "async_openat send file") ||
         !check(shutdown_pending(), "shutdown pending")) return 1;
 }

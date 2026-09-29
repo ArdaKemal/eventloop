@@ -5,9 +5,7 @@
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/task.h"
 #include "eventloop/unique_fd.h"
-#ifdef _WIN32
 #include "eventloop/detail/socket_operation.h"
-#endif
 
 #include <cstddef>
 #include <coroutine>
@@ -18,6 +16,7 @@
 #include <system_error>
 
 namespace eventloop {
+namespace detail { class socket_operations; }
 
 class tcp_stream : private detail::notifiable {
 public:
@@ -29,11 +28,7 @@ public:
     tcp_stream(const tcp_stream&) = delete;
     auto operator=(const tcp_stream&) -> tcp_stream& = delete;
 
-#ifdef _WIN32
     [[nodiscard]] auto descriptor() const noexcept -> native_socket override;
-#else
-    [[nodiscard]] auto descriptor() const noexcept -> int override;
-#endif
     [[nodiscard]] auto owning_loop() const noexcept -> event_loop& { return loop_; }
     class connect_awaiter {
     public:
@@ -53,6 +48,7 @@ public:
             -> std::expected<void, std::error_code>;
     private:
         friend class tcp_stream;
+        friend class detail::socket_operations;
         static auto cancel(detail::coroutine_cancellation_node& node)
             noexcept -> void;
         auto suspend(std::coroutine_handle<> handle,
@@ -62,10 +58,7 @@ public:
         detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::error_code error_ {};
-#ifdef _WIN32
-        detail::socket_operation operation_ {};
-        bool cancelled_ {false};
-#endif
+        [[no_unique_address]] detail::socket_operation operation_ {};
     };
     [[nodiscard]] auto async_connect() noexcept -> connect_awaiter
     {
@@ -91,6 +84,7 @@ public:
             -> std::expected<std::size_t, std::error_code>;
     private:
         friend class tcp_stream;
+        friend class detail::socket_operations;
         static auto cancel(detail::coroutine_cancellation_node& node)
             noexcept -> void;
         auto suspend(std::coroutine_handle<> handle,
@@ -103,10 +97,7 @@ public:
         std::coroutine_handle<> continuation_ {};
         std::size_t transferred_ {0};
         std::error_code error_ {};
-#ifdef _WIN32
-        detail::socket_operation operation_ {};
-        bool cancelled_ {false};
-#endif
+        [[no_unique_address]] detail::socket_operation operation_ {};
     };
     // Buffers remain caller-owned until completion, including cancellation.
     // One read and one write may be pending at a time. Operations return
@@ -144,6 +135,7 @@ private:
             -> std::expected<void, std::error_code>;
     private:
         friend class tcp_stream;
+        friend class detail::socket_operations;
         static auto cancel(detail::coroutine_cancellation_node& node)
             noexcept -> void;
         auto suspend(std::coroutine_handle<> handle,
@@ -156,12 +148,7 @@ private:
         detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::error_code error_ {};
-#ifdef _WIN32
-        detail::socket_operation operation_ {};
-        std::size_t requested_ {0};
-        std::size_t offset_ {0};
-        bool cancelled_ {false};
-#endif
+        [[no_unique_address]] detail::socket_operation operation_ {};
     };
     [[nodiscard]] static auto send_file_task(
         event_loop& loop, tcp_stream& socket, std::span<const std::byte> header,
@@ -184,6 +171,7 @@ protected:
 
 private:
     friend class event_loop;
+    friend class detail::socket_operations;
 
     [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
     {
@@ -215,10 +203,7 @@ private:
     bool transport_activated_ {false};
     bool read_interest_enabled_ {false};
     bool write_interest_enabled_ {false};
-#ifdef _WIN32
-    native_socket registered_descriptor_ {static_cast<native_socket>(-1)};
-    std::size_t pending_operations_ {0};
-#endif
+    [[no_unique_address]] detail::socket_stream_state socket_state_ {};
 };
 
 } // namespace eventloop

@@ -3,20 +3,85 @@
 #include "eventloop/detail/socket_operation.h"
 #include "eventloop/native_socket.h"
 #include "eventloop/ip_endpoint.h"
+#include "eventloop/tcp_acceptor.h"
+#include "eventloop/tcp_stream.h"
+#include "eventloop/udp_socket.h"
+#include "eventloop/unique_fd.h"
 
 #include <cstddef>
 #include <expected>
 #include <span>
 #include <system_error>
 
+namespace eventloop { class tcp_stream; class tcp_acceptor; class udp_socket; }
+
 namespace eventloop::detail {
+
+enum class stream_operation_kind { connect, read, write, file };
 
 // Shared socket classes own awaiters and cancellation. Each platform provides
 // submission and completion semantics: EAGAIN leaves a Linux readiness waiter;
 // a submitted Windows operation retains its frame until its IOCP packet arrives.
 class socket_operations {
 public:
+    static auto accept_register(tcp_acceptor& acceptor,
+                                ip_endpoint endpoint) noexcept -> void;
+    static auto accept_bind(tcp_acceptor::accept_awaiter& awaiter) noexcept -> void;
+    [[nodiscard]] static auto accept_start(tcp_acceptor& acceptor,
+        tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result;
+    [[nodiscard]] static auto accept_try_immediate(tcp_acceptor& acceptor,
+        tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result;
+    [[nodiscard]] static auto accept_submit(tcp_acceptor& acceptor,
+        tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result;
+    [[nodiscard]] static auto accept_cancel(tcp_acceptor& acceptor,
+        tcp_acceptor::accept_awaiter& awaiter) noexcept -> bool;
+    static auto accept_retire(tcp_acceptor& acceptor,
+        tcp_acceptor::accept_awaiter& awaiter) noexcept -> void;
+    static auto accept_close(tcp_acceptor& acceptor) -> void;
+    static auto datagram_register(udp_socket& socket) noexcept -> void;
+    static auto datagram_bind(udp_socket::receive_awaiter& awaiter) noexcept -> void;
+    static auto datagram_bind(udp_socket::send_awaiter& awaiter) noexcept -> void;
+    [[nodiscard]] static auto datagram_receive(udp_socket& socket,
+        udp_socket::receive_awaiter& awaiter) noexcept -> socket_result;
+    [[nodiscard]] static auto datagram_send(udp_socket& socket,
+        udp_socket::send_awaiter& awaiter) noexcept -> socket_result;
+    static auto datagram_submitted(udp_socket& socket,
+        socket_operation& operation) noexcept -> void;
+    [[nodiscard]] static auto datagram_cancel(udp_socket& socket,
+        socket_operation& operation) noexcept -> bool;
+    static auto datagram_retire(udp_socket& socket,
+        socket_operation& operation) noexcept -> void;
+    static auto datagram_close(udp_socket& socket) -> void;
+    [[nodiscard]] static auto datagram_pending(const udp_socket& socket) noexcept -> bool;
+    [[nodiscard]] static auto datagram_result(const socket_result& result) noexcept -> int;
+    static auto datagram_error(udp_socket& socket, int result) noexcept -> void;
+    static auto stream_register(tcp_stream& stream) noexcept -> void;
+    [[nodiscard]] static auto stream_has_pending(const tcp_stream& stream) noexcept -> bool;
+    static auto stream_bind(tcp_stream& stream, socket_operation& operation,
+                            void* awaiter, stream_operation_kind kind) noexcept -> void;
+    static auto stream_submitted(tcp_stream& stream,
+                                 socket_operation& operation) noexcept -> void;
+    static auto stream_retire(tcp_stream& stream,
+                              socket_operation& operation) noexcept -> void;
+    [[nodiscard]] static auto stream_pending(const socket_operation& operation)
+        noexcept -> bool;
+    [[nodiscard]] static auto stream_cancel(tcp_stream& stream,
+                                            socket_operation& operation) noexcept -> bool;
+    static auto stream_close(tcp_stream& stream) -> void;
+    [[nodiscard]] static auto stream_send_file(tcp_stream& stream,
+                                               const unique_fd& file,
+                                               std::size_t size,
+                                               socket_operation& operation) noexcept
+        -> socket_result;
+    static auto stream_file_advanced(socket_operation& operation,
+                                     std::size_t bytes) noexcept -> void;
     [[nodiscard]] static auto create(int family, int type, int protocol)
+        -> native_socket;
+    [[nodiscard]] static auto create_listener(ip_endpoint endpoint)
+        -> native_socket;
+    [[nodiscard]] static auto create_datagram(ip_endpoint endpoint)
+        -> native_socket;
+    [[nodiscard]] static auto create_stream(ip_endpoint endpoint)
         -> native_socket;
     static auto prepare_listener(native_socket socket, ip_endpoint endpoint,
                                  bool reuse_port) -> void;
@@ -75,5 +140,85 @@ public:
     static auto cancel(native_socket socket, socket_operation& operation) noexcept
         -> void;
 };
+
+#ifndef _WIN32
+inline auto socket_operations::accept_register(tcp_acceptor&, ip_endpoint) noexcept -> void {}
+inline auto socket_operations::accept_bind(tcp_acceptor::accept_awaiter&) noexcept -> void {}
+inline auto socket_operations::accept_start(tcp_acceptor& acceptor,
+    tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result
+{ return start_accept(acceptor.descriptor_.get(), 0, {}, awaiter.operation_); }
+inline auto socket_operations::accept_try_immediate(tcp_acceptor& acceptor,
+    tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result
+{ return accept_start(acceptor, awaiter); }
+inline auto socket_operations::accept_submit(tcp_acceptor&,
+    tcp_acceptor::accept_awaiter&) noexcept -> socket_result
+{ return {.pending = true}; }
+inline auto socket_operations::accept_cancel(tcp_acceptor&,
+    tcp_acceptor::accept_awaiter&) noexcept -> bool { return false; }
+inline auto socket_operations::accept_retire(tcp_acceptor&,
+    tcp_acceptor::accept_awaiter&) noexcept -> void {}
+inline auto socket_operations::accept_close(tcp_acceptor& acceptor) -> void
+{ acceptor.loop_.remove(acceptor.descriptor_.get()); }
+
+inline auto socket_operations::datagram_register(udp_socket&) noexcept -> void {}
+inline auto socket_operations::datagram_bind(udp_socket::receive_awaiter&) noexcept -> void {}
+inline auto socket_operations::datagram_bind(udp_socket::send_awaiter&) noexcept -> void {}
+inline auto socket_operations::datagram_receive(udp_socket& socket,
+    udp_socket::receive_awaiter& awaiter) noexcept -> socket_result
+{ return start_receive_from(socket.descriptor_.get(), awaiter.buffer_.data(),
+                            awaiter.buffer_.size(), awaiter.operation_); }
+inline auto socket_operations::datagram_send(udp_socket& socket,
+    udp_socket::send_awaiter& awaiter) noexcept -> socket_result
+{ return start_send_to(socket.descriptor_.get(), awaiter.buffer_.data(),
+                       awaiter.buffer_.size(), awaiter.destination_,
+                       awaiter.operation_); }
+inline auto socket_operations::datagram_submitted(udp_socket&,
+    socket_operation&) noexcept -> void {}
+inline auto socket_operations::datagram_cancel(udp_socket&,
+    socket_operation&) noexcept -> bool { return false; }
+inline auto socket_operations::datagram_retire(udp_socket&,
+    socket_operation&) noexcept -> void {}
+inline auto socket_operations::datagram_close(udp_socket& socket) -> void
+{ socket.loop_.remove(socket.descriptor_.get()); }
+inline auto socket_operations::datagram_pending(const udp_socket&) noexcept -> bool
+{ return false; }
+inline auto socket_operations::datagram_result(const socket_result& result) noexcept -> int
+{ return result.error ? -result.error.value() : static_cast<int>(result.transferred); }
+inline auto socket_operations::datagram_error(udp_socket& socket, int result) noexcept -> void
+{ socket.complete_pending(result); }
+
+inline auto socket_operations::stream_register(tcp_stream&) noexcept -> void {}
+inline auto socket_operations::stream_has_pending(const tcp_stream&) noexcept -> bool
+{ return false; }
+inline auto socket_operations::stream_bind(tcp_stream&, socket_operation&,
+                                    void*, stream_operation_kind) noexcept -> void {}
+inline auto socket_operations::stream_submitted(tcp_stream&,
+                                         socket_operation&) noexcept -> void {}
+inline auto socket_operations::stream_retire(tcp_stream&,
+                                      socket_operation&) noexcept -> void {}
+inline auto socket_operations::stream_pending(const socket_operation&) noexcept -> bool
+{ return false; }
+inline auto socket_operations::stream_cancel(tcp_stream&,
+                                      socket_operation&) noexcept -> bool
+{ return false; }
+inline auto socket_operations::stream_close(tcp_stream& stream) -> void
+{ stream.loop_.remove(stream.descriptor_.get()); }
+inline auto socket_operations::stream_send_file(tcp_stream& stream,
+                                         const unique_fd& file, std::size_t size,
+                                         socket_operation& operation) noexcept
+    -> socket_result
+{ return start_send_file(stream.descriptor_.get(), file.get(), size, operation); }
+inline auto socket_operations::stream_file_advanced(socket_operation&,
+                                             std::size_t) noexcept -> void {}
+
+inline auto socket_operations::received_source(const socket_operation&) noexcept
+    -> ip_endpoint { return {}; }
+
+inline auto socket_operations::finish_accept(native_socket, native_socket) noexcept
+    -> std::error_code { return {}; }
+
+inline auto socket_operations::cancel(native_socket, socket_operation&) noexcept
+    -> void {}
+#endif
 
 } // namespace eventloop::detail

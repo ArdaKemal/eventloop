@@ -17,6 +17,8 @@
 #include <unistd.h>
 #endif
 
+namespace eventloop::detail { class socket_operations; }
+
 namespace eventloop {
 
 // Owns one descriptor. Moving transfers ownership without allocating.
@@ -112,6 +114,7 @@ public:
     }
 
 private:
+    friend class detail::socket_operations;
 #ifdef _WIN32
     static constexpr native_socket invalid = static_cast<native_socket>(-1);
     native_socket descriptor_ {invalid};

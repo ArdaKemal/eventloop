@@ -1,11 +1,305 @@
 #include "socket_operations.h"
+#include "eventloop/tcp_stream.h"
+#include "eventloop/tcp_acceptor.h"
+#include "eventloop/udp_socket.h"
 #include "ip_endpoint_native.h"
 
 #include <mswsock.h>
+#include <cerrno>
+#include <io.h>
 #include <limits>
 #include <stdexcept>
 
 namespace eventloop::detail {
+auto socket_operations::accept_register(tcp_acceptor& acceptor,
+    ip_endpoint endpoint) noexcept -> void
+{
+    acceptor.backend_state_.registered_descriptor = acceptor.descriptor_.get();
+    acceptor.backend_state_.family = socket_family(endpoint);
+}
+auto socket_operations::accept_bind(tcp_acceptor::accept_awaiter& awaiter)
+    noexcept -> void
+{
+    auto& operation = awaiter.operation_;
+    operation.context = &awaiter;
+    operation.complete = [](socket_operation& op, std::size_t, int error) noexcept {
+        auto& self = *static_cast<tcp_acceptor::accept_awaiter*>(op.context);
+        std::error_code result;
+        if (op.cancelled || self.owner_.closed_)
+            result = {ECANCELED, std::generic_category()};
+        else if (error != 0) result = {error, std::system_category()};
+        else result = finish_accept(self.owner_.descriptor_.get(),
+                                    self.backend_state_.accepted.get());
+        unique_fd accepted = std::move(self.backend_state_.accepted);
+        if (result) accepted.reset();
+        self.owner_.complete_accept(std::move(accepted), result);
+    };
+}
+auto socket_operations::accept_start(tcp_acceptor& acceptor,
+    tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result
+{
+    auto result = start_accept(acceptor.descriptor_.get(),
+        acceptor.backend_state_.family, awaiter.backend_state_.addresses,
+        awaiter.operation_);
+    if (result.pending && result.accepted != static_cast<native_socket>(-1))
+        awaiter.backend_state_.accepted.reset(result.accepted);
+    return result;
+}
+auto socket_operations::accept_try_immediate(tcp_acceptor&,
+    tcp_acceptor::accept_awaiter&) noexcept -> socket_result
+{ return {.pending = true}; }
+auto socket_operations::accept_submit(tcp_acceptor& acceptor,
+    tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result
+{ return accept_start(acceptor, awaiter); }
+auto socket_operations::accept_cancel(tcp_acceptor& acceptor,
+    tcp_acceptor::accept_awaiter& awaiter) noexcept -> bool
+{
+    if (!awaiter.operation_.pending_completion) return false;
+    awaiter.operation_.cancelled = true;
+    cancel(acceptor.descriptor_.get(), awaiter.operation_);
+    return true;
+}
+auto socket_operations::accept_retire(tcp_acceptor& acceptor,
+    tcp_acceptor::accept_awaiter& awaiter) noexcept -> void
+{
+    awaiter.operation_.pending_completion = false;
+    if (acceptor.closed_)
+        acceptor.loop_.remove(acceptor.backend_state_.registered_descriptor);
+}
+auto socket_operations::accept_close(tcp_acceptor& acceptor) -> void
+{ acceptor.loop_.remove(acceptor.backend_state_.registered_descriptor); }
+
+auto socket_operations::datagram_register(udp_socket& socket) noexcept -> void
+{ socket.backend_state_.registered_descriptor = socket.descriptor_.get(); }
+auto socket_operations::datagram_bind(udp_socket::receive_awaiter& awaiter)
+    noexcept -> void
+{
+    auto& operation = awaiter.operation_;
+    operation.context = &awaiter;
+    operation.complete = [](socket_operation& op, std::size_t bytes,
+                            int error) noexcept {
+        auto& self = *static_cast<udp_socket::receive_awaiter*>(op.context);
+        socket_result result {.transferred = bytes};
+        if (error != 0) result.error = {error, std::system_category()};
+        const int value = op.cancelled || self.socket_.closing_
+            ? -ECANCELED : datagram_result(result);
+        self.socket_.complete_receive(value, received_source(op));
+    };
+}
+auto socket_operations::datagram_bind(udp_socket::send_awaiter& awaiter)
+    noexcept -> void
+{
+    auto& operation = awaiter.operation_;
+    operation.context = &awaiter;
+    operation.complete = [](socket_operation& op, std::size_t bytes,
+                            int error) noexcept {
+        auto& self = *static_cast<udp_socket::send_awaiter*>(op.context);
+        socket_result result {.transferred = bytes};
+        if (error != 0) result.error = {error, std::system_category()};
+        self.socket_.complete_send(op.cancelled || self.socket_.closing_
+            ? -ECANCELED : datagram_result(result));
+    };
+}
+auto socket_operations::datagram_receive(udp_socket& socket,
+    udp_socket::receive_awaiter& awaiter) noexcept -> socket_result
+{ return start_receive_from(socket.descriptor_.get(), awaiter.buffer_.data(),
+                            awaiter.buffer_.size(), awaiter.operation_); }
+auto socket_operations::datagram_send(udp_socket& socket,
+    udp_socket::send_awaiter& awaiter) noexcept -> socket_result
+{ return start_send_to(socket.descriptor_.get(), awaiter.buffer_.data(),
+                       awaiter.buffer_.size(), awaiter.destination_,
+                       awaiter.operation_); }
+auto socket_operations::datagram_submitted(udp_socket& socket,
+    socket_operation& operation) noexcept -> void
+{ if (operation.pending_completion) ++socket.backend_state_.pending_operations; }
+auto socket_operations::datagram_cancel(udp_socket& socket,
+    socket_operation& operation) noexcept -> bool
+{
+    if (!operation.pending_completion) return false;
+    operation.cancelled = true;
+    cancel(socket.descriptor_.get(), operation);
+    return true;
+}
+auto socket_operations::datagram_retire(udp_socket& socket,
+    socket_operation& operation) noexcept -> void
+{
+    if (operation.pending_completion) {
+        operation.pending_completion = false;
+        if (socket.backend_state_.pending_operations == 0) std::terminate();
+        --socket.backend_state_.pending_operations;
+    }
+    if (socket.closing_ && socket.backend_state_.pending_operations == 0)
+        socket.loop_.remove(socket.backend_state_.registered_descriptor);
+}
+auto socket_operations::datagram_close(udp_socket& socket) -> void
+{
+    if (socket.backend_state_.pending_operations != 0) socket.descriptor_.reset();
+    else socket.loop_.remove(socket.backend_state_.registered_descriptor);
+}
+auto socket_operations::datagram_pending(const udp_socket& socket) noexcept -> bool
+{ return socket.backend_state_.pending_operations != 0; }
+auto socket_operations::datagram_result(const socket_result& result) noexcept -> int
+{
+    if (!result.error) return static_cast<int>(result.transferred);
+    if (result.error.value() == WSAEMSGSIZE ||
+        result.error.value() == ERROR_MORE_DATA) return -EMSGSIZE;
+    if (result.error.value() == WSAEINVAL ||
+        result.error.value() == ERROR_INVALID_PARAMETER) return -EINVAL;
+    if (result.error.value() == ERROR_OPERATION_ABORTED) return -ECANCELED;
+    return -EIO;
+}
+auto socket_operations::datagram_error(udp_socket& socket, int result) noexcept -> void
+{
+    if (socket.backend_state_.pending_operations != 0) socket.close();
+    else socket.complete_pending(result);
+}
+
+auto socket_operations::stream_register(tcp_stream& stream) noexcept -> void
+{ stream.socket_state_.registered_descriptor = stream.descriptor_.get(); }
+
+auto socket_operations::stream_has_pending(const tcp_stream& stream) noexcept
+    -> bool
+{ return stream.socket_state_.pending_operations != 0; }
+
+auto socket_operations::stream_bind(tcp_stream&, socket_operation& operation,
+                                    void* awaiter,
+                                    stream_operation_kind kind) noexcept -> void
+{
+    operation.context = awaiter;
+    switch (kind) {
+    case stream_operation_kind::connect:
+        operation.complete = [](socket_operation& op, std::size_t,
+                                int error) noexcept {
+            auto& self = *static_cast<tcp_stream::connect_awaiter*>(op.context);
+            std::error_code result;
+            if (op.cancelled || self.owner_.closed_)
+                result = {ECANCELED, std::generic_category()};
+            else if (error == ERROR_CONNECTION_REFUSED)
+                result = {WSAECONNREFUSED, std::system_category()};
+            else if (error != 0)
+                result = {error, std::system_category()};
+            else result = finish_connect(self.owner_.descriptor_.get());
+            if (result && !self.owner_.closed_) {
+                self.owner_.closed_ = true;
+                self.owner_.descriptor_.reset();
+            }
+            if (!result) self.owner_.connected_ = true;
+            self.owner_.complete_connect(result);
+        };
+        break;
+    case stream_operation_kind::read:
+        operation.complete = [](socket_operation& op, std::size_t bytes,
+                                int error) noexcept {
+            auto& self = *static_cast<tcp_stream::io_awaiter<true>*>(op.context);
+            std::error_code result;
+            if (op.cancelled || self.owner_.closed_)
+                result = {ECANCELED, std::generic_category()};
+            else if (error != 0) result = {error, std::system_category()};
+            self.owner_.complete_read(bytes, result);
+        };
+        break;
+    case stream_operation_kind::write:
+        operation.complete = [](socket_operation& op, std::size_t bytes,
+                                int error) noexcept {
+            auto& self = *static_cast<tcp_stream::io_awaiter<false>*>(op.context);
+            std::error_code result;
+            if (op.cancelled || self.owner_.closed_)
+                result = {ECANCELED, std::generic_category()};
+            else if (error != 0) result = {error, std::system_category()};
+            self.owner_.complete_write(bytes, result);
+        };
+        break;
+    case stream_operation_kind::file:
+        operation.complete = [](socket_operation& op, std::size_t bytes,
+                                int error) noexcept {
+            auto& self = *static_cast<tcp_stream::file_awaiter*>(op.context);
+            if (!op.pending_completion ||
+                self.owner_.socket_state_.pending_operations == 0)
+                std::terminate();
+            stream_retire(self.owner_, op);
+            if (op.cancelled || self.owner_.closed_) {
+                self.owner_.complete_file({ECANCELED, std::generic_category()});
+                return;
+            }
+            if (error != 0) {
+                self.owner_.complete_file({error, std::system_category()});
+                return;
+            }
+            if (bytes == 0 || bytes > op.file_requested ||
+                bytes > self.remaining_) {
+                self.owner_.complete_file({EIO, std::generic_category()});
+                return;
+            }
+            self.remaining_ -= bytes;
+            op.file_offset += bytes;
+            const auto next = self.advance();
+            if (next.value() != EAGAIN) self.owner_.complete_file(next);
+        };
+        break;
+    }
+}
+
+auto socket_operations::stream_submitted(tcp_stream& stream,
+                                         socket_operation& operation) noexcept
+    -> void
+{ if (operation.pending_completion) ++stream.socket_state_.pending_operations; }
+
+auto socket_operations::stream_retire(tcp_stream& stream,
+                                      socket_operation& operation) noexcept -> void
+{
+    if (operation.pending_completion) {
+        operation.pending_completion = false;
+        if (stream.socket_state_.pending_operations == 0) std::terminate();
+        --stream.socket_state_.pending_operations;
+    }
+    if (stream.closed_ && stream.socket_state_.pending_operations == 0)
+        stream.loop_.remove(stream.socket_state_.registered_descriptor);
+}
+
+auto socket_operations::stream_pending(const socket_operation& operation)
+    noexcept -> bool
+{ return operation.pending_completion; }
+
+auto socket_operations::stream_cancel(tcp_stream& stream,
+                                      socket_operation& operation) noexcept
+    -> bool
+{
+    if (!operation.pending_completion) return false;
+    operation.cancelled = true;
+    cancel(stream.descriptor_.get(), operation);
+    return true;
+}
+
+auto socket_operations::stream_close(tcp_stream& stream) -> void
+{
+    if (stream.socket_state_.pending_operations != 0) stream.descriptor_.reset();
+    else stream.loop_.remove(stream.socket_state_.registered_descriptor);
+}
+
+auto socket_operations::stream_send_file(tcp_stream& stream,
+                                         const unique_fd& file, std::size_t size,
+                                         socket_operation& operation) noexcept
+    -> socket_result
+{
+    native_socket native_file = file.get();
+    if (file.kind_ == unique_fd::kind::file) {
+        const auto handle = ::_get_osfhandle(static_cast<int>(file.get()));
+        if (handle == -1)
+            return {.error = {EBADF, std::generic_category()}};
+        native_file = static_cast<native_socket>(handle);
+    }
+    operation.file_requested = size;
+    const auto offset = static_cast<std::uint64_t>(operation.file_offset);
+    operation.overlapped = {};
+    operation.overlapped.Offset = static_cast<DWORD>(offset);
+    operation.overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    return start_send_file(stream.descriptor_.get(), native_file, size, operation);
+}
+
+auto socket_operations::stream_file_advanced(socket_operation& operation,
+                                             std::size_t bytes) noexcept -> void
+{ operation.file_offset += bytes; }
+
 namespace {
 [[nodiscard]] auto last_error() noexcept -> std::error_code
 {
@@ -51,6 +345,13 @@ auto socket_operations::create(int family, int type, int protocol)
         throw std::system_error(last_error(), "WSASocket");
     return static_cast<native_socket>(socket);
 }
+
+auto socket_operations::create_stream(ip_endpoint endpoint) -> native_socket
+{ return create(socket_family(endpoint), SOCK_STREAM, 0); }
+auto socket_operations::create_listener(ip_endpoint endpoint) -> native_socket
+{ return create(socket_family(endpoint), SOCK_STREAM, 0); }
+auto socket_operations::create_datagram(ip_endpoint endpoint) -> native_socket
+{ return create(socket_family(endpoint), SOCK_DGRAM, 0); }
 
 auto socket_operations::prepare_listener(native_socket socket,
                                          ip_endpoint endpoint,

@@ -15,6 +15,7 @@ if(WIN32)
     endif()
     add_library(eventloop
         src/event_loop.cc
+        src/windows/file_operation.cc
         src/executor/single_thread_executor.cc
         src/executor/multi_thread_executor.cc
         src/tcp_acceptor.cc
@@ -274,6 +275,7 @@ add_library(eventloop
     include/eventloop/util/arg_parser.h
     include/eventloop/ws/web_socket.h
     src/linux/epoll_loop.cc
+    src/linux/file_operation.cc
     src/linux/http_file_operations.cc
     src/linux/socket_operations.cc
     src/event_loop.cc

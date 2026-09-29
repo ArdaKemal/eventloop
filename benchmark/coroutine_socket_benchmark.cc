@@ -38,6 +38,7 @@ struct benchmark_state {
     event_loop& loop;
     std::size_t target;
     std::size_t completed {0};
+    std::size_t round_trips {0};
     bool valid {true};
 
     auto finish() noexcept -> void
@@ -151,7 +152,11 @@ auto tcp_client(event_loop&, tcp_stream& socket,
             }
             offset += *result;
         }
-        if (received != sent) state.valid = false;
+        if (received != sent) {
+            state.valid = false;
+        } else {
+            ++state.round_trips;
+        }
     }
     state.finish();
 }
@@ -217,18 +222,20 @@ auto run_tcp(std::size_t transactions, std::size_t clients) -> bool
     const auto result = loop.run();
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started);
+    const bool timed_out = watchdog.done();
     if (!watchdog.done()) (void)watchdog.cancel();
     // Cancellation completes the observed task synchronously, but its frame
     // is retired when the loop drains completed roots.
     loop.stop();
     (void)loop.run();
     const auto total = transactions * clients;
-    std::cout << "TCP: " << clients << " clients, " << total
-              << " 64-byte echo round trips in " << elapsed.count() << " s ("
-              << static_cast<double>(total) / elapsed.count()
-              << " round trips/s)\n";
+    std::cout << "TCP: " << clients << " clients, " << state.round_trips
+              << " of " << total << " 64-byte echo round trips in "
+              << elapsed.count() << " s ("
+              << static_cast<double>(state.round_trips) / elapsed.count()
+              << " round trips/s)" << (timed_out ? " [timeout]" : "") << '\n';
     return result == event_loop_result::stopped && state.valid &&
-           state.completed == state.target;
+           state.completed == state.target && state.round_trips == total;
 }
 
 auto udp_echo_server(event_loop&, udp_socket& socket, std::size_t datagrams,
@@ -275,6 +282,7 @@ auto udp_client(event_loop&, udp_socket& socket, ip_endpoint destination,
             state.finish();
             co_return;
         }
+        ++state.round_trips;
     }
     state.finish();
 }
@@ -318,15 +326,17 @@ auto run_udp(std::size_t transactions, std::size_t clients) -> bool
     const auto result = loop.run();
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started);
+    const bool timed_out = watchdog.done();
     if (!watchdog.done()) (void)watchdog.cancel();
     loop.stop();
     (void)loop.run();
-    std::cout << "UDP: " << clients << " clients, " << datagrams
-              << " 64-byte echo round trips in " << elapsed.count() << " s ("
-              << static_cast<double>(datagrams) / elapsed.count()
-              << " round trips/s)\n";
+    std::cout << "UDP: " << clients << " clients, " << state.round_trips
+              << " of " << datagrams << " 64-byte echo round trips in "
+              << elapsed.count() << " s ("
+              << static_cast<double>(state.round_trips) / elapsed.count()
+              << " round trips/s)" << (timed_out ? " [timeout]" : "") << '\n';
     return result == event_loop_result::stopped && state.valid &&
-           state.completed == state.target;
+           state.completed == state.target && state.round_trips == datagrams;
 }
 
 auto parse_count(std::string_view text, const char* description) -> std::size_t

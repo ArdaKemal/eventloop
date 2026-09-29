@@ -9,6 +9,8 @@
 #include <cstdint>
 #include "eventloop/native_socket.h"
 #include "eventloop/ip_endpoint.h"
+#include "eventloop/unique_fd.h"
+#include <array>
 #include <system_error>
 
 #ifdef _WIN32
@@ -28,10 +30,42 @@ struct socket_operation {
     sockaddr_storage address {};
     int address_length {sizeof(sockaddr_storage)};
     DWORD flags {0};
-#endif
     void* context {nullptr};
     void (*complete)(socket_operation&, std::size_t, int) noexcept {nullptr};
     bool pending_completion {false};
+    bool cancelled {false};
+    std::size_t file_requested {0};
+    std::size_t file_offset {0};
+#endif
+};
+
+// Empty on readiness backends, so embedding it does not enlarge a stream.
+struct socket_stream_state {
+#ifdef _WIN32
+    native_socket registered_descriptor {static_cast<native_socket>(-1)};
+    std::size_t pending_operations {0};
+#endif
+};
+
+struct socket_accept_state {
+#ifdef _WIN32
+    native_socket registered_descriptor {static_cast<native_socket>(-1)};
+    int family {0};
+#endif
+};
+
+struct socket_accept_awaiter_state {
+#ifdef _WIN32
+    unique_fd accepted;
+    std::array<std::byte, 288> addresses {};
+#endif
+};
+
+struct socket_datagram_state {
+#ifdef _WIN32
+    native_socket registered_descriptor {static_cast<native_socket>(-1)};
+    std::size_t pending_operations {0};
+#endif
 };
 
 struct socket_result {

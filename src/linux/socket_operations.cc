@@ -1,4 +1,7 @@
 #include "socket_operations.h"
+#include "eventloop/tcp_stream.h"
+#include "eventloop/tcp_acceptor.h"
+#include "eventloop/udp_socket.h"
 #include "ip_endpoint_native.h"
 
 #include <cerrno>
@@ -35,6 +38,13 @@ auto socket_operations::create(int family, int type, int protocol)
         throw std::system_error(errno, std::system_category(), "socket");
     return descriptor;
 }
+
+auto socket_operations::create_stream(ip_endpoint endpoint) -> native_socket
+{ return create(socket_family(endpoint), SOCK_STREAM, 0); }
+auto socket_operations::create_listener(ip_endpoint endpoint) -> native_socket
+{ return create(socket_family(endpoint), SOCK_STREAM, 0); }
+auto socket_operations::create_datagram(ip_endpoint endpoint) -> native_socket
+{ return create(socket_family(endpoint), SOCK_DGRAM, 0); }
 
 auto socket_operations::prepare_listener(native_socket socket,
                                          ip_endpoint endpoint,
@@ -99,9 +109,6 @@ auto socket_operations::peer_endpoint(native_socket socket) noexcept
     }
 }
 
-auto socket_operations::received_source(const socket_operation&) noexcept
-    -> ip_endpoint { return {}; }
-
 auto socket_operations::configure_client(native_socket socket,
                                          ip_endpoint endpoint) noexcept
     -> std::error_code
@@ -154,9 +161,6 @@ auto socket_operations::start_accept(native_socket listener, int,
     }
     return {.pending = true};
 }
-
-auto socket_operations::finish_accept(native_socket, native_socket) noexcept
-    -> std::error_code { return {}; }
 
 auto socket_operations::start_connect(native_socket socket,
                                       ip_endpoint endpoint,
@@ -277,8 +281,5 @@ auto socket_operations::start_send_to(native_socket socket,
         return {.error = code(errno)};
     }
 }
-
-auto socket_operations::cancel(native_socket, socket_operation&) noexcept
-    -> void {}
 
 } // namespace eventloop::detail

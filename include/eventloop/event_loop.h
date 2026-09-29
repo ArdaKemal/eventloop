@@ -23,6 +23,7 @@ class task_handle;
 
 namespace detail {
 
+class socket_operations;
 struct file_io_operation;
 class notifiable;
 enum class file_opcode;
@@ -208,6 +209,7 @@ public:
 
 private:
     friend struct detail::coroutine_frame_access;
+    friend class detail::socket_operations;
     friend class event_loop_yield_awaiter;
     friend class tcp_acceptor;
     friend class udp_socket;
