@@ -58,6 +58,11 @@ public:
                                           std::size_t size,
                                           socket_operation& operation) noexcept
         -> socket_result;
+    [[nodiscard]] static auto start_send_file(native_socket socket,
+                                              native_socket file,
+                                              std::size_t size,
+                                              socket_operation& operation) noexcept
+        -> socket_result;
     [[nodiscard]] static auto start_receive_from(
         native_socket socket, void* buffer, std::size_t size,
         socket_operation& operation) noexcept -> socket_result;

@@ -268,6 +268,20 @@ auto socket_operations::start_write(native_socket socket, const void* buffer,
                                        &operation.overlapped, nullptr), operation);
 }
 
+auto socket_operations::start_send_file(native_socket socket,
+                                        native_socket file, std::size_t size,
+                                        socket_operation& operation) noexcept
+    -> socket_result
+{
+    if (size == 0) return {};
+    if (size > std::numeric_limits<DWORD>::max())
+        return {.error = std::make_error_code(std::errc::invalid_argument)};
+    const BOOL started = ::TransmitFile(
+        static_cast<SOCKET>(socket), reinterpret_cast<HANDLE>(file),
+        static_cast<DWORD>(size), 0, &operation.overlapped, nullptr, 0);
+    return submission_result(started ? 0 : SOCKET_ERROR, operation);
+}
+
 auto socket_operations::start_receive_from(
     native_socket socket, void* buffer, std::size_t size,
     socket_operation& operation) noexcept -> socket_result

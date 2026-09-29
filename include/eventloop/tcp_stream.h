@@ -146,6 +146,10 @@ private:
         detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::error_code error_ {};
+        detail::socket_operation operation_ {};
+        std::size_t requested_ {0};
+        std::size_t offset_ {0};
+        bool cancelled_ {false};
     };
     [[nodiscard]] static auto send_file_task(
         event_loop& loop, tcp_stream& socket, std::span<const std::byte> header,

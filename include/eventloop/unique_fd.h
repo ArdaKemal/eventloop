@@ -5,7 +5,11 @@
 #include <utility>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
+#include <windows.h>
 #include <io.h>
 #else
 #include <unistd.h>
@@ -16,7 +20,7 @@ namespace eventloop {
 // Owns one descriptor. Moving transfers ownership without allocating.
 class unique_fd {
 public:
-    enum class kind { socket, file };
+    enum class kind { socket, file, native_file };
     unique_fd() noexcept = default;
     explicit unique_fd(native_socket descriptor, kind handle_kind = kind::socket) noexcept
         : descriptor_(descriptor), kind_(handle_kind) {}
@@ -57,6 +61,8 @@ public:
 #ifdef _WIN32
             if (kind_ == kind::socket)
                 (void)::closesocket(static_cast<SOCKET>(descriptor_));
+            else if (kind_ == kind::native_file)
+                (void)::CloseHandle(reinterpret_cast<HANDLE>(descriptor_));
             else
                 (void)::_close(static_cast<int>(descriptor_));
 #else

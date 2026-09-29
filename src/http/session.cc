@@ -3,20 +3,18 @@
 #include "eventloop/http/directory_listing.h"
 #include "eventloop/http/mime_types.h"
 #include "resource.h"
+#include "file_operations.h"
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
-
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace eventloop::http {
 namespace {
@@ -45,35 +43,9 @@ constexpr std::string_view options_response =
     "HTTP/1.1 204 No Content\r\nAllow: GET, HEAD, OPTIONS\r\nContent-Length: 0\r\n\r\n";
 constexpr std::size_t sendfile_min_size = 11 * 1024;
 
-auto format_http_time(std::time_t value, std::span<char> output) noexcept
-    -> std::size_t
-{
-    std::tm time {};
-    if (gmtime_r(&value, &time) == nullptr) return 0;
-    return std::strftime(output.data(), output.size(),
-                         "%a, %d %b %Y %H:%M:%S GMT", &time);
-}
-
-auto read_file(int descriptor, std::span<std::byte> output) noexcept -> bool
-{
-    std::size_t offset = 0;
-    while (offset < output.size()) {
-        const auto size = ::read(descriptor, output.data() + offset,
-                                 output.size() - offset);
-        if (size > 0) {
-            offset += static_cast<std::size_t>(size);
-        } else if (size == -1 && errno == EINTR) {
-            continue;
-        } else {
-            return false;
-        }
-    }
-    return true;
-}
-
 } // namespace
 
-session::session(int root_descriptor, bool directory_listing) noexcept
+session::session(native_socket root_descriptor, bool directory_listing) noexcept
     : root_descriptor_(root_descriptor), directory_listing_(directory_listing)
 {
 }
@@ -187,15 +159,15 @@ auto session::serve_resource(const request& parsed, bool headers_only) -> void
         return;
     }
 
-    struct stat info {};
-    if (fstat(descriptor.get(), &info) == -1 ||
-        (!S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode))) {
+    auto info = detail::get_file_info(descriptor.get());
+    if (!info || (info->kind != detail::file_info::type::regular &&
+                  info->kind != detail::file_info::type::directory)) {
         descriptor.reset();
         send_static_response(not_found);
         return;
     }
-    if (S_ISREG(info.st_mode)) {
-        serve_file(std::move(descriptor), info, headers_only, parsed.target);
+    if (info->kind == detail::file_info::type::regular) {
+        serve_file(std::move(descriptor), *info, headers_only, parsed.target);
         return;
     }
 
@@ -207,13 +179,11 @@ auto session::serve_resource(const request& parsed, bool headers_only) -> void
         return;
     }
 
-    unique_fd index(openat(descriptor.get(), "index.html",
-                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-    struct stat index_info {};
-    if (index && fstat(index.get(), &index_info) == 0 &&
-        S_ISREG(index_info.st_mode)) {
+    unique_fd index = detail::open_child(descriptor.get(), "index.html", false);
+    auto index_info = index ? detail::get_file_info(index.get()) : std::nullopt;
+    if (index_info && index_info->kind == detail::file_info::type::regular) {
         descriptor.reset();
-        serve_file(std::move(index), index_info, headers_only, "index.html");
+        serve_file(std::move(index), *index_info, headers_only, "index.html");
         return;
     }
     index.reset();
@@ -226,12 +196,10 @@ auto session::serve_resource(const request& parsed, bool headers_only) -> void
     serve_directory(std::move(descriptor), headers_only);
 }
 
-auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
+auto session::serve_file(unique_fd descriptor, const detail::file_info& info,
                          bool headers_only, std::string_view mime_path) -> void
 {
-    if (info.st_size < 0 ||
-        static_cast<std::uintmax_t>(info.st_size) >
-            std::numeric_limits<std::size_t>::max()) {
+    if (info.size > (std::numeric_limits<std::size_t>::max)()) {
         descriptor.reset();
         close_after_response_ = true;
         send_static_response(internal_error);
@@ -240,8 +208,8 @@ auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
 
     std::array<char, 64> date {};
     std::array<char, 64> modified {};
-    const auto date_size = format_http_time(std::time(nullptr), date);
-    const auto modified_size = format_http_time(info.st_mtime, modified);
+    const auto date_size = detail::format_http_time(std::time(nullptr), date);
+    const auto modified_size = detail::format_http_time(info.modified, modified);
     const auto mime = mime_type_from_path(mime_path);
     std::array<char, 1024> header {};
     const int header_size = std::snprintf(
@@ -251,7 +219,7 @@ auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
         "Connection: %s\r\n\r\n",
         static_cast<int>(date_size), date.data(),
         static_cast<int>(modified_size), modified.data(),
-        static_cast<std::intmax_t>(info.st_size),
+        static_cast<std::intmax_t>(info.size),
         static_cast<int>(mime.size()), mime.data(),
         close_after_response_ ? "close" : "keep-alive");
     if (header_size < 0 || static_cast<std::size_t>(header_size) >= header.size()) {
@@ -261,9 +229,9 @@ auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
     }
 
     const auto body_size = headers_only ? std::size_t {0}
-                                        : static_cast<std::size_t>(info.st_size);
+                                        : static_cast<std::size_t>(info.size);
     const auto header_length = static_cast<std::size_t>(header_size);
-    if (body_size > std::numeric_limits<std::size_t>::max() - header_length) {
+    if (body_size > (std::numeric_limits<std::size_t>::max)() - header_length) {
         descriptor.reset();
         close_after_response_ = true;
         send_static_response(internal_error);
@@ -281,7 +249,7 @@ auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
     try {
         auto response = allocate_response(response_size);
         std::memcpy(response.data(), header.data(), header_length);
-        if (!headers_only && !read_file(descriptor.get(), std::as_writable_bytes(
+        if (!headers_only && !detail::read_file(descriptor.get(), std::as_writable_bytes(
                 response.subspan(header_length, body_size)))) {
             descriptor.reset();
             file_output_.reset();
@@ -308,7 +276,7 @@ auto session::serve_file(unique_fd descriptor, const struct ::stat& info,
 auto session::serve_directory(unique_fd descriptor, bool headers_only) -> void
 {
     try {
-        auto listing = make_directory_listing(descriptor.release());
+        auto listing = detail::render_directory_listing(std::move(descriptor));
         if (!listing) {
             close_after_response_ = true;
             send_static_response(internal_error);
@@ -333,7 +301,7 @@ auto session::serve_directory(unique_fd descriptor, bool headers_only) -> void
             send_response(std::span {header}.first(header_length));
             return;
         }
-        if (body_size > std::numeric_limits<std::size_t>::max() - header_length) {
+        if (body_size > (std::numeric_limits<std::size_t>::max)() - header_length) {
             throw std::length_error("directory listing is too large");
         }
 

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -15,7 +16,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
-#include <sys/sendfile.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -151,7 +151,11 @@ auto tcp_stream::fail_and_close(std::error_code error) -> void
         writer_->cancelled_ = true;
         detail::socket_operations::cancel(descriptor_.get(), writer_->operation_);
     } else complete_write(0, error);
-    complete_file(error);
+    if (file_writer_ != nullptr && file_writer_->operation_.pending_completion) {
+        file_writer_->cancelled_ = true;
+        detail::socket_operations::cancel(descriptor_.get(),
+                                          file_writer_->operation_);
+    } else complete_file(error);
     if (pending_operations_ != 0) descriptor_.reset();
     else loop_.remove(registered_descriptor_);
 }
@@ -240,8 +244,11 @@ auto tcp_stream::complete_file(std::error_code error) noexcept -> void
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(file_writer_, nullptr);
     if (waiter == nullptr) return;
+    if (waiter->operation_.pending_completion) std::terminate();
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
+    if (closed_ && pending_operations_ == 0 && !descriptor_)
+        loop_.remove(registered_descriptor_);
     update_async_interest();
     waiter->finish(error);
 }
@@ -483,6 +490,31 @@ tcp_stream::file_awaiter::file_awaiter(tcp_stream& owner, unique_fd file,
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
+    operation_.context = this;
+    operation_.complete = [](detail::socket_operation& operation,
+                             std::size_t bytes, int error) noexcept {
+        auto& self = *static_cast<file_awaiter*>(operation.context);
+        if (!operation.pending_completion || self.owner_.pending_operations_ == 0)
+            std::terminate();
+        operation.pending_completion = false;
+        --self.owner_.pending_operations_;
+        if (self.cancelled_ || self.owner_.closed_) {
+            self.owner_.complete_file(code(ECANCELED));
+            return;
+        }
+        if (error != 0) {
+            self.owner_.complete_file({error, std::system_category()});
+            return;
+        }
+        if (bytes == 0 || bytes > self.requested_ || bytes > self.remaining_) {
+            self.owner_.complete_file(code(EIO));
+            return;
+        }
+        self.remaining_ -= bytes;
+        self.offset_ += bytes;
+        const auto next = self.advance();
+        if (next.value() != EAGAIN) self.owner_.complete_file(next);
+    };
 }
 
 tcp_stream::file_awaiter::~file_awaiter()
@@ -492,23 +524,29 @@ tcp_stream::file_awaiter::~file_awaiter()
 
 auto tcp_stream::file_awaiter::advance() noexcept -> std::error_code
 {
-#ifdef _WIN32
-    return code(ENOTSUP);
-#else
     while (remaining_ != 0) {
-        const auto requested = std::min(remaining_, std::size_t {0x7ffff000});
-        const auto result = ::sendfile(owner_.descriptor_.get(), file_.get(),
-                                       nullptr, requested);
-        if (result > 0) {
-            remaining_ -= static_cast<std::size_t>(result);
+        requested_ = std::min(remaining_, std::size_t {0x7ffff000});
+#ifdef _WIN32
+        const auto offset = static_cast<std::uint64_t>(offset_);
+        operation_.overlapped = {};
+        operation_.overlapped.Offset = static_cast<DWORD>(offset);
+        operation_.overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+#endif
+        const auto result = detail::socket_operations::start_send_file(
+            owner_.descriptor_.get(), file_.get(), requested_, operation_);
+        if (result.pending) {
+            if (operation_.pending_completion) ++owner_.pending_operations_;
+            return code(EAGAIN);
+        }
+        if (result.error) return result.error;
+        if (result.transferred > 0) {
+            remaining_ -= result.transferred;
+            offset_ += result.transferred;
             continue;
         }
-        if (result == 0) return code(EIO);
-        if (errno == EINTR) continue;
-        return code(errno);
+        return code(EIO);
     }
     return {};
-#endif
 }
 
 auto tcp_stream::file_awaiter::suspend(
@@ -531,8 +569,6 @@ auto tcp_stream::file_awaiter::suspend(
         error_ = code(ECANCELED);
         return false;
     }
-    error_ = advance();
-    if (error_.value() != EAGAIN) return false;
     continuation_ = handle;
     if (!detail::coroutine_frame_access::attach_cancellation(
             state, cancellation_)) {
@@ -540,9 +576,19 @@ auto tcp_stream::file_awaiter::suspend(
         return false;
     }
     owner_.file_writer_ = this;
+    error_ = advance();
+    if (error_.value() != EAGAIN) {
+        owner_.file_writer_ = nullptr;
+        detail::coroutine_frame_access::detach_cancellation(cancellation_);
+        return false;
+    }
     try {
         owner_.set_async_interest(owner_.reader_ != nullptr, true);
     } catch (const std::system_error& error) {
+        if (operation_.pending_completion) {
+            owner_.fail_and_close(error.code());
+            return true;
+        }
         owner_.file_writer_ = nullptr;
         detail::coroutine_frame_access::detach_cancellation(
             cancellation_);
@@ -556,7 +602,12 @@ auto tcp_stream::file_awaiter::cancel(
     detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<file_awaiter*>(node.operation);
-    self.owner_.complete_file(code(ECANCELED));
+    detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
+    if (self.operation_.pending_completion) {
+        self.cancelled_ = true;
+        detail::socket_operations::cancel(self.owner_.descriptor_.get(),
+                                          self.operation_);
+    } else self.owner_.complete_file(code(ECANCELED));
 }
 
 auto tcp_stream::file_awaiter::finish(std::error_code error) noexcept -> void
@@ -577,14 +628,6 @@ auto tcp_stream::send_file_task(event_loop& loop, tcp_stream& socket,
                                 unique_fd file, std::size_t size)
     -> task<std::expected<void, std::error_code>>
 {
-#ifdef _WIN32
-    (void)loop;
-    (void)socket;
-    (void)header;
-    (void)file;
-    (void)size;
-    co_return std::unexpected(code(ENOTSUP));
-#else
     (void)loop;
     while (!header.empty()) {
         auto sent = co_await socket.async_write_some(header);
@@ -593,15 +636,11 @@ auto tcp_stream::send_file_task(event_loop& loop, tcp_stream& socket,
         header = header.subspan(*sent);
     }
     co_return co_await tcp_stream::file_awaiter(socket, std::move(file), size);
-#endif
 }
 auto tcp_stream::async_send_file(std::span<const std::byte> header,
                                   unique_fd file, std::size_t size)
     -> task<std::expected<void, std::error_code>>
 {
-#ifdef _WIN32
-    file = unique_fd(file.release(), unique_fd::kind::file);
-#endif
     return send_file_task(loop_, *this, header, std::move(file), size);
 }
 

@@ -2,20 +2,28 @@
 
 #include "eventloop/task.h"
 #include "eventloop/tcp_acceptor.h"
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 #include "eventloop/tls_context.h"
+#endif
 
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 
+namespace eventloop { class tls_context; }
+
 namespace eventloop::http {
 
 struct server_options {
     bool directory_listing {false};
     bool reuse_port {false};
-    // HTTPS advertises h2 and http/1.1 by default. Plain HTTP remains HTTP/1.1.
+    // HTTPS advertises h2 on Linux; Windows currently serves HTTP/1.1 only.
+#ifdef _WIN32
+    bool enable_http2 {false};
+#else
     bool enable_http2 {true};
+#endif
 };
 
 class server final : public tcp_acceptor {
@@ -36,6 +44,7 @@ private:
     server_options options_;
 };
 
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 class https_server final : public tcp_acceptor {
 public:
     https_server(event_loop& loop, std::uint16_t port,
@@ -56,6 +65,7 @@ private:
     std::shared_ptr<tls_context> context_;
     server_options options_;
 };
+#endif
 
 class redirect_server final : public tcp_acceptor {
 public:

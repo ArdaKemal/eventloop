@@ -1,12 +1,11 @@
 #include "resource.h"
+#include "file_operations.h"
 
 #include <array>
 #include <cerrno>
 #include <cstddef>
 #include <span>
 #include <utility>
-
-#include <fcntl.h>
 
 namespace eventloop::http::detail {
 namespace {
@@ -72,11 +71,11 @@ namespace {
     return size;
 }
 
-[[nodiscard]] auto open_beneath(int root, std::span<char> path) noexcept
+[[nodiscard]] auto open_beneath(native_socket root, std::span<char> path) noexcept
     -> unique_fd
 {
     std::size_t start = 0;
-    int parent = root;
+    native_socket parent = root;
     unique_fd owned_parent;
 
     while (start < path.size()) {
@@ -85,16 +84,10 @@ namespace {
 
         auto end = start;
         while (end < path.size() && path[end] != '/') ++end;
-        const char saved = end < path.size() ? path[end] : '\0';
-        if (end < path.size()) path[end] = '\0';
-        const int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
-                          (end < path.size() ? O_DIRECTORY : 0);
-        unique_fd next(openat(parent, path.data() + start, flags));
-        if (end < path.size()) path[end] = saved;
+        unique_fd next = open_child(parent,
+            std::string_view {path.data() + start, end - start},
+            end < path.size());
         if (!next) {
-            const int error = errno;
-            owned_parent.reset();
-            errno = error;
             return {};
         }
         owned_parent = std::move(next);
@@ -103,12 +96,12 @@ namespace {
     }
 
     if (owned_parent) return owned_parent;
-    return unique_fd(openat(root, ".", O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    return open_child(root, ".", false);
 }
 
 } // namespace
 
-auto open_resource(int root, std::string_view target) noexcept
+auto open_resource(native_socket root, std::string_view target) noexcept
     -> std::expected<unique_fd, resource_error>
 {
     std::array<char, 4096> path {};

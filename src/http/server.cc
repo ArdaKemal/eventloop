@@ -1,12 +1,16 @@
 #include "eventloop/http/server.h"
 
+#ifndef _WIN32
 #include "../http2/connection.h"
+#endif
+#include "file_operations.h"
 #include "eventloop/http/session.h"
 #include "eventloop/tcp_stream.h"
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 #include "eventloop/tls_stream.h"
+#endif
 
 #include <array>
-#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <expected>
@@ -20,29 +24,8 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
-#include <unistd.h>
-
 namespace eventloop::http {
 namespace {
-
-[[nodiscard]] auto system_error(const char* operation) -> std::system_error
-{
-    return {errno, std::system_category(), operation};
-}
-
-[[nodiscard]] auto open_root(std::string_view root) -> unique_fd
-{
-    std::array<char, 4096> path {};
-    if (root.empty() || root.size() >= path.size() ||
-        root.find('\0') != std::string_view::npos) {
-        throw std::invalid_argument("HTTP root path is invalid or too long");
-    }
-    std::memcpy(path.data(), root.data(), root.size());
-    unique_fd descriptor(open(path.data(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    if (!descriptor) throw system_error("open HTTP root");
-    return descriptor;
-}
 
 auto validate_hostname(std::string_view hostname) -> void
 {
@@ -95,24 +78,36 @@ template<typename Stream>
     Stream* peer = nullptr;
     bool registered = false;
     try {
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         if constexpr (std::is_same_v<Stream, tls_stream>) {
             socket = std::make_unique<tls_stream>(
                 loop, std::move(descriptor), std::move(context),
-                tls_server_options {.application_protocols = options.enable_http2
+                tls_server_options {.application_protocols =
+#ifdef _WIN32
+                    std::vector<std::string> {"http/1.1"}
+#else
+                    options.enable_http2
                     ? std::vector<std::string> {"h2", "http/1.1"}
-                    : std::vector<std::string> {"http/1.1"}});
+                    : std::vector<std::string> {"http/1.1"}
+#endif
+                });
         } else {
+#endif
             socket = std::make_unique<tcp_stream>(loop, std::move(descriptor));
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         }
+#endif
         peer = socket.get();
         loop.add(std::move(socket));
         registered = true;
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         if constexpr (std::is_same_v<Stream, tls_stream>) {
             const auto handshake = co_await peer->async_handshake();
             if (!operation_succeeded(handshake)) {
                 peer->close();
                 co_return;
             }
+#ifndef _WIN32
             if (options.enable_http2 && peer->application_protocol() == "h2") {
                 const auto served = co_await http2::detail::serve(
                     loop, *peer, root, options.directory_listing);
@@ -123,11 +118,15 @@ template<typename Stream>
                 peer->close();
                 co_return;
             }
+#endif
         }
+#endif
 
         // The parser and I/O buffers live outside the bounded coroutine frame.
         auto state = std::make_unique<session>(root->get(), options.directory_listing);
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         std::unique_ptr<std::byte[]> tls_file_buffer;
+#endif
         while (!state->closed()) {
             while (!state->has_response() && !state->closed()) {
                 auto buffer = state->read_space();
@@ -167,6 +166,7 @@ template<typename Stream>
                         peer->close();
                         co_return;
                     }
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
                 } else {
                     if (!tls_file_buffer) {
                         tls_file_buffer.reset(
@@ -180,16 +180,12 @@ template<typename Stream>
                         tls_file_buffer.get(), 4096};
                     std::size_t remaining = file_size;
                     while (remaining != 0) {
-                        const auto bytes = ::read(file.get(),
-                            file_buffer.data(),
-                            std::min(remaining, file_buffer.size()));
-                        if (bytes == -1 && errno == EINTR) continue;
-                        if (bytes <= 0) {
+                        const auto bytes = std::min(remaining, file_buffer.size());
+                        if (!detail::read_file(file.get(), file_buffer.first(bytes))) {
                             peer->close();
                             co_return;
                         }
-                        auto chunk = file_buffer.first(
-                            static_cast<std::size_t>(bytes));
+                        auto chunk = file_buffer.first(bytes);
                         while (!chunk.empty()) {
                             auto written = operation_result(
                                 co_await peer->async_write_some(chunk));
@@ -199,20 +195,25 @@ template<typename Stream>
                             }
                             chunk = chunk.subspan(*written);
                         }
-                        remaining -= static_cast<std::size_t>(bytes);
+                        remaining -= bytes;
                     }
                     tls_file_buffer.reset();
+#endif
                 }
             }
             state->finish_response();
         }
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         if constexpr (std::is_same_v<Stream, tls_stream>) {
             const auto closed = co_await peer->async_close();
             (void)closed;
             peer->close();
         } else {
+#endif
             peer->close();
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         }
+#endif
     } catch (...) {
         // Construction and response allocation failures retire the connection.
         if (registered) peer->close();
@@ -305,7 +306,7 @@ server::server(event_loop& loop, std::uint16_t port, std::string_view root,
                std::string_view address, server_options options)
     : tcp_acceptor(loop, ip_endpoint::parse(address, port), options.reuse_port), options_(options)
 {
-    root_descriptor_ = std::make_shared<unique_fd>(open_root(root));
+    root_descriptor_ = std::make_shared<unique_fd>(detail::open_root(root));
 }
 
 server::~server() = default;
@@ -331,12 +332,13 @@ auto server::accept_loop(event_loop& loop, server& listener,
     }
 }
 
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 https_server::https_server(event_loop& loop, std::uint16_t port,
                            std::shared_ptr<tls_context> context,
                            std::string_view root, std::string_view address,
                            server_options options)
     : tcp_acceptor(loop, ip_endpoint::parse(address, port), options.reuse_port),
-      root_descriptor_(std::make_shared<unique_fd>(open_root(root))),
+      root_descriptor_(std::make_shared<unique_fd>(detail::open_root(root))),
       context_(std::move(context)), options_(options)
 {
     if (!context_) throw std::invalid_argument("HTTPS context is required");
@@ -360,6 +362,7 @@ auto https_server::accept_loop(event_loop& loop, https_server& listener,
         if (result != task_spawn_result::accepted) accepted->reset();
     }
 }
+#endif
 
 redirect_server::redirect_server(event_loop& loop, std::uint16_t port,
                                  std::string_view hostname,

@@ -10,13 +10,13 @@
 #include <string_view>
 #include <vector>
 
-#include <sys/stat.h>
-
 namespace eventloop::http {
+
+namespace detail { struct file_info; }
 
 class session {
 public:
-    session(int root_descriptor, bool directory_listing = false) noexcept;
+    session(native_socket root_descriptor, bool directory_listing = false) noexcept;
     ~session() = default;
 
     session(const session&) = delete;
@@ -37,7 +37,7 @@ private:
     auto process_requests() -> void;
     auto handle_request(const request& parsed) -> void;
     auto serve_resource(const request& parsed, bool headers_only) -> void;
-    auto serve_file(unique_fd descriptor, const struct ::stat& info,
+    auto serve_file(unique_fd descriptor, const detail::file_info& info,
                     bool headers_only, std::string_view mime_path) -> void;
     auto serve_directory(unique_fd descriptor, bool headers_only) -> void;
     auto send_directory_redirect(std::string_view target) -> void;
@@ -51,7 +51,7 @@ private:
     [[nodiscard]] auto input_data() noexcept -> char*;
     [[nodiscard]] auto allocate_response(std::size_t size) -> std::span<char>;
 
-    int root_descriptor_;
+    native_socket root_descriptor_;
     std::array<char, 256> input_ {};
     std::unique_ptr<char[]> expanded_input_;
     std::vector<char> output_;

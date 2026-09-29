@@ -16,7 +16,7 @@ enum class resource_error {
 // Decode a request target and walk below root one component at a time.
 // Every opened component uses O_NOFOLLOW; open failures are left to the
 // caller to map to its protocol's response.
-[[nodiscard]] auto open_resource(int root, std::string_view target) noexcept
+[[nodiscard]] auto open_resource(native_socket root, std::string_view target) noexcept
     -> std::expected<unique_fd, resource_error>;
 
 } // namespace eventloop::http::detail

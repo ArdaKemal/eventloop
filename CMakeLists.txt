@@ -21,12 +21,20 @@ if(WIN32)
         src/tcp_stream.cc
         src/udp_socket.cc
         src/util/arg_parser.cc
+        src/http/request.cc
+        src/http/mime_types.cc
+        src/http/resource.cc
+        src/http/directory_listing.cc
+        src/http/session.cc
+        src/http/server.cc
         src/windows/iocp_loop.cc
+        src/windows/http_file_operations.cc
         src/windows/socket_operations.cc
     )
     if(EVENTLOOP_WINDOWS_TLS)
         target_sources(eventloop PRIVATE src/tls_stream.cc src/ws/web_socket.cpp)
         target_link_libraries(eventloop PUBLIC botan::botan)
+        target_compile_definitions(eventloop PUBLIC EVENTLOOP_WINDOWS_TLS=1)
     endif()
     add_library(eventloop::eventloop ALIAS eventloop)
     target_include_directories(eventloop PUBLIC
@@ -35,6 +43,7 @@ if(WIN32)
     )
     target_include_directories(eventloop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_features(eventloop PUBLIC cxx_std_23)
+    target_compile_definitions(eventloop PRIVATE NOMINMAX)
     target_link_libraries(eventloop PUBLIC ws2_32 mswsock Threads::Threads)
     if(BUILD_SHARED_LIBS)
         target_compile_definitions(eventloop PRIVATE EVENTLOOP_WINDOWS_SHARED=1)
@@ -43,6 +52,15 @@ if(WIN32)
         target_compile_options(eventloop PRIVATE /W4)
     endif()
     if(BUILD_TESTING)
+        add_executable(http_api_test tests/http_api.cc)
+        target_link_libraries(http_api_test PRIVATE eventloop::eventloop)
+        add_test(NAME http_api COMMAND http_api_test)
+        set_tests_properties(http_api PROPERTIES TIMEOUT 10)
+        if(EVENTLOOP_WINDOWS_TLS)
+            set_tests_properties(http_api PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:botan::botan>")
+        endif()
+
         add_executable(coroutine_smoke_test tests/coroutine_smoke.cc)
         target_link_libraries(coroutine_smoke_test PRIVATE eventloop::eventloop)
         add_test(NAME coroutine_smoke COMMAND coroutine_smoke_test)
@@ -91,6 +109,11 @@ if(WIN32)
         endif()
     endif()
 
+    if(EVENTLOOP_WINDOWS_TLS)
+        add_executable(http_server examples/http_server.cc)
+        target_link_libraries(http_server PRIVATE eventloop::eventloop)
+    endif()
+
     add_executable(executor_benchmark benchmark/executor_benchmark.cc)
     target_link_libraries(executor_benchmark PRIVATE eventloop::eventloop)
     add_executable(event_loop_benchmark benchmark/event_loop_benchmark.cc)
@@ -112,7 +135,6 @@ if(WIN32)
     )
     set(eventloop_windows_excluded_headers
         PATTERN "file_io.h" EXCLUDE
-        PATTERN "http" EXCLUDE
     )
     if(NOT EVENTLOOP_WINDOWS_TLS)
         list(APPEND eventloop_windows_excluded_headers
@@ -173,6 +195,7 @@ add_library(eventloop
     include/eventloop/util/arg_parser.h
     include/eventloop/ws/web_socket.h
     src/linux/epoll_loop.cc
+    src/linux/http_file_operations.cc
     src/linux/socket_operations.cc
     src/event_loop.cc
     src/executor/single_thread_executor.cc
@@ -287,6 +310,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 if(BUILD_TESTING)
+    add_executable(http_api_test tests/http_api.cc)
+    target_link_libraries(http_api_test PRIVATE eventloop::eventloop)
+    target_compile_options(http_api_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http_api COMMAND http_api_test)
+    set_tests_properties(http_api PROPERTIES TIMEOUT 10)
+
     add_executable(coroutine_smoke_test tests/coroutine_smoke.cc)
     target_link_libraries(coroutine_smoke_test PRIVATE eventloop::eventloop)
     target_compile_options(coroutine_smoke_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)

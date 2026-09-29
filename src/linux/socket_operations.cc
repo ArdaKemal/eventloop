@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <netinet/tcp.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -207,6 +208,20 @@ auto socket_operations::start_write(native_socket socket, const void* buffer,
     for (;;) {
         const auto result = ::send(socket, buffer, size, MSG_NOSIGNAL);
         if (result >= 0) return {.transferred = static_cast<std::size_t>(result)};
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return {.pending = true};
+        return {.error = code(errno)};
+    }
+}
+
+auto socket_operations::start_send_file(native_socket socket,
+                                        native_socket file, std::size_t size,
+                                        socket_operation&) noexcept -> socket_result
+{
+    for (;;) {
+        const auto result = ::sendfile(socket, file, nullptr, size);
+        if (result >= 0)
+            return {.transferred = static_cast<std::size_t>(result)};
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return {.pending = true};
         return {.error = code(errno)};
