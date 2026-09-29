@@ -10,6 +10,33 @@ namespace {
 constexpr ULONG_PTR wake_key = 1;
 constexpr ULONG_PTR stop_key = 2;
 
+#ifndef EVENTLOOP_WINDOWS_SHARED
+class winsock_runtime {
+public:
+    winsock_runtime()
+    {
+        WSADATA data {};
+        const int startup = ::WSAStartup(MAKEWORD(2, 2), &data);
+        if (startup != 0) {
+            throw std::system_error(startup, std::system_category(), "WSAStartup");
+        }
+    }
+
+    ~winsock_runtime() { ::WSACleanup(); }
+
+    winsock_runtime(const winsock_runtime&) = delete;
+    auto operator=(const winsock_runtime&) -> winsock_runtime& = delete;
+};
+
+auto ensure_winsock() -> void
+{
+    // In executable-linked builds, the process owns this Winsock reference.
+    // Shared builds cannot clean up from a C++ DLL static destructor.
+    static const winsock_runtime runtime;
+    (void)runtime;
+}
+#endif
+
 [[nodiscard]] auto timeout_for(
     std::optional<std::chrono::steady_clock::time_point> deadline,
     bool nonblocking) noexcept -> DWORD
@@ -29,15 +56,22 @@ constexpr ULONG_PTR stop_key = 2;
 
 iocp_loop::iocp_loop()
 {
+#ifdef EVENTLOOP_WINDOWS_SHARED
     WSADATA data {};
     const int startup = ::WSAStartup(MAKEWORD(2, 2), &data);
     if (startup != 0) {
         throw std::system_error(startup, std::system_category(), "WSAStartup");
     }
+#else
+    ensure_winsock();
+#endif
     port_ = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
     if (port_ == nullptr) {
+        const auto error = ::GetLastError();
+#ifdef EVENTLOOP_WINDOWS_SHARED
         ::WSACleanup();
-        throw std::system_error(static_cast<int>(::GetLastError()),
+#endif
+        throw std::system_error(static_cast<int>(error),
                                 std::system_category(), "CreateIoCompletionPort");
     }
 }
@@ -45,7 +79,9 @@ iocp_loop::iocp_loop()
 iocp_loop::~iocp_loop()
 {
     if (port_ != nullptr) ::CloseHandle(port_);
+#ifdef EVENTLOOP_WINDOWS_SHARED
     ::WSACleanup();
+#endif
 }
 
 auto iocp_loop::add_descriptor(native_socket descriptor, bool) -> void

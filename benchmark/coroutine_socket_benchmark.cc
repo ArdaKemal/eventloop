@@ -4,6 +4,7 @@
 
 #include <array>
 #include <charconv>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -16,9 +17,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 
 using namespace eventloop;
 
@@ -151,14 +156,24 @@ auto tcp_client(event_loop&, tcp_stream& socket,
     state.finish();
 }
 
-auto bound_port(int descriptor) -> std::uint16_t
+auto bound_port(native_socket descriptor) -> std::uint16_t
 {
     sockaddr_in endpoint {};
+#ifdef _WIN32
+    int length = sizeof(endpoint);
+    if (::getsockname(static_cast<SOCKET>(descriptor),
+                      reinterpret_cast<sockaddr*>(&endpoint), &length) ==
+        SOCKET_ERROR) {
+        throw std::system_error(::WSAGetLastError(), std::system_category(),
+                                "getsockname");
+    }
+#else
     socklen_t length = sizeof(endpoint);
     if (::getsockname(descriptor, reinterpret_cast<sockaddr*>(&endpoint),
                       &length) == -1) {
         throw std::system_error(errno, std::system_category(), "getsockname");
     }
+#endif
     return ntohs(endpoint.sin_port);
 }
 

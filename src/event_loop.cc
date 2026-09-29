@@ -52,7 +52,12 @@ namespace eventloop {
 namespace {
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
 constexpr std::size_t max_timers_per_iteration = 64;
+#ifdef _WIN32
+constexpr std::size_t coroutine_frame_alignment =
+    std::max<std::size_t>(alignof(std::max_align_t), 16);
+#else
 constexpr std::size_t coroutine_frame_alignment = alignof(std::max_align_t);
+#endif
 static_assert(coroutine_frame_alignment >= alignof(std::max_align_t));
 
 auto poison_memory(void* pointer, std::size_t size) noexcept -> void

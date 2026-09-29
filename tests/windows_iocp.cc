@@ -1,16 +1,71 @@
 #include "windows/iocp_loop.h"
+#include "eventloop/event_loop.h"
 
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace {
 auto check(bool condition, const char* message) -> void
 {
     if (!condition) throw std::runtime_error(message);
+}
+
+auto check_winsock_active() -> void
+{
+    const SOCKET socket = ::WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP,
+                                       nullptr, 0, WSA_FLAG_OVERLAPPED);
+    check(socket != INVALID_SOCKET, "Winsock stopped while loops use it");
+    ::closesocket(socket);
+}
+
+auto test_runtime_lifetime() -> void
+{
+    constexpr int thread_count = 8;
+    constexpr int rounds = 32;
+    std::barrier rendezvous(thread_count);
+    std::array<std::exception_ptr, thread_count> errors {};
+    std::vector<std::jthread> threads;
+    threads.reserve(thread_count);
+    for (int index = 0; index < thread_count; ++index) {
+        threads.emplace_back([&, index] {
+            try {
+                for (int round = 0; round < rounds; ++round) {
+                    eventloop::iocp_loop loop;
+                    rendezvous.arrive_and_wait();
+                    check_winsock_active();
+                    rendezvous.arrive_and_wait();
+                }
+            } catch (...) {
+                errors[index] = std::current_exception();
+                rendezvous.arrive_and_drop();
+            }
+        });
+    }
+    threads.clear(); // Join before checking worker failures.
+    for (const auto& error : errors) {
+        if (error) std::rethrow_exception(error);
+    }
+#ifndef EVENTLOOP_WINDOWS_SHARED
+    check_winsock_active();
+#endif
+    for (int index = 0; index < 128; ++index) {
+        eventloop::iocp_loop loop;
+        check_winsock_active();
+    }
+    for (int index = 0; index < 16; ++index) {
+        eventloop::event_loop loop;
+        check_winsock_active();
+    }
+#ifndef EVENTLOOP_WINDOWS_SHARED
+    check_winsock_active(); // Last loop is gone; cleanup belongs to process exit.
+#endif
 }
 } // namespace
 
@@ -18,6 +73,7 @@ auto main() -> int
 {
     try {
         using namespace std::chrono_literals;
+        test_runtime_lifetime();
         eventloop::iocp_loop loop;
         std::array<eventloop::ready_event, 8> events {};
 
