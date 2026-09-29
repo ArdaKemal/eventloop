@@ -385,7 +385,8 @@ auto h2_request_client(event_loop& loop, tls_stream& peer,
     auto client_context = tls_context::make_client(certificate);
     event_loop loop;
     auto listener = std::make_unique<http::https_server>(
-        loop, 0, std::move(server_context), root.string(), "127.0.0.1");
+        loop, 0, std::move(server_context), root.string(), "127.0.0.1",
+        http::server_options {.enable_http2 = true});
     auto* server = listener.get();
     const auto port = listener_port(*server);
     auto client = std::make_unique<tls_stream>(

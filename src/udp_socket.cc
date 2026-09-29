@@ -27,7 +27,10 @@ namespace {
 {
     if (!result.error) return static_cast<int>(result.transferred);
 #ifdef _WIN32
-    if (result.error.value() == WSAEMSGSIZE) return -EMSGSIZE;
+    if (result.error.value() == WSAEMSGSIZE ||
+        result.error.value() == ERROR_MORE_DATA) return -EMSGSIZE;
+    if (result.error.value() == WSAEINVAL ||
+        result.error.value() == ERROR_INVALID_PARAMETER) return -EINVAL;
     if (result.error.value() == ERROR_OPERATION_ABORTED) return -ECANCELED;
     return -EIO;
 #else
@@ -47,7 +50,9 @@ udp_socket::udp_socket(event_loop& loop, ip_endpoint endpoint,
 {
     descriptor_.reset(detail::socket_operations::create(
         detail::socket_family(endpoint), SOCK_DGRAM, 0));
+#ifdef _WIN32
     registered_descriptor_ = descriptor_.get();
+#endif
     detail::socket_operations::prepare_datagram(descriptor_.get(), endpoint,
                                                 reuse_port);
 }
@@ -56,7 +61,11 @@ udp_socket::~udp_socket()
 {
     // Removing a socket with an active awaiter would leave a coroutine with a
     // dangling socket reference. Cancel its task before removing the handler.
-    if (receive_ != nullptr || send_ != nullptr || pending_operations_ != 0)
+    if (receive_ != nullptr || send_ != nullptr
+#ifdef _WIN32
+        || pending_operations_ != 0
+#endif
+    )
         std::terminate();
 }
 
@@ -75,6 +84,7 @@ auto udp_socket::close() -> void
     event_loop::handler_call_scope scope(loop_);
     if (closing_) return;
     closing_ = true;
+#ifdef _WIN32
     const bool receive_kernel = receive_ != nullptr &&
                                 receive_->operation_.pending_completion;
     const bool send_kernel = send_ != nullptr &&
@@ -94,6 +104,10 @@ auto udp_socket::close() -> void
     }
     if (pending_operations_ != 0) descriptor_.reset();
     else loop_.remove(registered_descriptor_);
+#else
+    complete_pending(-ECANCELED);
+    loop_.remove(descriptor_.get());
+#endif
 }
 
 auto udp_socket::async_receive_from(std::span<std::byte> buffer) noexcept
@@ -114,6 +128,7 @@ udp_socket::receive_awaiter::receive_awaiter(
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
+#ifdef _WIN32
     operation_.context = this;
     operation_.complete = [](detail::socket_operation& operation,
                              std::size_t bytes, int error) noexcept {
@@ -128,6 +143,7 @@ udp_socket::receive_awaiter::receive_awaiter(
         self.socket_.complete_receive(
             value, detail::socket_operations::received_source(operation));
     };
+#endif
 }
 
 auto udp_socket::receive_awaiter::start(
@@ -149,8 +165,14 @@ auto udp_socket::receive_awaiter::start(
         return false;
     }
     socket_.receive_ = this;
+#ifdef _WIN32
     const auto result = detail::socket_operations::start_receive_from(
         socket_.descriptor_.get(), buffer_.data(), buffer_.size(), operation_);
+#else
+    detail::socket_operation operation;
+    const auto result = detail::socket_operations::start_receive_from(
+        socket_.descriptor_.get(), buffer_.data(), buffer_.size(), operation);
+#endif
     if (!result.pending) {
         socket_.receive_ = nullptr;
         detail::coroutine_frame_access::detach_cancellation(cancellation_);
@@ -158,7 +180,9 @@ auto udp_socket::receive_awaiter::start(
         source_ = result.source;
         return false;
     }
+#ifdef _WIN32
     if (operation_.pending_completion) ++socket_.pending_operations_;
+#endif
     bool armed = false;
     try {
         socket_.update_interest();
@@ -186,8 +210,12 @@ auto udp_socket::receive_awaiter::cancel(
 {
     auto& self = *static_cast<receive_awaiter*>(node.operation);
     detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
+#ifdef _WIN32
     if (self.operation_.pending_completion) self.socket_.close();
     else self.socket_.complete_receive(-ECANCELED);
+#else
+    self.socket_.complete_receive(-ECANCELED);
+#endif
 }
 
 udp_socket::send_awaiter::send_awaiter(
@@ -197,6 +225,7 @@ udp_socket::send_awaiter::send_awaiter(
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
+#ifdef _WIN32
     operation_.context = this;
     operation_.complete = [](detail::socket_operation& operation,
                              std::size_t bytes, int error) noexcept {
@@ -209,6 +238,7 @@ udp_socket::send_awaiter::send_awaiter(
         self.socket_.complete_send(self.cancelled_ || self.socket_.closing_
                                        ? -ECANCELED : numeric_result(result));
     };
+#endif
 }
 
 auto udp_socket::send_awaiter::start(
@@ -230,16 +260,25 @@ auto udp_socket::send_awaiter::start(
         return false;
     }
     socket_.send_ = this;
+#ifdef _WIN32
     const auto result = detail::socket_operations::start_send_to(
         socket_.descriptor_.get(), buffer_.data(), buffer_.size(),
         destination_, operation_);
+#else
+    detail::socket_operation operation;
+    const auto result = detail::socket_operations::start_send_to(
+        socket_.descriptor_.get(), buffer_.data(), buffer_.size(),
+        destination_, operation);
+#endif
     if (!result.pending) {
         socket_.send_ = nullptr;
         detail::coroutine_frame_access::detach_cancellation(cancellation_);
         result_ = numeric_result(result);
         return false;
     }
+#ifdef _WIN32
     if (operation_.pending_completion) ++socket_.pending_operations_;
+#endif
     bool armed = false;
     try {
         socket_.update_interest();
@@ -267,8 +306,12 @@ auto udp_socket::send_awaiter::cancel(
 {
     auto& self = *static_cast<send_awaiter*>(node.operation);
     detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
+#ifdef _WIN32
     if (self.operation_.pending_completion) self.socket_.close();
     else self.socket_.complete_send(-ECANCELED);
+#else
+    self.socket_.complete_send(-ECANCELED);
+#endif
 }
 
 auto udp_socket::update_interest() -> void
@@ -283,17 +326,21 @@ auto udp_socket::complete_receive(int result, ip_endpoint source) noexcept
     event_loop::handler_call_scope scope(loop_);
     auto* operation = std::exchange(receive_, nullptr);
     if (operation == nullptr) return;
+#ifdef _WIN32
     if (operation->operation_.pending_completion) {
         operation->operation_.pending_completion = false;
         if (pending_operations_ == 0) std::terminate();
         --pending_operations_;
     }
+#endif
     detail::coroutine_frame_access::detach_cancellation(
         operation->cancellation_);
     operation->result_ = result;
     operation->source_ = source;
+#ifdef _WIN32
     if (closing_ && pending_operations_ == 0)
         loop_.remove(registered_descriptor_);
+#endif
     try {
         update_interest();
     } catch (...) {
@@ -308,16 +355,20 @@ auto udp_socket::complete_send(int result) noexcept -> void
     event_loop::handler_call_scope scope(loop_);
     auto* operation = std::exchange(send_, nullptr);
     if (operation == nullptr) return;
+#ifdef _WIN32
     if (operation->operation_.pending_completion) {
         operation->operation_.pending_completion = false;
         if (pending_operations_ == 0) std::terminate();
         --pending_operations_;
     }
+#endif
     detail::coroutine_frame_access::detach_cancellation(
         operation->cancellation_);
     operation->result_ = result;
+#ifdef _WIN32
     if (closing_ && pending_operations_ == 0)
         loop_.remove(registered_descriptor_);
+#endif
     try {
         update_interest();
     } catch (...) {
@@ -359,18 +410,32 @@ auto udp_socket::complete_pending(int result) noexcept -> void
 auto udp_socket::on_read() -> void
 {
     if (receive_ == nullptr) return;
+#ifdef _WIN32
     const auto result = detail::socket_operations::start_receive_from(
         descriptor_.get(), receive_->buffer_.data(), receive_->buffer_.size(),
         receive_->operation_);
+#else
+    detail::socket_operation operation;
+    const auto result = detail::socket_operations::start_receive_from(
+        descriptor_.get(), receive_->buffer_.data(), receive_->buffer_.size(),
+        operation);
+#endif
     if (!result.pending) complete_receive(numeric_result(result), result.source);
 }
 
 auto udp_socket::on_write() -> void
 {
     if (send_ == nullptr) return;
+#ifdef _WIN32
     const auto result = detail::socket_operations::start_send_to(
         descriptor_.get(), send_->buffer_.data(), send_->buffer_.size(),
         send_->destination_, send_->operation_);
+#else
+    detail::socket_operation operation;
+    const auto result = detail::socket_operations::start_send_to(
+        descriptor_.get(), send_->buffer_.data(), send_->buffer_.size(),
+        send_->destination_, operation);
+#endif
     if (!result.pending) complete_send(numeric_result(result));
 }
 

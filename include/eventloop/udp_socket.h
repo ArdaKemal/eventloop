@@ -4,7 +4,9 @@
 #include "eventloop/detail/notifiable.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/unique_fd.h"
+#ifdef _WIN32
 #include "eventloop/detail/socket_operation.h"
+#endif
 
 #include <array>
 #include <coroutine>
@@ -31,7 +33,11 @@ public:
     udp_socket(const udp_socket&) = delete;
     auto operator=(const udp_socket&) -> udp_socket& = delete;
 
+#ifdef _WIN32
     [[nodiscard]] auto descriptor() const noexcept -> native_socket override;
+#else
+    [[nodiscard]] auto descriptor() const noexcept -> int override;
+#endif
     [[nodiscard]] auto local_endpoint() const -> ip_endpoint;
     auto close() -> void;
 
@@ -75,8 +81,10 @@ public:
         detail::coroutine_cancellation_node cancellation_ {};
         ip_endpoint source_;
         int result_ {0};
+#ifdef _WIN32
         detail::socket_operation operation_ {};
         bool cancelled_ {false};
+#endif
     };
 
     class send_awaiter {
@@ -115,8 +123,10 @@ public:
         std::coroutine_handle<> continuation_ {};
         detail::coroutine_cancellation_node cancellation_ {};
         int result_ {0};
+#ifdef _WIN32
         detail::socket_operation operation_ {};
         bool cancelled_ {false};
+#endif
     };
 
     [[nodiscard]] auto async_receive_from(std::span<std::byte> buffer) noexcept
@@ -149,8 +159,10 @@ private:
     receive_awaiter* receive_ {nullptr};
     send_awaiter* send_ {nullptr};
     bool closing_ {false};
+#ifdef _WIN32
     native_socket registered_descriptor_ {static_cast<native_socket>(-1)};
     std::size_t pending_operations_ {0};
+#endif
 };
 
 } // namespace eventloop

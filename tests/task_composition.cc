@@ -2,21 +2,58 @@
 
 #include <chrono>
 #include <atomic>
+#include <array>
 #include <cstdlib>
 #include <expected>
 #include <exception>
 #include <iostream>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <system_error>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 using namespace eventloop;
 
 using namespace std::chrono_literals;
 
 namespace {
+#ifdef _WIN32
+auto child_exits_77(const wchar_t* argument) -> bool
+{
+    std::array<wchar_t, MAX_PATH> path {};
+    const auto length = ::GetModuleFileNameW(nullptr, path.data(),
+                                              static_cast<DWORD>(path.size()));
+    if (length == 0 || length == path.size()) return false;
+    std::wstring command = L"\"" + std::wstring(path.data()) + L"\" " + argument;
+    STARTUPINFOW startup {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process {};
+    if (!::CreateProcessW(path.data(), command.data(), nullptr, nullptr, FALSE,
+                          CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                          &process)) return false;
+    ::CloseHandle(process.hThread);
+    const auto wait = ::WaitForSingleObject(process.hProcess, 5000);
+    if (wait != WAIT_OBJECT_0) {
+        ::TerminateProcess(process.hProcess, 1);
+        ::WaitForSingleObject(process.hProcess, INFINITE);
+    }
+    DWORD code = 0;
+    const bool passed = wait == WAIT_OBJECT_0 &&
+                        ::GetExitCodeProcess(process.hProcess, &code) && code == 77;
+    ::CloseHandle(process.hProcess);
+    return passed;
+}
+#endif
 auto value(event_loop&, int number) -> task<int> { co_return number; }
 auto no_value(event_loop&) -> task<void> { co_return; }
 auto later(event_loop& loop, int number, std::chrono::milliseconds delay,
@@ -95,6 +132,7 @@ auto invalid_immediate_timeout_root(event_loop& loop, event_loop& foreign,
     if (started) (void)operation.start();
     (void)co_await with_timeout(loop, std::move(operation), 0ms);
 }
+#ifndef _WIN32
 auto immediate_timeout_validation_test() -> bool
 {
     for (const bool started : {false, true}) {
@@ -114,6 +152,13 @@ auto immediate_timeout_validation_test() -> bool
     }
     return true;
 }
+#else
+auto immediate_timeout_validation_test() -> bool
+{
+    return child_exits_77(L"--invalid-immediate-foreign") &&
+           child_exits_77(L"--invalid-immediate-started");
+}
+#endif
 auto blocking_child(event_loop& loop, std::atomic<bool>& release,
                     bool& cancelled) -> task<int>
 {
@@ -252,8 +297,23 @@ auto run_case(auto factory) -> bool
     return passed && loop.coroutine_statistics().live == 0;
 }
 }
-int main()
+int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    if (argc == 2) {
+        const std::string_view mode = argv[1];
+        if (mode == "--invalid-immediate-foreign" ||
+            mode == "--invalid-immediate-started") {
+            std::set_terminate([] { std::_Exit(77); });
+            event_loop loop;
+            event_loop foreign;
+            (void)loop.spawn(invalid_immediate_timeout_root(
+                loop, foreign, mode == "--invalid-immediate-started"));
+            return 1;
+        }
+        return 1;
+    }
+#endif
     bool a = run_case(all_root);
     bool b = run_case(delayed_all_root);
     bool c = run_case(race_root);

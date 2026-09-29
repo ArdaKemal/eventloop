@@ -1,6 +1,7 @@
 #include "eventloop/task.h"
 
 #include <chrono>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -9,10 +10,20 @@
 #include <iostream>
 #include <new>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <thread>
 
+#ifdef _WIN32
+#include <malloc.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 using namespace eventloop;
 
@@ -30,22 +41,67 @@ auto operator new(std::size_t size) -> void*
 auto operator new(std::size_t size, std::align_val_t alignment) -> void*
 {
     ++allocations;
+#ifdef _WIN32
+    if (void* memory = _aligned_malloc(size, static_cast<std::size_t>(alignment))) {
+        return memory;
+    }
+#else
     void* memory = nullptr;
     if (posix_memalign(&memory, static_cast<std::size_t>(alignment), size) == 0) {
         return memory;
     }
+#endif
     throw std::bad_alloc {};
 }
 
 void operator delete(void* memory) noexcept { std::free(memory); }
 void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
-void operator delete(void* memory, std::align_val_t) noexcept { std::free(memory); }
+void operator delete(void* memory, std::align_val_t) noexcept
+{
+#ifdef _WIN32
+    _aligned_free(memory);
+#else
+    std::free(memory);
+#endif
+}
 void operator delete(void* memory, std::size_t, std::align_val_t) noexcept
 {
+#ifdef _WIN32
+    _aligned_free(memory);
+#else
     std::free(memory);
+#endif
 }
 
 namespace {
+
+#ifdef _WIN32
+auto child_exits_77(const wchar_t* argument) -> bool
+{
+    std::array<wchar_t, MAX_PATH> path {};
+    const auto length = ::GetModuleFileNameW(nullptr, path.data(),
+                                              static_cast<DWORD>(path.size()));
+    if (length == 0 || length == path.size()) return false;
+    std::wstring command = L"\"" + std::wstring(path.data()) + L"\" " + argument;
+    STARTUPINFOW startup {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process {};
+    if (!::CreateProcessW(path.data(), command.data(), nullptr, nullptr, FALSE,
+                          CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                          &process)) return false;
+    ::CloseHandle(process.hThread);
+    const auto wait = ::WaitForSingleObject(process.hProcess, 5000);
+    if (wait != WAIT_OBJECT_0) {
+        ::TerminateProcess(process.hProcess, 1);
+        ::WaitForSingleObject(process.hProcess, INFINITE);
+    }
+    DWORD code = 0;
+    const bool passed = wait == WAIT_OBJECT_0 &&
+                        ::GetExitCodeProcess(process.hProcess, &code) && code == 77;
+    ::CloseHandle(process.hProcess);
+    return passed;
+}
+#endif
 
 auto increment(event_loop&, int& value) -> task<void>
 {
@@ -65,6 +121,7 @@ auto foreign_awaiter_root(event_loop& owner, event_loop& foreign, int kind)
     else (void)co_await run_blocking(foreign, []() noexcept {});
 }
 
+#ifndef _WIN32
 auto wrong_loop_awaiter_test() -> bool
 {
     for (int kind = 0; kind < 4; ++kind) {
@@ -83,6 +140,18 @@ auto wrong_loop_awaiter_test() -> bool
     }
     return true;
 }
+#else
+auto wrong_loop_awaiter_test() -> bool
+{
+    constexpr std::array arguments {
+        L"--wrong-loop-yield", L"--wrong-loop-timer",
+        L"--wrong-loop-immediate-timer", L"--wrong-loop-blocking"};
+    for (const auto* argument : arguments) {
+        if (!child_exits_77(argument)) return false;
+    }
+    return true;
+}
+#endif
 
 auto value_task(event_loop&) -> task<int> { co_return 42; }
 
@@ -208,6 +277,7 @@ auto cancellable_blocking_root(event_loop& loop, std::atomic<bool>& started,
     if (!result) error = result.error();
 }
 
+#ifndef _WIN32
 auto active_worker_destruction_test() -> bool
 {
     const pid_t child = ::fork();
@@ -235,6 +305,12 @@ auto active_worker_destruction_test() -> bool
     return ::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
            WEXITSTATUS(status) == 77;
 }
+#else
+auto active_worker_destruction_test() -> bool
+{
+    return child_exits_77(L"--active-worker-destruction");
+}
+#endif
 
 auto rejected_blocking_root(event_loop& loop, bool& ran,
                             blocking_error& error) -> task<void>
@@ -336,6 +412,17 @@ auto bounded_growth_and_release_test() -> bool
     options.coroutine_frame_initial_capacities.back() = 1;
     event_loop loop(options);
     const auto before_growth = allocations;
+#if defined(_WIN32) && defined(EVENTLOOP_TEST_SHARED_LIBRARY)
+    // An eventloop DLL uses its own operator new; executable interposition
+    // does not observe its slab allocations.
+    const auto growth_allocations_valid = [&] {
+        return allocations == before_growth;
+    };
+#else
+    const auto growth_allocations_valid = [&] {
+        return allocations == before_growth + 2;
+    };
+#endif
     int value = 0;
     {
         auto first = increment(loop, value);
@@ -349,7 +436,7 @@ auto bounded_growth_and_release_test() -> bool
             rejected.state() != task_state::frame_allocation_failure ||
             statistics.capacity != 3 || statistics.backed_capacity != 3 ||
             statistics.live != 3 || statistics.allocation_failures != 1 ||
-            allocations != before_growth + 2) {
+            !growth_allocations_valid()) {
             return false;
         }
     }
@@ -649,10 +736,48 @@ auto spawn_failure_test() -> bool
            value == 0;
 }
 
+#ifdef _WIN32
+auto run_child_mode(std::string_view mode) -> int
+{
+    std::set_terminate([] { std::_Exit(77); });
+    constexpr std::array modes {
+        std::string_view {"--wrong-loop-yield"},
+        std::string_view {"--wrong-loop-timer"},
+        std::string_view {"--wrong-loop-immediate-timer"},
+        std::string_view {"--wrong-loop-blocking"}};
+    for (int kind = 0; kind < static_cast<int>(modes.size()); ++kind) {
+        if (mode == modes[static_cast<std::size_t>(kind)]) {
+            event_loop owner;
+            event_loop foreign(event_loop_options {.worker_count = 1});
+            (void)owner.spawn(foreign_awaiter_root(owner, foreign, kind));
+            return 1;
+        }
+    }
+    if (mode == "--active-worker-destruction") {
+        std::atomic<bool> started {false};
+        std::atomic<bool> release {false};
+        blocking_error error = blocking_error::cancelled;
+        {
+            event_loop loop(event_loop_options {.worker_count = 1});
+            if (loop.spawn(cancellable_blocking_root(loop, started, release,
+                                                    error)) !=
+                task_spawn_result::accepted) return 1;
+            while (!started.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        }
+        return 1;
+    }
+    return 1;
+}
+#endif
 } // namespace
 
-auto main() -> int
+auto main(int argc, char** argv) -> int
 {
+#ifdef _WIN32
+    if (argc == 2) return run_child_mode(argv[1]);
+#endif
     if (!wrong_loop_awaiter_test()) {
         std::cerr << "wrong-loop awaiter test failed\n";
         return 1;

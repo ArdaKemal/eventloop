@@ -74,6 +74,47 @@ if(WIN32)
         target_link_libraries(coroutine_smoke_test PRIVATE eventloop::eventloop)
         add_test(NAME coroutine_smoke COMMAND coroutine_smoke_test)
 
+        add_executable(event_loop_test tests/event_loop.cc)
+        target_link_libraries(event_loop_test PRIVATE eventloop::eventloop)
+        add_test(NAME event_loop COMMAND event_loop_test)
+
+        add_executable(executor_test tests/executor.cc)
+        target_include_directories(executor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(executor_test PRIVATE eventloop::eventloop)
+        add_test(NAME executor COMMAND executor_test)
+        set_tests_properties(executor PROPERTIES TIMEOUT 30)
+
+        add_executable(task_test tests/task.cc)
+        target_link_libraries(task_test PRIVATE eventloop::eventloop)
+        if(BUILD_SHARED_LIBS)
+            target_compile_definitions(task_test PRIVATE
+                EVENTLOOP_TEST_SHARED_LIBRARY=1)
+        endif()
+        add_test(NAME task COMMAND task_test)
+
+        add_executable(task_composition_test tests/task_composition.cc)
+        target_link_libraries(task_composition_test PRIVATE eventloop::eventloop)
+        add_test(NAME task_composition COMMAND task_composition_test)
+
+        add_executable(task_handle_test tests/task_handle.cc)
+        target_link_libraries(task_handle_test PRIVATE eventloop::eventloop)
+        add_test(NAME task_handle COMMAND task_handle_test)
+
+        add_executable(file_io_test tests/file_io.cc)
+        target_link_libraries(file_io_test PRIVATE eventloop::eventloop)
+        add_test(NAME file_io COMMAND file_io_test)
+        set_tests_properties(file_io PROPERTIES TIMEOUT 10)
+
+        add_executable(coroutine_tcp_test tests/tcp_coroutine.cc)
+        target_link_libraries(coroutine_tcp_test PRIVATE eventloop::eventloop)
+        add_test(NAME coroutine_tcp COMMAND coroutine_tcp_test)
+        set_tests_properties(coroutine_tcp PROPERTIES TIMEOUT 10)
+
+        add_executable(coroutine_udp_test tests/udp_coroutine.cc)
+        target_link_libraries(coroutine_udp_test PRIVATE eventloop::eventloop)
+        add_test(NAME coroutine_udp COMMAND coroutine_udp_test)
+        set_tests_properties(coroutine_udp PROPERTIES TIMEOUT 10)
+
         add_executable(socket_api_test tests/socket_api.cc)
         target_link_libraries(socket_api_test PRIVATE eventloop::eventloop)
         if(EVENTLOOP_WINDOWS_TLS)
@@ -115,12 +156,43 @@ if(WIN32)
             add_executable(web_socket_test tests/web_socket.cc)
             target_link_libraries(web_socket_test PRIVATE eventloop::eventloop)
             add_test(NAME web_socket COMMAND web_socket_test)
+
+            add_executable(http2_hpack_test tests/http2_hpack.cc)
+            target_include_directories(http2_hpack_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            target_link_libraries(http2_hpack_test PRIVATE eventloop::eventloop)
+            add_test(NAME http2_hpack COMMAND http2_hpack_test)
+        endif()
+
+        if(EVENTLOOP_WINDOWS_TLS)
+            set_tests_properties(
+                event_loop executor task task_composition task_handle file_io
+                coroutine_tcp coroutine_udp
+                http2_hpack PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:botan::botan>")
         endif()
     endif()
+
+    add_executable(tcp_echo examples/tcp_echo.cc)
+    target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)
+
+    add_executable(http_benchmark_server examples/http_benchmark_server.cc)
+    target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
+
+    add_executable(file_io_benchmark benchmark/file_io_benchmark.cc)
+    target_link_libraries(file_io_benchmark PRIVATE eventloop::eventloop)
 
     if(EVENTLOOP_WINDOWS_TLS)
         add_executable(http_server examples/http_server.cc)
         target_link_libraries(http_server PRIVATE eventloop::eventloop)
+
+        add_executable(tls_echo examples/tls_echo.cc)
+        target_link_libraries(tls_echo PRIVATE eventloop::eventloop)
+
+        add_executable(http_client
+            examples/http_client.cc
+            examples/http_client_url.cc
+            examples/http_client_resolve.cc)
+        target_link_libraries(http_client PRIVATE eventloop::eventloop)
     endif()
 
     add_executable(executor_benchmark benchmark/executor_benchmark.cc)
@@ -142,9 +214,7 @@ if(WIN32)
         LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
         RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
     )
-    set(eventloop_windows_excluded_headers
-        PATTERN "file_io.h" EXCLUDE
-    )
+    set(eventloop_windows_excluded_headers)
     if(NOT EVENTLOOP_WINDOWS_TLS)
         list(APPEND eventloop_windows_excluded_headers
             PATTERN "tls_context.h" EXCLUDE

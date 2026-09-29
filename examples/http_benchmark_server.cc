@@ -69,6 +69,12 @@ auto main(int argc, char* argv[]) -> int
         const auto threads =
             argc == 4 ? parse_threads(argv[3]) : std::size_t {1};
 
+#ifdef _WIN32
+        if (threads != 1) {
+            throw std::invalid_argument(
+                "multiple listener threads require SO_REUSEPORT");
+        }
+#endif
         if (threads == 1) {
             serve(port, argv[1], false);
             return 0;

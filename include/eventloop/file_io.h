@@ -19,7 +19,14 @@
 #include <utility>
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#ifndef AT_FDCWD
+#define AT_FDCWD (-100)
+#endif
+#else
 #include <unistd.h>
+#endif
 
 namespace eventloop {
 
@@ -60,7 +67,11 @@ public:
         : loop_(loop), operation_(Kind)
     {
         operation_.descriptor = directory;
+#ifdef _WIN32
+        operation_.flags = flags;
+#else
         operation_.flags = flags | O_CLOEXEC;
+#endif
         operation_.mode = mode;
         if (path.empty() || path.size() >= path_.size()) {
             result_ = -ENAMETOOLONG;
@@ -132,7 +143,13 @@ public:
                                                     std::generic_category()));
         }
         if constexpr (Kind == detail::file_opcode::openat) {
+#ifdef _WIN32
+            return unique_fd(static_cast<native_socket>(
+                                 std::exchange(result_, -1)),
+                             unique_fd::kind::file);
+#else
             return unique_fd(std::exchange(result_, -1));
+#endif
         } else {
             return static_cast<value_type>(result_);
         }
@@ -158,7 +175,13 @@ private:
             operation.cancellation);
         if (operation.cancelled.load(std::memory_order_acquire)) {
             if constexpr (Kind == detail::file_opcode::openat) {
-                if (result >= 0) (void)::close(result);
+                if (result >= 0) {
+#ifdef _WIN32
+                    (void)::_close(result);
+#else
+                    (void)::close(result);
+#endif
+                }
             }
             result = -ECANCELED;
         }

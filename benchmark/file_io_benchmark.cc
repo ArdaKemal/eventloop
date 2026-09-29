@@ -5,13 +5,22 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <filesystem>
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
 #include <span>
+#include <string>
 #include <system_error>
-#include <unistd.h>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#include <share.h>
+#include <sys/stat.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace eventloop;
 
@@ -22,26 +31,71 @@ constexpr std::size_t operation_count = 100'000;
 constexpr std::size_t concurrent_tasks = 16;
 
 struct temporary_file {
-    std::array<char, 40> path {"/tmp/eventloop-file-bench-XXXXXX"};
+    std::filesystem::path path;
     int descriptor {-1};
 
     temporary_file()
     {
-        descriptor = ::mkstemp(path.data());
+#ifdef _WIN32
+        const auto directory = std::filesystem::temp_directory_path();
+        const auto seed = clock::now().time_since_epoch().count();
+        for (unsigned attempt = 0; attempt < 100 && descriptor == -1;
+             ++attempt) {
+            path = directory /
+                   ("eventloop-file-bench-" + std::to_string(seed) + "-" +
+                    std::to_string(attempt));
+            const auto error = ::_wsopen_s(
+                &descriptor, path.c_str(),
+                _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY,
+                _SH_DENYNO, _S_IREAD | _S_IWRITE);
+            if (error != 0 && error != EEXIST) {
+                throw std::system_error(error, std::generic_category(),
+                                        "create benchmark file");
+            }
+        }
+#else
+        path = "/tmp/eventloop-file-bench-XXXXXX";
+        auto native_path = path.string();
+        descriptor = ::mkstemp(native_path.data());
+        if (descriptor != -1) path = native_path;
+#endif
         if (descriptor == -1) {
-            throw std::system_error(errno, std::generic_category(), "mkstemp");
+            throw std::system_error(errno, std::generic_category(),
+                                    "create benchmark file");
         }
         std::array<std::byte, 4096> block {};
-        if (::write(descriptor, block.data(), block.size()) !=
-            static_cast<ssize_t>(block.size())) {
-            throw std::system_error(errno, std::generic_category(), "write");
+#ifdef _WIN32
+        const auto written = ::_write(descriptor, block.data(),
+                                     static_cast<unsigned int>(block.size()));
+#else
+        const auto written = ::write(descriptor, block.data(), block.size());
+#endif
+        if (written != static_cast<decltype(written)>(block.size())) {
+            const auto error = errno;
+            close_descriptor();
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+            throw std::system_error(error, std::generic_category(), "write");
         }
     }
 
     ~temporary_file()
     {
-        if (descriptor != -1) (void)::close(descriptor);
-        (void)::unlink(path.data());
+        close_descriptor();
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+
+private:
+    auto close_descriptor() noexcept -> void
+    {
+        if (descriptor == -1) return;
+#ifdef _WIN32
+        (void)::_close(descriptor);
+#else
+        (void)::close(descriptor);
+#endif
+        descriptor = -1;
     }
 };
 

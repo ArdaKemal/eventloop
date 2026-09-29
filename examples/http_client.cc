@@ -7,16 +7,24 @@
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
 
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#include <ws2tcpip.h>
+#else
 #include <netdb.h>
 #include <unistd.h>
+#endif
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <expected>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -52,7 +60,14 @@ using http_client_example::url_parts;
 [[nodiscard]] auto write_stdout(std::span<const std::byte> bytes) -> bool
 {
     while (!bytes.empty()) {
+#ifdef _WIN32
+        const auto length = static_cast<unsigned int>(std::min(
+            bytes.size(), static_cast<std::size_t>(
+                              std::numeric_limits<int>::max())));
+        const auto count = ::_write(::_fileno(stdout), bytes.data(), length);
+#else
         const auto count = ::write(STDOUT_FILENO, bytes.data(), bytes.size());
+#endif
         if (count < 0 && errno == EINTR) continue;
         if (count <= 0) return false;
         bytes = bytes.subspan(static_cast<std::size_t>(count));
@@ -186,6 +201,12 @@ auto main(int argc, char* argv[]) -> int
         return 2;
     }
     try {
+#ifdef _WIN32
+        if (::_setmode(::_fileno(stdout), _O_BINARY) == -1) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "set stdout binary mode");
+        }
+#endif
         auto url = parse_url(argv[1]);
         eventloop::event_loop_options options;
         options.worker_count = 1;

@@ -9,8 +9,10 @@
 #include <system_error>
 #include <thread>
 
+#ifndef _WIN32
 #include <sys/timerfd.h>
 #include <unistd.h>
+#endif
 
 using namespace eventloop;
 
@@ -218,6 +220,7 @@ auto shutdown_tests() -> bool
     }
 }
 
+#ifndef _WIN32
 auto signal_test() -> bool
 {
     event_loop loop;
@@ -259,16 +262,21 @@ auto nested_signal_mask_test() -> bool
     sigprocmask(SIG_SETMASK, &original, nullptr);
     return valid;
 }
+#endif
 } // namespace
 
 auto main() -> int
 {
+#ifndef _WIN32
     if (!nested_signal_mask_test()) return 1;
+#endif
     if (!post_tests()) return 1;
     if (!executor_integration_test()) return 1;
     if (!timer_tests()) return 1;
     if (!timer_arm_failure_test()) return 1;
     if (!shutdown_tests()) return 1;
+#ifndef _WIN32
     if (!signal_test()) return 1;
+#endif
     return 0;
 }

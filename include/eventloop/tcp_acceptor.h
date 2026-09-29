@@ -4,7 +4,9 @@
 #include "eventloop/detail/notifiable.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/unique_fd.h"
+#ifdef _WIN32
 #include "eventloop/detail/socket_operation.h"
+#endif
 
 #include <cstdint>
 #include <array>
@@ -25,7 +27,11 @@ public:
     tcp_acceptor(const tcp_acceptor&) = delete;
     auto operator=(const tcp_acceptor&) -> tcp_acceptor& = delete;
 
+#ifdef _WIN32
     [[nodiscard]] auto descriptor() const noexcept -> native_socket override;
+#else
+    [[nodiscard]] auto descriptor() const noexcept -> int override;
+#endif
     auto close() -> void;
 
     class accept_awaiter {
@@ -56,10 +62,12 @@ public:
         detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::expected<unique_fd, std::error_code> result_ {unique_fd {}};
+#ifdef _WIN32
         detail::socket_operation operation_ {};
         unique_fd accepted_;
         bool cancelled_ {false};
         std::array<std::byte, 288> accept_addresses_ {};
+#endif
     };
 
     // Returns an owned descriptor. A duplicate accept returns EBUSY;
@@ -95,8 +103,10 @@ private:
     accept_awaiter* waiter_ {nullptr};
     bool read_interest_enabled_ {false};
     bool closed_ {false};
+#ifdef _WIN32
     native_socket registered_descriptor_ {static_cast<native_socket>(-1)};
     int family_ {0};
+#endif
 };
 
 } // namespace eventloop

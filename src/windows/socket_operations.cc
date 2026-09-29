@@ -303,6 +303,12 @@ auto socket_operations::start_send_to(native_socket socket,
                                       socket_operation& operation) noexcept
     -> socket_result
 {
+    const std::size_t maximum_payload =
+        destination.address_family == ip_endpoint::family::ipv6 ? 65527 : 65507;
+    if (size > maximum_payload)
+        return {.error = {WSAEMSGSIZE, std::system_category()}};
+    if (destination.port == 0)
+        return {.error = {WSAEINVAL, std::system_category()}};
     if (size > std::numeric_limits<ULONG>::max())
         return {.error = std::make_error_code(std::errc::invalid_argument)};
     const auto native = native_endpoint(destination);

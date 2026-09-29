@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstddef>
 #include <exception>
-#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -13,8 +12,14 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 
 using namespace eventloop;
 
@@ -22,28 +27,79 @@ using namespace std::chrono_literals;
 
 namespace {
 
+#ifdef _WIN32
+struct winsock_scope {
+    winsock_scope()
+    {
+        WSADATA data {};
+        const int error = ::WSAStartup(MAKEWORD(2, 2), &data);
+        if (error != 0)
+            throw std::system_error(error, std::system_category(), "WSAStartup");
+    }
+    ~winsock_scope() { (void)::WSACleanup(); }
+};
+#endif
+
+[[nodiscard]] auto closed_socket(native_socket descriptor) -> bool
+{
+#ifdef _WIN32
+    int kind = 0;
+    int length = sizeof(kind);
+    return ::getsockopt(static_cast<SOCKET>(descriptor), SOL_SOCKET, SO_TYPE,
+                        reinterpret_cast<char*>(&kind), &length) == SOCKET_ERROR &&
+           ::WSAGetLastError() == WSAENOTSOCK;
+#else
+    return ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
+#endif
+}
+
 [[nodiscard]] auto ipv6_loopback_available() -> bool
 {
-    unique_fd descriptor(::socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    unique_fd descriptor(::socket(AF_INET6,
+#ifdef _WIN32
+                                  SOCK_DGRAM,
+#else
+                                  SOCK_DGRAM | SOCK_CLOEXEC,
+#endif
+                                  0));
     if (!descriptor) {
+#ifdef _WIN32
+        const int error = ::WSAGetLastError();
+        if (error == WSAEAFNOSUPPORT || error == WSAEPROTONOSUPPORT) return false;
+        throw std::system_error(error, std::system_category(), "IPv6 socket probe");
+#else
         if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) return false;
         throw std::system_error(errno, std::system_category(), "IPv6 socket probe");
+#endif
     }
     sockaddr_in6 address {};
     address.sin6_family = AF_INET6;
     address.sin6_addr = in6addr_loopback;
     if (::bind(descriptor.get(), reinterpret_cast<sockaddr*>(&address),
                sizeof(address)) == 0) return true;
+#ifdef _WIN32
+    if (::WSAGetLastError() == WSAEADDRNOTAVAIL) return false;
+    throw std::system_error(::WSAGetLastError(), std::system_category(),
+                            "IPv6 loopback probe");
+#else
     if (errno == EADDRNOTAVAIL || errno == ENODEV) return false;
     throw std::system_error(errno, std::system_category(), "IPv6 loopback probe");
+#endif
 }
 
-[[nodiscard]] auto ipv6_only(int descriptor) -> bool
+[[nodiscard]] auto ipv6_only(native_socket descriptor) -> bool
 {
     int value = 0;
+#ifdef _WIN32
+    int size = sizeof(value);
+    return ::getsockopt(static_cast<SOCKET>(descriptor), IPPROTO_IPV6,
+                        IPV6_V6ONLY, reinterpret_cast<char*>(&value), &size) == 0 &&
+           value == 1;
+#else
     socklen_t size = sizeof(value);
     return ::getsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &value, &size) == 0 &&
            value == 1;
+#endif
 }
 
 auto shutdown_after(event_loop& loop, std::chrono::seconds delay) -> task<void>
@@ -146,14 +202,20 @@ auto roundtrip_and_rearm(
 auto receive_truncated(event_loop& loop, udp_socket& receiver,
                        bool& passed) -> task<void>
 {
-    std::array<std::byte, 2> small {};
-    const auto truncated = co_await receiver.async_receive_from(small);
+    std::array<std::byte, 2> limited {};
+    const auto truncated = co_await receiver.async_receive_from(limited);
     std::array<std::byte, 3> full {};
     const auto next = co_await receiver.async_receive_from(full);
     passed = !truncated && truncated.error().value() == EMSGSIZE &&
              next && next->size == full.size() &&
              full == std::array<std::byte, 3> {
                  std::byte {'o'}, std::byte {'k'}, std::byte {'!'}};
+    if (!passed) {
+        std::cerr << "truncated receive first="
+                  << (truncated ? 0 : truncated.error().value())
+                  << " next=" << (next ? 0 : next.error().value())
+                  << " size=" << (next ? next->size : 0) << '\n';
+    }
     loop.stop();
 }
 
@@ -226,7 +288,7 @@ auto duplicate_and_close() -> bool
 {
     event_loop loop;
     auto* socket = add_socket(loop);
-    const int descriptor = socket->descriptor();
+    const native_socket descriptor = socket->descriptor();
     bool cancelled = false;
     bool rejected = false;
     if (loop.spawn(pending_receive(loop, *socket, cancelled)) !=
@@ -239,15 +301,15 @@ auto duplicate_and_close() -> bool
     socket->close();
     loop.stop();
     (void)loop.run();
-    return cancelled && rejected && ::fcntl(descriptor, F_GETFD) == -1 &&
-           errno == EBADF && loop.coroutine_statistics().live == 0;
+    return cancelled && rejected && closed_socket(descriptor) &&
+           loop.coroutine_statistics().live == 0;
 }
 
 auto shutdown_cancels_receive() -> bool
 {
     event_loop loop;
     auto* socket = add_socket(loop);
-    const int descriptor = socket->descriptor();
+    const native_socket descriptor = socket->descriptor();
     bool receive_cancelled = false;
     bool send_cancelled = false;
     const auto destination = socket->local_endpoint();
@@ -264,11 +326,11 @@ auto shutdown_cancels_receive() -> bool
     const auto result = loop.run();
     return result == event_loop_result::stopped && receive_cancelled &&
            send_cancelled &&
-           ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF &&
+           closed_socket(descriptor) &&
            loop.coroutine_statistics().live == 0;
 }
 
-auto send_errors(event_loop&, udp_socket& socket, ip_endpoint destination,
+auto send_errors(event_loop& loop, udp_socket& socket, ip_endpoint destination,
                  std::span<const std::byte> oversized, bool& passed)
     -> task<void>
 {
@@ -278,6 +340,12 @@ auto send_errors(event_loop&, udp_socket& socket, ip_endpoint destination,
         ip_endpoint::loopback_v4());
     passed = !too_large && too_large.error().value() == EMSGSIZE &&
              !invalid && invalid.error().value() == EINVAL;
+    if (!passed) {
+        std::cerr << "send errors: oversized="
+                  << (too_large ? 0 : too_large.error().value())
+                  << " invalid=" << (invalid ? 0 : invalid.error().value()) << '\n';
+    }
+    loop.stop();
 }
 
 auto send_error_cases() -> bool
@@ -290,7 +358,17 @@ auto send_error_cases() -> bool
                                passed)) != task_spawn_result::accepted) {
         return false;
     }
-    return passed && loop.coroutine_statistics().live == 0;
+    task_handle<void> watchdog;
+    if (loop.spawn(shutdown_after(loop, 1s), watchdog) !=
+        task_spawn_result::accepted) return false;
+    const auto result = loop.run();
+    if (!watchdog.done()) {
+        (void)watchdog.cancel();
+        loop.stop();
+        (void)loop.run();
+    }
+    return result == event_loop_result::stopped && passed &&
+           loop.coroutine_statistics().live == 0;
 }
 
 auto parser_rejects_invalid_address() -> bool
@@ -314,14 +392,22 @@ auto parser_rejects_invalid_address() -> bool
 int main()
 {
     try {
-        const bool passed = roundtrip_and_rearm() &&
-                            (!ipv6_loopback_available() ||
-                             roundtrip_and_rearm(ip_endpoint::loopback_v6())) &&
-                            truncated_receive() &&
-                            duplicate_and_close() &&
-                            shutdown_cancels_receive() && send_error_cases() &&
-                            parser_rejects_invalid_address();
-        if (!passed) std::cerr << "UDP coroutine test failed\n";
+#ifdef _WIN32
+        winsock_scope winsock;
+#endif
+        const auto check = [](bool result, const char* name) {
+            if (!result) std::cerr << "UDP coroutine test failed: " << name << '\n';
+            return result;
+        };
+        const bool passed = check(roundtrip_and_rearm(), "IPv4 roundtrip") &&
+            (!ipv6_loopback_available() ||
+             check(roundtrip_and_rearm(ip_endpoint::loopback_v6()),
+                   "IPv6 roundtrip")) &&
+            check(truncated_receive(), "truncated receive") &&
+            check(duplicate_and_close(), "duplicate receive and close") &&
+            check(shutdown_cancels_receive(), "shutdown receive") &&
+            check(send_error_cases(), "send errors") &&
+            check(parser_rejects_invalid_address(), "endpoint parser");
         return passed ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "UDP coroutine test exception: " << error.what() << '\n';

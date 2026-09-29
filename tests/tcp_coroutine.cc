@@ -11,11 +11,16 @@
 #include <span>
 #include <system_error>
 #include <utility>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#endif
 
 using namespace eventloop;
 
@@ -23,10 +28,36 @@ using namespace std::chrono_literals;
 
 namespace {
 
-[[nodiscard]] auto local_port(int descriptor) -> std::uint16_t
+#ifdef _WIN32
+struct winsock_scope {
+    winsock_scope()
+    {
+        WSADATA data {};
+        const int error = ::WSAStartup(MAKEWORD(2, 2), &data);
+        if (error != 0)
+            throw std::system_error(error, std::system_category(), "WSAStartup");
+    }
+    ~winsock_scope() { (void)::WSACleanup(); }
+};
+#endif
+
+[[nodiscard]] auto raw_socket(int family) -> native_socket
+{
+#ifdef _WIN32
+    return static_cast<native_socket>(::socket(family, SOCK_STREAM, 0));
+#else
+    return ::socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#endif
+}
+
+[[nodiscard]] auto local_port(native_socket descriptor) -> std::uint16_t
 {
     sockaddr_storage address {};
+#ifdef _WIN32
+    int length = sizeof(address);
+#else
     socklen_t length = sizeof(address);
+#endif
     if (::getsockname(descriptor, reinterpret_cast<sockaddr*>(&address),
                       &length) == -1) return 0;
     if (address.ss_family == AF_INET6) {
@@ -35,39 +66,66 @@ namespace {
     return ntohs(reinterpret_cast<const sockaddr_in&>(address).sin_port);
 }
 
-[[nodiscard]] auto closed_descriptor(int descriptor) -> bool
+[[nodiscard]] auto closed_descriptor(native_socket descriptor) -> bool
 {
+#ifdef _WIN32
+    int kind = 0;
+    int length = sizeof(kind);
+    return ::getsockopt(static_cast<SOCKET>(descriptor), SOL_SOCKET, SO_TYPE,
+                        reinterpret_cast<char*>(&kind), &length) == SOCKET_ERROR &&
+           ::WSAGetLastError() == WSAENOTSOCK;
+#else
     errno = 0;
     return ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
+#endif
 }
 
 [[nodiscard]] auto ipv6_loopback_available() -> bool
 {
-    unique_fd descriptor(::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    unique_fd descriptor(raw_socket(AF_INET6));
     if (!descriptor) {
+#ifdef _WIN32
+        const int error = ::WSAGetLastError();
+        if (error == WSAEAFNOSUPPORT || error == WSAEPROTONOSUPPORT) return false;
+        throw std::system_error(error, std::system_category(), "IPv6 socket probe");
+#else
         if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) return false;
         throw std::system_error(errno, std::system_category(), "IPv6 socket probe");
+#endif
     }
     sockaddr_in6 address {};
     address.sin6_family = AF_INET6;
     address.sin6_addr = in6addr_loopback;
     if (::bind(descriptor.get(), reinterpret_cast<sockaddr*>(&address),
                sizeof(address)) == 0) return true;
+#ifdef _WIN32
+    if (::WSAGetLastError() == WSAEADDRNOTAVAIL) return false;
+    throw std::system_error(::WSAGetLastError(), std::system_category(),
+                            "IPv6 loopback probe");
+#else
     if (errno == EADDRNOTAVAIL || errno == ENODEV) return false;
     throw std::system_error(errno, std::system_category(), "IPv6 loopback probe");
+#endif
 }
 
-[[nodiscard]] auto ipv6_only(int descriptor) -> bool
+[[nodiscard]] auto ipv6_only(native_socket descriptor) -> bool
 {
     int value = 0;
+#ifdef _WIN32
+    int size = sizeof(value);
+    return ::getsockopt(static_cast<SOCKET>(descriptor), IPPROTO_IPV6,
+                        IPV6_V6ONLY, reinterpret_cast<char*>(&value), &size) == 0 &&
+           value == 1;
+#else
     socklen_t size = sizeof(value);
     return ::getsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &value, &size) == 0 &&
            value == 1;
+#endif
 }
 
 [[nodiscard]] auto unused_port() -> std::uint16_t
 {
-    unique_fd descriptor(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    unique_fd descriptor(raw_socket(AF_INET));
     if (!descriptor) return 0;
     sockaddr_in address {};
     address.sin_family = AF_INET;
@@ -97,7 +155,7 @@ auto shutdown_after(event_loop& loop, std::chrono::seconds delay) -> task<void>
 }
 
 auto server(event_loop& loop, tcp_acceptor& listener,
-            int& completed, bool& passed, int& accepted_descriptor)
+            int& completed, bool& passed, native_socket& accepted_descriptor)
     -> task<void>
 {
     auto accepted = co_await listener.async_accept();
@@ -137,7 +195,7 @@ auto server(event_loop& loop, tcp_acceptor& listener,
 }
 
 auto client(event_loop& loop, ip_endpoint endpoint, int& completed,
-            bool& passed, int& descriptor) -> task<void>
+            bool& passed, native_socket& descriptor) -> task<void>
 {
     auto socket = std::make_unique<tcp_stream>(loop, endpoint);
     auto* peer = socket.get();
@@ -174,15 +232,15 @@ auto roundtrip(ip_endpoint endpoint = ip_endpoint::loopback_v4()) -> bool
     event_loop loop;
     auto listener = std::make_unique<tcp_acceptor>(loop, endpoint);
     auto* accepting = listener.get();
-    const int listener_descriptor = accepting->descriptor();
+    const native_socket listener_descriptor = accepting->descriptor();
     if (endpoint.address_family == ip_endpoint::family::ipv6 &&
         !ipv6_only(listener_descriptor)) return false;
     const auto port = local_port(accepting->descriptor());
     if (port == 0) return false;
     loop.add(std::move(listener));
     int completed = 0;
-    int accepted_descriptor = -1;
-    int client_descriptor = -1;
+    native_socket accepted_descriptor = static_cast<native_socket>(-1);
+    native_socket client_descriptor = static_cast<native_socket>(-1);
     bool server_passed = false;
     bool client_passed = false;
     if (loop.spawn(server(loop, *accepting, completed, server_passed,
@@ -224,7 +282,7 @@ struct tcp_pair {
 
 [[nodiscard]] auto connected_pair() -> tcp_pair
 {
-    unique_fd listener(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    unique_fd listener(raw_socket(AF_INET));
     if (!listener) return {};
     sockaddr_in address {};
     address.sin_family = AF_INET;
@@ -235,11 +293,16 @@ struct tcp_pair {
     }
     address.sin_port = htons(local_port(listener.get()));
     tcp_pair result;
-    result.client.reset(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    result.client.reset(raw_socket(AF_INET));
     if (!result.client ||
         ::connect(result.client.get(), reinterpret_cast<sockaddr*>(&address),
                   sizeof(address)) == -1) return {};
+#ifdef _WIN32
+    result.server.reset(::accept(static_cast<SOCKET>(listener.get()),
+                                 nullptr, nullptr));
+#else
     result.server.reset(::accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC));
+#endif
     return result;
 }
 
@@ -277,7 +340,7 @@ auto duplicate_accept_and_close() -> bool
     event_loop loop;
     auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4());
     auto* owner = listener.get();
-    const int descriptor = owner->descriptor();
+    const native_socket descriptor = owner->descriptor();
     loop.add(std::move(listener));
     int pending = -1;
     int duplicate = -1;
@@ -296,15 +359,28 @@ auto duplicate_accept_and_close() -> bool
            loop.coroutine_statistics().live == 0;
 }
 
-auto fill_send_queue(int descriptor) -> bool
+auto fill_send_queue(native_socket descriptor) -> bool
 {
     std::array<std::byte, 4096> buffer {};
+#ifdef _WIN32
+    u_long nonblocking = 1;
+    if (::ioctlsocket(static_cast<SOCKET>(descriptor), FIONBIO, &nonblocking) != 0)
+        return false;
+#endif
     for (int attempts = 0; attempts < 1024; ++attempts) {
+#ifdef _WIN32
+        const auto written = ::send(static_cast<SOCKET>(descriptor),
+                                    reinterpret_cast<const char*>(buffer.data()),
+                                    static_cast<int>(buffer.size()), 0);
+        if (written >= 0) continue;
+        return ::WSAGetLastError() == WSAEWOULDBLOCK;
+#else
         const auto written = ::send(descriptor, buffer.data(), buffer.size(),
                                     MSG_DONTWAIT | MSG_NOSIGNAL);
         if (written >= 0) continue;
         if (errno == EINTR) continue;
         return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
     }
     return false;
 }
@@ -317,7 +393,7 @@ auto duplicate_io_and_close() -> bool
     auto socket = std::make_unique<tcp_stream>(
         loop, std::move(pair.client));
     auto* owner = socket.get();
-    const int descriptor = owner->descriptor();
+    const native_socket descriptor = owner->descriptor();
     if (!fill_send_queue(descriptor)) return false;
     loop.add(std::move(socket));
     int pending_read = -1;
@@ -384,7 +460,7 @@ auto refused_connect() -> bool
     auto socket = std::make_unique<tcp_stream>(
         loop, ip_endpoint::loopback_v4(port));
     auto* owner = socket.get();
-    const int descriptor = owner->descriptor();
+    const native_socket descriptor = owner->descriptor();
     loop.add(std::move(socket));
     int error = -1;
     if (loop.spawn(connect_result(loop, *owner, error)) !=
@@ -392,7 +468,12 @@ auto refused_connect() -> bool
         owner->close();
         return false;
     }
-    if (loop.spawn(shutdown_after(loop, 1s)) !=
+#ifdef _WIN32
+    constexpr auto timeout = 5s;
+#else
+    constexpr auto timeout = 1s;
+#endif
+    if (loop.spawn(shutdown_after(loop, timeout)) !=
         task_spawn_result::accepted) return false;
     const auto result = loop.run();
     // Pending connect errors remove themselves; synchronous errors leave the
@@ -400,9 +481,21 @@ auto refused_connect() -> bool
     if (!closed_descriptor(descriptor)) owner->close();
     loop.shutdown(0s);
     (void)loop.run();
-    return result == event_loop_result::stopped && error == ECONNREFUSED &&
+    const bool passed = result == event_loop_result::stopped &&
+#ifdef _WIN32
+           error == WSAECONNREFUSED &&
+#else
+           error == ECONNREFUSED &&
+#endif
            closed_descriptor(descriptor) &&
            loop.coroutine_statistics().live == 0;
+    if (!passed) {
+        std::cerr << "refused connect result=" << static_cast<int>(result)
+                  << " error=" << error
+                  << " closed=" << closed_descriptor(descriptor)
+                  << " live=" << loop.coroutine_statistics().live << '\n';
+    }
+    return passed;
 }
 
 auto shutdown_pending() -> bool
@@ -415,8 +508,8 @@ auto shutdown_pending() -> bool
         loop, std::move(pair.client));
     auto* accepting = listener.get();
     auto* reading = socket.get();
-    const int listener_descriptor = accepting->descriptor();
-    const int socket_descriptor = reading->descriptor();
+    const native_socket listener_descriptor = accepting->descriptor();
+    const native_socket socket_descriptor = reading->descriptor();
     loop.add(std::move(listener));
     loop.add(std::move(socket));
     int accept_error = -1;
@@ -441,13 +534,19 @@ auto shutdown_pending() -> bool
 
 int main()
 {
-    if (!roundtrip() || (ipv6_loopback_available() &&
-                         !roundtrip(ip_endpoint::loopback_v6())) ||
-        !duplicate_accept_and_close() ||
-        !duplicate_io_and_close() || !immediate_error_cases() ||
-        !refused_connect() ||
-        !shutdown_pending()) {
-        std::cerr << "coroutine TCP test failed\n";
-        return 1;
-    }
+#ifdef _WIN32
+    winsock_scope winsock;
+#endif
+    const auto check = [](bool passed, const char* name) {
+        if (!passed) std::cerr << "coroutine TCP test failed: " << name << '\n';
+        return passed;
+    };
+    if (!check(roundtrip(), "IPv4 roundtrip") ||
+        (ipv6_loopback_available() &&
+         !check(roundtrip(ip_endpoint::loopback_v6()), "IPv6 roundtrip")) ||
+        !check(duplicate_accept_and_close(), "duplicate accept and close") ||
+        !check(duplicate_io_and_close(), "duplicate I/O and close") ||
+        !check(immediate_error_cases(), "immediate errors") ||
+        !check(refused_connect(), "refused connect") ||
+        !check(shutdown_pending(), "shutdown pending")) return 1;
 }
