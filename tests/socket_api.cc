@@ -148,6 +148,120 @@ auto tcp_client(event_loop& loop, tcp_stream& peer, int& completed,
            loop.coroutine_statistics().live == 0;
 }
 
+auto cancelled_read(event_loop& loop, tcp_stream& stream, bool& started,
+                    bool& cancelled) -> task<void>
+{
+    (void)loop;
+    std::array<std::byte, 1> buffer {};
+    started = true;
+    const auto result = co_await stream.async_read_some(buffer);
+    cancelled = !result && result.error() ==
+                               std::make_error_code(std::errc::operation_canceled);
+}
+
+auto cancelled_write(event_loop& loop, tcp_stream& stream, bool& started,
+                     bool& cancelled) -> task<void>
+{
+    (void)loop;
+    const std::array<std::byte, 256> buffer {};
+    started = true;
+    for (;;) {
+        const auto result = co_await stream.async_write_some(buffer);
+        if (!result) {
+            cancelled = result.error() ==
+                        std::make_error_code(std::errc::operation_canceled);
+            co_return;
+        }
+        if (*result == 0) co_return;
+    }
+}
+
+auto tcp_cancel_server(event_loop& loop, tcp_acceptor& listener,
+                       bool& both_pending, bool& read_started,
+                       bool& write_started, bool& read_cancelled,
+                       bool& write_cancelled) -> task<void>
+{
+    auto accepted = co_await listener.async_accept();
+    if (!accepted) {
+        loop.shutdown(0ms);
+        co_return;
+    }
+    listener.close();
+    auto stream = std::make_unique<tcp_stream>(loop, std::move(*accepted));
+    auto* peer = stream.get();
+    loop.add(std::move(stream));
+    const bool read_spawned =
+        loop.spawn(cancelled_read(loop, *peer, read_started, read_cancelled)) ==
+        task_spawn_result::accepted;
+    const bool write_spawned =
+        loop.spawn(cancelled_write(loop, *peer, write_started,
+                                   write_cancelled)) ==
+        task_spawn_result::accepted;
+    both_pending = read_spawned && write_spawned && read_started &&
+                   write_started && !read_cancelled && !write_cancelled;
+    loop.shutdown(0ms);
+}
+
+auto tcp_cancel_client(event_loop& loop, tcp_stream& stream) -> task<void>
+{
+    (void)loop;
+    (void)co_await stream.async_connect();
+}
+
+[[nodiscard]] auto test_concurrent_tcp_cancel() -> bool
+{
+    event_loop loop;
+    auto listener = std::make_unique<tcp_acceptor>(
+        loop, ip_endpoint::loopback_v4());
+    auto* accepting = listener.get();
+    auto client = std::make_unique<tcp_stream>(
+        loop, listener_endpoint(*accepting));
+    auto* connecting = client.get();
+    loop.add(std::move(listener));
+    loop.add(std::move(client));
+    bool both_pending = false;
+    bool read_started = false;
+    bool write_started = false;
+    bool read_cancelled = false;
+    bool write_cancelled = false;
+    bool timed_out = false;
+    check(loop.spawn(tcp_cancel_server(
+              loop, *accepting, both_pending, read_started, write_started,
+              read_cancelled, write_cancelled)) == task_spawn_result::accepted,
+          "spawn TCP cancellation server");
+    check(loop.spawn(tcp_cancel_client(loop, *connecting)) ==
+              task_spawn_result::accepted, "spawn TCP cancellation client");
+    check(loop.spawn(watchdog(loop, timed_out)) ==
+              task_spawn_result::accepted, "spawn TCP cancellation watchdog");
+    return loop.run() == event_loop_result::stopped && !timed_out &&
+           both_pending && read_cancelled && write_cancelled &&
+           loop.coroutine_statistics().live == 0;
+}
+
+auto cancelled_accept(event_loop& loop, tcp_acceptor& listener,
+                      bool& cancelled) -> task<void>
+{
+    (void)loop;
+    const auto result = co_await listener.async_accept();
+    cancelled = !result && result.error() ==
+                               std::make_error_code(std::errc::operation_canceled);
+}
+
+[[nodiscard]] auto test_pending_accept_cancel() -> bool
+{
+    event_loop loop;
+    auto listener = std::make_unique<tcp_acceptor>(
+        loop, ip_endpoint::loopback_v4());
+    auto* accepting = listener.get();
+    loop.add(std::move(listener));
+    bool cancelled = false;
+    check(loop.spawn(cancelled_accept(loop, *accepting, cancelled)) ==
+              task_spawn_result::accepted, "spawn pending accept");
+    loop.shutdown(0ms);
+    return loop.run() == event_loop_result::stopped && cancelled &&
+           loop.coroutine_statistics().live == 0;
+}
+
 auto udp_receive(event_loop& loop, udp_socket& socket, ip_endpoint source,
                  int& completed, bool& passed) -> task<void>
 {
@@ -336,6 +450,9 @@ auto main() -> int
 {
     try {
         check(test_tcp(), "TCP public API roundtrip failed");
+        check(test_concurrent_tcp_cancel(),
+              "concurrent TCP cancellation failed");
+        check(test_pending_accept_cancel(), "pending accept cancellation failed");
         check(test_udp(), "UDP public API roundtrip failed");
 #ifdef EVENTLOOP_TEST_TLS
         check(test_tls(), "TLS public API roundtrip failed");

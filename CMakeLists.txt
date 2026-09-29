@@ -75,6 +75,15 @@ if(WIN32)
         add_test(NAME windows_socket_operations
                  COMMAND windows_socket_operations_test)
         set_tests_properties(windows_socket_operations PROPERTIES TIMEOUT 10)
+
+        add_executable(windows_iocp_lifecycle_test
+            tests/windows_iocp_lifecycle.cc)
+        target_include_directories(windows_iocp_lifecycle_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(windows_iocp_lifecycle_test PRIVATE eventloop)
+        add_test(NAME windows_iocp_lifecycle
+                 COMMAND windows_iocp_lifecycle_test)
+        set_tests_properties(windows_iocp_lifecycle PROPERTIES TIMEOUT 10)
         if(EVENTLOOP_WINDOWS_TLS)
             add_executable(web_socket_test tests/web_socket.cc)
             target_link_libraries(web_socket_test PRIVATE eventloop::eventloop)
