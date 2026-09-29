@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
+#include <new>
 #include <stdexcept>
 #include <utility>
 
@@ -20,6 +21,7 @@
 #include <botan/tls_callbacks.h>
 #include <botan/tls_client.h>
 #include <botan/tls_exceptn.h>
+#include <botan/tls_magic.h>
 #include <botan/tls_policy.h>
 #include <botan/tls_server.h>
 #include <botan/tls_session_manager_memory.h>
@@ -251,9 +253,12 @@ auto make_error_code(tls_errc error) noexcept -> std::error_code
 class tls_stream::implementation final : public Botan::TLS::Callbacks {
 public:
     static constexpr std::size_t encrypted_capacity = 64 * 1024;
-    // Raw TCP reads are at most 4 KiB, so one read cannot deliver more
-    // plaintext than this before the caller consumes the queued bytes.
-    static constexpr std::size_t plaintext_capacity = 4096;
+    static constexpr std::size_t input_capacity = 4096;
+    static constexpr std::size_t inline_plaintext_capacity = 4096;
+    // Botan may finish a buffered maximum-size record and then consume the
+    // newly read ciphertext before the caller can drain plaintext.
+    static constexpr std::size_t spill_capacity =
+        Botan::TLS::MAX_PLAINTEXT_SIZE + input_capacity;
 
     implementation(std::shared_ptr<tls_context> context,
                    tls_client_options options)
@@ -300,10 +305,29 @@ public:
     auto tls_record_received(std::uint64_t, std::span<const std::uint8_t> data)
         -> void override
     {
-        if (data.size() > plaintext_capacity - plaintext_size_) {
+        if (data.size() > spill_capacity - plaintext_size_) {
             throw std::length_error("TLS plaintext input capacity exceeded");
         }
-        std::memcpy(plaintext_.data() + plaintext_size_, data.data(), data.size());
+        const auto required_size = plaintext_size_ + data.size();
+        if (required_size > inline_plaintext_capacity &&
+            required_size > plaintext_spill_capacity_) {
+            const auto growth_base = plaintext_spill_capacity_ == 0
+                ? inline_plaintext_capacity * 2
+                : plaintext_spill_capacity_ * 2;
+            const auto spill_size = std::min(
+                spill_capacity, std::max(required_size, growth_base));
+            auto spill = std::unique_ptr<std::byte[]>(
+                new (std::nothrow) std::byte[spill_size]);
+            if (!spill) throw std::length_error("TLS plaintext spill unavailable");
+            const auto* queued = plaintext_spill_ ? plaintext_spill_.get()
+                                                  : plaintext_.data();
+            std::memcpy(spill.get(), queued, plaintext_size_);
+            plaintext_spill_ = std::move(spill);
+            plaintext_spill_capacity_ = spill_size;
+        }
+        auto* destination = plaintext_spill_ ? plaintext_spill_.get()
+                                             : plaintext_.data();
+        std::memcpy(destination + plaintext_size_, data.data(), data.size());
         plaintext_size_ += data.size();
     }
 
@@ -345,9 +369,11 @@ public:
     bool peer_closed_ {false};
     std::array<std::byte, encrypted_capacity> encrypted_ {};
     std::size_t encrypted_size_ {0};
-    std::array<std::byte, plaintext_capacity> plaintext_ {};
+    std::array<std::byte, inline_plaintext_capacity> plaintext_ {};
+    std::unique_ptr<std::byte[]> plaintext_spill_;
+    std::size_t plaintext_spill_capacity_ {0};
     std::size_t plaintext_size_ {0};
-    std::array<std::byte, 4096> input_ {};
+    std::array<std::byte, input_capacity> input_ {};
 };
 
 tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
@@ -464,10 +490,16 @@ auto tls_stream::take_plaintext(std::span<std::byte> buffer) noexcept
     auto& state = *implementation_;
     const auto size = std::min(buffer.size(), state.plaintext_size_);
     if (size != 0) {
-        std::memcpy(buffer.data(), state.plaintext_.data(), size);
+        auto* source = state.plaintext_spill_ ? state.plaintext_spill_.get()
+                                             : state.plaintext_.data();
+        std::memcpy(buffer.data(), source, size);
         state.plaintext_size_ -= size;
-        std::memmove(state.plaintext_.data(), state.plaintext_.data() + size,
-                     state.plaintext_size_);
+        if (state.plaintext_size_ == 0) {
+            state.plaintext_spill_.reset();
+            state.plaintext_spill_capacity_ = 0;
+        } else {
+            std::memmove(source, source + size, state.plaintext_size_);
+        }
     }
     return size;
 }
