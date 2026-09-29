@@ -4,6 +4,7 @@
 #include "eventloop/detail/notifiable.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/unique_fd.h"
+#include "eventloop/detail/socket_operation.h"
 
 #include <array>
 #include <coroutine>
@@ -30,7 +31,7 @@ public:
     udp_socket(const udp_socket&) = delete;
     auto operator=(const udp_socket&) -> udp_socket& = delete;
 
-    [[nodiscard]] auto descriptor() const noexcept -> int override;
+    [[nodiscard]] auto descriptor() const noexcept -> native_socket override;
     [[nodiscard]] auto local_endpoint() const -> ip_endpoint;
     auto close() -> void;
 
@@ -74,6 +75,8 @@ public:
         detail::coroutine_cancellation_node cancellation_ {};
         ip_endpoint source_;
         int result_ {0};
+        detail::socket_operation operation_ {};
+        bool cancelled_ {false};
     };
 
     class send_awaiter {
@@ -112,6 +115,8 @@ public:
         std::coroutine_handle<> continuation_ {};
         detail::coroutine_cancellation_node cancellation_ {};
         int result_ {0};
+        detail::socket_operation operation_ {};
+        bool cancelled_ {false};
     };
 
     [[nodiscard]] auto async_receive_from(std::span<std::byte> buffer) noexcept
@@ -144,6 +149,8 @@ private:
     receive_awaiter* receive_ {nullptr};
     send_awaiter* send_ {nullptr};
     bool closing_ {false};
+    native_socket registered_descriptor_ {static_cast<native_socket>(-1)};
+    std::size_t pending_operations_ {0};
 };
 
 } // namespace eventloop

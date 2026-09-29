@@ -1,6 +1,7 @@
 #include "eventloop/tcp_stream.h"
 #include "eventloop/task.h"
 #include "ip_endpoint_native.h"
+#include "socket_operations.h"
 
 #include <algorithm>
 #include <array>
@@ -10,12 +11,17 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/sendfile.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 namespace eventloop {
 
@@ -25,29 +31,11 @@ namespace {
     return {error, std::generic_category()};
 }
 
-[[nodiscard]] auto transfer(int descriptor, void* buffer, std::size_t size,
-                            bool read) noexcept
-    -> std::expected<std::size_t, std::error_code>
-{
-    if (size == 0) return 0;
-    if (buffer == nullptr ||
-        size > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
-        return std::unexpected(code(EINVAL));
-    }
-    for (;;) {
-        const auto result = read
-            ? ::recv(descriptor, buffer, size, 0)
-            : ::send(descriptor, buffer, size, MSG_NOSIGNAL);
-        if (result >= 0) return static_cast<std::size_t>(result);
-        if (errno == EINTR) continue;
-        return std::unexpected(code(errno));
-    }
-}
-
 } // namespace
 
 tcp_stream::tcp_stream(event_loop& loop, unique_fd descriptor)
-    : loop_(loop), descriptor_(std::move(descriptor))
+    : loop_(loop), descriptor_(std::move(descriptor)),
+      registered_descriptor_(descriptor_.get())
 {
     if (!descriptor_) {
         throw std::invalid_argument("TCP stream descriptor is invalid");
@@ -58,26 +46,23 @@ tcp_stream::tcp_stream(event_loop& loop, ip_endpoint remote)
     : loop_(loop), remote_(remote), connected_(false),
       transport_activated_(true)
 {
-    descriptor_.reset(::socket(detail::socket_family(remote),
-                               SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
-    if (!descriptor_) {
-        throw std::system_error(errno, std::system_category(), "socket");
-    }
-    if (detail::set_ipv6_only(descriptor_.get(), remote) == -1) {
-        throw std::system_error(errno, std::system_category(),
-                                "setsockopt(IPV6_V6ONLY)");
-    }
+    descriptor_.reset(detail::socket_operations::create(
+        detail::socket_family(remote), SOCK_STREAM, 0));
+    registered_descriptor_ = descriptor_.get();
+    if (auto error = detail::socket_operations::configure_client(
+            descriptor_.get(), remote); error)
+        throw std::system_error(error, "IPV6_V6ONLY");
 }
 
 tcp_stream::~tcp_stream()
 {
     if (connector_ != nullptr || reader_ != nullptr || writer_ != nullptr ||
-        file_writer_ != nullptr) {
+        file_writer_ != nullptr || pending_operations_ != 0) {
         std::terminate();
     }
 }
 
-auto tcp_stream::descriptor() const noexcept -> int
+auto tcp_stream::descriptor() const noexcept -> native_socket
 {
     return descriptor_.get();
 }
@@ -88,11 +73,8 @@ auto tcp_stream::activate_async_transport() noexcept
     if (transport_activated_) return {};
     if (closed_) return std::unexpected(code(EBADF));
     if (!connected_) return std::unexpected(code(ENOTCONN));
-    const int flags = ::fcntl(descriptor_.get(), F_GETFL);
-    if (flags == -1 || ::fcntl(descriptor_.get(), F_SETFL,
-                               flags | O_NONBLOCK) == -1) {
-        return std::unexpected(code(errno));
-    }
+    if (auto error = detail::socket_operations::activate(descriptor_.get()); error)
+        return std::unexpected(error);
     try {
         set_async_interest(false, false);
     } catch (const std::system_error& error) {
@@ -110,20 +92,18 @@ auto tcp_stream::close() -> void
 auto tcp_stream::on_read() -> void
 {
     if (reader_ == nullptr || closed_) return;
-    auto result = transfer(descriptor_.get(), reader_->data_, reader_->size_, true);
-    if (!result && result.error().value() == EAGAIN) return;
-    if (result) complete_read(*result, {});
-    else complete_read(0, result.error());
+    auto result = detail::socket_operations::start_read(
+        descriptor_.get(), reader_->data_, reader_->size_, reader_->operation_);
+    if (result.pending) return;
+    complete_read(result.transferred, result.error);
 }
 
 auto tcp_stream::on_write() -> void
 {
     if (connector_ != nullptr && !closed_) {
-        int error = 0;
-        socklen_t length = sizeof(error);
-        if (::getsockopt(descriptor_.get(), SOL_SOCKET, SO_ERROR, &error,
-                         &length) == -1) error = errno;
-        if (error != 0) fail_and_close(code(error));
+        const auto error = detail::socket_operations::finish_connect(
+            descriptor_.get());
+        if (error) fail_and_close(error);
         else {
             connected_ = true;
             complete_connect({});
@@ -137,22 +117,16 @@ auto tcp_stream::on_write() -> void
         return;
     }
     if (writer_ == nullptr || closed_) return;
-    auto result = transfer(descriptor_.get(), writer_->data_, writer_->size_, false);
-    if (!result && result.error().value() == EAGAIN) return;
-    if (result) complete_write(*result, {});
-    else complete_write(0, result.error());
+    auto result = detail::socket_operations::start_write(
+        descriptor_.get(), writer_->data_, writer_->size_, writer_->operation_);
+    if (result.pending) return;
+    complete_write(result.transferred, result.error);
 }
 
 auto tcp_stream::on_error() -> void
 {
-    int error = 0;
-    socklen_t size = sizeof(error);
-    if (getsockopt(descriptor_.get(), SOL_SOCKET, SO_ERROR, &error, &size) == -1) {
-        error = errno;
-    } else if (error == 0) {
-        error = ECONNRESET;
-    }
-    fail_and_close(code(error));
+    fail_and_close(detail::socket_operations::pending_error(
+        descriptor_.get(), ECONNRESET));
 }
 
 auto tcp_stream::on_shutdown() -> void
@@ -165,11 +139,21 @@ auto tcp_stream::fail_and_close(std::error_code error) -> void
     event_loop::handler_call_scope scope(loop_);
     if (closed_) return;
     closed_ = true;
-    complete_connect(error);
-    complete_read(0, error);
-    complete_write(0, error);
+    if (connector_ != nullptr && connector_->operation_.pending_completion) {
+        connector_->cancelled_ = true;
+        detail::socket_operations::cancel(descriptor_.get(), connector_->operation_);
+    } else complete_connect(error);
+    if (reader_ != nullptr && reader_->operation_.pending_completion) {
+        reader_->cancelled_ = true;
+        detail::socket_operations::cancel(descriptor_.get(), reader_->operation_);
+    } else complete_read(0, error);
+    if (writer_ != nullptr && writer_->operation_.pending_completion) {
+        writer_->cancelled_ = true;
+        detail::socket_operations::cancel(descriptor_.get(), writer_->operation_);
+    } else complete_write(0, error);
     complete_file(error);
-    loop_.remove(descriptor_.get());
+    if (pending_operations_ != 0) descriptor_.reset();
+    else loop_.remove(registered_descriptor_);
 }
 
 auto tcp_stream::set_async_interest(bool read_enabled,
@@ -201,8 +185,14 @@ auto tcp_stream::complete_connect(std::error_code error) noexcept
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(connector_, nullptr);
     if (waiter == nullptr) return;
+    if (waiter->operation_.pending_completion) {
+        waiter->operation_.pending_completion = false;
+        if (pending_operations_ == 0) std::terminate();
+        --pending_operations_;
+    }
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
+    if (closed_ && pending_operations_ == 0) loop_.remove(registered_descriptor_);
     update_async_interest();
     waiter->finish(error);
 }
@@ -213,8 +203,14 @@ auto tcp_stream::complete_read(std::size_t size,
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(reader_, nullptr);
     if (waiter == nullptr) return;
+    if (waiter->operation_.pending_completion) {
+        waiter->operation_.pending_completion = false;
+        if (pending_operations_ == 0) std::terminate();
+        --pending_operations_;
+    }
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
+    if (closed_ && pending_operations_ == 0) loop_.remove(registered_descriptor_);
     waiter->finish(size, error);
     // The continuation often starts another read before returning. Keep the
     // existing read interest if it did, avoiding a disable/re-enable pair.
@@ -227,8 +223,14 @@ auto tcp_stream::complete_write(std::size_t size,
     event_loop::handler_call_scope scope(loop_);
     auto* waiter = std::exchange(writer_, nullptr);
     if (waiter == nullptr) return;
+    if (waiter->operation_.pending_completion) {
+        waiter->operation_.pending_completion = false;
+        if (pending_operations_ == 0) std::terminate();
+        --pending_operations_;
+    }
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
+    if (closed_ && pending_operations_ == 0) loop_.remove(registered_descriptor_);
     update_async_interest();
     waiter->finish(size, error);
 }
@@ -249,6 +251,22 @@ tcp_stream::connect_awaiter::connect_awaiter(
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
+    operation_.context = this;
+    operation_.complete = [](detail::socket_operation& operation,
+                             std::size_t, int error) noexcept {
+        auto& self = *static_cast<connect_awaiter*>(operation.context);
+        std::error_code result;
+        if (self.cancelled_ || self.owner_.closed_) result = code(ECANCELED);
+        else if (error != 0) result = {error, std::system_category()};
+        else result = detail::socket_operations::finish_connect(
+            self.owner_.descriptor_.get());
+        if (result && !self.owner_.closed_) {
+            self.owner_.closed_ = true;
+            self.owner_.descriptor_.reset();
+        }
+        if (!result) self.owner_.connected_ = true;
+        self.owner_.complete_connect(result);
+    };
 }
 
 tcp_stream::connect_awaiter::~connect_awaiter()
@@ -277,18 +295,6 @@ auto tcp_stream::connect_awaiter::suspend(
         return false;
     }
     owner_.connect_started_ = true;
-    const auto endpoint = detail::native_endpoint(owner_.remote_);
-    const int result = ::connect(owner_.descriptor_.get(),
-                                 endpoint.address(), endpoint.length);
-    if (result == 0 || (result == -1 && errno == EISCONN)) {
-        owner_.connected_ = true;
-        return false;
-    }
-    if (errno != EINPROGRESS && errno != EINTR) {
-        error_ = code(errno);
-        return false;
-    }
-
     continuation_ = handle;
     if (!detail::coroutine_frame_access::attach_cancellation(
             state, cancellation_)) {
@@ -296,6 +302,16 @@ auto tcp_stream::connect_awaiter::suspend(
         return false;
     }
     owner_.connector_ = this;
+    const auto result = detail::socket_operations::start_connect(
+        owner_.descriptor_.get(), owner_.remote_, operation_);
+    if (!result.pending) {
+        owner_.connector_ = nullptr;
+        detail::coroutine_frame_access::detach_cancellation(cancellation_);
+        error_ = result.error;
+        if (!error_) owner_.connected_ = true;
+        return false;
+    }
+    if (operation_.pending_completion) ++owner_.pending_operations_;
     try {
         owner_.set_async_interest(false, true);
     } catch (const std::system_error& error) {
@@ -312,6 +328,7 @@ auto tcp_stream::connect_awaiter::cancel(
     detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<connect_awaiter*>(node.operation);
+    detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
     self.owner_.fail_and_close(code(ECANCELED));
 }
 
@@ -336,6 +353,16 @@ tcp_stream::io_awaiter<Read>::io_awaiter(
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
+    operation_.context = this;
+    operation_.complete = [](detail::socket_operation& operation,
+                             std::size_t bytes, int error) noexcept {
+        auto& self = *static_cast<io_awaiter*>(operation.context);
+        std::error_code result;
+        if (self.cancelled_ || self.owner_.closed_) result = code(ECANCELED);
+        else if (error != 0) result = {error, std::system_category()};
+        if constexpr (Read) self.owner_.complete_read(bytes, result);
+        else self.owner_.complete_write(bytes, result);
+    };
 }
 
 template<bool Read>
@@ -380,15 +407,6 @@ auto tcp_stream::io_awaiter<Read>::suspend(
         error_ = code(ECANCELED);
         return false;
     }
-    auto result = transfer(owner_.descriptor_.get(), data_, size_, Read);
-    if (result) {
-        transferred_ = *result;
-        return false;
-    }
-    if (result.error().value() != EAGAIN) {
-        error_ = result.error();
-        return false;
-    }
     continuation_ = handle;
     if (!detail::coroutine_frame_access::attach_cancellation(
             state, cancellation_)) {
@@ -397,6 +415,23 @@ auto tcp_stream::io_awaiter<Read>::suspend(
     }
     if constexpr (Read) owner_.reader_ = this;
     else owner_.writer_ = this;
+    const auto result = [&] {
+        if constexpr (Read)
+            return detail::socket_operations::start_read(
+                owner_.descriptor_.get(), data_, size_, operation_);
+        else
+            return detail::socket_operations::start_write(
+                owner_.descriptor_.get(), data_, size_, operation_);
+    }();
+    if (!result.pending) {
+        if constexpr (Read) owner_.reader_ = nullptr;
+        else owner_.writer_ = nullptr;
+        detail::coroutine_frame_access::detach_cancellation(cancellation_);
+        transferred_ = result.transferred;
+        error_ = result.error;
+        return false;
+    }
+    if (operation_.pending_completion) ++owner_.pending_operations_;
     try {
         owner_.set_async_interest(owner_.reader_ != nullptr,
                                   owner_.writer_ != nullptr);
@@ -416,7 +451,9 @@ auto tcp_stream::io_awaiter<Read>::cancel(
     detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<io_awaiter*>(node.operation);
-    if constexpr (Read) self.owner_.complete_read(0, code(ECANCELED));
+    detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
+    if (self.operation_.pending_completion) self.owner_.close();
+    else if constexpr (Read) self.owner_.complete_read(0, code(ECANCELED));
     else self.owner_.complete_write(0, code(ECANCELED));
 }
 
@@ -455,6 +492,9 @@ tcp_stream::file_awaiter::~file_awaiter()
 
 auto tcp_stream::file_awaiter::advance() noexcept -> std::error_code
 {
+#ifdef _WIN32
+    return code(ENOTSUP);
+#else
     while (remaining_ != 0) {
         const auto requested = std::min(remaining_, std::size_t {0x7ffff000});
         const auto result = ::sendfile(owner_.descriptor_.get(), file_.get(),
@@ -468,6 +508,7 @@ auto tcp_stream::file_awaiter::advance() noexcept -> std::error_code
         return code(errno);
     }
     return {};
+#endif
 }
 
 auto tcp_stream::file_awaiter::suspend(
@@ -536,6 +577,14 @@ auto tcp_stream::send_file_task(event_loop& loop, tcp_stream& socket,
                                 unique_fd file, std::size_t size)
     -> task<std::expected<void, std::error_code>>
 {
+#ifdef _WIN32
+    (void)loop;
+    (void)socket;
+    (void)header;
+    (void)file;
+    (void)size;
+    co_return std::unexpected(code(ENOTSUP));
+#else
     (void)loop;
     while (!header.empty()) {
         auto sent = co_await socket.async_write_some(header);
@@ -544,11 +593,15 @@ auto tcp_stream::send_file_task(event_loop& loop, tcp_stream& socket,
         header = header.subspan(*sent);
     }
     co_return co_await tcp_stream::file_awaiter(socket, std::move(file), size);
+#endif
 }
 auto tcp_stream::async_send_file(std::span<const std::byte> header,
                                   unique_fd file, std::size_t size)
     -> task<std::expected<void, std::error_code>>
 {
+#ifdef _WIN32
+    file = unique_fd(file.release(), unique_fd::kind::file);
+#endif
     return send_file_task(loop_, *this, header, std::move(file), size);
 }
 

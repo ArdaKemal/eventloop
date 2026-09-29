@@ -2,9 +2,103 @@ cmake_minimum_required(VERSION 3.20)
 project(event_loop VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+
+if(WIN32)
+    include(CTest)
+    find_package(Threads REQUIRED)
+    option(EVENTLOOP_WINDOWS_TLS "Build Windows TLS/WebSocket support" ON)
+    set(EVENTLOOP_CONFIG_NEEDS_BOTAN ${EVENTLOOP_WINDOWS_TLS})
+    if(EVENTLOOP_WINDOWS_TLS)
+        find_package(Botan 3 REQUIRED)
+    endif()
+    add_library(eventloop
+        src/event_loop.cc
+        src/executor/single_thread_executor.cc
+        src/executor/multi_thread_executor.cc
+        src/tcp_acceptor.cc
+        src/tcp_stream.cc
+        src/udp_socket.cc
+        src/util/arg_parser.cc
+        src/windows/iocp_loop.cc
+        src/windows/socket_operations.cc
+    )
+    if(EVENTLOOP_WINDOWS_TLS)
+        target_sources(eventloop PRIVATE src/tls_stream.cc src/ws/web_socket.cpp)
+        target_link_libraries(eventloop PUBLIC botan::botan)
+    endif()
+    add_library(eventloop::eventloop ALIAS eventloop)
+    target_include_directories(eventloop PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_include_directories(eventloop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(eventloop PUBLIC cxx_std_23)
+    target_link_libraries(eventloop PUBLIC ws2_32 mswsock Threads::Threads)
+    if(MSVC)
+        target_compile_options(eventloop PRIVATE /W4)
+    endif()
+    if(BUILD_TESTING)
+        add_executable(windows_iocp_test tests/windows_iocp.cc)
+        target_include_directories(windows_iocp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(windows_iocp_test PRIVATE eventloop)
+        add_test(NAME windows_iocp COMMAND windows_iocp_test)
+        set_tests_properties(windows_iocp PROPERTIES TIMEOUT 10)
+
+        add_executable(windows_socket_operations_test
+            tests/windows_socket_operations.cc)
+        target_link_libraries(windows_socket_operations_test PRIVATE eventloop)
+        add_test(NAME windows_socket_operations
+                 COMMAND windows_socket_operations_test)
+        set_tests_properties(windows_socket_operations PROPERTIES TIMEOUT 10)
+    endif()
+
+    set(eventloop_package_dir "${CMAKE_INSTALL_LIBDIR}/cmake/eventloop")
+    install(TARGETS eventloop EXPORT eventloopTargets
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    )
+    set(eventloop_windows_excluded_headers
+        PATTERN "file_io.h" EXCLUDE
+        PATTERN "http" EXCLUDE
+    )
+    if(NOT EVENTLOOP_WINDOWS_TLS)
+        list(APPEND eventloop_windows_excluded_headers
+            PATTERN "tls_context.h" EXCLUDE
+            PATTERN "tls_stream.h" EXCLUDE
+            PATTERN "ws" EXCLUDE
+        )
+    endif()
+    install(DIRECTORY include/eventloop/
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/eventloop"
+        ${eventloop_windows_excluded_headers}
+    )
+    install(EXPORT eventloopTargets
+        FILE eventloopTargets.cmake
+        NAMESPACE eventloop::
+        DESTINATION "${eventloop_package_dir}"
+    )
+    configure_package_config_file(
+        cmake/eventloopConfig.cmake.in
+        "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfig.cmake"
+        INSTALL_DESTINATION "${eventloop_package_dir}"
+    )
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfigVersion.cmake"
+        VERSION "${PROJECT_VERSION}"
+        COMPATIBILITY SameMajorVersion
+    )
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfigVersion.cmake"
+        DESTINATION "${eventloop_package_dir}"
+    )
+    return()
+endif()
+
+set(EVENTLOOP_CONFIG_NEEDS_BOTAN ON)
 find_package(Botan 3 REQUIRED)
 find_package(Threads REQUIRED)
 include(CTest)
@@ -29,6 +123,7 @@ add_library(eventloop
     include/eventloop/util/arg_parser.h
     include/eventloop/ws/web_socket.h
     src/linux/epoll_loop.cc
+    src/linux/socket_operations.cc
     src/event_loop.cc
     src/executor/single_thread_executor.cc
     src/executor/multi_thread_executor.cc
@@ -60,6 +155,7 @@ target_include_directories(eventloop
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+target_include_directories(eventloop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(eventloop PUBLIC cxx_std_23)
 target_link_libraries(eventloop PUBLIC botan::botan Threads::Threads)
 target_compile_options(eventloop PRIVATE -Wall -Wextra -Wpedantic -Wconversion)

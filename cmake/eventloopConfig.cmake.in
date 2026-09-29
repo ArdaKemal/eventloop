@@ -1,7 +1,9 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-find_dependency(Botan 3)
+if(@EVENTLOOP_CONFIG_NEEDS_BOTAN@)
+    find_dependency(Botan 3)
+endif()
 find_dependency(Threads)
 
 include("${CMAKE_CURRENT_LIST_DIR}/eventloopTargets.cmake")

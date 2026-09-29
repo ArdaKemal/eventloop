@@ -1,5 +1,6 @@
 #include "eventloop/udp_socket.h"
 #include "ip_endpoint_native.h"
+#include "socket_operations.h"
 
 #include <array>
 #include <cerrno>
@@ -9,65 +10,29 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 
 namespace eventloop {
 
 namespace {
-[[nodiscard]] auto system_error(const char* operation) -> std::system_error
+[[nodiscard]] auto numeric_result(const detail::socket_result& result) noexcept
+    -> int
 {
-    return {errno, std::system_category(), operation};
-}
-
-[[nodiscard]] auto retryable(int error) noexcept -> bool
-{
-    return error == EAGAIN || error == EWOULDBLOCK;
-}
-
-[[nodiscard]] auto try_receive(int descriptor, std::span<std::byte> buffer,
-                               ip_endpoint& source) noexcept -> int
-{
-    if (buffer.size() > static_cast<std::size_t>(
-                            std::numeric_limits<int>::max())) {
-        return -EINVAL;
-    }
-    sockaddr_storage native_source {};
-    iovec iov {.iov_base = buffer.data(), .iov_len = buffer.size()};
-    msghdr message {};
-    message.msg_name = &native_source;
-    message.msg_namelen = sizeof(native_source);
-    message.msg_iov = &iov;
-    message.msg_iovlen = 1;
-    for (;;) {
-        const auto received = ::recvmsg(descriptor, &message, MSG_TRUNC);
-        if (received >= 0) {
-            if ((message.msg_flags & MSG_TRUNC) != 0 ||
-                static_cast<std::size_t>(received) > buffer.size()) {
-                return -EMSGSIZE;
-            }
-            source = detail::public_endpoint(native_source);
-            return static_cast<int>(received);
-        }
-        if (errno != EINTR) return -errno;
-    }
-}
-
-[[nodiscard]] auto try_send(int descriptor, std::span<const std::byte> buffer,
-                            ip_endpoint destination) noexcept -> int
-{
-    const bool ipv6 = destination.address_family == ip_endpoint::family::ipv6;
-    if (buffer.size() > (ipv6 ? 65527U : 65507U)) return -EMSGSIZE;
-    const auto native_destination = detail::native_endpoint(destination);
-    for (;;) {
-        const auto sent = ::sendto(descriptor, buffer.data(), buffer.size(),
-                                   MSG_NOSIGNAL,
-                                   native_destination.address(),
-                                   native_destination.length);
-        if (sent >= 0) return static_cast<int>(sent);
-        if (errno != EINTR) return -errno;
-    }
+    if (!result.error) return static_cast<int>(result.transferred);
+#ifdef _WIN32
+    if (result.error.value() == WSAEMSGSIZE) return -EMSGSIZE;
+    if (result.error.value() == ERROR_OPERATION_ABORTED) return -ECANCELED;
+    return -EIO;
+#else
+    return -result.error.value();
+#endif
 }
 
 [[nodiscard]] auto error_code(int result) noexcept -> std::error_code
@@ -80,51 +45,29 @@ udp_socket::udp_socket(event_loop& loop, ip_endpoint endpoint,
                        bool reuse_port)
     : loop_(loop)
 {
-    descriptor_.reset(::socket(detail::socket_family(endpoint),
-                               SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                               0));
-    if (!descriptor_) throw system_error("socket");
-
-    const int enabled = 1;
-    if (detail::set_ipv6_only(descriptor_.get(), endpoint) == -1) {
-        throw system_error("setsockopt(IPV6_V6ONLY)");
-    }
-    if (::setsockopt(descriptor_.get(), SOL_SOCKET, SO_REUSEADDR, &enabled,
-                     sizeof(enabled)) == -1) {
-        throw system_error("setsockopt(SO_REUSEADDR)");
-    }
-    if (reuse_port &&
-        ::setsockopt(descriptor_.get(), SOL_SOCKET, SO_REUSEPORT, &enabled,
-                     sizeof(enabled)) == -1) {
-        throw system_error("setsockopt(SO_REUSEPORT)");
-    }
-    const auto native = detail::native_endpoint(endpoint);
-    if (::bind(descriptor_.get(), native.address(), native.length) == -1) {
-        throw system_error("bind");
-    }
+    descriptor_.reset(detail::socket_operations::create(
+        detail::socket_family(endpoint), SOCK_DGRAM, 0));
+    registered_descriptor_ = descriptor_.get();
+    detail::socket_operations::prepare_datagram(descriptor_.get(), endpoint,
+                                                reuse_port);
 }
 
 udp_socket::~udp_socket()
 {
     // Removing a socket with an active awaiter would leave a coroutine with a
     // dangling socket reference. Cancel its task before removing the handler.
-    if (receive_ != nullptr || send_ != nullptr) std::terminate();
+    if (receive_ != nullptr || send_ != nullptr || pending_operations_ != 0)
+        std::terminate();
 }
 
-auto udp_socket::descriptor() const noexcept -> int
+auto udp_socket::descriptor() const noexcept -> native_socket
 {
     return descriptor_.get();
 }
 
 auto udp_socket::local_endpoint() const -> ip_endpoint
 {
-    sockaddr_storage native {};
-    socklen_t length = sizeof(native);
-    if (::getsockname(descriptor_.get(), reinterpret_cast<sockaddr*>(&native),
-                      &length) == -1) {
-        throw system_error("getsockname");
-    }
-    return detail::public_endpoint(native);
+    return detail::socket_operations::local_endpoint(descriptor_.get());
 }
 
 auto udp_socket::close() -> void
@@ -132,8 +75,25 @@ auto udp_socket::close() -> void
     event_loop::handler_call_scope scope(loop_);
     if (closing_) return;
     closing_ = true;
-    complete_pending(-ECANCELED);
-    loop_.remove(descriptor_.get());
+    const bool receive_kernel = receive_ != nullptr &&
+                                receive_->operation_.pending_completion;
+    const bool send_kernel = send_ != nullptr &&
+                             send_->operation_.pending_completion;
+    if (receive_kernel) {
+        receive_->cancelled_ = true;
+        detail::socket_operations::cancel(descriptor_.get(), receive_->operation_);
+    }
+    if (send_kernel) {
+        send_->cancelled_ = true;
+        detail::socket_operations::cancel(descriptor_.get(), send_->operation_);
+    }
+    if (!receive_kernel && !send_kernel) complete_pending(-ECANCELED);
+    else {
+        if (!receive_kernel) complete_receive(-ECANCELED);
+        if (!send_kernel) complete_send(-ECANCELED);
+    }
+    if (pending_operations_ != 0) descriptor_.reset();
+    else loop_.remove(registered_descriptor_);
 }
 
 auto udp_socket::async_receive_from(std::span<std::byte> buffer) noexcept
@@ -154,6 +114,20 @@ udp_socket::receive_awaiter::receive_awaiter(
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
+    operation_.context = this;
+    operation_.complete = [](detail::socket_operation& operation,
+                             std::size_t bytes, int error) noexcept {
+        auto& self = *static_cast<receive_awaiter*>(operation.context);
+        detail::socket_result result;
+        result.transferred = bytes;
+        if (self.cancelled_ || self.socket_.closing_)
+            result.error = std::make_error_code(std::errc::operation_canceled);
+        else if (error != 0) result.error = {error, std::system_category()};
+        const int value = self.cancelled_ || self.socket_.closing_
+                              ? -ECANCELED : numeric_result(result);
+        self.socket_.complete_receive(
+            value, detail::socket_operations::received_source(operation));
+    };
 }
 
 auto udp_socket::receive_awaiter::start(
@@ -168,9 +142,6 @@ auto udp_socket::receive_awaiter::start(
         result_ = -EBUSY;
         return false;
     }
-    result_ = try_receive(socket_.descriptor_.get(), buffer_, source_);
-    if (!retryable(-result_)) return false;
-
     continuation_ = continuation;
     if (!detail::coroutine_frame_access::attach_cancellation(
             cancellation, cancellation_)) {
@@ -178,6 +149,16 @@ auto udp_socket::receive_awaiter::start(
         return false;
     }
     socket_.receive_ = this;
+    const auto result = detail::socket_operations::start_receive_from(
+        socket_.descriptor_.get(), buffer_.data(), buffer_.size(), operation_);
+    if (!result.pending) {
+        socket_.receive_ = nullptr;
+        detail::coroutine_frame_access::detach_cancellation(cancellation_);
+        result_ = numeric_result(result);
+        source_ = result.source;
+        return false;
+    }
+    if (operation_.pending_completion) ++socket_.pending_operations_;
     bool armed = false;
     try {
         socket_.update_interest();
@@ -204,7 +185,9 @@ auto udp_socket::receive_awaiter::cancel(
     detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<receive_awaiter*>(node.operation);
-    self.socket_.complete_receive(-ECANCELED);
+    detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
+    if (self.operation_.pending_completion) self.socket_.close();
+    else self.socket_.complete_receive(-ECANCELED);
 }
 
 udp_socket::send_awaiter::send_awaiter(
@@ -214,6 +197,18 @@ udp_socket::send_awaiter::send_awaiter(
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
+    operation_.context = this;
+    operation_.complete = [](detail::socket_operation& operation,
+                             std::size_t bytes, int error) noexcept {
+        auto& self = *static_cast<send_awaiter*>(operation.context);
+        detail::socket_result result;
+        result.transferred = bytes;
+        if (self.cancelled_ || self.socket_.closing_)
+            result.error = std::make_error_code(std::errc::operation_canceled);
+        else if (error != 0) result.error = {error, std::system_category()};
+        self.socket_.complete_send(self.cancelled_ || self.socket_.closing_
+                                       ? -ECANCELED : numeric_result(result));
+    };
 }
 
 auto udp_socket::send_awaiter::start(
@@ -228,9 +223,6 @@ auto udp_socket::send_awaiter::start(
         result_ = -EBUSY;
         return false;
     }
-    result_ = try_send(socket_.descriptor_.get(), buffer_, destination_);
-    if (!retryable(-result_)) return false;
-
     continuation_ = continuation;
     if (!detail::coroutine_frame_access::attach_cancellation(
             cancellation, cancellation_)) {
@@ -238,6 +230,16 @@ auto udp_socket::send_awaiter::start(
         return false;
     }
     socket_.send_ = this;
+    const auto result = detail::socket_operations::start_send_to(
+        socket_.descriptor_.get(), buffer_.data(), buffer_.size(),
+        destination_, operation_);
+    if (!result.pending) {
+        socket_.send_ = nullptr;
+        detail::coroutine_frame_access::detach_cancellation(cancellation_);
+        result_ = numeric_result(result);
+        return false;
+    }
+    if (operation_.pending_completion) ++socket_.pending_operations_;
     bool armed = false;
     try {
         socket_.update_interest();
@@ -264,7 +266,9 @@ auto udp_socket::send_awaiter::cancel(
     detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<send_awaiter*>(node.operation);
-    self.socket_.complete_send(-ECANCELED);
+    detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
+    if (self.operation_.pending_completion) self.socket_.close();
+    else self.socket_.complete_send(-ECANCELED);
 }
 
 auto udp_socket::update_interest() -> void
@@ -279,10 +283,17 @@ auto udp_socket::complete_receive(int result, ip_endpoint source) noexcept
     event_loop::handler_call_scope scope(loop_);
     auto* operation = std::exchange(receive_, nullptr);
     if (operation == nullptr) return;
+    if (operation->operation_.pending_completion) {
+        operation->operation_.pending_completion = false;
+        if (pending_operations_ == 0) std::terminate();
+        --pending_operations_;
+    }
     detail::coroutine_frame_access::detach_cancellation(
         operation->cancellation_);
     operation->result_ = result;
     operation->source_ = source;
+    if (closing_ && pending_operations_ == 0)
+        loop_.remove(registered_descriptor_);
     try {
         update_interest();
     } catch (...) {
@@ -297,9 +308,16 @@ auto udp_socket::complete_send(int result) noexcept -> void
     event_loop::handler_call_scope scope(loop_);
     auto* operation = std::exchange(send_, nullptr);
     if (operation == nullptr) return;
+    if (operation->operation_.pending_completion) {
+        operation->operation_.pending_completion = false;
+        if (pending_operations_ == 0) std::terminate();
+        --pending_operations_;
+    }
     detail::coroutine_frame_access::detach_cancellation(
         operation->cancellation_);
     operation->result_ = result;
+    if (closing_ && pending_operations_ == 0)
+        loop_.remove(registered_descriptor_);
     try {
         update_interest();
     } catch (...) {
@@ -341,29 +359,26 @@ auto udp_socket::complete_pending(int result) noexcept -> void
 auto udp_socket::on_read() -> void
 {
     if (receive_ == nullptr) return;
-    ip_endpoint source;
-    const int result = try_receive(descriptor_.get(), receive_->buffer_, source);
-    if (!retryable(-result)) complete_receive(result, source);
+    const auto result = detail::socket_operations::start_receive_from(
+        descriptor_.get(), receive_->buffer_.data(), receive_->buffer_.size(),
+        receive_->operation_);
+    if (!result.pending) complete_receive(numeric_result(result), result.source);
 }
 
 auto udp_socket::on_write() -> void
 {
     if (send_ == nullptr) return;
-    const int result = try_send(descriptor_.get(), send_->buffer_,
-                                send_->destination_);
-    if (!retryable(-result)) complete_send(result);
+    const auto result = detail::socket_operations::start_send_to(
+        descriptor_.get(), send_->buffer_.data(), send_->buffer_.size(),
+        send_->destination_, send_->operation_);
+    if (!result.pending) complete_send(numeric_result(result));
 }
 
 auto udp_socket::on_error() -> void
 {
-    int error = 0;
-    socklen_t length = sizeof(error);
-    if (::getsockopt(descriptor_.get(), SOL_SOCKET, SO_ERROR, &error,
-                     &length) == -1) {
-        error = errno;
-    }
-    if (error == 0) error = EIO;
-    complete_pending(-error);
+    const auto error = detail::socket_operations::pending_error(
+        descriptor_.get(), EIO);
+    complete_pending(-error.value());
 }
 
 auto udp_socket::on_shutdown() -> void

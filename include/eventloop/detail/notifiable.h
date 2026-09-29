@@ -1,4 +1,5 @@
 #pragma once
+#include "eventloop/native_socket.h"
 
 namespace eventloop {
 
@@ -7,7 +8,7 @@ namespace detail {
 class notifiable {
 public:
     virtual ~notifiable() = default;
-    [[nodiscard]] virtual auto descriptor() const noexcept -> int = 0;
+    [[nodiscard]] virtual auto descriptor() const noexcept -> native_socket = 0;
     virtual auto on_read() -> void = 0;
     virtual auto on_write() -> void = 0;
     virtual auto on_error() -> void = 0;

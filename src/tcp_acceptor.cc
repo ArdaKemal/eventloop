@@ -1,5 +1,6 @@
 #include "eventloop/tcp_acceptor.h"
 #include "ip_endpoint_native.h"
+#include "socket_operations.h"
 
 #include <array>
 #include <cerrno>
@@ -10,97 +11,35 @@
 #include <system_error>
 #include <utility>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 namespace eventloop {
 
 namespace {
-constexpr std::size_t max_accepts_per_event = 64;
-
 [[nodiscard]] auto code(int error) noexcept -> std::error_code
 {
     return {error, std::generic_category()};
-}
-
-[[nodiscard]] auto system_error(const char* operation) -> std::system_error
-{
-    return {errno, std::system_category(), operation};
-}
-
-[[nodiscard]] constexpr auto transient_accept_error(int error) noexcept -> bool
-{
-    switch (error) {
-    case ECONNABORTED:
-    case ENETDOWN:
-    case EPROTO:
-    case ENOPROTOOPT:
-    case EHOSTDOWN:
-    case ENONET:
-    case EHOSTUNREACH:
-    case EOPNOTSUPP:
-    case ENETUNREACH:
-        return true;
-    default:
-        return false;
-    }
-}
-
-[[nodiscard]] auto accept_one(int listener)
-    -> std::expected<unique_fd, std::error_code>
-{
-    for (std::size_t attempt = 0; attempt < max_accepts_per_event; ++attempt) {
-        unique_fd client(::accept4(listener, nullptr, nullptr,
-                                   SOCK_NONBLOCK | SOCK_CLOEXEC));
-        if (client) {
-            const int enabled = 1;
-            if (::setsockopt(client.get(), IPPROTO_TCP, TCP_NODELAY, &enabled,
-                             sizeof(enabled)) == -1) {
-                return std::unexpected(code(errno));
-            }
-            return client;
-        }
-        if (errno == EINTR || transient_accept_error(errno)) continue;
-        return std::unexpected(code(errno));
-    }
-    return std::unexpected(code(EAGAIN));
 }
 } // namespace
 
 tcp_acceptor::tcp_acceptor(event_loop& loop, ip_endpoint bind_endpoint,
                            bool reuse_port)
-    : loop_(loop)
+    : loop_(loop), family_(detail::socket_family(bind_endpoint))
 {
-    descriptor_.reset(socket(detail::socket_family(bind_endpoint),
-                             SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
-    if (!descriptor_) {
-        throw system_error("socket");
-    }
-
-    const int enabled = 1;
-    if (detail::set_ipv6_only(descriptor_.get(), bind_endpoint) == -1) {
-        throw system_error("setsockopt(IPV6_V6ONLY)");
-    }
-    if (setsockopt(descriptor_.get(), SOL_SOCKET, SO_REUSEADDR, &enabled,
-                   sizeof(enabled)) == -1) {
-        throw system_error("setsockopt");
-    }
-    if (reuse_port &&
-        setsockopt(descriptor_.get(), SOL_SOCKET, SO_REUSEPORT, &enabled,
-                   sizeof(enabled)) == -1) {
-        throw system_error("setsockopt(SO_REUSEPORT)");
-    }
-
-    const auto endpoint = detail::native_endpoint(bind_endpoint);
-    if (bind(descriptor_.get(), endpoint.address(), endpoint.length) == -1) {
-        throw system_error("bind");
-    }
-    if (listen(descriptor_.get(), SOMAXCONN) == -1) {
-        throw system_error("listen");
-    }
+    descriptor_.reset(detail::socket_operations::create(
+        detail::socket_family(bind_endpoint), SOCK_STREAM, 0));
+    registered_descriptor_ = descriptor_.get();
+    detail::socket_operations::prepare_listener(descriptor_.get(),
+                                                bind_endpoint, reuse_port);
 }
 
 tcp_acceptor::~tcp_acceptor()
@@ -108,7 +47,7 @@ tcp_acceptor::~tcp_acceptor()
     if (waiter_ != nullptr) std::terminate();
 }
 
-auto tcp_acceptor::descriptor() const noexcept -> int
+auto tcp_acceptor::descriptor() const noexcept -> native_socket
 {
     return descriptor_.get();
 }
@@ -128,8 +67,14 @@ auto tcp_acceptor::fail_and_close(std::error_code error) -> void
     event_loop::handler_call_scope scope(loop_);
     if (closed_) return;
     closed_ = true;
+    if (waiter_ != nullptr && waiter_->operation_.pending_completion) {
+        waiter_->cancelled_ = true;
+        detail::socket_operations::cancel(descriptor_.get(), waiter_->operation_);
+        descriptor_.reset();
+        return;
+    }
     complete_accept({}, error);
-    loop_.remove(descriptor_.get());
+    loop_.remove(registered_descriptor_);
 }
 
 auto tcp_acceptor::set_read_interest(bool enabled) -> void
@@ -147,6 +92,7 @@ auto tcp_acceptor::complete_accept(unique_fd descriptor,
     if (waiter == nullptr) return;
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
+    if (closed_) loop_.remove(registered_descriptor_);
     waiter->finish(std::move(descriptor), error);
     if (!closed_) {
         try {
@@ -163,20 +109,17 @@ auto tcp_acceptor::complete_accept(unique_fd descriptor,
 auto tcp_acceptor::on_read() -> void
 {
     if (waiter_ == nullptr || closed_) return;
-    auto accepted = accept_one(descriptor_.get());
-    if (!accepted && accepted.error().value() == EAGAIN) return;
-    if (accepted) complete_accept(std::move(*accepted), {});
-    else complete_accept({}, accepted.error());
+    auto result = detail::socket_operations::start_accept(
+        descriptor_.get(), family_, waiter_->accept_addresses_,
+        waiter_->operation_);
+    if (result.pending) return;
+    complete_accept(unique_fd(result.accepted), result.error);
 }
 
 auto tcp_acceptor::on_error() -> void
 {
-    int error = 0;
-    socklen_t length = sizeof(error);
-    if (::getsockopt(descriptor_.get(), SOL_SOCKET, SO_ERROR, &error,
-                     &length) == -1) error = errno;
-    if (error == 0) error = ECONNRESET;
-    fail_and_close(code(error));
+    fail_and_close(detail::socket_operations::pending_error(
+        descriptor_.get(), ECONNRESET));
 }
 
 auto tcp_acceptor::on_shutdown() -> void
@@ -189,6 +132,22 @@ tcp_acceptor::accept_awaiter::accept_awaiter(tcp_acceptor& owner) noexcept
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
+    operation_.context = this;
+    operation_.complete = [](detail::socket_operation& operation,
+                             std::size_t, int error) noexcept {
+        auto& self = *static_cast<accept_awaiter*>(operation.context);
+        std::error_code result;
+        if (self.cancelled_ || self.owner_.closed_)
+            result = code(ECANCELED);
+        else if (error != 0)
+            result = {error, std::system_category()};
+        else
+            result = detail::socket_operations::finish_accept(
+                self.owner_.descriptor_.get(), self.accepted_.get());
+        unique_fd accepted = std::move(self.accepted_);
+        if (result) accepted.reset();
+        self.owner_.complete_accept(std::move(accepted), result);
+    };
 }
 
 tcp_acceptor::accept_awaiter::~accept_awaiter()
@@ -212,15 +171,6 @@ auto tcp_acceptor::accept_awaiter::suspend(
         result_ = std::unexpected(code(ECANCELED));
         return false;
     }
-    auto accepted = accept_one(owner_.descriptor_.get());
-    if (accepted) {
-        result_ = std::move(*accepted);
-        return false;
-    }
-    if (accepted.error().value() != EAGAIN) {
-        result_ = std::unexpected(accepted.error());
-        return false;
-    }
     continuation_ = handle;
     if (!detail::coroutine_frame_access::attach_cancellation(
             state, cancellation_)) {
@@ -228,6 +178,17 @@ auto tcp_acceptor::accept_awaiter::suspend(
         return false;
     }
     owner_.waiter_ = this;
+    const auto result = detail::socket_operations::start_accept(
+        owner_.descriptor_.get(), owner_.family_, accept_addresses_, operation_);
+    if (!result.pending) {
+        owner_.waiter_ = nullptr;
+        detail::coroutine_frame_access::detach_cancellation(cancellation_);
+        if (result.error) result_ = std::unexpected(result.error);
+        else result_ = unique_fd(result.accepted);
+        return false;
+    }
+    if (result.accepted != static_cast<native_socket>(-1))
+        accepted_.reset(result.accepted);
     try {
         owner_.set_read_interest(true);
     } catch (const std::system_error& error) {
@@ -244,7 +205,9 @@ auto tcp_acceptor::accept_awaiter::cancel(
     detail::coroutine_cancellation_node& node) noexcept -> void
 {
     auto& self = *static_cast<accept_awaiter*>(node.operation);
-    self.owner_.complete_accept({}, code(ECANCELED));
+    detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
+    if (self.operation_.pending_completion) self.owner_.close();
+    else self.owner_.complete_accept({}, code(ECANCELED));
 }
 
 auto tcp_acceptor::accept_awaiter::finish(unique_fd descriptor,

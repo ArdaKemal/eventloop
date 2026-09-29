@@ -1,18 +1,28 @@
 #pragma once
 
 #include "eventloop/ip_endpoint.h"
+#include "eventloop/native_socket.h"
 
 #include <cstring>
 #include <stdexcept>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 
 namespace eventloop::detail {
 
 struct native_ip_endpoint {
     sockaddr_storage storage {};
+#ifdef _WIN32
+    int length {0};
+#else
     socklen_t length {0};
+#endif
 
     [[nodiscard]] auto address() const noexcept -> const sockaddr*
     {
@@ -69,12 +79,18 @@ struct native_ip_endpoint {
     return endpoint.address_family == ip_endpoint::family::ipv6 ? AF_INET6 : AF_INET;
 }
 
-inline auto set_ipv6_only(int descriptor, ip_endpoint endpoint) -> int
+inline auto set_ipv6_only(native_socket descriptor, ip_endpoint endpoint) -> int
 {
     if (endpoint.address_family != ip_endpoint::family::ipv6) return 0;
     const int enabled = 1;
+#ifdef _WIN32
+    return ::setsockopt(static_cast<SOCKET>(descriptor), IPPROTO_IPV6,
+                        IPV6_V6ONLY, reinterpret_cast<const char*>(&enabled),
+                        sizeof(enabled));
+#else
     return ::setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &enabled,
                         sizeof(enabled));
+#endif
 }
 
 } // namespace eventloop::detail

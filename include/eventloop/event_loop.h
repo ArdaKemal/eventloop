@@ -1,6 +1,7 @@
 #pragma once
 
 #include "eventloop/executor.h"
+#include "eventloop/native_socket.h"
 
 #include <array>
 #include <chrono>
@@ -231,10 +232,10 @@ private:
     [[nodiscard]] auto can_spawn() const noexcept -> bool;
     [[nodiscard]] auto post_local(execution_task&& task) noexcept -> bool;
     auto add_handler(std::unique_ptr<detail::notifiable> handler) -> void;
-    auto remove(int descriptor) -> void;
-    auto set_io_interest(int descriptor, bool read_enabled,
+    auto remove(native_socket descriptor) -> void;
+    auto set_io_interest(native_socket descriptor, bool read_enabled,
                          bool write_enabled) -> void;
-    auto set_write_interest(int descriptor, bool enabled) -> void;
+    auto set_write_interest(native_socket descriptor, bool enabled) -> void;
 
     class implementation;
     std::unique_ptr<implementation> implementation_;

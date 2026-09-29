@@ -1,4 +1,5 @@
 #include "eventloop/tls_stream.h"
+#include "socket_operations.h"
 
 #include <algorithm>
 #include <array>
@@ -24,8 +25,6 @@
 #include <botan/tls_session_manager_memory.h>
 #include <botan/x509cert.h>
 #include <botan/x509_crl.h>
-
-#include <sys/socket.h>
 
 namespace eventloop {
 
@@ -593,12 +592,9 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
     }
     // Outbound TCP streams activate their transport before they connect.
     // Check the actual peer before sending the client's TLS handshake.
-    sockaddr_storage peer {};
-    socklen_t peer_size = sizeof(peer);
-    if (::getpeername(self.descriptor(), reinterpret_cast<sockaddr*>(&peer),
-                      &peer_size) == -1) {
-        co_return std::unexpected(system_code(errno));
-    }
+    if (auto peer = detail::socket_operations::peer_endpoint(self.descriptor());
+        !peer)
+        co_return std::unexpected(peer.error());
     if (auto activated = self.activate_async_tls(); !activated) {
         co_return std::unexpected(activated.error());
     }

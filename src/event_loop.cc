@@ -3,18 +3,27 @@
 #include "eventloop/tcp_acceptor.h"
 #include "eventloop/tcp_stream.h"
 #include "eventloop/udp_socket.h"
+#ifndef _WIN32
 #include "eventloop/file_io.h"
+#endif
 #include "eventloop/task.h"
 
 #include "executor/bounded_task_queue.h"
+#ifdef _WIN32
+#include "windows/iocp_loop.h"
+#else
 #include "linux/epoll_loop.h"
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#ifndef _WIN32
 #include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <limits>
 #include <map>
 #include <new>
@@ -25,7 +34,6 @@
 #include <unordered_set>
 #include <utility>
 
-#include <unistd.h>
 
 #if defined(__SANITIZE_ADDRESS__)
 #define EVENTLOOP_ADDRESS_SANITIZER 1
@@ -168,7 +176,9 @@ private:
         bool allocated;
     };
 
+#ifndef _WIN32
     static_assert(sizeof(block_header) == 2 * coroutine_frame_alignment);
+#endif
 
     struct alignas(coroutine_frame_alignment) slab_header {
         slab_header* all_next;
@@ -183,7 +193,9 @@ private:
         bool retained;
     };
 
+#ifndef _WIN32
     static_assert(sizeof(slab_header) == 5 * coroutine_frame_alignment);
+#endif
 
     struct size_class {
         ~size_class()
@@ -390,14 +402,20 @@ public:
 
     auto initialize_file_executor() -> void
     {
+#ifndef _WIN32
         if (file_executor) return;
         file_executor = make_multi_thread_executor(
             {.worker_count = 1, .queue_capacity = file_io_depth});
+#endif
     }
 
     [[nodiscard]] static auto perform_file_operation(
         detail::file_io_operation& operation) noexcept -> int
     {
+#ifdef _WIN32
+        (void)operation;
+        return -ENOTSUP;
+#else
         using detail::file_opcode;
         if (operation.cancelled.load(std::memory_order_acquire)) {
             return -ECANCELED;
@@ -426,11 +444,16 @@ public:
                 return -ECANCELED;
             }
         }
+#endif
     }
 
     [[nodiscard]] auto submit_file(detail::file_io_operation& operation)
         noexcept -> int
     {
+#ifdef _WIN32
+        (void)operation;
+        return -ENOTSUP;
+#else
         if (shutting_down) return -ECANCELED;
         if (!file_executor) {
             try {
@@ -463,14 +486,20 @@ public:
         }
         ++file_io_inflight;
         return 0;
+#endif
     }
 
     auto complete_file(detail::file_io_operation& operation,
                        int result) noexcept -> void
     {
+#ifndef _WIN32
         if (file_io_inflight == 0) std::terminate();
         --file_io_inflight;
         operation.finish(operation, result);
+#else
+        (void)operation;
+        (void)result;
+#endif
     }
 
     [[nodiscard]] auto drain_posted() -> bool
@@ -546,7 +575,7 @@ public:
 
     auto erase_pending() -> void
     {
-        for (const int descriptor : pending_removals) {
+        for (const native_socket descriptor : pending_removals) {
             handlers.erase(descriptor);
         }
         pending_removals.clear();
@@ -557,8 +586,19 @@ public:
         if (--dispatch_depth != 0) return;
         if (force_shutdown_pending) {
             force_shutdown_pending = false;
+#ifdef _WIN32
+            // Closing an IOCP socket requests cancellation. Keep each handler
+            // until its outstanding completions have been dequeued.
+            ++dispatch_depth;
+            for (auto& [descriptor, handler] : handlers) {
+                if (!pending_removals.contains(descriptor)) handler->on_shutdown();
+            }
+            --dispatch_depth;
+            erase_pending();
+#else
             pending_removals.clear();
             handlers.clear();
+#endif
         } else {
             erase_pending();
         }
@@ -663,12 +703,24 @@ public:
 
     auto force_shutdown() noexcept -> void
     {
+#ifdef _WIN32
+        if (dispatch_depth != 0) {
+            force_shutdown_pending = true;
+            return;
+        }
+        ++dispatch_depth;
+        for (auto& [descriptor, handler] : handlers) {
+            if (!pending_removals.contains(descriptor)) handler->on_shutdown();
+        }
+        finish_dispatch();
+#else
         if (dispatch_depth != 0) {
             force_shutdown_pending = true;
             return;
         }
         pending_removals.clear();
         handlers.clear();
+#endif
     }
 
     [[nodiscard]] auto shutdown_complete() const noexcept -> bool
@@ -750,7 +802,11 @@ public:
     using timer_key = std::pair<event_loop::clock::time_point,
                                 std::uint64_t>;
     coroutine_frame_pool coroutine_frames;
+#ifdef _WIN32
+    iocp_loop poller;
+#else
     epoll_loop poller;
+#endif
     const std::thread::id owner_thread {std::this_thread::get_id()};
     bounded_task_queue posted_tasks;
     // Only the owning loop thread reads or writes this hint. Local yield
@@ -765,8 +821,8 @@ public:
     const std::size_t file_io_depth;
     std::unique_ptr<executor> file_executor;
     std::size_t file_io_inflight {0};
-    std::unordered_map<int, std::unique_ptr<detail::notifiable>> handlers;
-    std::unordered_set<int> pending_removals;
+    std::unordered_map<native_socket, std::unique_ptr<detail::notifiable>> handlers;
+    std::unordered_set<native_socket> pending_removals;
     std::map<timer_key, execution_task> timers;
     std::uint64_t next_timer {1};
     std::size_t dispatch_depth {0};
@@ -816,8 +872,14 @@ auto event_loop::run() -> event_loop_result
 
         try {
             for (std::size_t index = 0; index < result.event_count; ++index) {
+#ifndef _WIN32
                 if (implementation_->force_shutdown_pending) break;
+#endif
                 const auto event = events[index];
+#ifdef _WIN32
+                event.operation->complete(*event.operation, event.bytes,
+                                          event.error);
+#else
                 const auto found = implementation_->handlers.find(event.descriptor);
                 if (found == implementation_->handlers.end()) {
                     continue;
@@ -837,6 +899,7 @@ auto event_loop::run() -> event_loop_result
                         event.descriptor)) {
                     handler->on_write();
                 }
+#endif
             }
         } catch (...) {
             if (result.event_count != 0) implementation_->finish_dispatch();
@@ -956,7 +1019,7 @@ auto event_loop::add_handler(
     if (implementation_->shutting_down) {
         throw std::logic_error("cannot add a handler during shutdown");
     }
-    const int descriptor = handler->descriptor();
+    const native_socket descriptor = handler->descriptor();
     if (implementation_->handlers.contains(descriptor)) {
         throw std::logic_error("descriptor is already registered");
     }
@@ -971,7 +1034,7 @@ auto event_loop::add_handler(
     }
 }
 
-auto event_loop::remove(int descriptor) -> void
+auto event_loop::remove(native_socket descriptor) -> void
 {
     if (!implementation_->handlers.contains(descriptor) ||
         implementation_->pending_removals.contains(descriptor)) {
@@ -991,7 +1054,7 @@ auto event_loop::remove(int descriptor) -> void
     }
 }
 
-auto event_loop::set_io_interest(int descriptor, bool read_enabled,
+auto event_loop::set_io_interest(native_socket descriptor, bool read_enabled,
                                  bool write_enabled) -> void
 {
     if (!implementation_->pending_removals.contains(descriptor)) {
@@ -1000,7 +1063,7 @@ auto event_loop::set_io_interest(int descriptor, bool read_enabled,
     }
 }
 
-auto event_loop::set_write_interest(int descriptor, bool enabled) -> void
+auto event_loop::set_write_interest(native_socket descriptor, bool enabled) -> void
 {
     set_io_interest(descriptor, true, enabled);
 }

@@ -5,6 +5,7 @@
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/task.h"
 #include "eventloop/unique_fd.h"
+#include "eventloop/detail/socket_operation.h"
 
 #include <cstddef>
 #include <coroutine>
@@ -26,7 +27,7 @@ public:
     tcp_stream(const tcp_stream&) = delete;
     auto operator=(const tcp_stream&) -> tcp_stream& = delete;
 
-    [[nodiscard]] auto descriptor() const noexcept -> int override;
+    [[nodiscard]] auto descriptor() const noexcept -> native_socket override;
     [[nodiscard]] auto owning_loop() const noexcept -> event_loop& { return loop_; }
     class connect_awaiter {
     public:
@@ -55,6 +56,8 @@ public:
         detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::error_code error_ {};
+        detail::socket_operation operation_ {};
+        bool cancelled_ {false};
     };
     [[nodiscard]] auto async_connect() noexcept -> connect_awaiter
     {
@@ -92,6 +95,8 @@ public:
         std::coroutine_handle<> continuation_ {};
         std::size_t transferred_ {0};
         std::error_code error_ {};
+        detail::socket_operation operation_ {};
+        bool cancelled_ {false};
     };
     // Buffers remain caller-owned until completion, including cancellation.
     // One read and one write may be pending at a time. Operations return
@@ -194,6 +199,8 @@ private:
     bool transport_activated_ {false};
     bool read_interest_enabled_ {false};
     bool write_interest_enabled_ {false};
+    native_socket registered_descriptor_ {static_cast<native_socket>(-1)};
+    std::size_t pending_operations_ {0};
 };
 
 } // namespace eventloop
