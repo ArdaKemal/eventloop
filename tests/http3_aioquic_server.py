@@ -65,16 +65,22 @@ async def main(args):
                 status = b"200"
                 if path == "/large":
                     body = LARGE_BODY
-                elif path == "/empty":
+                elif path in ("/empty", "/empty-content-length"):
                     status, body = b"204", b""
+                elif path == "/empty-content-length-nonzero":
+                    status, body = b"204", b""
+                elif path == "/empty-with-body":
+                    status, body = b"204", b"unexpected"
                 elif path == "/missing":
                     status, body = b"404", b"missing\n"
                 else:
                     body = json.dumps({"path": path, "authority": authority},
                                       sort_keys=True).encode() + b"\n"
                 fields = [(b":status", status), (b"content-type", b"application/octet-stream")]
-                if status != b"204":
-                    fields.append((b"content-length", str(len(body)).encode()))
+                if status != b"204" or path in (
+                        "/empty-content-length", "/empty-content-length-nonzero"):
+                    length = 1 if path == "/empty-content-length-nonzero" else len(body)
+                    fields.append((b"content-length", str(length).encode()))
                 self.http.send_headers(received.stream_id, fields)
                 self.http.send_data(received.stream_id, body, end_stream=True)
                 self.transmit()

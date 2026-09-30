@@ -154,7 +154,9 @@ auto response_headers(session& s) -> bool
         } else {
             s.final_headers = true;
             s.content_length = length;
-            if (*status == 204 && length) return false;
+            // Some deployed servers send Content-Length: 0 on 204 despite
+            // RFC 9110. Tolerate that harmless value, but never accept a body.
+            if (*status == 204 && length && *length != 0) return false;
             // These statuses cannot carry DATA. Content-Length on 304 refers
             // to a selected representation rather than this response body.
             if (*status == 204 || *status == 304) s.content_length = 0;

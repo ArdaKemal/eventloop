@@ -105,11 +105,15 @@ def run(client, version):
             authority = f"127.0.0.1:{port}"
             cases = [("", "/"), ("?x=1", "/?x=1"),
                      ("/echo/a%2Fb?x=1&x=2#ignored", "/echo/a%2Fb?x=1&x=2"),
-                     ("/large", "/large"), ("/empty", "/empty"), ("/missing", "/missing")]
+                     ("/large", "/large"), ("/empty", "/empty"),
+                     ("/empty-content-length", "/empty-content-length"),
+                     ("/missing", "/missing")]
             for target, path in cases:
                 result = invoke(client, version, port, target, cert)
-                status = 204 if path == "/empty" else 404 if path == "/missing" else 200
-                expected = (LARGE_BODY if path == "/large" else b"" if path == "/empty"
+                status = 204 if path in ("/empty", "/empty-content-length") else \
+                    404 if path == "/missing" else 200
+                expected = (LARGE_BODY if path == "/large" else
+                            b"" if path in ("/empty", "/empty-content-length")
                             else b"missing\n" if path == "/missing" else
                             json.dumps({"path": path, "authority": authority},
                                        sort_keys=True).encode() + b"\n")
@@ -117,6 +121,12 @@ def run(client, version):
                         f"HTTP/3 {status}\n".encode() not in result.stderr):
                     raise RuntimeError(f"{version} {target!r}: rc={result.returncode}, "
                                        f"body={len(result.stdout)} bytes, stderr={result.stderr!r}")
+            for target in ("/empty-content-length-nonzero", "/empty-with-body"):
+                invalid = invoke(client, version, port, target, cert)
+                if (invalid.returncode != 1 or invalid.stdout or
+                        b"HTTP/3 exchange failed" not in invalid.stderr):
+                    raise RuntimeError(f"accepted invalid 204 {target}: "
+                                       f"rc={invalid.returncode}, stderr={invalid.stderr!r}")
             untrusted = invoke(client, version, port, "/", None, timeout_ms=1000)
             if untrusted.returncode != 1 or b"HTTP/3 200" in untrusted.stderr:
                 raise RuntimeError(f"untrusted certificate accepted: {untrusted.stderr!r}")

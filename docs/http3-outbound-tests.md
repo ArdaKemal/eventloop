@@ -40,8 +40,9 @@ after binding. Its aioquic configuration permits exactly one QUIC version. It
 asserts the negotiated version and `h3` ALPN, request method/scheme/authority,
 and FIN. The runner verifies an omitted path, query-only URL, percent-encoded
 path, repeated query parameters, discarded fragment, 32 KiB binary response,
-204 and 404 status/body behavior, rejected untrusted certificates and wrong
-certificate IP identity, and deadlines during handshake and HTTP exchange.
+204 and 404 status/body behavior, tolerance of `Content-Length: 0` on 204,
+rejection of nonzero 204 lengths or bodies, rejected untrusted certificates and
+wrong certificate IP identity, and deadlines during handshake and HTTP exchange.
 The large binary body exceeds the 4 KiB per-stream receive window and requires
 credit replenishment. All success responses are compared byte for byte, and
 server request records independently verify the path and exact wire version.
@@ -63,6 +64,8 @@ python3 tests/probe_http3_live.py --client build/http3_client \
   --version v1 --contains 'colo=' https://www.cloudflare.com/cdn-cgi/trace
 python3 tests/probe_http3_live.py --client build/http3_client \
   --version v2 --timeout-ms 5000 https://www.haproxy.org/
+python3 tests/probe_http3_live.py --client build/http3_client \
+  --version v1 --expect-status 204 https://www.google.com/generate_204
 ```
 
 On 2026-10-01, explicit v1 and v2 GETs both passed against `www.haproxy.org`
@@ -77,12 +80,12 @@ version, exit status, byte count, body hash, and client diagnostics. Use
 hashes for changing public HTML. Network restrictions, remote changes, and DNS
 failures make live results unsuitable as deterministic release gates.
 
-One additional v1 edge case surfaced during that pass: the client rejected
-`https://www.google.com/generate_204` with a protocol error, while curl's
-HTTP/3-only mode received a 204 with an empty body. Treat this as an outstanding
-response-interoperability issue; it is separate from the successful v1/v2
-version checks above.
+Google returned `Content-Length: 0` on a 204 in one live response. RFC 9110
+prohibits that field on 204 responses, but the client now tolerates exactly zero
+for interoperability. It continues to reject nonzero lengths and any body. The
+explicit Google probe passed after this change.
 
 Sources: [aioquic configuration](https://github.com/aiortc/aioquic/blob/1.3.0/src/aioquic/quic/configuration.py),
 [Cloudflare trace endpoint](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/),
-[QUIC working group implementation list](https://github.com/quicwg/base-drafts/wiki/Implementations).
+[QUIC working group implementation list](https://github.com/quicwg/base-drafts/wiki/Implementations),
+[RFC 9110 Content-Length rules](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6).
