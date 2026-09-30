@@ -83,6 +83,10 @@ async def main(args):
                     fields.append((b"content-length", str(length).encode()))
                 self.http.send_headers(received.stream_id, fields)
                 self.http.send_data(received.stream_id, body, end_stream=True)
+                if path == "/decoder-cancel":
+                    self._quic.send_stream_data(self.http._local_decoder_stream_id, b"\x40")
+                elif path == "/decoder-invalid-ack":
+                    self._quic.send_stream_data(self.http._local_decoder_stream_id, b"\x80")
                 self.transmit()
 
     server = await serve("127.0.0.1", 0, configuration=configuration,

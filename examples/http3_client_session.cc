@@ -82,7 +82,7 @@ struct session {
     std::uint64_t request_id {}, request_field_size {}, received_body {};
     std::optional<std::uint64_t> content_length, goaway_id;
     std::error_code failure;
-    bool final_headers {}, trailers {};
+    bool final_headers {}, trailers {}, decoder_cancelled {};
     unsigned informational {};
     std::array<std::byte, 4096> request {};
     std::array<std::byte, section_limit> headers {};
@@ -256,9 +256,14 @@ auto read_peer_stream(event_loop& loop, session& s, std::uint64_t id) -> task<vo
             // octet 0x20. Chunk boundaries cannot split a valid instruction.
             if (!h3::qpack_validate_encoder_instructions(bytes)) { s.fail(); co_return; }
         } else if (*type == 3 && !bytes.empty()) {
-            // Our encoder never inserts; there is nothing to acknowledge or
-            // cancel and any decoder instruction is invalid in this session.
-            s.fail(); co_return;
+            // This one-shot client uses request stream 0 and never references
+            // the dynamic table. Accept its Stream Cancellation; other QPACK
+            // decoder instructions cannot be valid for this request.
+            if (s.request_id != 0 || s.decoder_cancelled || bytes.size() != 1 ||
+                bytes.front() != std::byte{0x40}) {
+                s.fail(); co_return;
+            }
+            s.decoder_cancelled = true;
         }
         // Unknown uni stream types are drained and ignored in fixed storage.
     }

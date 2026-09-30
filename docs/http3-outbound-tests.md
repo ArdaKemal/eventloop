@@ -85,6 +85,10 @@ prohibits that field on 204 responses, but the client now tolerates exactly zero
 for interoperability. It continues to reject nonzero lengths and any body. The
 explicit Google probe passed after this change.
 
+See the [2026-10-01 public HTTP/3 interoperability sweep](http3-public-interoperability-2026-10-01.md)
+for the broader endpoint matrix, the QPACK Stream Cancellation fix, and current
+unresolved endpoint/version results.
+
 Sources: [aioquic configuration](https://github.com/aiortc/aioquic/blob/1.3.0/src/aioquic/quic/configuration.py),
 [Cloudflare trace endpoint](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/),
 [QUIC working group implementation list](https://github.com/quicwg/base-drafts/wiki/Implementations),

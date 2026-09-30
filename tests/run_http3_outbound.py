@@ -105,7 +105,8 @@ def run(client, version):
             authority = f"127.0.0.1:{port}"
             cases = [("", "/"), ("?x=1", "/?x=1"),
                      ("/echo/a%2Fb?x=1&x=2#ignored", "/echo/a%2Fb?x=1&x=2"),
-                     ("/large", "/large"), ("/empty", "/empty"),
+                     ("/large", "/large"), ("/decoder-cancel", "/decoder-cancel"),
+                     ("/empty", "/empty"),
                      ("/empty-content-length", "/empty-content-length"),
                      ("/missing", "/missing")]
             for target, path in cases:
@@ -127,6 +128,11 @@ def run(client, version):
                         b"HTTP/3 exchange failed" not in invalid.stderr):
                     raise RuntimeError(f"accepted invalid 204 {target}: "
                                        f"rc={invalid.returncode}, stderr={invalid.stderr!r}")
+            invalid_ack = invoke(client, version, port, "/decoder-invalid-ack", cert)
+            if (invalid_ack.returncode != 1 or
+                    b"HTTP/3 exchange failed" not in invalid_ack.stderr):
+                raise RuntimeError("accepted invalid QPACK section acknowledgement: "
+                                   f"rc={invalid_ack.returncode}, stderr={invalid_ack.stderr!r}")
             untrusted = invoke(client, version, port, "/", None, timeout_ms=1000)
             if untrusted.returncode != 1 or b"HTTP/3 200" in untrusted.stderr:
                 raise RuntimeError(f"untrusted certificate accepted: {untrusted.stderr!r}")
