@@ -160,8 +160,8 @@ switching PCs; a fresh clone will not contain uncommitted work.
 - `src/quic/packet_protection.{h,cc}` uses OpenSSL EVP for QUIC v1/v2 Initial
   secrets, AES-128-GCM traffic keys, payload/header protection, Retry integrity,
   and v1/v2 1-RTT key-update derivation. The TLS adapter uses OpenSSL 3.5+'s
-  supported external QUIC callbacks. Botan remains for the existing TCP/TLS
-  paths; it is no longer in the QUIC crypto path.
+  supported external QUIC callbacks. TCP/TLS streams also use OpenSSL, with
+  fixed-capacity BIO input/output and direct reads into caller buffers.
 - `src/quic/key_update.{h,cc}` tracks send/receive key phases, ACK gates, peer
   updates, and previous-key retention. The caller must authenticate candidate
   packets before committing updates and enforce AEAD usage limits and update
@@ -335,8 +335,8 @@ switching PCs; a fresh clone will not contain uncommitted work.
 
 ## Environment and verification
 
-Build dependencies include a C++23 compiler, CMake, OpenSSL 3.5+, Botan 3 for
-the existing TLS paths, and threads. The current host is Fedora 44 on Linux
+Build dependencies include a C++23 compiler, CMake, OpenSSL 3.5+, and threads.
+The current host is Fedora 44 on Linux
 7.2.5 with the project on Btrfs and `/tmp` on memory-backed `tmpfs`.
 
 ```sh
@@ -392,6 +392,32 @@ Use build directories ignored by Git or outside the repository on the new
 machine. Recheck warnings, `git diff --check`, and test results after changes.
 
 ## Worktree and commit scope
+
+### OpenSSL TCP/TLS migration (2026-09-30)
+
+- Botan is no longer a build or package dependency. TCP/TLS contexts use
+  OpenSSL for certificate chains, encrypted private keys, system/custom trust,
+  hostname/IP verification, ALPN, and optional CRL checking.
+- TLS streams use custom BIOs over the existing 4 KiB input and 64 KiB output
+  arrays. Reads go directly into caller buffers; the former plaintext spill
+  allocation is removed. Writes remain capped at 4 KiB. Record buffers are
+  retained by OpenSSL rather than released and reallocated on each operation.
+- `tests/tls_openssl.cc` checks TLS 1.2/1.3 interoperability with conventional
+  OpenSSL peers, 16 KiB records drained through 317-byte spans, encrypted-key
+  passwords, and mismatched keys. Its OpenSSL allocator hooks measured only
+  40-byte internal packet-metadata allocations after warm-up: 62 allocations
+  (2,480 bytes) for 31 TLS 1.2 exchanges and 124 (4,960 bytes) for TLS 1.3.
+  This is not a claim of allocation-free OpenSSL internals.
+- A clean GCC 14.2 Release build in `/tmp/eventloop-openssl` passed CTest
+  62/62. The extended TLS loopback test covers ALPN mismatch, PEM bundles,
+  DER trust directories, and revoked certificates. An installed-package
+  consumer configured and linked using only the exported eventloop target.
+- MSVC RelWithDebInfo built in `build/windows-openssl-port` and passed 59/61
+  Windows tests, including HTTP/TLS/socket tests. `quic_public_api` and
+  `quic_connection_driver` abort with `0xc0000409`; both also fail on an
+  untouched HEAD snapshot built with identical default MSVC flags in
+  `build/windows-openssl-baseline-build`. The older passing Windows build had
+  empty `CMAKE_CXX_FLAGS*` values, so its results are not a matching baseline.
 
 Before any commit, inspect `git status` and stage only intended files. The
 file-I/O slice remains experimental infrastructure, not a completed

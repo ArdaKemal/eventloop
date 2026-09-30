@@ -200,7 +200,7 @@ participant while diagnosing a result.
 
 This is a local HTTP/1.1 static-file benchmark, not a production tuning guide.
 Plain HTTP file responses use Linux `sendfile`; HTTPS responses pass through
-Botan in user space. Plain HTTP files smaller than 11 KiB use the buffered path;
+OpenSSL in user space. Plain HTTP files smaller than 11 KiB use the buffered path;
 larger files use `sendfile`. Treat the comparison as end-to-end baseline data
 and record the command, CPU, and package versions with any result.
 

@@ -56,8 +56,8 @@ empty list from an inaccessible page.
   QUIC through `tls_stream` or use a third-party QUIC engine.
 - Use OpenSSL 3.5 or later for QUIC TLS and EVP packet cryptography. Its
   external QUIC TLS callback API exposes handshake bytes, traffic secrets,
-  transport parameters, ALPN, and alerts without a TLS-record shim. Keep the
-  existing TCP/TLS provider unchanged; Botan remains for those paths.
+  transport parameters, ALPN, and alerts without a TLS-record shim. TCP/TLS
+  streams also use OpenSSL.
 - Validate codecs and packet protection against RFC vectors and negative
   cases.
 
@@ -187,7 +187,8 @@ workspace contains:
   v2; `examples/quic_echo_server.cc` is a runnable server.
 
 On 2026-09-30, the Visual Studio 18/MSVC RelWithDebInfo build with OpenSSL
-3.5.6 and Botan 3.13 passed the full Windows CTest suite, 61/61. A GCC 14.2
+3.5.6 and the previous TLS provider passed the full Windows CTest suite,
+61/61. A GCC 14.2
 Release build on Linux (epoll) passed the full suite 61/61 as well. The Linux
 build previously failed because `src/http/file_operations.h` used
 `native_socket` without including `eventloop/native_socket.h`; the missing

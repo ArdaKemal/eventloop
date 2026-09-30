@@ -1,9 +1,6 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-if(@EVENTLOOP_CONFIG_NEEDS_BOTAN@)
-    find_dependency(Botan 3)
-endif()
 if(@EVENTLOOP_CONFIG_NEEDS_OPENSSL@)
     find_dependency(OpenSSL 3.5 COMPONENTS Crypto SSL)
 endif()

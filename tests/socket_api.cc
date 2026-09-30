@@ -20,10 +20,7 @@
 #ifdef EVENTLOOP_TEST_TLS
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
-#include <botan/auto_rng.h>
-#include <botan/pkcs8.h>
-#include <botan/rsa.h>
-#include <botan/x509self.h>
+#include "tls_test_certificate.h"
 #endif
 
 #ifdef _WIN32
@@ -335,16 +332,7 @@ struct temporary_certificate {
         std::filesystem::create_directory(directory);
         certificate = directory / "cert.pem";
         key = directory / "key.pem";
-        Botan::AutoSeeded_RNG rng;
-        Botan::RSA_PrivateKey private_key(rng, 2048);
-        Botan::X509_Cert_Options options("localhost");
-        options.more_dns.push_back("localhost");
-        options.not_before("20260101000000Z");
-        options.not_after("20300101000000Z");
-        auto generated = Botan::X509::create_self_signed_cert(
-            options, private_key, "SHA-256", rng);
-        std::ofstream(certificate, std::ios::binary) << generated.PEM_encode();
-        std::ofstream(key, std::ios::binary) << Botan::PKCS8::PEM_encode(private_key);
+        eventloop::test::make_localhost_certificate(certificate, key);
     }
 
     ~temporary_certificate()

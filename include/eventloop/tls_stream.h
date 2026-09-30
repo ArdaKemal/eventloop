@@ -85,7 +85,6 @@ private:
         -> std::expected<void, std::error_code>;
     [[nodiscard]] auto receive_encrypted(std::span<const std::byte> data) noexcept
         -> std::error_code;
-    auto take_plaintext(std::span<std::byte> buffer) noexcept -> std::size_t;
 
     class implementation;
     std::unique_ptr<implementation> implementation_;

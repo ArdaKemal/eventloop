@@ -28,7 +28,7 @@ using namespace eventloop;
 
 namespace {
 
-constexpr std::string_view message = "Botan TLS loopback";
+constexpr std::string_view message = "OpenSSL TLS loopback";
 
 [[nodiscard]] auto system_error(const char* operation) -> std::system_error
 {
@@ -102,7 +102,8 @@ struct stream_pair {
                                const std::filesystem::path& key,
                                const std::filesystem::path& trusted_ca,
                                std::string_view hostname = "localhost",
-                               bool small_send_buffer = false) -> stream_pair
+                               bool small_send_buffer = false,
+                               bool mismatch_alpn = false) -> stream_pair
 {
     auto sockets = connect_loopback();
     if (small_send_buffer) {
@@ -120,7 +121,7 @@ struct stream_pair {
         loop, std::move(sockets.client),
         tls_context::make_client(trusted_ca),
         tls_client_options {.hostname = std::string(hostname),
-                            .application_protocols = {"echo"}});
+                            .application_protocols = {mismatch_alpn ? "other" : "echo"}});
     stream_pair pair {server.get(), client.get()};
     loop.add(std::move(server));
     loop.add(std::move(client));
@@ -311,7 +312,7 @@ struct stream_pair {
     result_state result {loop};
     auto streams = add_streams(loop, certificate, key, trusted_ca,
                                which == 1 ? "wrong.example" : "localhost",
-                               which == 3);
+                               which == 3, which == 6);
     task<void> server;
     task<void> client;
     switch (which) {
@@ -320,6 +321,8 @@ struct stream_pair {
         client = echo_client(loop, *streams.client, result);
         break;
     case 1:
+    case 5:
+    case 6:
         server = rejection_server(loop, *streams.server, result);
         client = rejection_client(loop, *streams.client, result);
         break;
@@ -445,16 +448,20 @@ struct stream_pair {
 
 auto main(int argc, char* argv[]) -> int
 {
-    if (argc != 4) return 2;
+    if (argc != 4 && argc != 5) return 2;
     try {
         const std::filesystem::path certificate = argv[1];
         const std::filesystem::path key = argv[2];
         const std::filesystem::path trusted_ca = argv[3];
+        if (argc == 5) {
+            return run_case(certificate, key, trusted_ca, 5) ? 0 : 1;
+        }
         const bool passed = run_case(certificate, key, trusted_ca, 0) &&
                             run_case(certificate, key, trusted_ca, 1) &&
                             run_case(certificate, key, trusted_ca, 2) &&
                             run_case(certificate, key, trusted_ca, 3) &&
                             run_case(certificate, key, trusted_ca, 4) &&
+                            run_case(certificate, key, trusted_ca, 6) &&
                             run_outbound_case(certificate, key, trusted_ca,
                                               false, false) &&
                             run_outbound_case(certificate, key, trusted_ca,

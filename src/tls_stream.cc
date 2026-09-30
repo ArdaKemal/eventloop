@@ -5,377 +5,337 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
-#include <cstdint>
-#include <new>
 #include <stdexcept>
 #include <utility>
 
-#include <botan/auto_rng.h>
-#include <botan/certstor.h>
-#include <botan/certstor_system.h>
-#include <botan/credentials_manager.h>
-#include <botan/data_src.h>
-#include <botan/exceptn.h>
-#include <botan/pkcs8.h>
-#include <botan/tls_alert.h>
-#include <botan/tls_callbacks.h>
-#include <botan/tls_client.h>
-#include <botan/tls_exceptn.h>
-#include <botan/tls_magic.h>
-#include <botan/tls_policy.h>
-#include <botan/tls_server.h>
-#include <botan/tls_session_manager_memory.h>
-#include <botan/x509cert.h>
-#include <botan/x509_crl.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#ifdef _WIN32
+#include <wincrypt.h>
+#endif
 
 namespace eventloop {
-
 namespace {
-
 [[nodiscard]] auto system_code(int value) noexcept -> std::error_code
 {
     return {value, std::generic_category()};
 }
-
 [[nodiscard]] auto task_code(task_result result) noexcept -> std::error_code
 {
-    return system_code(result == task_result::frame_allocation_failure
-                           ? ENOMEM : ECANCELED);
+    return system_code(result == task_result::frame_allocation_failure ? ENOMEM : ECANCELED);
 }
-
 struct active_operation_guard {
     bool& active;
     ~active_operation_guard() { active = false; }
 };
-
 enum class context_role { client, server };
-
-class client_credentials final : public Botan::Credentials_Manager {
-public:
-    client_credentials()
-        : store_(std::make_unique<Botan::System_Certificate_Store>())
-    {
-    }
-
-    explicit client_credentials(const std::filesystem::path& trusted_ca)
-    {
-        auto store = std::make_unique<Botan::Certificate_Store_In_Memory>();
-        if (std::filesystem::is_directory(trusted_ca)) {
-            for (const auto& entry : std::filesystem::directory_iterator(trusted_ca)) {
-                if (!entry.is_regular_file()) continue;
-                try {
-                    store->add_certificate(Botan::X509_Certificate(
-                        entry.path().string()));
-                } catch (const Botan::Exception&) {
-                }
-                try {
-                    store->add_crl(Botan::X509_CRL(entry.path().string()));
-                } catch (const Botan::Exception&) {
-                }
-            }
-            if (store->all_subjects().empty()) {
-                throw std::invalid_argument("trusted CA directory contains no certificates");
-            }
-            store_ = std::move(store);
-            return;
-        }
-        Botan::DataSource_Stream source(trusted_ca.string());
-        while (!source.end_of_data()) {
-            try {
-                store->add_certificate(Botan::X509_Certificate(source));
-            } catch (const Botan::Exception&) {
-                break;
-            }
-        }
-        if (store->all_subjects().empty()) {
-            throw std::invalid_argument("trusted CA file contains no certificates");
-        }
-        store_ = std::move(store);
-    }
-
-    auto trusted_certificate_authorities(const std::string&, const std::string&)
-        -> std::vector<Botan::Certificate_Store*> override
-    {
-        return {store_.get()};
-    }
-
-private:
-    std::unique_ptr<Botan::Certificate_Store> store_;
+struct tls_callbacks {
+    std::vector<std::string> server_protocols_;
+    std::error_code fatal_error_;
 };
-
-class server_credentials final : public Botan::Credentials_Manager {
-public:
-    server_credentials(const std::filesystem::path& certificate_chain,
-                       const std::filesystem::path& private_key,
-                       std::string_view password)
-    {
-        Botan::DataSource_Stream certificates(certificate_chain.string());
-        while (!certificates.end_of_data()) {
-            try {
-                certificate_chain_.emplace_back(certificates);
-            } catch (const Botan::Exception&) {
-                break;
+int select_alpn(SSL* ssl, const unsigned char** out, unsigned char* length,
+                const unsigned char* input, unsigned int size, void*)
+{
+    auto& state = *static_cast<tls_callbacks*>(SSL_get_app_data(ssl));
+    if (state.server_protocols_.empty()) return SSL_TLSEXT_ERR_NOACK;
+    for (const auto& protocol : state.server_protocols_) {
+        for (unsigned int offset = 0; offset < size;) {
+            const auto n = input[offset++];
+            if (n == 0 || n > size - offset) return SSL_TLSEXT_ERR_ALERT_FATAL;
+            if (n == protocol.size() && std::memcmp(input + offset, protocol.data(), n) == 0) {
+                *out = input + offset; *length = n;
+                return SSL_TLSEXT_ERR_OK;
             }
-        }
-        if (certificate_chain_.empty()) {
-            throw std::invalid_argument("certificate chain file contains no certificates");
-        }
-
-        Botan::DataSource_Stream key_source(private_key.string());
-        if (password.empty()) {
-            private_key_ = Botan::PKCS8::load_key(key_source);
-        } else {
-            private_key_ = Botan::PKCS8::load_key(key_source, password);
-        }
-
-        const auto certificate_key = certificate_chain_.front().subject_public_key();
-        if (certificate_key->public_key_bits() != private_key_->public_key_bits()) {
-            throw std::invalid_argument("certificate and private key do not match");
+            offset += n;
         }
     }
-
-    auto trusted_certificate_authorities(const std::string&, const std::string&)
-        -> std::vector<Botan::Certificate_Store*> override
-    {
-        return {};
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+template<class T, auto Free> using ssl_ptr = std::unique_ptr<T, decltype(Free)>;
+auto require_ssl(long result, const char* message) -> void
+{
+    if (result != 1) { ERR_clear_error(); throw std::invalid_argument(message); }
+}
+// Missing CRLs are allowed, as in the previous trust-store implementation.
+// A supplied CRL must still pass signature/time checks and revoked leaves fail.
+auto verify_certificate(int ok, X509_STORE_CTX* store) -> int
+{
+    if (!ok && X509_STORE_CTX_get_error(store) == X509_V_ERR_UNABLE_TO_GET_CRL) {
+        X509_STORE_CTX_set_error(store, X509_V_OK);
+        return 1;
     }
-
-    auto find_cert_chain(
-        const std::vector<std::string>& key_types,
-        const std::vector<Botan::AlgorithmIdentifier>&,
-        const std::vector<Botan::X509_DN>&,
-        const std::string&, const std::string&)
-        -> std::vector<Botan::X509_Certificate> override
-    {
-        const auto algorithm = certificate_chain_.front().subject_public_key()->algo_name();
-        if (key_types.empty() ||
-            std::ranges::find(key_types, algorithm) != key_types.end()) {
-            return certificate_chain_;
+    return ok;
+}
+auto load_trust_file(X509_STORE* store, const std::filesystem::path& path,
+                     bool& has_crl) -> std::size_t
+{
+    ssl_ptr<BIO, BIO_free> input(BIO_new_file(path.string().c_str(), "rb"), BIO_free);
+    if (!input) { ERR_clear_error(); return 0; }
+    STACK_OF(X509_INFO)* entries = PEM_X509_INFO_read_bio(input.get(), nullptr, nullptr, nullptr);
+    if (!entries || sk_X509_INFO_num(entries) == 0) {
+        sk_X509_INFO_pop_free(entries, X509_INFO_free);
+        ERR_clear_error();
+        (void)BIO_reset(input.get());
+        ssl_ptr<X509, X509_free> cert(d2i_X509_bio(input.get(), nullptr), X509_free);
+        if (cert) {
+            require_ssl(X509_STORE_add_cert(store, cert.get()), "cannot add trusted certificate");
+            return 1;
         }
-        return {};
+        ERR_clear_error();
+        (void)BIO_reset(input.get());
+        ssl_ptr<X509_CRL, X509_CRL_free> crl(d2i_X509_CRL_bio(input.get(), nullptr), X509_CRL_free);
+        if (crl) {
+            require_ssl(X509_STORE_add_crl(store, crl.get()), "cannot add trusted CRL");
+            has_crl = true;
+        }
+        ERR_clear_error();
+        return 0;
     }
-
-    auto private_key_for(const Botan::X509_Certificate&, const std::string&,
-                         const std::string&) -> std::shared_ptr<Botan::Private_Key> override
-    {
-        return private_key_;
+    struct entries_guard {
+        STACK_OF(X509_INFO)* entries;
+        ~entries_guard() { sk_X509_INFO_pop_free(entries, X509_INFO_free); }
+    } guard {entries};
+    std::size_t count = 0;
+    for (int i = 0; i < sk_X509_INFO_num(entries); ++i) {
+        auto* entry = sk_X509_INFO_value(entries, i);
+        if (entry->x509) {
+            require_ssl(X509_STORE_add_cert(store, entry->x509), "cannot add trusted certificate");
+            ++count;
+        }
+        if (entry->crl) {
+            require_ssl(X509_STORE_add_crl(store, entry->crl), "cannot add trusted CRL");
+            has_crl = true;
+        }
     }
-
-private:
-    std::vector<Botan::X509_Certificate> certificate_chain_;
-    std::shared_ptr<Botan::Private_Key> private_key_;
-};
-
+    ERR_clear_error();
+    return count;
+}
 class tls_category final : public std::error_category {
 public:
-    [[nodiscard]] auto name() const noexcept -> const char* override
+    auto name() const noexcept -> const char* override { return "tls"; }
+    auto message(int value) const -> std::string override
     {
-        return "tls";
-    }
-
-    [[nodiscard]] auto message(int value) const -> std::string override
-    {
-        if (value >= 0 && value < 256) {
-            return Botan::TLS::Alert(static_cast<Botan::TLS::AlertType>(value)).type_string();
-        }
+        if (value >= 0 && value < 256) return SSL_alert_desc_string_long(value);
         switch (static_cast<tls_errc>(value)) {
-        case tls_errc::truncated:
-            return "TLS connection closed without close_notify";
-        case tls_errc::handshake_failed:
-            return "TLS handshake failed";
-        case tls_errc::protocol_error:
-            return "TLS protocol error";
+        case tls_errc::truncated: return "TLS connection closed without close_notify";
+        case tls_errc::handshake_failed: return "TLS handshake failed";
+        case tls_errc::protocol_error: return "TLS protocol error";
         }
         return "unknown TLS error";
     }
 };
-
 } // namespace
 
 class tls_context::implementation {
 public:
-    implementation(context_role role,
-                   std::shared_ptr<Botan::Credentials_Manager> credentials)
-        : role(role), rng(std::make_shared<Botan::AutoSeeded_RNG>()),
-          sessions(std::make_shared<Botan::TLS::Session_Manager_In_Memory>(rng)),
-          credentials(std::move(credentials)),
-          policy(std::make_shared<Botan::TLS::Policy>())
+    explicit implementation(context_role role)
+        : role(role), context(SSL_CTX_new(TLS_method()), SSL_CTX_free)
     {
+        if (!context) throw std::bad_alloc();
+        require_ssl(SSL_CTX_set_min_proto_version(context.get(), TLS1_2_VERSION), "TLS minimum version");
+        SSL_CTX_set_options(context.get(), SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_COMPRESSION);
+        // Keep record buffers for the connection, avoiding release/reallocate on each read.
+        SSL_CTX_clear_mode(context.get(), SSL_MODE_RELEASE_BUFFERS);
+        SSL_CTX_set_mode(context.get(), SSL_MODE_AUTO_RETRY);
+        require_ssl(SSL_CTX_set_max_send_fragment(context.get(), 4096), "TLS send fragment limit");
+        SSL_CTX_set_session_cache_mode(context.get(), SSL_SESS_CACHE_OFF);
+        SSL_CTX_set_num_tickets(context.get(), 0);
+        if (role == context_role::client)
+            SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, verify_certificate);
     }
-
     context_role role;
-    std::shared_ptr<Botan::RandomNumberGenerator> rng;
-    std::shared_ptr<Botan::TLS::Session_Manager> sessions;
-    std::shared_ptr<Botan::Credentials_Manager> credentials;
-    std::shared_ptr<const Botan::TLS::Policy> policy;
+    ssl_ptr<SSL_CTX, SSL_CTX_free> context;
 };
-
 tls_context::tls_context(std::unique_ptr<implementation> implementation)
-    : implementation_(std::move(implementation))
-{
-}
-
+    : implementation_(std::move(implementation)) {}
 tls_context::~tls_context() = default;
-
 auto tls_context::make_system_client() -> std::shared_ptr<tls_context>
 {
-    return std::shared_ptr<tls_context>(new tls_context(std::make_unique<implementation>(
-        context_role::client, std::make_shared<client_credentials>())));
+    auto config = std::make_unique<implementation>(context_role::client);
+#ifdef _WIN32
+    auto* roots = CertOpenSystemStoreA(0, "ROOT");
+    if (!roots) throw std::invalid_argument("cannot open system certificate store");
+    struct root_guard { HCERTSTORE store; ~root_guard() { CertCloseStore(store, 0); } } guard {roots};
+    PCCERT_CONTEXT entry = nullptr;
+    while ((entry = CertEnumCertificatesInStore(roots, entry)) != nullptr) {
+        const unsigned char* bytes = entry->pbCertEncoded;
+        ssl_ptr<X509, X509_free> cert(d2i_X509(nullptr, &bytes, entry->cbCertEncoded), X509_free);
+        if (cert) (void)X509_STORE_add_cert(SSL_CTX_get_cert_store(config->context.get()), cert.get());
+        ERR_clear_error();
+    }
+#else
+    require_ssl(SSL_CTX_set_default_verify_paths(config->context.get()), "cannot load system trust store");
+#endif
+    return std::shared_ptr<tls_context>(new tls_context(std::move(config)));
 }
-
-auto tls_context::make_client(const std::filesystem::path& trusted_ca)
-    -> std::shared_ptr<tls_context>
+auto tls_context::make_client(const std::filesystem::path& trusted_ca) -> std::shared_ptr<tls_context>
 {
-    return std::shared_ptr<tls_context>(new tls_context(std::make_unique<implementation>(
-        context_role::client, std::make_shared<client_credentials>(trusted_ca))));
+    auto config = std::make_unique<implementation>(context_role::client);
+    auto* store = SSL_CTX_get_cert_store(config->context.get());
+    bool has_crl = false;
+    std::size_t count = 0;
+    if (std::filesystem::is_directory(trusted_ca)) {
+        for (const auto& entry : std::filesystem::directory_iterator(trusted_ca))
+            if (entry.is_regular_file()) count += load_trust_file(store, entry.path(), has_crl);
+    } else count = load_trust_file(store, trusted_ca, has_crl);
+    if (count == 0) throw std::invalid_argument("trusted CA path contains no certificates");
+    if (has_crl) require_ssl(X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL), "CRL checks");
+    return std::shared_ptr<tls_context>(new tls_context(std::move(config)));
 }
-
 auto tls_context::make_server(const std::filesystem::path& certificate_chain,
                               const std::filesystem::path& private_key,
                               std::string_view password) -> std::shared_ptr<tls_context>
 {
-    return std::shared_ptr<tls_context>(new tls_context(std::make_unique<implementation>(
-        context_role::server,
-        std::make_shared<server_credentials>(certificate_chain, private_key, password))));
+    auto config = std::make_unique<implementation>(context_role::server);
+    auto* ctx = config->context.get();
+    SSL_CTX_set_alpn_select_cb(ctx, select_alpn, nullptr);
+    require_ssl(SSL_CTX_use_certificate_chain_file(ctx, certificate_chain.string().c_str()), "cannot load certificate chain");
+    SSL_CTX_set_default_passwd_cb(ctx, [](char* out, int size, int, void* arg) -> int {
+        auto pass = *static_cast<std::string_view*>(arg);
+        if (size <= 0 || pass.size() >= static_cast<std::size_t>(size)) return 0;
+        if (!pass.empty()) std::memcpy(out, pass.data(), pass.size());
+        return static_cast<int>(pass.size());
+    });
+    SSL_CTX_set_default_passwd_cb_userdata(ctx, &password);
+    const auto loaded = SSL_CTX_use_PrivateKey_file(ctx, private_key.string().c_str(), SSL_FILETYPE_PEM);
+    SSL_CTX_set_default_passwd_cb_userdata(ctx, nullptr);
+    SSL_CTX_set_default_passwd_cb(ctx, nullptr);
+    require_ssl(loaded, "cannot load private key");
+    require_ssl(SSL_CTX_check_private_key(ctx), "certificate and private key do not match");
+    return std::shared_ptr<tls_context>(new tls_context(std::move(config)));
 }
-
 auto tls_error_category() noexcept -> const std::error_category&
 {
     static const tls_category category;
     return category;
 }
-
 auto make_error_code(tls_errc error) noexcept -> std::error_code
 {
     return {static_cast<int>(error), tls_error_category()};
 }
 
-class tls_stream::implementation final : public Botan::TLS::Callbacks {
+class tls_stream::implementation : public tls_callbacks {
 public:
     static constexpr std::size_t encrypted_capacity = 64 * 1024;
     static constexpr std::size_t input_capacity = 4096;
-    static constexpr std::size_t inline_plaintext_capacity = 4096;
-    // Botan may finish a buffered maximum-size record and then consume the
-    // newly read ciphertext before the caller can drain plaintext.
-    static constexpr std::size_t spill_capacity =
-        Botan::TLS::MAX_PLAINTEXT_SIZE + input_capacity;
-
-    implementation(std::shared_ptr<tls_context> context,
-                   tls_client_options options)
-        : context_(std::move(context)),
-          callback_(this, [](Botan::TLS::Callbacks*) {})
+    implementation(std::shared_ptr<tls_context> context, tls_client_options options)
+        : context_(std::move(context)), ssl_(nullptr, SSL_free)
     {
-        if (!context_ || context_->implementation_->role != context_role::client) {
-            throw std::invalid_argument("a client TLS context is required");
+        initialize(context_role::client);
+        if (options.hostname.empty() || options.hostname.size() > 255 || options.hostname.find('\0') != std::string::npos)
+            throw std::invalid_argument("TLS client hostname is invalid");
+        auto* param = SSL_get0_param(ssl_.get());
+        X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        // Numeric IPs use iPAddress SANs; DNS names use hostname verification and SNI.
+        if (X509_VERIFY_PARAM_set1_ip_asc(param, options.hostname.c_str()) != 1) {
+            ERR_clear_error();
+            require_ssl(SSL_set1_host(ssl_.get(), options.hostname.c_str()), "TLS hostname");
+            require_ssl(SSL_set_tlsext_host_name(ssl_.get(), options.hostname.c_str()), "TLS SNI");
         }
-        if (options.hostname.empty()) {
-            throw std::invalid_argument("TLS client hostname cannot be empty");
+        // ALPN's on-wire length is bounded by the TLS extension length.
+        auto* protocols = reinterpret_cast<unsigned char*>(encrypted_.data());
+        constexpr std::size_t protocol_capacity = 65535;
+        std::size_t size = 0;
+        for (const auto& protocol : options.application_protocols) {
+            if (protocol.empty() || protocol.size() > 255 || protocol.size() + 1 > protocol_capacity - size)
+                throw std::invalid_argument("TLS ALPN list exceeds wire limits");
+            protocols[size++] = static_cast<unsigned char>(protocol.size());
+            std::memcpy(protocols + size, protocol.data(), protocol.size());
+            size += protocol.size();
         }
-        const auto& config = *context_->implementation_;
-        channel_ = std::make_unique<Botan::TLS::Client>(
-            callback_, config.sessions, config.credentials, config.policy, config.rng,
-            Botan::TLS::Server_Information(options.hostname),
-            Botan::TLS::Protocol_Version::latest_tls_version(),
-            options.application_protocols);
+        if (size != 0 && SSL_set_alpn_protos(ssl_.get(), protocols, static_cast<unsigned int>(size)) != 0)
+            throw std::bad_alloc();
+        SSL_set_connect_state(ssl_.get());
     }
-
-    implementation(std::shared_ptr<tls_context> context,
-                   tls_server_options options)
-        : context_(std::move(context)),
-          server_protocols_(std::move(options.application_protocols)),
-          callback_(this, [](Botan::TLS::Callbacks*) {})
+    implementation(std::shared_ptr<tls_context> context, tls_server_options options)
+        : tls_callbacks {std::move(options.application_protocols), {}}, context_(std::move(context)), ssl_(nullptr, SSL_free)
     {
-        if (!context_ || context_->implementation_->role != context_role::server) {
-            throw std::invalid_argument("a server TLS context is required");
-        }
-        const auto& config = *context_->implementation_;
-        channel_ = std::make_unique<Botan::TLS::Server>(
-            callback_, config.sessions, config.credentials, config.policy, config.rng);
+        initialize(context_role::server);
+        for (const auto& protocol : server_protocols_)
+            if (protocol.empty() || protocol.size() > 255) throw std::invalid_argument("invalid TLS ALPN protocol");
+        SSL_set_accept_state(ssl_.get());
     }
-
-    auto tls_emit_data(std::span<const std::uint8_t> data) -> void override
+    auto initialize(context_role role) -> void
     {
-        if (data.size() > encrypted_capacity - encrypted_size_) {
-            throw std::length_error("TLS encrypted output capacity exceeded");
-        }
-        std::memcpy(encrypted_.data() + encrypted_size_, data.data(), data.size());
-        encrypted_size_ += data.size();
-    }
-
-    auto tls_record_received(std::uint64_t, std::span<const std::uint8_t> data)
-        -> void override
-    {
-        if (data.size() > spill_capacity - plaintext_size_) {
-            throw std::length_error("TLS plaintext input capacity exceeded");
-        }
-        const auto required_size = plaintext_size_ + data.size();
-        if (required_size > inline_plaintext_capacity &&
-            required_size > plaintext_spill_capacity_) {
-            const auto growth_base = plaintext_spill_capacity_ == 0
-                ? inline_plaintext_capacity * 2
-                : plaintext_spill_capacity_ * 2;
-            const auto spill_size = std::min(
-                spill_capacity, std::max(required_size, growth_base));
-            auto spill = std::unique_ptr<std::byte[]>(
-                new (std::nothrow) std::byte[spill_size]);
-            if (!spill) throw std::length_error("TLS plaintext spill unavailable");
-            const auto* queued = plaintext_spill_ ? plaintext_spill_.get()
-                                                  : plaintext_.data();
-            std::memcpy(spill.get(), queued, plaintext_size_);
-            plaintext_spill_ = std::move(spill);
-            plaintext_spill_capacity_ = spill_size;
-        }
-        auto* destination = plaintext_spill_ ? plaintext_spill_.get()
-                                             : plaintext_.data();
-        std::memcpy(destination + plaintext_size_, data.data(), data.size());
-        plaintext_size_ += data.size();
-    }
-
-    auto tls_alert(Botan::TLS::Alert alert) -> void override
-    {
-        if (alert.is_fatal()) {
-            fatal_error_ = std::error_code(
-                static_cast<int>(alert.type()), tls_error_category());
-        }
-    }
-
-    auto tls_peer_closed_connection() -> bool override
-    {
-        peer_closed_ = true;
-        return true;
-    }
-
-    auto tls_server_choose_app_protocol(const std::vector<std::string>& client_protocols)
-        -> std::string override
-    {
-        if (server_protocols_.empty()) {
-            return {};
-        }
-        for (const auto& protocol : server_protocols_) {
-            if (std::ranges::find(client_protocols, protocol) != client_protocols.end()) {
-                selected_protocol_ = protocol;
-                return protocol;
+        if (!context_ || context_->implementation_->role != role)
+            throw std::invalid_argument("TLS context role mismatch");
+        ssl_.reset(SSL_new(context_->implementation_->context.get()));
+        if (!ssl_) throw std::bad_alloc();
+        auto* bio = BIO_new(bio_method());
+        if (!bio) throw std::bad_alloc();
+        BIO_set_data(bio, this);
+        BIO_set_init(bio, 1);
+        SSL_set_bio(ssl_.get(), bio, bio);
+        SSL_set_app_data(ssl_.get(), static_cast<tls_callbacks*>(this));
+        SSL_set_info_callback(ssl_.get(), [](const SSL* ssl, int where, int value) {
+            if ((where & SSL_CB_ALERT) && (value >> 8) == SSL3_AL_FATAL) {
+                auto* state = static_cast<tls_callbacks*>(SSL_get_app_data(ssl));
+                state->fatal_error_ = {value & 255, tls_error_category()};
             }
-        }
-        throw Botan::TLS::TLS_Exception(Botan::TLS::AlertType::NoApplicationProtocol);
+        });
     }
-
+    static auto bio_method() -> const BIO_METHOD*
+    {
+        static ssl_ptr<BIO_METHOD, BIO_meth_free> methods([] {
+            auto* method = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "eventloop fixed TLS buffers");
+            if (!method) throw std::bad_alloc();
+            if (BIO_meth_set_read(method, [](BIO* bio, char* out, int count) -> int {
+                BIO_clear_retry_flags(bio);
+                auto& state = *static_cast<implementation*>(BIO_get_data(bio));
+                if (count <= 0) return 0;
+                if (state.input_size_ == 0) { BIO_set_retry_read(bio); return -1; }
+                const auto size = std::min(static_cast<std::size_t>(count), state.input_size_);
+                std::memcpy(out, state.input_.data() + state.input_offset_, size);
+                state.input_offset_ += size; state.input_size_ -= size;
+                return static_cast<int>(size);
+            }) != 1 || BIO_meth_set_write(method, [](BIO* bio, const char* input, int count) -> int {
+                BIO_clear_retry_flags(bio);
+                auto& state = *static_cast<implementation*>(BIO_get_data(bio));
+                if (count <= 0) return 0;
+                const auto size = static_cast<std::size_t>(count);
+                if (size > state.encrypted_.size()) {
+                    state.fatal_error_ = system_code(ENOBUFS);
+                    return -1;
+                }
+                if (size > state.encrypted_.size() - state.encrypted_size_) {
+                    BIO_set_retry_write(bio); return -1;
+                }
+                std::memcpy(state.encrypted_.data() + state.encrypted_size_, input, size);
+                state.encrypted_size_ += size;
+                return count;
+            }) != 1 || BIO_meth_set_ctrl(method, [](BIO* bio, int command, long, void*) -> long {
+                auto& state = *static_cast<implementation*>(BIO_get_data(bio));
+                if (command == BIO_CTRL_FLUSH) return 1;
+                if (command == BIO_CTRL_PENDING) return static_cast<long>(state.input_size_);
+                if (command == BIO_CTRL_WPENDING) return static_cast<long>(state.encrypted_size_);
+                return 0;
+            }) != 1) { BIO_meth_free(method); throw std::bad_alloc(); }
+            return method;
+        }(), BIO_meth_free);
+        return methods.get();
+    }
+    auto active() const noexcept -> bool { return SSL_is_init_finished(ssl_.get()) == 1; }
+    auto error(int result) noexcept -> int { return SSL_get_error(ssl_.get(), result); }
+    auto failure() noexcept -> std::error_code
+    {
+        const auto code = ERR_peek_last_error();
+        const bool exhausted = code && ERR_GET_REASON(code) == ERR_R_MALLOC_FAILURE;
+        ERR_clear_error();
+        if (exhausted) return system_code(ENOMEM);
+        if (fatal_error_) return fatal_error_;
+        return make_error_code(active() ? tls_errc::protocol_error : tls_errc::handshake_failed);
+    }
     std::shared_ptr<tls_context> context_;
-    std::vector<std::string> server_protocols_;
-    std::string selected_protocol_;
-    std::shared_ptr<Botan::TLS::Callbacks> callback_;
-    std::unique_ptr<Botan::TLS::Channel> channel_;
-    std::error_code fatal_error_;
+    ssl_ptr<SSL, SSL_free> ssl_;
     bool peer_closed_ {false};
     std::array<std::byte, encrypted_capacity> encrypted_ {};
     std::size_t encrypted_size_ {0};
-    std::array<std::byte, inline_plaintext_capacity> plaintext_ {};
-    std::unique_ptr<std::byte[]> plaintext_spill_;
-    std::size_t plaintext_spill_capacity_ {0};
-    std::size_t plaintext_size_ {0};
     std::array<std::byte, input_capacity> input_ {};
+    std::size_t input_offset_ {0};
+    std::size_t input_size_ {0};
 };
-
 tls_stream::tls_stream(event_loop& loop, unique_fd descriptor,
                        std::shared_ptr<tls_context> context,
                        tls_client_options options)
@@ -420,13 +380,12 @@ auto tls_stream::close() -> void
 
 auto tls_stream::application_protocol() const -> std::string
 {
-    if (!implementation_ || !implementation_->channel_->is_active()) {
-        return {};
-    }
-    if (implementation_->context_->implementation_->role == context_role::server) {
-        return implementation_->selected_protocol_;
-    }
-    return implementation_->channel_->application_protocol();
+    if (!implementation_ || !implementation_->active()) return {};
+    const unsigned char* protocol = nullptr;
+    unsigned int size = 0;
+    SSL_get0_alpn_selected(implementation_->ssl_.get(), &protocol, &size);
+    if (size == 0) return {};
+    return {reinterpret_cast<const char*>(protocol), size};
 }
 
 auto tls_stream::async_handshake()
@@ -467,41 +426,12 @@ auto tls_stream::activate_async_tls() noexcept
 auto tls_stream::receive_encrypted(std::span<const std::byte> data) noexcept
     -> std::error_code
 {
-    try {
-        implementation_->channel_->received_data({
-            reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
-    } catch (const Botan::TLS::TLS_Exception& error) {
-        return {static_cast<int>(error.type()), tls_error_category()};
-    } catch (const Botan::Exception&) {
-        return make_error_code(implementation_->channel_->is_active()
-                                   ? tls_errc::protocol_error
-                                   : tls_errc::handshake_failed);
-    } catch (const std::length_error&) {
-        return system_code(ENOBUFS);
-    } catch (...) {
-        return make_error_code(tls_errc::protocol_error);
-    }
-    return implementation_->fatal_error_;
-}
-
-auto tls_stream::take_plaintext(std::span<std::byte> buffer) noexcept
-    -> std::size_t
-{
     auto& state = *implementation_;
-    const auto size = std::min(buffer.size(), state.plaintext_size_);
-    if (size != 0) {
-        auto* source = state.plaintext_spill_ ? state.plaintext_spill_.get()
-                                             : state.plaintext_.data();
-        std::memcpy(buffer.data(), source, size);
-        state.plaintext_size_ -= size;
-        if (state.plaintext_size_ == 0) {
-            state.plaintext_spill_.reset();
-            state.plaintext_spill_capacity_ = 0;
-        } else {
-            std::memmove(source, source + size, state.plaintext_size_);
-        }
-    }
-    return size;
+    if (state.input_size_ != 0 || data.size() > state.input_.size()) return system_code(ENOBUFS);
+    if (data.data() != state.input_.data()) std::memcpy(state.input_.data(), data.data(), data.size());
+    state.input_offset_ = 0;
+    state.input_size_ = data.size();
+    return {};
 }
 
 class tls_stream::flush_waiter {
@@ -613,150 +543,139 @@ auto tls_stream::flush_task(event_loop& loop, tls_stream& self)
 auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
     -> task<std::expected<void, std::error_code>>
 {
-    if (self.exclusive_operation_active_ || self.read_operation_active_ ||
-        self.write_operation_active_) {
+    if (self.exclusive_operation_active_ || self.read_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    }
     self.exclusive_operation_active_ = true;
     active_operation_guard guard {self.exclusive_operation_active_};
-    if (co_await cancellation_requested()) {
-        co_return std::unexpected(system_code(ECANCELED));
-    }
-    // Outbound TCP streams activate their transport before they connect.
-    // Check the actual peer before sending the client's TLS handshake.
-    if (auto peer = detail::socket_operations::peer_endpoint(self.descriptor());
-        !peer)
+    if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+    if (auto peer = detail::socket_operations::peer_endpoint(self.descriptor()); !peer)
         co_return std::unexpected(peer.error());
-    if (auto activated = self.activate_async_tls(); !activated) {
-        co_return std::unexpected(activated.error());
-    }
-    auto& encrypted = self.implementation_->input_;
-    while (!self.implementation_->channel_->is_active()) {
+    if (auto activated = self.activate_async_tls(); !activated) co_return std::unexpected(activated.error());
+    bool completed = false;
+    struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
+    auto& state = *self.implementation_;
+    for (;;) {
+        ERR_clear_error();
+        const int result = SSL_do_handshake(state.ssl_.get());
+        const int error = result == 1 ? SSL_ERROR_NONE : state.error(result);
+        if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
+            co_return std::unexpected(state.failure());
         auto flushed = co_await flush_task(loop, self);
         if (!flushed) co_return std::unexpected(task_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
-        auto received = co_await self.tcp_stream::async_read_some(encrypted);
+        if (result == 1) { completed = true; co_return std::expected<void, std::error_code> {}; }
+        if (error == SSL_ERROR_WANT_WRITE || state.input_size_ != 0) continue;
+        auto received = co_await self.tcp_stream::async_read_some(state.input_);
         if (!received) co_return std::unexpected(received.error());
-        if (*received == 0) {
-            co_return std::unexpected(make_error_code(tls_errc::truncated));
-        }
-        if (auto error = self.receive_encrypted(
-                std::span(encrypted).first(*received)); error) {
-            co_return std::unexpected(error);
-        }
+        if (*received == 0) co_return std::unexpected(make_error_code(tls_errc::truncated));
+        if (auto input_error = self.receive_encrypted(std::span(state.input_).first(*received)); input_error)
+            co_return std::unexpected(input_error);
     }
-    auto flushed = co_await flush_task(loop, self);
-    if (!flushed) co_return std::unexpected(task_code(flushed.error()));
-    if (!*flushed) co_return std::unexpected(flushed->error());
-    co_return std::expected<void, std::error_code> {};
 }
 
-auto tls_stream::read_task(event_loop& loop, tls_stream& self,
-                           std::span<std::byte> buffer)
+auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::byte> buffer)
     -> task<std::expected<std::size_t, std::error_code>>
 {
-    if (self.exclusive_operation_active_ || self.read_operation_active_) {
+    if (self.exclusive_operation_active_ || self.read_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    }
     self.read_operation_active_ = true;
     active_operation_guard guard {self.read_operation_active_};
-    if (co_await cancellation_requested()) {
-        co_return std::unexpected(system_code(ECANCELED));
-    }
-    if (!self.async_tls_mode_) {
-        co_return std::unexpected(system_code(ENOTCONN));
-    }
+    if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+    if (!self.async_tls_mode_) co_return std::unexpected(system_code(ENOTCONN));
     if (buffer.empty()) co_return std::size_t {0};
-    if (auto size = self.take_plaintext(buffer); size != 0) co_return size;
-    if (self.implementation_->peer_closed_) co_return std::size_t {0};
-    if (!self.implementation_->channel_->is_active()) {
-        co_return std::unexpected(system_code(ENOTCONN));
-    }
-    auto& encrypted = self.implementation_->input_;
+    auto& state = *self.implementation_;
+    if (state.peer_closed_) co_return std::size_t {0};
+    if (!state.active()) co_return std::unexpected(system_code(ENOTCONN));
+    bool completed = false;
+    struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
     for (;;) {
-        if (self.implementation_->peer_closed_) co_return std::size_t {0};
-        auto received = co_await self.tcp_stream::async_read_some(encrypted);
-        if (!received) co_return std::unexpected(received.error());
-        if (*received == 0) {
-            if (self.implementation_->peer_closed_) co_return std::size_t {0};
-            co_return std::unexpected(make_error_code(tls_errc::truncated));
+        std::size_t size = 0;
+        ERR_clear_error();
+        const int result = SSL_read_ex(state.ssl_.get(), buffer.data(), buffer.size(), &size);
+        const int error = result == 1 ? SSL_ERROR_NONE : state.error(result);
+        if (error == SSL_ERROR_ZERO_RETURN) {
+            state.peer_closed_ = true;
+            completed = true;
+            co_return std::size_t {0};
         }
-        if (auto error = self.receive_encrypted(
-                std::span(encrypted).first(*received)); error) {
-            co_return std::unexpected(error);
-        }
+        if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
+            co_return std::unexpected(state.failure());
         auto flushed = co_await flush_task(loop, self);
         if (!flushed) co_return std::unexpected(task_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
-        if (auto size = self.take_plaintext(buffer); size != 0) co_return size;
+        if (result == 1) { completed = true; co_return size; }
+        if (error == SSL_ERROR_WANT_WRITE || state.input_size_ != 0) continue;
+        auto received = co_await self.tcp_stream::async_read_some(state.input_);
+        if (!received) co_return std::unexpected(received.error());
+        if (*received == 0) co_return std::unexpected(make_error_code(tls_errc::truncated));
+        if (auto input_error = self.receive_encrypted(std::span(state.input_).first(*received)); input_error)
+            co_return std::unexpected(input_error);
     }
 }
 
-auto tls_stream::write_task(event_loop& loop, tls_stream& self,
-                            std::span<const std::byte> buffer)
+auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const std::byte> buffer)
     -> task<std::expected<std::size_t, std::error_code>>
 {
-    if (self.exclusive_operation_active_ || self.write_operation_active_) {
+    if (self.exclusive_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    }
     self.write_operation_active_ = true;
     active_operation_guard guard {self.write_operation_active_};
-    if (co_await cancellation_requested()) {
-        co_return std::unexpected(system_code(ECANCELED));
-    }
-    if (!self.async_tls_mode_ || !self.implementation_->channel_->is_active() ||
-        self.transport_closed() ||
-        self.implementation_->channel_->is_closed_for_writing()) {
+    if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+    auto& state = *self.implementation_;
+    if (!self.async_tls_mode_ || !state.active() || self.transport_closed() ||
+        (SSL_get_shutdown(state.ssl_.get()) & SSL_SENT_SHUTDOWN))
         co_return std::unexpected(system_code(ENOTCONN));
-    }
     if (buffer.empty()) co_return std::size_t {0};
+    bool completed = false;
+    struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
     const auto size = std::min<std::size_t>(buffer.size(), 4096);
-    try {
-        self.implementation_->channel_->send({
-            reinterpret_cast<const std::uint8_t*>(buffer.data()), size});
-    } catch (const Botan::TLS::TLS_Exception& error) {
-        co_return std::unexpected(std::error_code(
-            static_cast<int>(error.type()), tls_error_category()));
-    } catch (const Botan::Exception&) {
-        co_return std::unexpected(make_error_code(tls_errc::protocol_error));
-    } catch (const std::length_error&) {
-        co_return std::unexpected(system_code(ENOBUFS));
-    }
+    // Flush before writing, so this record always has bounded output space.
     auto flushed = co_await flush_task(loop, self);
     if (!flushed) co_return std::unexpected(task_code(flushed.error()));
     if (!*flushed) co_return std::unexpected(flushed->error());
-    co_return size;
+    for (;;) {
+        std::size_t written = 0;
+        ERR_clear_error();
+        const int result = SSL_write_ex(state.ssl_.get(), buffer.data(), size, &written);
+        const int error = result == 1 ? SSL_ERROR_NONE : state.error(result);
+        // Renegotiation is disabled; established writes do not need a second
+        // transport reader. Preserve the caller's buffer across output retries.
+        if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_WRITE)
+            co_return std::unexpected(state.failure());
+        auto sent = co_await flush_task(loop, self);
+        if (!sent) co_return std::unexpected(task_code(sent.error()));
+        if (!*sent) co_return std::unexpected(sent->error());
+        if (result == 1) { completed = true; co_return written; }
+    }
 }
 
 auto tls_stream::close_task(event_loop& loop, tls_stream& self)
     -> task<std::expected<void, std::error_code>>
 {
-    if (self.exclusive_operation_active_ || self.read_operation_active_ ||
-        self.write_operation_active_) {
+    if (self.exclusive_operation_active_ || self.read_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    }
     self.exclusive_operation_active_ = true;
     active_operation_guard guard {self.exclusive_operation_active_};
-    if (co_await cancellation_requested()) {
-        co_return std::unexpected(system_code(ECANCELED));
-    }
-    if (!self.async_tls_mode_) {
-        co_return std::unexpected(system_code(ENOTCONN));
-    }
-    try {
-        if (!self.implementation_->channel_->is_closed_for_writing()) {
-            self.implementation_->channel_->close();
+    if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+    if (!self.async_tls_mode_) co_return std::unexpected(system_code(ENOTCONN));
+    bool completed = false;
+    struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
+    auto& state = *self.implementation_;
+    for (;;) {
+        ERR_clear_error();
+        const int result = SSL_shutdown(state.ssl_.get());
+        const int error = result < 0 ? state.error(result) : SSL_ERROR_NONE;
+        if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_WRITE && error != SSL_ERROR_WANT_READ)
+            co_return std::unexpected(state.failure());
+        auto flushed = co_await flush_task(loop, self);
+        if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+        if (!*flushed) co_return std::unexpected(flushed->error());
+        // API sends close_notify without waiting for the peer's reply.
+        if (SSL_get_shutdown(state.ssl_.get()) & SSL_SENT_SHUTDOWN) {
+            completed = true;
+            co_return std::expected<void, std::error_code> {};
         }
-    } catch (const Botan::Exception&) {
-        co_return std::unexpected(make_error_code(tls_errc::protocol_error));
-    } catch (const std::length_error&) {
-        co_return std::unexpected(system_code(ENOBUFS));
-    } catch (...) {
-        co_return std::unexpected(make_error_code(tls_errc::protocol_error));
+        if (error != SSL_ERROR_WANT_WRITE) co_return std::unexpected(state.failure());
     }
-    auto flushed = co_await flush_task(loop, self);
-    if (!flushed) co_return std::unexpected(task_code(flushed.error()));
-    co_return *flushed;
 }
-
 } // namespace eventloop

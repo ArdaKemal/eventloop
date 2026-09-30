@@ -53,3 +53,23 @@ openssl ca -config "$test_directory/ca.cnf" -gencrl \
 
 "$test_binary" "$test_directory/certificate.pem" "$test_directory/key.pem" \
     "$test_directory/trust"
+
+# Accept DER certificate/CRL trust directories and PEM bundles as well.
+mkdir "$test_directory/der-trust"
+openssl x509 -in "$test_directory/ca.pem" -outform DER \
+    -out "$test_directory/der-trust/ca.der"
+openssl crl -in "$test_directory/trust/ca.crl" -outform DER \
+    -out "$test_directory/der-trust/ca.crl"
+"$test_binary" "$test_directory/certificate.pem" "$test_directory/key.pem" \
+    "$test_directory/der-trust"
+cat "$test_directory/ca.pem" "$test_directory/trust/ca.crl" >"$test_directory/bundle.pem"
+"$test_binary" "$test_directory/certificate.pem" "$test_directory/key.pem" \
+    "$test_directory/bundle.pem"
+
+# Revocation must reject a certificate with the correct hostname and ALPN.
+openssl ca -config "$test_directory/ca.cnf" -revoke "$test_directory/certificate.pem" \
+    >/dev/null 2>&1
+openssl ca -config "$test_directory/ca.cnf" -gencrl \
+    -out "$test_directory/trust/ca.crl" >/dev/null 2>&1
+"$test_binary" "$test_directory/certificate.pem" "$test_directory/key.pem" \
+    "$test_directory/trust" reject

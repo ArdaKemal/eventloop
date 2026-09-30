@@ -9,20 +9,10 @@ if(WIN32)
     include(CTest)
     find_package(Threads REQUIRED)
     option(EVENTLOOP_WINDOWS_TLS "Build Windows TLS/WebSocket support" ON)
-    # Botan remains the provider for the existing TLS stream. QUIC uses
-    # OpenSSL's supported external TLS callback API and EVP primitives.
-    set(EVENTLOOP_CONFIG_NEEDS_BOTAN ${EVENTLOOP_WINDOWS_TLS})
-    if(EVENTLOOP_WINDOWS_TLS)
-        find_package(Botan 3 REQUIRED)
-    endif()
     set(EVENTLOOP_CONFIG_NEEDS_OPENSSL ON)
     find_package(OpenSSL 3.5 REQUIRED COMPONENTS Crypto SSL)
     set(EVENTLOOP_QUIC_TEST_ENV
         "PATH=path_list_prepend:${OPENSSL_ROOT_DIR}/bin")
-    if(EVENTLOOP_WINDOWS_TLS)
-        list(APPEND EVENTLOOP_QUIC_TEST_ENV
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:botan::botan>")
-    endif()
     add_library(eventloop
         src/event_loop.cc
         src/quic/packet_protection.cc
@@ -73,10 +63,7 @@ if(WIN32)
     target_compile_features(eventloop PUBLIC cxx_std_23)
     target_compile_definitions(eventloop PRIVATE NOMINMAX)
     target_link_libraries(eventloop PUBLIC ws2_32 mswsock Threads::Threads
-        PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    if(EVENTLOOP_WINDOWS_TLS)
-        target_link_libraries(eventloop PUBLIC botan::botan)
-    endif()
+        PRIVATE crypt32 OpenSSL::SSL OpenSSL::Crypto)
     if(BUILD_SHARED_LIBS)
         target_compile_definitions(eventloop PRIVATE EVENTLOOP_WINDOWS_SHARED=1)
     endif()
@@ -85,12 +72,12 @@ if(WIN32)
     endif()
     if(BUILD_TESTING)
         add_executable(http_api_test tests/http_api.cc)
-        target_link_libraries(http_api_test PRIVATE eventloop::eventloop)
+        target_link_libraries(http_api_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
         add_test(NAME http_api COMMAND http_api_test)
         set_tests_properties(http_api PROPERTIES TIMEOUT 10)
         if(EVENTLOOP_WINDOWS_TLS)
             set_tests_properties(http_api PROPERTIES ENVIRONMENT_MODIFICATION
-                "PATH=path_list_prepend:$<TARGET_FILE_DIR:botan::botan>")
+                "PATH=path_list_prepend:${OPENSSL_ROOT_DIR}/bin")
         endif()
 
         add_executable(coroutine_smoke_test tests/coroutine_smoke.cc)
@@ -518,7 +505,7 @@ if(WIN32)
         set_tests_properties(coroutine_udp PROPERTIES TIMEOUT 10)
 
         add_executable(socket_api_test tests/socket_api.cc)
-        target_link_libraries(socket_api_test PRIVATE eventloop::eventloop)
+        target_link_libraries(socket_api_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
         if(EVENTLOOP_WINDOWS_TLS)
             target_compile_definitions(socket_api_test PRIVATE EVENTLOOP_TEST_TLS=1)
         endif()
@@ -526,7 +513,7 @@ if(WIN32)
         set_tests_properties(socket_api PROPERTIES TIMEOUT 10)
         if(EVENTLOOP_WINDOWS_TLS)
             set_tests_properties(socket_api PROPERTIES ENVIRONMENT_MODIFICATION
-                "PATH=path_list_prepend:$<TARGET_FILE_DIR:botan::botan>")
+                "PATH=path_list_prepend:${OPENSSL_ROOT_DIR}/bin")
         endif()
 
         add_executable(windows_iocp_test tests/windows_iocp.cc)
@@ -565,13 +552,9 @@ if(WIN32)
             add_test(NAME http2_hpack COMMAND http2_hpack_test)
         endif()
 
-        if(EVENTLOOP_WINDOWS_TLS)
-            set_tests_properties(
-                event_loop executor task task_composition task_handle file_io
-                coroutine_tcp coroutine_udp
-                http2_hpack PROPERTIES ENVIRONMENT_MODIFICATION
-                "PATH=path_list_prepend:$<TARGET_FILE_DIR:botan::botan>")
-        endif()
+        get_property(eventloop_windows_tests DIRECTORY PROPERTY TESTS)
+        set_tests_properties(${eventloop_windows_tests} PROPERTIES
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
     endif()
 
     add_executable(tcp_echo examples/tcp_echo.cc)
@@ -654,8 +637,6 @@ if(WIN32)
     return()
 endif()
 
-set(EVENTLOOP_CONFIG_NEEDS_BOTAN ON)
-find_package(Botan 3 REQUIRED)
 set(EVENTLOOP_CONFIG_NEEDS_OPENSSL ON)
 find_package(OpenSSL 3.5 REQUIRED COMPONENTS Crypto SSL)
 find_package(Threads REQUIRED)
@@ -726,7 +707,7 @@ target_include_directories(eventloop
 )
 target_include_directories(eventloop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(eventloop PUBLIC cxx_std_23)
-target_link_libraries(eventloop PUBLIC botan::botan Threads::Threads
+target_link_libraries(eventloop PUBLIC Threads::Threads
     PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 target_compile_options(eventloop PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
@@ -815,7 +796,7 @@ endif()
 
 if(BUILD_TESTING)
     add_executable(http_api_test tests/http_api.cc)
-    target_link_libraries(http_api_test PRIVATE eventloop::eventloop)
+    target_link_libraries(http_api_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
     target_compile_options(http_api_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http_api COMMAND http_api_test)
     set_tests_properties(http_api PROPERTIES TIMEOUT 10)
@@ -826,7 +807,7 @@ if(BUILD_TESTING)
     add_test(NAME coroutine_smoke COMMAND coroutine_smoke_test)
 
     add_executable(socket_api_test tests/socket_api.cc)
-    target_link_libraries(socket_api_test PRIVATE eventloop::eventloop)
+    target_link_libraries(socket_api_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
     target_compile_definitions(socket_api_test PRIVATE EVENTLOOP_TEST_TLS=1)
     target_compile_options(socket_api_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME socket_api COMMAND socket_api_test)
@@ -834,6 +815,12 @@ if(BUILD_TESTING)
 
     find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
     find_program(CURL_EXECUTABLE curl REQUIRED)
+    add_executable(tls_openssl_test tests/tls_openssl.cc)
+    target_link_libraries(tls_openssl_test PRIVATE eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(tls_openssl_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME tls_openssl COMMAND tls_openssl_test)
+    set_tests_properties(tls_openssl PROPERTIES TIMEOUT 10)
+
     add_executable(tls_loopback_test tests/tls_loopback.cc)
     target_link_libraries(tls_loopback_test PRIVATE eventloop::eventloop)
     target_compile_options(tls_loopback_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
