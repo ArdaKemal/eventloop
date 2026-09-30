@@ -22,6 +22,7 @@ class bounded_connection {
 public:
     static constexpr std::size_t stream_capacity = 32;
     static constexpr std::size_t stream_bytes = 4096;
+    static constexpr std::size_t receive_bytes = stream_capacity * stream_bytes;
     static constexpr std::size_t packet_capacity = 128;
     static constexpr std::size_t frames_per_packet = 8;
     struct transmitted_range {
@@ -70,6 +71,11 @@ public:
         if (!local || !callbacks_.validate_parameters)
             return std::unexpected(connection_error::invalid_configuration);
         local_ = limits(*local);
+        // Every byte of advertised receive credit must fit reserved storage,
+        // including sparse STREAM ranges while the application is suspended.
+        if (local_.data > receive_bytes || local_.bidi_local > stream_bytes ||
+            local_.bidi_remote > stream_bytes || local_.stream_uni > stream_bytes)
+            return std::unexpected(connection_error::invalid_configuration);
         if (!registry_.set_local_limit(stream_direction::bidirectional, local_.bidi) ||
             !registry_.set_local_limit(stream_direction::unidirectional, local_.uni))
             return std::unexpected(connection_error::invalid_configuration);

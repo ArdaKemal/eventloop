@@ -42,7 +42,7 @@ struct contexts {
 
 
 static constexpr std::array<std::uint8_t, 4> protocol {'t','e','s','t'};
-static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x60,0,5,2,0x60,0,6,2,0x60,0,7,2,0x60,0,8,1,32,9,1,32,0x20,2,0x44,0xb0};
+static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,1,32,9,1,32,0x20,2,0x44,0xb0};
 static constexpr std::array<std::uint8_t, 8> dcid {1,2,3,4,5,6,7,8};
 static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcept
 {
@@ -95,6 +95,36 @@ static auto transfer(bounded_connection& sender, bounded_connection& receiver,
 int main()
 {
     contexts context;
+    // Internal callers must not bypass the endpoint's storage caps by passing
+    // raw transport parameters with an unsafe stream or connection window.
+    for (const auto index : {8u, 12u, 16u}) {
+        auto unsafe = parameters;
+        unsafe[index + 1] = 0x60; // 8192 bytes, versus the 4096-byte ring
+        connection_callbacks callbacks {nullptr, valid_parameters, nullptr};
+        auto connection = std::make_unique<bounded_connection>(endpoint_role::client, callbacks);
+        const auto initialized = connection->initialize(context.client.get(),
+            {false,"localhost",protocol,unsafe},version_1,dcid);
+        check(!initialized && initialized.error() == connection_error::invalid_configuration);
+    }
+    {
+        // Preserve the rest of the parameters while replacing initial_max_data
+        // with the four-byte encoding of 131073 (one byte beyond all rings).
+        std::array<std::uint8_t, parameters.size() + 2> unsafe {};
+        std::copy_n(parameters.begin(), 4, unsafe.begin());
+        unsafe[4] = 4;
+        unsafe[5] = 0x80; unsafe[6] = 2; unsafe[7] = 0; unsafe[8] = 1;
+        std::copy(parameters.begin() + 7, parameters.end(), unsafe.begin() + 9);
+        connection_callbacks callbacks {nullptr, valid_parameters, nullptr};
+        auto connection = std::make_unique<bounded_connection>(endpoint_role::client, callbacks);
+        const auto initialized = connection->initialize(context.client.get(),
+            {false,"localhost",protocol,unsafe},version_1,dcid);
+        check(!initialized && initialized.error() == connection_error::invalid_configuration);
+        unsafe[8] = 0; // The full 128 KiB reserved connection window is valid.
+        auto exact = std::make_unique<bounded_connection>(endpoint_role::client, callbacks);
+        check(exact->initialize(context.client.get(),
+            {false,"localhost",protocol,unsafe},version_1,dcid).has_value());
+        check(exact->flow().receive_max_data() == bounded_connection::receive_bytes);
+    }
     for (auto version : {version_1, version_2}) {
         connection_callbacks callbacks {nullptr, valid_parameters, nullptr};
         auto client = std::make_unique<bounded_connection>(endpoint_role::client, callbacks);
@@ -208,7 +238,47 @@ int main()
         check(client->receive(std::span(buffer.encoded).first(*packet_size),0,dcid.size(),buffer.packet_scratch,
             buffer.plaintext,buffer.auth_scratch,now,std::chrono::milliseconds(10)).has_value());
         check(retransmit->send.complete());
-        for (int i = 2; i < 32; ++i) check(client->open_stream(stream_direction::bidirectional).has_value());
+        // Fill a receive ring, including a sparse range ending exactly at the
+        // advertised boundary, then slide the window only after consumption.
+        const auto buffered_id = client->open_stream(stream_direction::bidirectional);
+        check(buffered_id.has_value());
+        const auto deliver = [&](std::uint64_t offset, std::size_t length) {
+            std::array<std::byte, 1170> payload {};
+            decoded_frame incoming;
+            incoming.type = 0x0e; incoming.stream_id = *buffered_id;
+            incoming.offset = offset; incoming.data = std::span(payload).first(length);
+            const auto frame_length = encode_frame(incoming,
+                std::as_writable_bytes(std::span(buffer.frame)));
+            check(frame_length.has_value());
+            const auto packet = client->core().build(fields,
+                std::span(buffer.frame).first(*frame_length), buffer.encoded, buffer.build_scratch);
+            check(packet.has_value());
+            check(server->receive(std::span(buffer.encoded).first(*packet), 0,
+                dcid.size(), buffer.packet_scratch, buffer.plaintext,
+                buffer.auth_scratch, now, std::chrono::milliseconds(10)).has_value());
+        };
+        deliver(3501, 595);
+        auto* buffered = server->stream(*buffered_id);
+        check(buffered && buffered->receive_limit == bounded_connection::stream_bytes);
+        check(buffered->receive->readable().empty());
+        const std::array<std::byte, 1170> oversized {};
+        const auto rejected = buffered->receive->insert(3501, oversized);
+        check(!rejected && rejected.error() == stream_receive_error::flow_limit_exceeded);
+        check(buffered->receive->highest_received_offset() == 4096);
+        deliver(0, 1170);
+        deliver(1170, 1170);
+        deliver(2340, 1161);
+        check(buffered->receive->readable().size() == bounded_connection::stream_bytes);
+        check(server->consume_stream(*buffered_id, 64).has_value());
+        check(buffered->receive_limit == bounded_connection::stream_bytes + 64);
+        check(buffered->receive_limit - buffered->consumed == bounded_connection::stream_bytes);
+        deliver(4096, 64);
+        check(server->consume_stream(*buffered_id, 4032).has_value());
+        check(buffered->receive->readable().size() == 64);
+        check(server->consume_stream(*buffered_id, 64).has_value());
+        check(buffered->receive->readable().empty());
+        check(server->flow().receive_max_data() == 8192 + 3 + 4160);
+        for (int i = 3; i < 32; ++i) check(client->open_stream(stream_direction::bidirectional).has_value());
         check(!client->open_stream(stream_direction::bidirectional));
         // Path migration: an unvalidated candidate cannot be promoted; promotion
         // resets path-specific RTT/congestion state while cancellation and

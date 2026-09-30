@@ -51,8 +51,11 @@ struct is_error_code_enum<eventloop::quic_errc> : true_type {};
 
 namespace eventloop {
 
-// Limits advertised in the QUIC transport parameters. Unset datagram size (0)
-// disables RFC 9221 DATAGRAM negotiation.
+// Requested limits advertised in the QUIC transport parameters. Receive data
+// windows are capped to reserved storage: 4 KiB per stream and 128 KiB per
+// connection. Smaller requests are preserved. Consuming data replenishes these
+// windows, so they do not limit the total stream or connection transfer size.
+// Unset datagram size (0) disables RFC 9221 DATAGRAM negotiation.
 struct quic_transport_limits {
     std::uint64_t max_idle_timeout_ms {30000};
     std::uint64_t max_data {1024 * 1024};

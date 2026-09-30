@@ -48,6 +48,37 @@ auto quic_category() noexcept -> const std::error_category&
     return instance;
 }
 
+// Preserve the driver's exact failure in the public expected error without
+// exposing internal transport enums in the public API.
+auto driver_error_code(connection_error value) noexcept -> std::error_code
+{
+    static const struct category final : std::error_category {
+        auto name() const noexcept -> const char* override
+        { return "eventloop.quic.driver"; }
+        auto message(int value) const -> std::string override
+        {
+            switch (static_cast<connection_error>(value - 1)) {
+            case connection_error::invalid_state: return "invalid connection state";
+            case connection_error::invalid_configuration: return "invalid connection configuration";
+            case connection_error::unavailable_keys: return "packet keys unavailable";
+            case connection_error::malformed_packet: return "malformed packet";
+            case connection_error::authentication_failed: return "packet authentication failed";
+            case connection_error::protocol_violation: return "protocol violation";
+            case connection_error::capacity_exceeded: return "connection capacity exceeded";
+            case connection_error::tls_failure: return "TLS failure";
+            case connection_error::provider_failure: return "transport provider failure";
+            case connection_error::output_too_small: return "packet output buffer too small";
+            case connection_error::unsupported_frame: return "unsupported frame";
+            case connection_error::key_update_violation: return "key update violation";
+            case connection_error::aead_limit_reached: return "AEAD usage limit reached";
+            }
+            return "unknown connection driver error";
+        }
+    } instance;
+    // connection_error starts at zero; reserve zero for success in error_code.
+    return {static_cast<int>(value) + 1, instance};
+}
+
 constexpr std::size_t connection_capacity = 8;
 constexpr std::size_t short_cid_length = 8;
 constexpr std::size_t waiter_capacity = 64;
@@ -78,7 +109,10 @@ public:
         bool occupied {false};
         bool accepted {false};
         bool closing {false};
+        bool driver_finished {false};
         std::uint32_t generation {0};
+        // Retained after clear() until this slot receives a new generation.
+        std::error_code terminal_error {};
         std::optional<quic::detail::bounded_connection> connection;
         std::optional<quic::detail::connection_driver> driver;
         ip_endpoint peer {};
@@ -98,6 +132,7 @@ public:
             occupied = false;
             accepted = false;
             closing = false;
+            driver_finished = false;
             original_dcid_size = 0;
             parameters_size = 0;
             accepted_count = 0;
@@ -129,7 +164,7 @@ public:
     {
         if (receiving_) std::terminate();
         for (auto& entry : slots_)
-            if (entry.driver && !entry.driver->retired()) std::terminate();
+            if (entry.driver && !entry.driver_finished) std::terminate();
         if (context_) SSL_CTX_free(context_);
     }
 
@@ -173,7 +208,7 @@ public:
     {
         if (receiving_) return false;
         for (const auto& entry : slots_)
-            if (entry.driver && !entry.driver->retired()) return false;
+            if (entry.driver && !entry.driver_finished) return false;
         return true;
     }
 
@@ -181,7 +216,8 @@ public:
     {
         for (auto& entry : slots_) {
             if (!entry.occupied) continue;
-            if (entry.driver && !entry.driver->retired()) continue;
+            if (entry.driver && !entry.driver_finished) continue;
+            if (entry.terminal_error && !entry.accepted) continue;
             entry.clear();
         }
     }
@@ -195,6 +231,7 @@ public:
         entry.occupied = true;
         entry.accepted = true;
         entry.generation = ++next_generation_;
+        entry.terminal_error = {};
         entry.peer = server;
         if (RAND_bytes(reinterpret_cast<unsigned char*>(entry.local_cid.data()),
                 static_cast<int>(entry.local_cid.size())) != 1) {
@@ -234,7 +271,7 @@ public:
             entry.clear();
             return false;
         }
-        if (loop_.spawn(drive(loop_, *entry.driver)) !=
+        if (loop_.spawn(drive(loop_, *this, entry)) !=
             task_spawn_result::accepted) {
             (void)endpoint_.router().remove(entry.route);
             entry.clear();
@@ -305,9 +342,21 @@ private:
         self.receiving_ = false;
     }
 
-    static auto drive(event_loop&, connection_driver& driver) -> task<void>
+    static auto drive(event_loop&, implementation& self, slot& entry) -> task<void>
     {
-        (void)co_await driver.run();
+        const auto result = co_await entry.driver->run();
+        entry.driver_finished = true;
+        if (!result)
+            entry.terminal_error = detail::task_error_code(result.error());
+        else if (!*result)
+            entry.terminal_error = driver_error_code(result->error());
+        else
+            entry.terminal_error = make_error_code(quic_errc::peer_closed);
+        entry.closing = true;
+        // run() has retired before resuming this wrapper. Reap before waking:
+        // resumed operations may close and destroy the endpoint inline.
+        self.reap();
+        self.wake_all();
     }
 
     static auto accept_initial(void* argument, endpoint_router& router,
@@ -325,6 +374,7 @@ private:
 
         entry->occupied = true;
         entry->generation = ++self.next_generation_;
+        entry->terminal_error = {};
         entry->peer = source;
         if (RAND_bytes(reinterpret_cast<unsigned char*>(entry->local_cid.data()),
                 static_cast<int>(entry->local_cid.size())) != 1) {
@@ -351,6 +401,10 @@ private:
             entry->clear();
             return false;
         }
+        if (!entry->connection->peer_ids().set_initial(header.source_cid)) {
+            entry->clear();
+            return false;
+        }
         entry->driver.emplace(self.loop_, self.endpoint_, *entry->connection,
             as_u8(std::span<const std::byte>(entry->local_cid)),
             as_u8(header.source_cid), source, false);
@@ -361,7 +415,7 @@ private:
             entry->clear();
             return false;
         }
-        if (self.loop_.spawn(self.drive(self.loop_, *entry->driver)) !=
+        if (self.loop_.spawn(self.drive(self.loop_, self, *entry)) !=
             task_spawn_result::accepted) {
             (void)self.endpoint_.router().remove(entry->route);
             entry->clear();
@@ -401,6 +455,10 @@ private:
             return true;
         };
         const auto& settings = limits();
+        const auto receive_data = std::min<std::uint64_t>(
+            settings.max_data, bounded_connection::receive_bytes);
+        const auto receive_stream_data = std::min<std::uint64_t>(
+            settings.max_stream_data, bounded_connection::stream_bytes);
         if (!client &&
             !add_bytes(static_cast<std::uint64_t>(parameter_id::original_destination_connection_id),
                 {entry.original_dcid.data(), entry.original_dcid_size}))
@@ -410,13 +468,13 @@ private:
             !add_number(static_cast<std::uint64_t>(parameter_id::max_idle_timeout),
                 settings.max_idle_timeout_ms) ||
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_data),
-                settings.max_data) ||
+                receive_data) ||
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_stream_data_bidi_local),
-                settings.max_stream_data) ||
+                receive_stream_data) ||
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_stream_data_bidi_remote),
-                settings.max_stream_data) ||
+                receive_stream_data) ||
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_stream_data_uni),
-                settings.max_stream_data) ||
+                receive_stream_data) ||
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_streams_bidi),
                 settings.max_streams_bidi) ||
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_streams_uni),
@@ -467,6 +525,8 @@ auto open_stream_task(event_loop&, quic_endpoint::implementation& impl,
     if (slot_index >= impl.slots_.size())
         co_return std::unexpected(make_error_code(quic_errc::not_connected));
     auto& slot = impl.slots_[slot_index];
+    if (slot.generation == generation && slot.terminal_error)
+        co_return std::unexpected(slot.terminal_error);
     if (!slot.occupied || slot.generation != generation || !slot.connection)
         co_return std::unexpected(make_error_code(quic_errc::not_connected));
     const auto internal = direction == quic_stream_direction::bidirectional
@@ -487,6 +547,8 @@ auto read_stream(event_loop&, quic_endpoint::implementation& impl,
         if (slot_index >= impl.slots_.size())
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto& slot = impl.slots_[slot_index];
+        if (slot.generation == generation && slot.terminal_error)
+            co_return std::unexpected(slot.terminal_error);
         if (!slot.occupied || slot.generation != generation || !slot.connection)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto* stream = slot.connection->stream(stream_id);
@@ -516,18 +578,20 @@ auto write_stream(event_loop&, quic_endpoint::implementation& impl,
     std::span<const std::byte> buffer, bool fin)
     -> task<std::expected<std::size_t, std::error_code>>
 {
-    if (buffer.empty() && !fin) co_return std::size_t {0};
     for (;;) {
         if (co_await cancellation_requested())
             co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
         if (slot_index >= impl.slots_.size())
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto& slot = impl.slots_[slot_index];
+        if (slot.generation == generation && slot.terminal_error)
+            co_return std::unexpected(slot.terminal_error);
         if (!slot.occupied || slot.generation != generation || !slot.connection)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto* stream = slot.connection->stream(stream_id);
         if (stream == nullptr || !stream->receive)
             co_return std::unexpected(make_error_code(quic_errc::invalid_argument));
+        if (buffer.empty() && !fin) co_return std::size_t {0};
         const auto writable = stream->send.writable_bytes();
         if (writable >= buffer.size()) {
             if (!buffer.empty() && !stream->send.append(buffer))
@@ -556,12 +620,16 @@ auto accept_stream(event_loop&, quic_endpoint::implementation& impl,
         if (slot_index >= impl.slots_.size())
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto& slot = impl.slots_[slot_index];
+        if (slot.generation == generation && slot.terminal_error)
+            co_return std::unexpected(slot.terminal_error);
         if (!slot.occupied || slot.generation != generation || !slot.connection)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
+        const auto peer_role = impl.client_mode()
+            ? stream_role::server : stream_role::client;
         const auto accepted_end = slot.accepted_streams.begin() +
             static_cast<std::ptrdiff_t>(slot.accepted_count);
         for (const auto& candidate : slot.connection->stream_slots()) {
-            if (!candidate.occupied || stream_initiator(candidate.id) != stream_role::client)
+            if (!candidate.occupied || stream_initiator(candidate.id) != peer_role)
                 continue;
             if (std::find(slot.accepted_streams.begin(), accepted_end, candidate.id) != accepted_end)
                 continue;
@@ -585,6 +653,8 @@ auto send_datagram_task(event_loop&, quic_endpoint::implementation& impl,
         if (slot_index >= impl.slots_.size())
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto& slot = impl.slots_[slot_index];
+        if (slot.generation == generation && slot.terminal_error)
+            co_return std::unexpected(slot.terminal_error);
         if (!slot.occupied || slot.generation != generation || !slot.connection)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         const auto result = slot.connection->queue_datagram(payload);
@@ -605,6 +675,8 @@ auto receive_datagram_task(event_loop&, quic_endpoint::implementation& impl,
         if (slot_index >= impl.slots_.size())
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto& slot = impl.slots_[slot_index];
+        if (slot.generation == generation && slot.terminal_error)
+            co_return std::unexpected(slot.terminal_error);
         if (!slot.occupied || slot.generation != generation || !slot.connection)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         const auto received = slot.connection->receive_datagram(buffer);
@@ -622,6 +694,10 @@ auto accept_connection(event_loop&, quic_endpoint::implementation& impl)
         impl.reap();
         for (std::size_t i = 0; i < impl.slots_.size(); ++i) {
             auto& slot = impl.slots_[i];
+            if (slot.occupied && !slot.accepted && slot.terminal_error) {
+                slot.accepted = true;
+                co_return std::unexpected(slot.terminal_error);
+            }
             if (slot.occupied && !slot.accepted && slot.connection &&
                 slot.connection->core().state() == connection_state::active) {
                 slot.accepted = true;
@@ -651,6 +727,8 @@ auto connect_task(event_loop&, quic_endpoint::implementation& impl,
         if (co_await cancellation_requested())
             co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
         auto& slot = impl.slots_[index];
+        if (slot.generation == generation && slot.terminal_error)
+            co_return std::unexpected(slot.terminal_error);
         if (!slot.occupied || slot.generation != generation)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         if (slot.connection &&
@@ -701,7 +779,8 @@ auto quic_connection::valid() const noexcept -> bool
     const auto& impl = *endpoint_->implementation_;
     if (slot_ >= impl.slots_.size()) return false;
     const auto& slot = impl.slots_[slot_];
-    return slot.occupied && slot.generation == generation_ && slot.connection.has_value();
+    return slot.generation == generation_ &&
+        ((slot.occupied && slot.connection.has_value()) || slot.terminal_error);
 }
 
 auto quic_connection::remote_endpoint() const noexcept -> ip_endpoint

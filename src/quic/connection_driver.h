@@ -105,9 +105,14 @@ private:
                 const auto learned=parse_packet_header(
                     std::as_bytes(std::span(packet.bytes).first(packet.size)),0,local_size_,true);
                 if (learned && (learned->kind==packet_kind::initial||learned->kind==packet_kind::handshake) &&
-                    !learned->source_cid.empty() && learned->source_cid.size()<=peer_.size()) {
-                    peer_size_=learned->source_cid.size();
-                    std::memcpy(peer_.data(),learned->source_cid.data(),peer_size_);
+                    learned->source_cid.size()<=peer_.size()) {
+                    if (!connection_.peer_ids().selected() &&
+                        !connection_.peer_ids().set_initial(learned->source_cid))
+                        return std::unexpected(connection_error::invalid_state);
+                    if (!learned->source_cid.empty()) {
+                        peer_size_=learned->source_cid.size();
+                        std::memcpy(peer_.data(),learned->source_cid.data(),peer_size_);
+                    }
                 }
                 if (!connection_.synchronize_discarded_spaces())
                     return std::unexpected(connection_error::invalid_state);
