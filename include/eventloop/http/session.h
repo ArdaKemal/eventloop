@@ -1,6 +1,7 @@
 #pragma once
 
 #include "eventloop/http/request.h"
+#include "eventloop/native_socket.h"
 #include "eventloop/unique_fd.h"
 
 #include <array>

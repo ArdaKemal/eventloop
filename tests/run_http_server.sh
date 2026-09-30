@@ -93,7 +93,7 @@ if "$curl" --version | grep -q 'HTTP2'; then
     cmp "$work_dir/www/h2-large.bin" "$work_dir/h2-large.out"
 
     "$curl" --silent --insecure --fail --http2 --parallel \
-        --parallel-max-host 1 \
+        --parallel-max 1 \
         --output "$work_dir/h2-parallel-file.out" \
         "https://localhost:$https_port/file.txt" \
         --output "$work_dir/h2-parallel-index.out" \

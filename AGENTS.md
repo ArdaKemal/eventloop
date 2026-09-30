@@ -1,6 +1,6 @@
 # Agent handoff: eventloop
 
-Updated 2026-09-28. Read this before continuing work after a machine or
+Updated 2026-09-30. Read this before continuing work after a machine or
 session switch. Verify all status claims with `git status` and the tests below;
 this file is a handoff snapshot, not a substitute for inspecting the code.
 Commit or otherwise sync this file and the uncommitted implementation before
@@ -145,6 +145,163 @@ switching PCs; a fresh clone will not contain uncommitted work.
   same settings. This is a small directional difference from separate-day
   measurements, not a controlled performance claim.
 
+## QUIC milestone (active)
+
+- Scope and release gates are tracked in `docs/quic-milestone.md`. The current
+  target is in-house QUIC v1/v2 transport with RFC 9368 version negotiation,
+  RFC 9221 DATAGRAM, RFC 9287 greasing, loop-affine APIs, bounded queues, and
+  independent-stack interoperability. HTTP/3, WebTransport, video, 0-RTT, and
+  unpublished drafts are excluded.
+- `src/quic/varint.h`, `version.h`, `transport_parameters.h`,
+  `packet_header.h`, and `frames.h` provide internal bounded wire codecs.
+  `encode_frame()` validates supported frames and writes canonically into
+  caller storage. `frame_policy.h` checks packet-kind and receiver-role
+  restrictions.
+- `src/quic/packet_protection.{h,cc}` uses OpenSSL EVP for QUIC v1/v2 Initial
+  secrets, AES-128-GCM traffic keys, payload/header protection, Retry integrity,
+  and v1/v2 1-RTT key-update derivation. The TLS adapter uses OpenSSL 3.5+'s
+  supported external QUIC callbacks. Botan remains for the existing TCP/TLS
+  paths; it is no longer in the QUIC crypto path.
+- `src/quic/key_update.{h,cc}` tracks send/receive key phases, ACK gates, peer
+  updates, and previous-key retention. The caller must authenticate candidate
+  packets before committing updates and enforce AEAD usage limits and update
+  rate limits.
+- `packet_protection_context` reuses OpenSSL EVP contexts for payload and
+  header protection; the context-aware protected-packet overloads use
+  caller-owned authentication scratch and clear it after each attempt.
+  Stateless compatibility wrappers still create per-call context/scratch.
+- `src/quic/retry_token.{h,cc}` seals bounded Retry-only tokens with AES-GCM,
+  binding issue time, canonical peer-address bytes, and original DCID. The
+  caller owns nonce uniqueness, key rotation, and replay policy.
+- `src/quic/retry_packet.{h,cc}` builds and validates v1/v2 Retry packets with
+  the version-specific integrity tag and preserves output on build failure.
+- `src/quic/transport_parameter_validation.h` revalidates parsed parameter
+  sets and binds mandatory connection-ID, Retry, and version-negotiation
+  parameters to authenticated handshake observations.
+- `src/quic/stateless_reset.h` provides bounded reset encoding and token
+  matching; callers must ensure the triggering packet is eligible and tokens
+  belong to active connections.
+- `src/quic/ecn_state.h` validates cumulative ACK_ECN feedback per packet-number
+  space and reports newly observed CE counts. Callers supply first-time ACK
+  accounting from validated sent history and preserve counters across paths.
+- `src/quic/stream_state.h` and `connection_lifecycle.h` provide bounded stream
+  and connection transition helpers, including final-size consistency, idle
+  timeout, closing/draining, and transmit-permission decisions.
+- `src/quic/protected_packet.{h,cc}` builds and opens caller-buffer v1/v2
+  Initial, 0-RTT, Handshake, and 1-RTT packets with packet-number truncation,
+  header protection, and authenticated payloads. It prepends sample padding
+  so lengthless STREAM payloads stay unchanged. The RFC 9001 A.3 server Initial
+  vector is covered. OpenSSL EVP provider internals may still allocate.
+- `src/quic/crypto_send_buffer.h` tracks bounded CRYPTO send ranges, ACKs, and
+  loss retransmission state. `crypto_buffer.h` provides bounded ordered CRYPTO
+  receive reassembly.
+- `src/quic/stream_receive_buffer.h` and `stream_send_buffer.h` provide
+  bounded per-stream receive reassembly and send/retransmit state.
+- `src/quic/stream_registry.h` tracks stream IDs, direction permissions,
+  cumulative stream limits, implicit lower peer stream IDs, and closed-ID
+  tombstones. `flow_control.h` tracks connection and stream credit, overlapping
+  ranges, consumption/replenishment, and stable FIN/RESET_STREAM final sizes.
+- `src/quic/datagram_queue.h` provides bounded RFC 9221 datagram queues and
+  checks the complete encoded frame size against the configured limit.
+- `src/quic/connection_id_registry.h` tracks peer-issued IDs, reset-token and
+  sequence consistency, active-ID limits, monotonic retirement, and pending
+  `RETIRE_CONNECTION_ID` work in fixed storage.
+- `src/quic/connection_core.{h,cc}` composes OpenSSL QUIC TLS, CRYPTO send and
+  receive buffers, packet protection, duplicate-packet tracking, ACK generation,
+  frame-policy checks, and connection closing/draining on one owner thread.
+  The owner still supplies transport-parameter observations, stream/recovery/
+  path handling, routing, anti-amplification, and UDP transmission.
+- `src/quic/local_connection_id_registry.h` tracks bounded server-issued IDs,
+  reset-token uniqueness, `RETIRE_CONNECTION_ID` effects, and retired-ID
+  routing tombstones.
+- `src/quic/path_validation.h` tracks fixed-capacity path slots, matched
+  `PATH_CHALLENGE` responses, and per-path server anti-amplification credit.
+- `src/quic/version_negotiation.h` provides Version Negotiation packet
+  encoding and RFC 9368 downgrade validation.
+- `src/quic/recovery_timer.h` provides allocation-free RTT estimation,
+  space-specific PTO calculation with exponential backoff, and earliest-loss-
+  deadline selection that ignores absent entries. `recovery_orchestration.h`
+  coordinates ACK/loss processing, NewReno, PTO requests, and persistent-
+  congestion detection across the three packet-number spaces. PTO handling
+  prioritizes armed loss deadlines, uses the last ack-eliciting send time,
+  resets backoff when packet-number spaces are discarded, and exposes bounded
+  client probe/server amplification controls.
+- `src/quic/ack_ranges.h` traverses decoded ACK ranges in descending packet
+  number order without allocating and validates manually constructed frames.
+- `src/quic/received_packet_ranges.h` tracks received packet ranges, retires
+  ranges after the carrying ACK is acknowledged, preserves a minimum accepted
+  packet number, and emits the newest ranges that fit caller storage.
+- `src/quic/loss_detection.h` implements RFC 9002's recommended packet and
+  time thresholds as helpers. Its time delay uses the larger RTT, 9/8
+  multiplier, and 1 ms floor. Packet threshold takes a count of later packets
+  actually transmitted, not numeric packet-number distance.
+- `src/quic/sent_packet_history.h` retains one packet-number space in fixed
+  storage, processes ACK ranges and RTT samples, and removes packet/time-
+  threshold losses atomically into caller storage. It reports the next relative
+  loss deadline. Strictly increasing packet numbers may have gaps; a fixed
+  sent-range ledger validates delayed ACKs after records are removed. Each gap
+  permanently consumes one configured range slot until reset, and exhaustion
+  rejects a new gapped record without changing state. Packet-threshold loss
+  counts later packets actually sent, including retired ones.
+- `src/quic/congestion_control.h` provides an allocation-free, path-scoped
+  RFC 9002 NewReno controller with bounded flight accounting, slow start,
+  congestion avoidance, recovery epochs, ECN and probe hooks, and the
+  persistent-congestion response. Recovery orchestration applies the
+  persistent-congestion response after detecting persistent congestion.
+- CMake registers QUIC varint, transport-parameter, packet-header, frame,
+  frame-encoder, frame-policy, CRYPTO receive/send, packet-protection,
+  protected-packet/context, stream receive/send/registry/state, flow-control,
+  DATAGRAM, peer/local connection-ID registries, path validation, Retry
+  packet/token, transport-parameter validation,
+  stateless reset, ECN state, connection lifecycle, key update, Version Negotiation, recovery
+  timer/orchestration, ACK-range tracking, loss-detection,
+  sent-packet-history, congestion-control, and connection-core tests on Linux
+  and Windows. The
+  packet-protection test uses always-active checks so RelWithDebInfo/NDEBUG
+  runs its RFC vectors.
+- On 2026-09-30, the integrated Visual Studio 18/MSVC RelWithDebInfo build
+  with OpenSSL 3.5.6 and Botan 3.13 passed Windows CTest 61/61 using the
+  Visual Studio generator (not NMake). A GCC 14.2 Release build on Linux
+  (epoll) also passed 61/61. The Linux build previously failed in
+  `src/http/file_operations.h` because `native_socket` was only included
+  transitively on Windows; the include is now explicit (`native_socket.h` in
+  `file_operations.h`, `http/session.h`, and `http/resource.h`). The earlier
+  `quic_connection`, `quic_packet_scheduler`, and `quic_connection_driver`
+  failures came from test callbacks rejecting the now-required RFC 9287
+  `grease_quic_bit` advertisement; the tests were corrected.
+- RFC 9287 is negotiated end to end: the TLS adapter advertises the empty
+  `grease_quic_bit` parameter, peer support is recorded only after validated
+  transport parameters, a zero QUIC bit is accepted only when advertised
+  locally, and the bit is greased on send only after the peer advertised it.
+  `tests/quic_grease_quic_bit.cc` covers parsing, opening, and routing;
+  `tests/quic_connection_core.cc` covers negotiation and sending.
+- `src/quic/path_recovery_state.h` provides bounded per-path recovery state.
+  `bounded_connection` gates candidate promotion on validation and resets
+  path-specific RTT/congestion state on promotion via
+  `recovery_orchestration::reset_path_recovery()` while keeping packet-number
+  spaces, ACK ranges, sent-packet history, and loss detection connection-wide.
+  `tests/quic_path_recovery_state.cc` and `tests/quic_connection.cc` cover
+  cancellation, failed promotion, promotion, and old-path retirement.
+- `include/eventloop/quic.h` exposes a loop-affine public API: `quic_endpoint`
+  (server and client), move-only `quic_connection` handles into fixed-capacity
+  endpoint slots, stream open/accept/read/write, and RFC 9221 DATAGRAM
+  send/receive. TLS contexts are built internally from cert/key (server) or a
+  trust store (client). `src/quic/quic_endpoint.cc` implements it, keeping
+  internals under `src/quic`. Awaiters are resumed by a `connection_driver`
+  progress hook instead of polling. `tests/quic_public_api.cc` runs an
+  in-house client/server handshake, bidirectional stream echo, and DATAGRAM
+  exchange for both QUIC v1 and v2.
+- Independent-stack interoperability is verified for **QUIC v1**: the OpenSSL
+  3.5.6 `openssl s_client -quic` client completes a full handshake with the
+  `examples/quic_echo_server` server and exchanges bidirectional stream data
+  (the server reads the request and the client receives the echo). OpenSSL
+  3.5.6 rejects `-min_protocol QUICv2`, so its CLI is v1-only and no other
+  independent stack is installed; v2 interop is therefore verified only
+  in-house. The remaining milestone gates are: independent-stack QUIC v2
+  interop, automatic Retry/Version-Negotiation client restart, PMTU, ECN, and
+  connection lifetime/shutdown auditing at the endpoint boundary. Do not
+  describe the library as QUIC-capable until the milestone gates pass.
+
 ## Important limits and decisions still open
 
 1. Do not claim a storage-performance win from the file-I/O benchmark. On
@@ -178,9 +335,9 @@ switching PCs; a fresh clone will not contain uncommitted work.
 
 ## Environment and verification
 
-Build dependencies include a C++23 compiler, CMake, Botan 3, and threads. The
-current host is Fedora 44 on Linux 7.2.5 with the project on Btrfs and `/tmp`
-on memory-backed `tmpfs`.
+Build dependencies include a C++23 compiler, CMake, OpenSSL 3.5+, Botan 3 for
+the existing TLS paths, and threads. The current host is Fedora 44 on Linux
+7.2.5 with the project on Btrfs and `/tmp` on memory-backed `tmpfs`.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

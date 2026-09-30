@@ -1,5 +1,6 @@
 #pragma once
 
+#include "eventloop/native_socket.h"
 #include "eventloop/unique_fd.h"
 
 #include <expected>

@@ -1,0 +1,220 @@
+#include "quic/packet_scheduler.h"
+#include <openssl/evp.h>
+#include <openssl/x509v3.h>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+using namespace eventloop::quic::detail;
+static auto checked(bool value, int line) -> void
+{ if (!value) { std::fprintf(stderr, "connection core check failed at line %d\n", line); std::abort(); } }
+#define check(value) checked((value), __LINE__)
+struct contexts {
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> client {SSL_CTX_new(TLS_method()), SSL_CTX_free};
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> server {SSL_CTX_new(TLS_method()), SSL_CTX_free};
+
+    contexts()
+    {
+        check(client && server);
+        std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key {
+            EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "prime256v1"), EVP_PKEY_free};
+        std::unique_ptr<X509, decltype(&X509_free)> certificate {X509_new(), X509_free};
+        check(key && certificate);
+        check(X509_set_version(certificate.get(), 2) == 1);
+        check(ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1) == 1);
+        check(X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -60) != nullptr);
+        check(X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3600) != nullptr);
+        check(X509_set_pubkey(certificate.get(), key.get()) == 1);
+        auto* name = X509_get_subject_name(certificate.get());
+        check(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+              reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) == 1);
+        check(X509_set_issuer_name(certificate.get(), name) == 1);
+        std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> san {
+            X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
+                               const_cast<char*>("DNS:localhost")), X509_EXTENSION_free};
+        check(san && X509_add_ext(certificate.get(), san.get(), -1) == 1);
+        check(X509_sign(certificate.get(), key.get(), EVP_sha256()) > 0);
+        check(SSL_CTX_use_certificate(server.get(), certificate.get()) == 1);
+        check(SSL_CTX_use_PrivateKey(server.get(), key.get()) == 1);
+        check(X509_STORE_add_cert(SSL_CTX_get_cert_store(client.get()), certificate.get()) == 1);
+        tls_provider::configure_server_context(server.get());
+    }
+};
+
+
+static constexpr std::array<std::uint8_t, 4> protocol {'t','e','s','t'};
+static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x44,0,5,2,0x44,0,6,2,0x44,0,7,2,0x44,0,8,1,32,9,1,32,0x20,2,0x44,0xb0};
+static constexpr std::array<std::uint8_t, 8> dcid {1,2,3,4,5,6,7,8};
+static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcept
+{
+    // The TLS adapter appends the empty RFC 9287 grease_quic_bit parameter
+    // (0x2ab2) to the configured transport parameters.
+    constexpr std::array<std::uint8_t, 3> grease {0x6a, 0xb2, 0};
+    return value.size() == parameters.size() + grease.size() &&
+        std::ranges::equal(value.first(parameters.size()), parameters) &&
+        std::ranges::equal(value.subspan(parameters.size()), grease);
+}
+static bool on_frame(void* argument, tls_level, const decoded_frame&) noexcept
+{ ++*static_cast<int*>(argument); return true; }
+struct buffers {
+    std::array<std::uint8_t, 2048> encoded {}, frame {}, build_scratch {},
+        packet_scratch {}, plaintext {}, auth_scratch {};
+};
+int main()
+{
+    crypto_send_buffer<8> probe_buffer;
+    const std::array<std::byte,4> probe_bytes{};
+    check(probe_buffer.append(probe_bytes).has_value());
+    check(probe_buffer.mark_sent(0,4).has_value());
+    check(probe_buffer.next_pending(8).data.empty());
+    check(probe_buffer.next_unacknowledged(8).data.size()==4);
+    check(probe_buffer.acknowledge(1,2).has_value());
+    check(probe_buffer.next_unacknowledged(8).data.size()==1);
+    check(probe_buffer.acknowledge(0,1).has_value());
+    check(probe_buffer.next_unacknowledged(8).offset==3);
+    check(probe_buffer.acknowledge(3,1).has_value());
+    check(probe_buffer.next_unacknowledged(8).data.empty());
+    contexts context;
+    for (auto version : {version_1,version_2}) {
+        connection_callbacks callbacks {nullptr,valid_parameters,nullptr};
+        auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks);
+        auto server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks);
+        check(client->initialize(context.client.get(),{false,"localhost",protocol,parameters},version,dcid).has_value());
+        check(server->initialize(context.server.get(),{true,{},protocol,parameters},version,dcid).has_value());
+        packet_scheduler outgoing(*client), incoming(*server);
+        buffers buffer;
+        std::size_t last_plaintext_size=0;
+        auto now=lifecycle_time_point{};
+        check(client->core().advance(now).has_value());
+        check(server->core().advance(now).has_value());
+        auto send=[&](bounded_connection& from, bounded_connection& to, packet_scheduler& scheduler,
+                      packet_scheduler& receiver, tls_level level, bool fail=false, bool probe=false) {
+            if (!to.core().keys_available(level,tls_direction::read)) return false;
+            protected_packet_fields fields; fields.destination_cid=dcid;
+            auto size=scheduler.prepare(level,fields,now,buffer.encoded,buffer.build_scratch,probe);
+            if (!size) return false;
+            check(scheduler.pending());
+            if (level==tls_level::initial) check(*size==1200);
+            check(!scheduler.prepare(level,fields,now,buffer.encoded,buffer.build_scratch));
+            check(scheduler.complete(!fail,now).has_value());
+            if (fail) return true;
+            const auto opened=to.receive(std::span(buffer.encoded).first(*size),0,dcid.size(),
+                buffer.packet_scratch,buffer.plaintext,buffer.auth_scratch,now,std::chrono::milliseconds(10));
+            check(opened.has_value());
+            last_plaintext_size=opened->plaintext_size;
+            bool eliciting=false;
+            std::size_t cursor=0;
+            while(cursor<opened->plaintext_size) {
+                const auto frame=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(opened->plaintext_size)).subspan(cursor));
+                check(frame.has_value()); cursor+=frame->encoded_size;
+                eliciting |= frame->type!=0 && frame->type!=2 && frame->type!=3;
+            }
+            if(eliciting) receiver.request_ack(level);
+            return true;
+        };
+        // Failed submission keeps Initial CRYPTO pending and consumes no history.
+        check(send(*client,*server,outgoing,incoming,tls_level::initial,true));
+        check(client->recovery().history(packet_number_space::initial)->size()==0);
+        // A PTO sends outstanding CRYPTO even though it is no longer pending.
+        // Failed probe submissions neither retire the original nor change it.
+        check(send(*client,*server,outgoing,incoming,tls_level::initial));
+        const auto crypto_probe=client->core().next_crypto_probe(tls_level::initial,100);
+        check(!crypto_probe.data.empty());
+        check(crypto_probe.offset==0);
+        check(send(*client,*server,outgoing,incoming,tls_level::initial,true,true));
+        check(client->recovery().history(packet_number_space::initial)->size()==1);
+        check(client->core().next_crypto_probe(tls_level::initial,100).offset==crypto_probe.offset);
+        check(send(*client,*server,outgoing,incoming,tls_level::initial,false,true));
+        check(client->recovery().history(packet_number_space::initial)->size()==2);
+        check(decode_frame(std::as_bytes(std::span(buffer.plaintext).first(last_plaintext_size)))->type==6);
+        for(int step=0;step<100;++step) {
+            now+=std::chrono::milliseconds(1); bool progress=false;
+            for(auto level:{tls_level::initial,tls_level::handshake,tls_level::application}) {
+                progress|=send(*client,*server,outgoing,incoming,level);
+                progress|=send(*server,*client,incoming,outgoing,level);
+            }
+            if(!progress) break;
+        }
+        check(client->core().state()==connection_state::active);
+        check(server->core().state()==connection_state::active);
+        const auto id=client->open_stream(stream_direction::bidirectional); check(id.has_value());
+        const std::array<std::byte,3> bytes{std::byte{1},std::byte{2},std::byte{3}};
+        check(client->stream(*id)->send.append(bytes).has_value());
+        check(client->stream(*id)->send.close().has_value());
+        check(client->queue_datagram(bytes).has_value());
+        check(send(*client,*server,outgoing,incoming,tls_level::application,true));
+        check(client->outgoing_datagrams().size()==1);
+        check(client->stream(*id)->send.next_pending(100).data.size()==3);
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        check(client->outgoing_datagrams().empty());
+        check(server->stream(*id)->receive->readable().size()==3);
+        check(client->stream(*id)->send.next_pending(100).data.empty());
+        check(client->stream(*id)->send.next_unacknowledged(100).data.size()==3);
+        const auto sent_credit=client->flow().sent_total();
+        check(send(*client,*server,outgoing,incoming,tls_level::application,true,true));
+        check(client->flow().sent_total()==sent_credit);
+        check(send(*client,*server,outgoing,incoming,tls_level::application,false,true));
+        check(client->flow().sent_total()==sent_credit);
+        const auto probe_frame=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(last_plaintext_size)));
+        check(probe_frame && probe_frame->type==15 && probe_frame->stream_id==*id && probe_frame->fin);
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        check(client->stream(*id)->send.complete());
+        check(client->stream(*id)->send.next_unacknowledged(100).data.empty());
+        check(!client->stream(*id)->send.next_unacknowledged(100).fin);
+        decoded_frame control; control.type=0x10; control.limit=10000;
+        check(outgoing.queue_control(tls_level::application,control).has_value());
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        const auto number=outgoing.packet_number();
+        outgoing.lose_control(tls_level::application,number);
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        outgoing.acknowledge_control(tls_level::application,outgoing.packet_number());
+        // Consuming receive storage renews both credits and reliably advertises
+        // them, so a bounded ring supports a transfer beyond its initial window.
+        check(server->consume_stream(*id,3).has_value());
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        const auto bulk=client->open_stream(stream_direction::bidirectional); check(bulk.has_value());
+        const std::array<std::byte,1024> block{};
+        for(int round=0;round<3;++round) {
+            check(client->stream(*bulk)->send.append(block).has_value());
+            check(send(*client,*server,outgoing,incoming,tls_level::application));
+            check(server->stream(*bulk)->receive->readable().size()==block.size());
+            check(server->consume_stream(*bulk,block.size()).has_value());
+            check(server->flow().receive_max_data()==1027+(round+1)*1024);
+            check(server->stream(*bulk)->receive->flow_limit()==1024+(round+1)*1024);
+            check(send(*server,*client,incoming,outgoing,tls_level::application));
+        }
+        check(client->flow().sent_total()==3075);
+        // STOP_SENDING after a partial transmission fixes RESET_STREAM's final
+        // size at the bytes actually sent, discarding the queued unsent tail.
+        const auto stopped=client->open_stream(stream_direction::bidirectional); check(stopped.has_value());
+        const std::array<std::byte,2000> tail{};
+        check(client->stream(*stopped)->send.append(tail).has_value());
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        const auto final=client->stream(*stopped)->sent_highest;
+        check(final>0 && final<tail.size());
+        decoded_frame stop; stop.type=5; stop.stream_id=*stopped; stop.error_code=42;
+        check(incoming.queue_control(tls_level::application,stop).has_value());
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        check(client->stream(*stopped)->state.sending()==stream_send_state::reset_sent);
+        check(client->stream(*stopped)->state.send_final_size()==final);
+        check(client->stream(*stopped)->state.stop_error()==42);
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        check(server->stream(*stopped)->state.receive_final_size()==final);
+        check(server->stream(*stopped)->state.receiving()==stream_receive_state::reset_received);
+        check(server->consume_reset(*stopped).has_value());
+        check(server->flow().consumed_total()==3075+final);
+        outgoing.lose_control(tls_level::application,outgoing.packet_number());
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        check(client->stream(*stopped)->state.sending()==stream_send_state::reset_received);
+        // Old STREAM losses cannot resurrect data on a reset stream.
+        if (send(*client,*server,outgoing,incoming,tls_level::application)) {
+            std::size_t cursor=0;
+            while(cursor<last_plaintext_size) {
+                const auto frame=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(last_plaintext_size)).subspan(cursor));
+                check(frame.has_value());
+                check(frame->type<8 || frame->type>15 || frame->stream_id!=*stopped);
+                cursor+=frame->encoded_size;
+            }
+        }
+    }
+}

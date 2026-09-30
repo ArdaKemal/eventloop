@@ -36,6 +36,18 @@ udp_socket::~udp_socket()
     if (receive_ != nullptr || send_ != nullptr ||
         detail::socket_operations::datagram_pending(*this))
         std::terminate();
+    descriptor_.reset();
+    auto* context = std::exchange(lifetime_observer_context_, nullptr);
+    const auto observer = std::exchange(lifetime_observer_, nullptr);
+    if (observer != nullptr) observer(context);
+}
+
+auto udp_socket::set_lifetime_observer(
+    void* context, void (*observer)(void*) noexcept) noexcept -> void
+{
+    if ((context == nullptr) != (observer == nullptr)) std::terminate();
+    lifetime_observer_context_ = context;
+    lifetime_observer_ = observer;
 }
 
 auto udp_socket::descriptor() const noexcept -> native_socket

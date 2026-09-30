@@ -17,6 +17,7 @@
 
 namespace eventloop {
 namespace detail { class socket_operations; }
+namespace quic::detail { class udp_endpoint; }
 
 struct udp_datagram {
     std::size_t size {0};
@@ -131,6 +132,10 @@ private:
     friend class receive_awaiter;
     friend class send_awaiter;
     friend class detail::socket_operations;
+    friend class quic::detail::udp_endpoint;
+
+    auto set_lifetime_observer(void* context,
+        void (*observer)(void*) noexcept) noexcept -> void;
 
     [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
     {
@@ -151,6 +156,8 @@ private:
     receive_awaiter* receive_ {nullptr};
     send_awaiter* send_ {nullptr};
     bool closing_ {false};
+    void* lifetime_observer_context_ {nullptr};
+    void (*lifetime_observer_)(void*) noexcept {nullptr};
     [[no_unique_address]] detail::socket_datagram_state backend_state_ {};
 };
 

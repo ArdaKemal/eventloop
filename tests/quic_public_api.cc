@@ -1,0 +1,214 @@
+// Public QUIC API end-to-end test: in-house client and server over loopback
+// for QUIC v1 and v2, exercising the handshake, bidirectional stream I/O, and
+// the RFC 9221 DATAGRAM extension. The certificate is generated in-process.
+#include "eventloop/quic.h"
+#include "eventloop/event_loop.h"
+
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509v3.h>
+
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace {
+
+using namespace eventloop;
+using namespace std::chrono_literals;
+
+auto check(bool condition, std::string_view message) -> void
+{
+    if (condition) return;
+    std::fprintf(stderr, "QUIC public API: %.*s\n",
+                 static_cast<int>(message.size()), message.data());
+    std::abort();
+}
+
+auto write_pem(const std::filesystem::path& path, X509* certificate,
+               EVP_PKEY* key) -> bool
+{
+    // Use a memory BIO so the test does not pass a C-runtime FILE* across the
+    // OpenSSL DLL boundary (which needs OPENSSL_Applink on Windows).
+    std::unique_ptr<BIO, decltype(&BIO_free)> bio {BIO_new(BIO_s_mem()), BIO_free};
+    if (!bio) return false;
+    const int written = certificate != nullptr
+        ? PEM_write_bio_X509(bio.get(), certificate)
+        : PEM_write_bio_PrivateKey(bio.get(), key, nullptr, nullptr, 0, nullptr, nullptr);
+    if (written != 1) return false;
+    char* data = nullptr;
+    const auto size = BIO_get_mem_data(bio.get(), &data);
+    if (size <= 0) return false;
+    std::unique_ptr<FILE, decltype(&std::fclose)> file {
+        std::fopen(path.string().c_str(), "wb"), std::fclose};
+    if (!file) return false;
+    return std::fwrite(data, 1, static_cast<std::size_t>(size), file.get()) ==
+        static_cast<std::size_t>(size);
+}
+
+auto make_certificate(const std::filesystem::path& directory) -> bool
+{
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key {
+        EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "prime256v1"), EVP_PKEY_free};
+    std::unique_ptr<X509, decltype(&X509_free)> certificate {X509_new(), X509_free};
+    if (!key || !certificate) return false;
+    if (X509_set_version(certificate.get(), 2) != 1) return false;
+    if (ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1) != 1) return false;
+    if (X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -60) == nullptr) return false;
+    if (X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3600) == nullptr) return false;
+    if (X509_set_pubkey(certificate.get(), key.get()) != 1) return false;
+    auto* name = X509_get_subject_name(certificate.get());
+    if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) != 1)
+        return false;
+    if (X509_set_issuer_name(certificate.get(), name) != 1) return false;
+    std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> san {
+        X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
+                            const_cast<char*>("DNS:localhost")), X509_EXTENSION_free};
+    if (!san || X509_add_ext(certificate.get(), san.get(), -1) != 1) return false;
+    if (X509_sign(certificate.get(), key.get(), EVP_sha256()) <= 0) return false;
+    return write_pem(directory / "cert.pem", certificate.get(), nullptr) &&
+        write_pem(directory / "key.pem", nullptr, key.get());
+}
+
+constexpr std::array<std::uint8_t, 4> protocol {'t', 'e', 's', 't'};
+const std::array<std::byte, 4> request {std::byte {'p'}, std::byte {'i'},
+                                        std::byte {'n'}, std::byte {'g'}};
+const std::array<std::byte, 4> reply {std::byte {'p'}, std::byte {'o'},
+                                      std::byte {'n'}, std::byte {'g'}};
+const std::array<std::byte, 5> datagram_in {std::byte {'d'}, std::byte {'g'},
+                                            std::byte {'1'}, std::byte {'2'},
+                                            std::byte {'3'}};
+const std::array<std::byte, 4> datagram_out {std::byte {'d'}, std::byte {'g'},
+                                             std::byte {'o'}, std::byte {'k'}};
+
+struct outcome {
+    bool server_ok {false};
+    bool client_ok {false};
+};
+
+auto server_serve(event_loop&, quic_endpoint& server, outcome& result) -> task<void>
+{
+    auto accepted = flatten_result(co_await server.async_accept());
+    if (!accepted) co_return;
+    auto connection = std::move(*accepted);
+    auto stream = flatten_result(co_await connection.async_accept_stream());
+    if (!stream) { connection.close(); co_return; }
+    std::array<std::byte, 64> buffer {};
+    auto count = flatten_result(co_await connection.async_read(*stream, buffer));
+    const bool stream_ok = count && *count == request.size() &&
+        std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*count),
+                   request.begin());
+    if (stream_ok)
+        (void)flatten_result(co_await connection.async_write(*stream, reply, false));
+    auto received = flatten_result(co_await connection.async_receive_datagram(buffer));
+    const bool datagram_ok = received && *received == datagram_in.size() &&
+        std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*received),
+                   datagram_in.begin());
+    if (datagram_ok)
+        (void)flatten_result(co_await connection.async_send_datagram(datagram_out));
+    result.server_ok = stream_ok && datagram_ok;
+}
+
+auto client_run(event_loop&, quic_endpoint& client, ip_endpoint server,
+                outcome& result) -> task<void>
+{
+    auto connected = flatten_result(co_await client.async_connect(server, "localhost"));
+    if (!connected) co_return;
+    auto connection = std::move(*connected);
+    auto stream = flatten_result(co_await connection.async_open_stream(
+        quic_stream_direction::bidirectional));
+    if (!stream) { connection.close(); co_return; }
+    (void)flatten_result(co_await connection.async_write(*stream, request, false));
+    std::array<std::byte, 64> buffer {};
+    auto count = flatten_result(co_await connection.async_read(*stream, buffer));
+    const bool stream_ok = count && *count == reply.size() &&
+        std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*count),
+                   reply.begin());
+    (void)flatten_result(co_await connection.async_send_datagram(datagram_in));
+    auto received = flatten_result(co_await connection.async_receive_datagram(buffer));
+    const bool datagram_ok = received && *received == datagram_out.size() &&
+        std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*received),
+                   datagram_out.begin());
+    (void)flatten_result(co_await connection.async_write(*stream, {}, true));
+    result.client_ok = stream_ok && datagram_ok;
+}
+
+auto watch(event_loop& loop, quic_endpoint& server, quic_endpoint& client,
+           outcome& result) -> task<void>
+{
+    for (int i = 0; i < 2000 && !(result.server_ok && result.client_ok); ++i)
+        (void)co_await sleep_for(loop, 5ms);
+    co_await server.async_close();
+    co_await client.async_close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto scenario(quic_version version, const std::filesystem::path& certificate) -> bool
+{
+    event_loop loop;
+    quic_server_options server_options;
+    server_options.certificate_chain = certificate / "cert.pem";
+    server_options.private_key = certificate / "key.pem";
+    server_options.alpn = protocol;
+    server_options.limits.max_datagram_frame_size = 1200;
+
+    quic_client_options client_options;
+    client_options.alpn = protocol;
+    client_options.trusted_ca = certificate / "cert.pem";
+    client_options.limits.max_datagram_frame_size = 1200;
+    client_options.version = version;
+
+    quic_endpoint server(loop, ip_endpoint::loopback_v4(0),
+                         std::move(server_options));
+    quic_endpoint client(loop, ip_endpoint::loopback_v4(0),
+                         std::move(client_options));
+    const auto server_address = server.local_endpoint();
+    outcome result;
+    check(loop.spawn(server_serve(loop, server, result)) == task_spawn_result::accepted,
+          "spawn server");
+    check(loop.spawn(client_run(loop, client, server_address, result)) ==
+              task_spawn_result::accepted,
+          "spawn client");
+    check(loop.spawn(watch(loop, server, client, result)) == task_spawn_result::accepted,
+          "spawn watch");
+    (void)loop.run();
+    return result.server_ok && result.client_ok;
+}
+
+} // namespace
+
+auto main() -> int
+{
+#ifdef _WIN32
+    WSADATA data {};
+    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
+#endif
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("eventloop-quic-public-" + std::to_string(
+            static_cast<unsigned long long>(std::rand())));
+    std::filesystem::create_directories(directory);
+    if (!make_certificate(directory)) {
+        std::fprintf(stderr, "certificate generation failed\n");
+        return 1;
+    }
+    const bool v1 = scenario(quic_version::v1, directory);
+    const bool v2 = scenario(quic_version::v2, directory);
+    std::filesystem::remove_all(directory);
+#ifdef _WIN32
+    (void)WSACleanup();
+#endif
+    check(v1, "QUIC v1 public API scenario");
+    check(v2, "QUIC v2 public API scenario");
+    std::puts("QUIC public API tests passed (v1 and v2)");
+    return 0;
+}

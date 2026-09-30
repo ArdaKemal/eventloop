@@ -9,12 +9,31 @@ if(WIN32)
     include(CTest)
     find_package(Threads REQUIRED)
     option(EVENTLOOP_WINDOWS_TLS "Build Windows TLS/WebSocket support" ON)
+    # Botan remains the provider for the existing TLS stream. QUIC uses
+    # OpenSSL's supported external TLS callback API and EVP primitives.
     set(EVENTLOOP_CONFIG_NEEDS_BOTAN ${EVENTLOOP_WINDOWS_TLS})
     if(EVENTLOOP_WINDOWS_TLS)
         find_package(Botan 3 REQUIRED)
     endif()
+    set(EVENTLOOP_CONFIG_NEEDS_OPENSSL ON)
+    find_package(OpenSSL 3.5 REQUIRED COMPONENTS Crypto SSL)
+    set(EVENTLOOP_QUIC_TEST_ENV
+        "PATH=path_list_prepend:${OPENSSL_ROOT_DIR}/bin")
+    if(EVENTLOOP_WINDOWS_TLS)
+        list(APPEND EVENTLOOP_QUIC_TEST_ENV
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:botan::botan>")
+    endif()
     add_library(eventloop
         src/event_loop.cc
+        src/quic/packet_protection.cc
+        src/quic/protected_packet.cc
+        src/quic/connection_core.cc
+        src/quic/udp_endpoint.cc
+        src/quic/key_update.cc
+        src/quic/retry_packet.cc
+        src/quic/retry_token.cc
+        src/quic/tls_provider.cc
+        src/quic/quic_endpoint.cc
         src/windows/file_operation.cc
         src/executor/single_thread_executor.cc
         src/executor/multi_thread_executor.cc
@@ -43,7 +62,6 @@ if(WIN32)
             src/http2/session.h
             src/http2/session.cc
         )
-        target_link_libraries(eventloop PUBLIC botan::botan)
         target_compile_definitions(eventloop PUBLIC EVENTLOOP_WINDOWS_TLS=1)
     endif()
     add_library(eventloop::eventloop ALIAS eventloop)
@@ -54,7 +72,11 @@ if(WIN32)
     target_include_directories(eventloop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_features(eventloop PUBLIC cxx_std_23)
     target_compile_definitions(eventloop PRIVATE NOMINMAX)
-    target_link_libraries(eventloop PUBLIC ws2_32 mswsock Threads::Threads)
+    target_link_libraries(eventloop PUBLIC ws2_32 mswsock Threads::Threads
+        PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(EVENTLOOP_WINDOWS_TLS)
+        target_link_libraries(eventloop PUBLIC botan::botan)
+    endif()
     if(BUILD_SHARED_LIBS)
         target_compile_definitions(eventloop PRIVATE EVENTLOOP_WINDOWS_SHARED=1)
     endif()
@@ -78,6 +100,385 @@ if(WIN32)
         add_executable(event_loop_test tests/event_loop.cc)
         target_link_libraries(event_loop_test PRIVATE eventloop::eventloop)
         add_test(NAME event_loop COMMAND event_loop_test)
+
+        add_executable(quic_varint_test tests/quic_varint.cc)
+        target_include_directories(quic_varint_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_varint_test PRIVATE eventloop::eventloop)
+        add_test(NAME quic_varint COMMAND quic_varint_test)
+
+        add_executable(quic_transport_parameters_test
+            tests/quic_transport_parameters.cc)
+        target_include_directories(quic_transport_parameters_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_transport_parameters_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_transport_parameters
+            COMMAND quic_transport_parameters_test)
+
+        add_executable(quic_packet_header_test tests/quic_packet_header.cc)
+        target_include_directories(quic_packet_header_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_packet_header_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_packet_header COMMAND quic_packet_header_test)
+
+        add_executable(quic_frames_test tests/quic_frames.cc)
+        target_include_directories(quic_frames_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_frames_test PRIVATE eventloop::eventloop)
+        add_test(NAME quic_frames COMMAND quic_frames_test)
+
+        add_executable(quic_frame_encoder_test
+            tests/quic_frame_encoder.cc)
+        target_include_directories(quic_frame_encoder_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_frame_encoder_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_frame_encoder COMMAND quic_frame_encoder_test)
+
+        add_executable(quic_frame_policy_test tests/quic_frame_policy.cc)
+        target_include_directories(quic_frame_policy_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_frame_policy_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_frame_policy COMMAND quic_frame_policy_test)
+
+        add_executable(quic_crypto_buffer_test tests/quic_crypto_buffer.cc)
+        target_include_directories(quic_crypto_buffer_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_crypto_buffer_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_crypto_buffer COMMAND quic_crypto_buffer_test)
+
+        add_executable(quic_crypto_send_buffer_test
+            tests/quic_crypto_send_buffer.cc)
+        target_include_directories(quic_crypto_send_buffer_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_crypto_send_buffer_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_crypto_send_buffer
+            COMMAND quic_crypto_send_buffer_test)
+
+        add_executable(quic_stream_receive_test
+            tests/quic_stream_receive.cc)
+        target_include_directories(quic_stream_receive_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_stream_receive_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_stream_receive COMMAND quic_stream_receive_test)
+
+        add_executable(quic_stream_send_buffer_test
+            tests/quic_stream_send_buffer.cc)
+        target_include_directories(quic_stream_send_buffer_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_stream_send_buffer_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_stream_send_buffer
+            COMMAND quic_stream_send_buffer_test)
+
+        add_executable(quic_version_negotiation_test
+            tests/quic_version_negotiation.cc)
+        target_include_directories(quic_version_negotiation_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_version_negotiation_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_version_negotiation
+            COMMAND quic_version_negotiation_test)
+
+        add_executable(quic_recovery_timer_test tests/quic_recovery_timer.cc)
+        target_include_directories(quic_recovery_timer_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_recovery_timer_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_recovery_timer COMMAND quic_recovery_timer_test)
+
+        add_executable(quic_ack_ranges_test tests/quic_ack_ranges.cc)
+        target_include_directories(quic_ack_ranges_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_ack_ranges_test PRIVATE eventloop::eventloop)
+        add_test(NAME quic_ack_ranges COMMAND quic_ack_ranges_test)
+
+        add_executable(quic_received_packet_ranges_test
+            tests/quic_received_packet_ranges.cc)
+        target_include_directories(quic_received_packet_ranges_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_received_packet_ranges_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_received_packet_ranges
+            COMMAND quic_received_packet_ranges_test)
+
+        add_executable(quic_stream_registry_test tests/quic_stream_registry.cc)
+        target_include_directories(quic_stream_registry_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_stream_registry_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_stream_registry COMMAND quic_stream_registry_test)
+
+        add_executable(quic_datagram_queue_test tests/quic_datagram_queue.cc)
+        target_include_directories(quic_datagram_queue_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_datagram_queue_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_datagram_queue COMMAND quic_datagram_queue_test)
+
+        add_executable(quic_flow_control_test tests/quic_flow_control.cc)
+        target_include_directories(quic_flow_control_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_flow_control_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_flow_control COMMAND quic_flow_control_test)
+
+        add_executable(quic_path_validation_test
+            tests/quic_path_validation.cc)
+        target_include_directories(quic_path_validation_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_path_validation_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_path_validation COMMAND quic_path_validation_test)
+
+        add_executable(quic_connection_id_registry_test
+            tests/quic_connection_id_registry.cc)
+        target_include_directories(quic_connection_id_registry_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_connection_id_registry_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_connection_id_registry
+            COMMAND quic_connection_id_registry_test)
+
+        add_executable(quic_local_connection_id_registry_test
+            tests/quic_local_connection_id_registry.cc)
+        target_include_directories(quic_local_connection_id_registry_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_local_connection_id_registry_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_local_connection_id_registry
+            COMMAND quic_local_connection_id_registry_test)
+
+        add_executable(quic_stream_state_test tests/quic_stream_state.cc)
+        target_include_directories(quic_stream_state_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_stream_state_test PRIVATE eventloop::eventloop)
+        add_test(NAME quic_stream_state COMMAND quic_stream_state_test)
+
+        add_executable(quic_connection_lifecycle_test
+            tests/quic_connection_lifecycle.cc)
+        target_include_directories(quic_connection_lifecycle_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_connection_lifecycle_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_connection_lifecycle
+            COMMAND quic_connection_lifecycle_test)
+
+        add_executable(quic_stateless_reset_test
+            tests/quic_stateless_reset.cc)
+        target_include_directories(quic_stateless_reset_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_stateless_reset_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_stateless_reset COMMAND quic_stateless_reset_test)
+
+        add_executable(quic_ecn_state_test tests/quic_ecn_state.cc)
+        target_include_directories(quic_ecn_state_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_ecn_state_test PRIVATE eventloop::eventloop)
+        add_test(NAME quic_ecn_state COMMAND quic_ecn_state_test)
+
+        add_executable(quic_retry_token_test
+            tests/quic_retry_token.cc)
+        target_include_directories(quic_retry_token_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_retry_token_test PRIVATE
+            eventloop::eventloop OpenSSL::Crypto)
+        add_test(NAME quic_retry_token COMMAND quic_retry_token_test)
+        set_tests_properties(quic_retry_token PROPERTIES
+            ENVIRONMENT_MODIFICATION
+            "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_retry_packet_test tests/quic_retry_packet.cc)
+        target_include_directories(quic_retry_packet_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_retry_packet_test PRIVATE
+            eventloop::eventloop OpenSSL::Crypto)
+        add_test(NAME quic_retry_packet COMMAND quic_retry_packet_test)
+        set_tests_properties(quic_retry_packet PROPERTIES
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_transport_parameter_validation_test
+            tests/quic_transport_parameter_validation.cc)
+        target_include_directories(quic_transport_parameter_validation_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_transport_parameter_validation_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_transport_parameter_validation
+            COMMAND quic_transport_parameter_validation_test)
+
+        add_executable(quic_key_update_test tests/quic_key_update.cc)
+        target_include_directories(quic_key_update_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_key_update_test PRIVATE
+            eventloop::eventloop OpenSSL::Crypto)
+        add_test(NAME quic_key_update COMMAND quic_key_update_test)
+        set_tests_properties(quic_key_update PROPERTIES
+            ENVIRONMENT_MODIFICATION
+            "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_packet_protection_context_test
+            tests/quic_packet_protection_context.cc)
+        target_include_directories(quic_packet_protection_context_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_packet_protection_context_test PRIVATE
+            eventloop::eventloop OpenSSL::Crypto)
+        add_test(NAME quic_packet_protection_context
+            COMMAND quic_packet_protection_context_test)
+        set_tests_properties(quic_packet_protection_context PROPERTIES
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_loss_detection_test tests/quic_loss_detection.cc)
+        target_include_directories(quic_loss_detection_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_loss_detection_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_loss_detection COMMAND quic_loss_detection_test)
+
+        add_executable(quic_sent_packet_history_test
+            tests/quic_sent_packet_history.cc)
+        target_include_directories(quic_sent_packet_history_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_sent_packet_history_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_sent_packet_history
+            COMMAND quic_sent_packet_history_test)
+
+        add_executable(quic_recovery_orchestration_test
+            tests/quic_recovery_orchestration.cc)
+        target_include_directories(quic_recovery_orchestration_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_recovery_orchestration_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_recovery_orchestration
+            COMMAND quic_recovery_orchestration_test)
+
+        add_executable(quic_congestion_control_test
+            tests/quic_congestion_control.cc)
+        target_include_directories(quic_congestion_control_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_congestion_control_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_congestion_control
+            COMMAND quic_congestion_control_test)
+
+        add_executable(quic_path_recovery_state_test
+            tests/quic_path_recovery_state.cc)
+        target_include_directories(quic_path_recovery_state_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_path_recovery_state_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_path_recovery_state
+            COMMAND quic_path_recovery_state_test)
+
+        add_executable(quic_grease_quic_bit_test
+            tests/quic_grease_quic_bit.cc)
+        target_include_directories(quic_grease_quic_bit_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_grease_quic_bit_test PRIVATE
+            eventloop::eventloop OpenSSL::Crypto)
+        add_test(NAME quic_grease_quic_bit
+            COMMAND quic_grease_quic_bit_test)
+        set_tests_properties(quic_grease_quic_bit PROPERTIES
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_public_api_test tests/quic_public_api.cc)
+        target_include_directories(quic_public_api_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_public_api_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME quic_public_api COMMAND quic_public_api_test)
+        set_tests_properties(quic_public_api PROPERTIES TIMEOUT 20
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_packet_protection_test
+            tests/quic_packet_protection.cc)
+        target_include_directories(quic_packet_protection_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_packet_protection_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_packet_protection
+            COMMAND quic_packet_protection_test)
+        set_tests_properties(quic_packet_protection PROPERTIES
+            ENVIRONMENT_MODIFICATION
+            "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_protected_packet_test
+            tests/quic_protected_packet.cc)
+        target_include_directories(quic_protected_packet_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_protected_packet_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_protected_packet
+            COMMAND quic_protected_packet_test)
+        set_tests_properties(quic_protected_packet PROPERTIES
+            ENVIRONMENT_MODIFICATION
+            "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_tls_test tests/quic_tls.cc)
+        target_include_directories(quic_tls_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_tls_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME quic_tls COMMAND quic_tls_test)
+        set_tests_properties(quic_tls PROPERTIES ENVIRONMENT_MODIFICATION
+            "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_connection_core_test
+            tests/quic_connection_core.cc)
+        target_include_directories(quic_connection_core_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_connection_core_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME quic_connection_core COMMAND quic_connection_core_test)
+        set_tests_properties(quic_connection_core PROPERTIES
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_connection_test tests/quic_connection.cc)
+        target_include_directories(quic_connection_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_connection_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME quic_connection COMMAND quic_connection_test)
+        set_tests_properties(quic_connection PROPERTIES
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_packet_scheduler_test tests/quic_packet_scheduler.cc)
+        target_include_directories(quic_packet_scheduler_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_packet_scheduler_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME quic_packet_scheduler COMMAND quic_packet_scheduler_test)
+        set_tests_properties(quic_packet_scheduler PROPERTIES
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_endpoint_router_test
+            tests/quic_endpoint_router.cc)
+        target_include_directories(quic_endpoint_router_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_endpoint_router_test PRIVATE
+            eventloop::eventloop)
+        add_test(NAME quic_endpoint_router COMMAND quic_endpoint_router_test)
+
+        add_executable(quic_connection_driver_test tests/quic_connection_driver.cc)
+        target_include_directories(quic_connection_driver_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_connection_driver_test PRIVATE eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME quic_connection_driver COMMAND quic_connection_driver_test)
+        set_tests_properties(quic_connection_driver PROPERTIES TIMEOUT 15 ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+        add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
+        target_include_directories(quic_udp_endpoint_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_udp_endpoint_test PRIVATE
+            eventloop::eventloop OpenSSL::Crypto)
+        add_test(NAME quic_udp_endpoint COMMAND quic_udp_endpoint_test)
+        set_tests_properties(quic_udp_endpoint PROPERTIES
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
 
         add_executable(executor_test tests/executor.cc)
         target_include_directories(executor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -176,6 +577,9 @@ if(WIN32)
     add_executable(tcp_echo examples/tcp_echo.cc)
     target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)
 
+    add_executable(quic_echo_server examples/quic_echo_server.cc)
+    target_link_libraries(quic_echo_server PRIVATE eventloop::eventloop)
+
     add_executable(http_benchmark_server examples/http_benchmark_server.cc)
     target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
 
@@ -252,6 +656,8 @@ endif()
 
 set(EVENTLOOP_CONFIG_NEEDS_BOTAN ON)
 find_package(Botan 3 REQUIRED)
+set(EVENTLOOP_CONFIG_NEEDS_OPENSSL ON)
+find_package(OpenSSL 3.5 REQUIRED COMPONENTS Crypto SSL)
 find_package(Threads REQUIRED)
 include(CTest)
 
@@ -279,6 +685,15 @@ add_library(eventloop
     src/linux/http_file_operations.cc
     src/linux/socket_operations.cc
     src/event_loop.cc
+    src/quic/packet_protection.cc
+    src/quic/protected_packet.cc
+    src/quic/connection_core.cc
+    src/quic/udp_endpoint.cc
+    src/quic/key_update.cc
+    src/quic/retry_packet.cc
+    src/quic/retry_token.cc
+    src/quic/tls_provider.cc
+    src/quic/quic_endpoint.cc
     src/executor/single_thread_executor.cc
     src/executor/multi_thread_executor.cc
     src/http/directory_listing.cc
@@ -311,7 +726,8 @@ target_include_directories(eventloop
 )
 target_include_directories(eventloop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(eventloop PUBLIC cxx_std_23)
-target_link_libraries(eventloop PUBLIC botan::botan Threads::Threads)
+target_link_libraries(eventloop PUBLIC botan::botan Threads::Threads
+    PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 target_compile_options(eventloop PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 set(eventloop_package_dir "${CMAKE_INSTALL_LIBDIR}/cmake/eventloop")
@@ -347,6 +763,13 @@ install(FILES
 add_executable(tcp_echo examples/tcp_echo.cc)
 target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)
 target_compile_options(tcp_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(quic_echo_server examples/quic_echo_server.cc)
+target_link_libraries(quic_echo_server PRIVATE eventloop::eventloop)
+target_compile_options(quic_echo_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(quic_echo_server PRIVATE -Wno-mismatched-new-delete)
+endif()
 
 add_executable(tls_echo examples/tls_echo.cc)
 target_link_libraries(tls_echo PRIVATE eventloop::eventloop)
@@ -440,6 +863,428 @@ if(BUILD_TESTING)
     target_link_libraries(http2_hpack_test PRIVATE eventloop::eventloop)
     target_compile_options(http2_hpack_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http2_hpack COMMAND http2_hpack_test)
+
+    add_executable(quic_varint_test tests/quic_varint.cc)
+    target_include_directories(quic_varint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_varint_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_varint_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_varint COMMAND quic_varint_test)
+
+    add_executable(quic_transport_parameters_test
+        tests/quic_transport_parameters.cc)
+    target_include_directories(quic_transport_parameters_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_transport_parameters_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_transport_parameters_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_transport_parameters
+        COMMAND quic_transport_parameters_test)
+
+    add_executable(quic_packet_header_test tests/quic_packet_header.cc)
+    target_include_directories(quic_packet_header_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_packet_header_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_packet_header_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_packet_header COMMAND quic_packet_header_test)
+
+    add_executable(quic_frames_test tests/quic_frames.cc)
+    target_include_directories(quic_frames_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_frames_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_frames_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_frames COMMAND quic_frames_test)
+
+    add_executable(quic_frame_encoder_test tests/quic_frame_encoder.cc)
+    target_include_directories(quic_frame_encoder_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_frame_encoder_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_frame_encoder_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_frame_encoder COMMAND quic_frame_encoder_test)
+
+    add_executable(quic_frame_policy_test tests/quic_frame_policy.cc)
+    target_include_directories(quic_frame_policy_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_frame_policy_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_frame_policy_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_frame_policy COMMAND quic_frame_policy_test)
+
+    add_executable(quic_crypto_buffer_test tests/quic_crypto_buffer.cc)
+    target_include_directories(quic_crypto_buffer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_crypto_buffer_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_crypto_buffer_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_crypto_buffer COMMAND quic_crypto_buffer_test)
+
+    add_executable(quic_crypto_send_buffer_test
+        tests/quic_crypto_send_buffer.cc)
+    target_include_directories(quic_crypto_send_buffer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_crypto_send_buffer_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_crypto_send_buffer_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_crypto_send_buffer COMMAND quic_crypto_send_buffer_test)
+
+    add_executable(quic_stream_receive_test tests/quic_stream_receive.cc)
+    target_include_directories(quic_stream_receive_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_stream_receive_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_stream_receive_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_stream_receive COMMAND quic_stream_receive_test)
+
+    add_executable(quic_stream_send_buffer_test
+        tests/quic_stream_send_buffer.cc)
+    target_include_directories(quic_stream_send_buffer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_stream_send_buffer_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_stream_send_buffer_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_stream_send_buffer COMMAND quic_stream_send_buffer_test)
+
+    add_executable(quic_version_negotiation_test
+        tests/quic_version_negotiation.cc)
+    target_include_directories(quic_version_negotiation_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_version_negotiation_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_version_negotiation_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_version_negotiation COMMAND quic_version_negotiation_test)
+
+    add_executable(quic_recovery_timer_test tests/quic_recovery_timer.cc)
+    target_include_directories(quic_recovery_timer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_recovery_timer_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_recovery_timer_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_recovery_timer COMMAND quic_recovery_timer_test)
+
+    add_executable(quic_ack_ranges_test tests/quic_ack_ranges.cc)
+    target_include_directories(quic_ack_ranges_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_ack_ranges_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_ack_ranges_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_ack_ranges COMMAND quic_ack_ranges_test)
+
+    add_executable(quic_received_packet_ranges_test
+        tests/quic_received_packet_ranges.cc)
+    target_include_directories(quic_received_packet_ranges_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_received_packet_ranges_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_received_packet_ranges_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_received_packet_ranges
+        COMMAND quic_received_packet_ranges_test)
+
+    add_executable(quic_stream_registry_test tests/quic_stream_registry.cc)
+    target_include_directories(quic_stream_registry_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_stream_registry_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_stream_registry_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_stream_registry COMMAND quic_stream_registry_test)
+
+    add_executable(quic_datagram_queue_test tests/quic_datagram_queue.cc)
+    target_include_directories(quic_datagram_queue_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_datagram_queue_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_datagram_queue_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_datagram_queue COMMAND quic_datagram_queue_test)
+
+    add_executable(quic_flow_control_test tests/quic_flow_control.cc)
+    target_include_directories(quic_flow_control_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_flow_control_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_flow_control_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_flow_control COMMAND quic_flow_control_test)
+
+    add_executable(quic_path_validation_test tests/quic_path_validation.cc)
+    target_include_directories(quic_path_validation_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_path_validation_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_path_validation_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_path_validation COMMAND quic_path_validation_test)
+
+    add_executable(quic_connection_id_registry_test
+        tests/quic_connection_id_registry.cc)
+    target_include_directories(quic_connection_id_registry_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_connection_id_registry_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_connection_id_registry_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_connection_id_registry
+        COMMAND quic_connection_id_registry_test)
+
+    add_executable(quic_local_connection_id_registry_test
+        tests/quic_local_connection_id_registry.cc)
+    target_include_directories(quic_local_connection_id_registry_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_local_connection_id_registry_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_local_connection_id_registry_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_local_connection_id_registry
+        COMMAND quic_local_connection_id_registry_test)
+
+    add_executable(quic_stream_state_test tests/quic_stream_state.cc)
+    target_include_directories(quic_stream_state_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_stream_state_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_stream_state_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_stream_state COMMAND quic_stream_state_test)
+
+    add_executable(quic_connection_lifecycle_test
+        tests/quic_connection_lifecycle.cc)
+    target_include_directories(quic_connection_lifecycle_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_connection_lifecycle_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_connection_lifecycle_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_connection_lifecycle
+        COMMAND quic_connection_lifecycle_test)
+
+    add_executable(quic_stateless_reset_test
+        tests/quic_stateless_reset.cc)
+    target_include_directories(quic_stateless_reset_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_stateless_reset_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_stateless_reset_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_stateless_reset COMMAND quic_stateless_reset_test)
+
+    add_executable(quic_ecn_state_test tests/quic_ecn_state.cc)
+    target_include_directories(quic_ecn_state_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_ecn_state_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_ecn_state_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_ecn_state COMMAND quic_ecn_state_test)
+
+    add_executable(quic_retry_token_test tests/quic_retry_token.cc)
+    target_include_directories(quic_retry_token_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_retry_token_test PRIVATE
+        eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(quic_retry_token_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_retry_token COMMAND quic_retry_token_test)
+
+    add_executable(quic_retry_packet_test tests/quic_retry_packet.cc)
+    target_include_directories(quic_retry_packet_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_retry_packet_test PRIVATE
+        eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(quic_retry_packet_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_retry_packet COMMAND quic_retry_packet_test)
+
+    add_executable(quic_transport_parameter_validation_test
+        tests/quic_transport_parameter_validation.cc)
+    target_include_directories(quic_transport_parameter_validation_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_transport_parameter_validation_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_transport_parameter_validation_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_transport_parameter_validation
+        COMMAND quic_transport_parameter_validation_test)
+
+    add_executable(quic_key_update_test tests/quic_key_update.cc)
+    target_include_directories(quic_key_update_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_key_update_test PRIVATE
+        eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(quic_key_update_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_key_update COMMAND quic_key_update_test)
+
+    add_executable(quic_packet_protection_context_test
+        tests/quic_packet_protection_context.cc)
+    target_include_directories(quic_packet_protection_context_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_packet_protection_context_test PRIVATE
+        eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(quic_packet_protection_context_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_packet_protection_context
+        COMMAND quic_packet_protection_context_test)
+
+    add_executable(quic_loss_detection_test tests/quic_loss_detection.cc)
+    target_include_directories(quic_loss_detection_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_loss_detection_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_loss_detection_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_loss_detection COMMAND quic_loss_detection_test)
+
+    add_executable(quic_sent_packet_history_test
+        tests/quic_sent_packet_history.cc)
+    target_include_directories(quic_sent_packet_history_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_sent_packet_history_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_sent_packet_history_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_sent_packet_history
+        COMMAND quic_sent_packet_history_test)
+
+    add_executable(quic_recovery_orchestration_test
+        tests/quic_recovery_orchestration.cc)
+    target_include_directories(quic_recovery_orchestration_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_recovery_orchestration_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_recovery_orchestration_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_recovery_orchestration
+        COMMAND quic_recovery_orchestration_test)
+
+    add_executable(quic_congestion_control_test
+        tests/quic_congestion_control.cc)
+    target_include_directories(quic_congestion_control_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_congestion_control_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_congestion_control_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_congestion_control
+        COMMAND quic_congestion_control_test)
+
+    add_executable(quic_path_recovery_state_test
+        tests/quic_path_recovery_state.cc)
+    target_include_directories(quic_path_recovery_state_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_path_recovery_state_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_path_recovery_state_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_path_recovery_state
+        COMMAND quic_path_recovery_state_test)
+
+    add_executable(quic_grease_quic_bit_test
+        tests/quic_grease_quic_bit.cc)
+    target_include_directories(quic_grease_quic_bit_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_grease_quic_bit_test PRIVATE
+        eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(quic_grease_quic_bit_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_grease_quic_bit
+        COMMAND quic_grease_quic_bit_test)
+
+    add_executable(quic_public_api_test tests/quic_public_api.cc)
+    target_include_directories(quic_public_api_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_public_api_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(quic_public_api_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(quic_public_api_test PRIVATE
+            -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME quic_public_api COMMAND quic_public_api_test)
+    set_tests_properties(quic_public_api PROPERTIES TIMEOUT 20)
+
+    add_executable(quic_packet_protection_test
+        tests/quic_packet_protection.cc)
+    target_include_directories(quic_packet_protection_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_packet_protection_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_packet_protection_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_packet_protection
+        COMMAND quic_packet_protection_test)
+
+    add_executable(quic_protected_packet_test
+        tests/quic_protected_packet.cc)
+    target_include_directories(quic_protected_packet_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_protected_packet_test PRIVATE
+        eventloop::eventloop)
+    target_compile_options(quic_protected_packet_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_protected_packet
+        COMMAND quic_protected_packet_test)
+
+    add_executable(quic_tls_test tests/quic_tls.cc)
+    target_include_directories(quic_tls_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_tls_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(quic_tls_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_tls COMMAND quic_tls_test)
+
+    add_executable(quic_connection_core_test
+        tests/quic_connection_core.cc)
+    target_include_directories(quic_connection_core_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_connection_core_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(quic_connection_core_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_connection_core COMMAND quic_connection_core_test)
+
+    add_executable(quic_connection_test tests/quic_connection.cc)
+    target_include_directories(quic_connection_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_connection_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(quic_connection_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_connection COMMAND quic_connection_test)
+
+    add_executable(quic_packet_scheduler_test tests/quic_packet_scheduler.cc)
+    target_include_directories(quic_packet_scheduler_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_packet_scheduler_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(quic_packet_scheduler_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_packet_scheduler COMMAND quic_packet_scheduler_test)
+
+    add_executable(quic_endpoint_router_test tests/quic_endpoint_router.cc)
+    target_include_directories(quic_endpoint_router_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_endpoint_router_test PRIVATE eventloop::eventloop)
+    target_compile_options(quic_endpoint_router_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_endpoint_router COMMAND quic_endpoint_router_test)
+
+    add_executable(quic_connection_driver_test tests/quic_connection_driver.cc)
+    target_include_directories(quic_connection_driver_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_connection_driver_test PRIVATE eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME quic_connection_driver COMMAND quic_connection_driver_test)
+    set_tests_properties(quic_connection_driver PROPERTIES TIMEOUT 15)
+    add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
+    target_include_directories(quic_udp_endpoint_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_udp_endpoint_test PRIVATE
+        eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(quic_udp_endpoint_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_udp_endpoint COMMAND quic_udp_endpoint_test)
 
     add_executable(executor_test tests/executor.cc)
     target_include_directories(executor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
