@@ -10,6 +10,8 @@
 #include "executor/bounded_task_queue.h"
 #ifdef _WIN32
 #include "windows/iocp_loop.h"
+#elif defined(__APPLE__)
+#include "macos/kqueue_loop.h"
 #else
 #include "linux/epoll_loop.h"
 #endif
@@ -47,7 +49,7 @@ namespace eventloop {
 namespace {
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
 constexpr std::size_t max_timers_per_iteration = 64;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 constexpr std::size_t coroutine_frame_alignment =
     std::max<std::size_t>(alignof(std::max_align_t), 16);
 #else
@@ -755,6 +757,8 @@ public:
     coroutine_frame_pool coroutine_frames;
 #ifdef _WIN32
     iocp_loop poller;
+#elif defined(__APPLE__)
+    kqueue_loop poller;
 #else
     epoll_loop poller;
 #endif
@@ -762,7 +766,7 @@ public:
     bounded_task_queue posted_tasks;
     // Only the owning loop thread reads or writes this hint. Local yield
     // continuations and same-thread posts use posted_tasks without writing
-    // to the wake eventfd.
+    // to the backend wake notifier.
     bool local_post_pending {false};
     bounded_task_queue coroutine_completions;
     const std::size_t coroutine_completion_capacity;

@@ -661,10 +661,8 @@ add_library(eventloop
     include/eventloop/udp_socket.h
     include/eventloop/util/arg_parser.h
     include/eventloop/ws/web_socket.h
-    src/linux/epoll_loop.cc
     src/linux/file_operation.cc
     src/linux/http_file_operations.cc
-    src/linux/socket_operations.cc
     src/event_loop.cc
     src/quic/packet_protection.cc
     src/quic/protected_packet.cc
@@ -697,6 +695,20 @@ add_library(eventloop
     src/udp_socket.cc
     src/ws/web_socket.cpp
 )
+
+if(APPLE)
+    target_sources(eventloop PRIVATE
+        src/macos/kqueue_loop.cc
+        src/macos/socket_operations.cc
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(eventloop PRIVATE
+        src/linux/epoll_loop.cc
+        src/linux/socket_operations.cc
+    )
+else()
+    message(FATAL_ERROR "eventloop supports Linux, macOS, and Windows")
+endif()
 
 add_library(eventloop::eventloop ALIAS eventloop)
 
@@ -834,7 +846,8 @@ if(BUILD_TESTING)
     add_executable(event_loop_test tests/event_loop.cc)
     target_link_libraries(event_loop_test PRIVATE eventloop::eventloop)
     target_compile_options(event_loop_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_link_options(event_loop_test PRIVATE -Wl,--wrap=timerfd_settime)
         target_compile_definitions(event_loop_test PRIVATE EVENTLOOP_TEST_WRAP_TIMERFD=1)
     endif()
