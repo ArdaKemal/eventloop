@@ -3,6 +3,7 @@
 #include "quic/packet_header.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -39,6 +40,25 @@ enum class version_negotiation_error {
     std::uint32_t version) noexcept -> bool
 {
     return (version & 0x0f0f0f0fU) == 0x0a0a0a0aU;
+}
+
+// This endpoint accepts v1/v2 but cannot switch versions during a handshake.
+// RFC 9368 Section 3: a client's list describes its compatible first flight;
+// a server's list describes all fully deployed versions, not switch support.
+[[nodiscard]] constexpr auto encode_fixed_version_information(
+    std::uint32_t chosen, bool client, std::span<std::byte> output) noexcept
+    -> std::expected<std::size_t, version_negotiation_error>
+{
+    if (!is_supported_version(chosen))
+        return std::unexpected(version_negotiation_error::invalid_version_list);
+    const auto size = client ? std::size_t{8} : std::size_t{12};
+    if (output.size() < size)
+        return std::unexpected(version_negotiation_error::output_too_small);
+    const std::array versions {chosen, client ? chosen : version_1, version_2};
+    for (std::size_t index = 0; index < size / 4; ++index)
+        for (std::size_t byte = 0; byte < 4; ++byte)
+            output[4 * index + byte] = static_cast<std::byte>(versions[index] >> (24 - 8 * byte));
+    return size;
 }
 
 // The 7 low bits are arbitrary. The caller supplies entropy for them; the

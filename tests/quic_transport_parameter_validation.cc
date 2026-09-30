@@ -9,6 +9,21 @@ using namespace eventloop::quic::detail;
 int main()
 {
     using error = parameter_validation_error;
+    // Both connection versions advertise version information. The client
+    // cannot invite a version switch; the server reports all accepted versions.
+    for (const auto chosen : {version_1, version_2}) {
+        for (const auto client : {false, true}) {
+            std::array<std::byte, 12> encoded {};
+            const auto size = encode_fixed_version_information(chosen, client, encoded);
+            CHECK(size && *size == (client ? 8 : 12));
+            CHECK(version_at(encoded, 0) == chosen);
+            CHECK(version_at(encoded, 1) == (client ? chosen : version_1));
+            if (!client) CHECK(version_at(encoded, 2) == version_2);
+        }
+    }
+    std::array<std::byte, 7> short_output {};
+    CHECK(encode_fixed_version_information(version_1, true, short_output).error() ==
+          version_negotiation_error::output_too_small);
     const std::array a {std::byte{1}}, b {std::byte{2}}, c {std::byte{3}};
     const std::array<std::uint32_t, 2> preference {version_2, version_1};
     const std::array<std::byte, 12> vi1 {
@@ -32,6 +47,9 @@ int main()
     CHECK(validate_peer_transport_parameters(p, seen).error() == error::missing_original_destination_cid);
     put(parameter_id::original_destination_connection_id, b);
     CHECK(validate_peer_transport_parameters(p, seen));
+    seen.client_chosen_version = seen.negotiated_version = version_2;
+    CHECK(validate_peer_transport_parameters(p, seen).error() == error::missing_version_information);
+    seen.client_chosen_version = seen.negotiated_version = version_1;
     p.entries[0].value = b;
     CHECK(validate_peer_transport_parameters(p, seen).error() == error::initial_source_cid_mismatch);
     p.entries[0].value = a;
@@ -94,6 +112,28 @@ int main()
     p.count = 1;
     CHECK(validate_peer_transport_parameters(p, seen).error() == error::missing_version_information);
     seen.negotiated_version = version_1;
+    seen.client_chosen_version = seen.negotiated_version = version_2;
+    CHECK(validate_peer_transport_parameters(p, seen).error() == error::missing_version_information);
+    const std::array<std::uint32_t, 1> only_v2 {version_2};
+    const std::array<std::byte, 8> only_v2_information {
+        std::byte{0x6b}, std::byte{0x33}, std::byte{0x43}, std::byte{0xcf},
+        std::byte{0x6b}, std::byte{0x33}, std::byte{0x43}, std::byte{0xcf}};
+    put(parameter_id::version_information, only_v2_information);
+    CHECK(validate_peer_transport_parameters(p, seen));
+    seen.peer_role = parameter_sender::server;
+    seen.original_initial_dcid = b;
+    seen.client_available_versions = only_v2;
+    put(parameter_id::original_destination_connection_id, b);
+    CHECK(validate_peer_transport_parameters(p, seen));
+    p.entries[1].value = vi1;
+    CHECK(validate_peer_transport_parameters(p, seen).error() == error::chosen_version_mismatch);
+    p.entries[1].value = only_v2_information;
+    p.entries[0].value = b;
+    CHECK(validate_peer_transport_parameters(p, seen).error() == error::initial_source_cid_mismatch);
+    p.entries[0].value = a;
+    p.count = 1;
+    seen = {};
+    seen.peer_role = parameter_sender::client;
     p.entries[0].value = {};
     seen.peer_first_initial_scid = {};
     CHECK(validate_peer_transport_parameters(p, seen)); // empty CID is present, not missing

@@ -476,6 +476,12 @@ auto connection_core::receive(std::span<const std::uint8_t> datagram, std::size_
             return fail(connection_error::aead_limit_reached);
         return std::unexpected(packet_error(opened.error()));
     }
+    if (opened->kind == packet_kind::initial && !peer_initial_source_cid_seen_) {
+        std::copy(header->source_cid.begin(), header->source_cid.end(),
+                  peer_initial_source_cid_.begin());
+        peer_initial_source_cid_size_ = header->source_cid.size();
+        peer_initial_source_cid_seen_ = true;
+    }
     const auto inserted = numbers.insert(opened->packet_number);
     if (!inserted) {
         if (inserted.error() == received_packet_error::retired_packet_number) return *opened;

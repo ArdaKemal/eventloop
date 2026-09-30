@@ -5,6 +5,31 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+option(EVENTLOOP_HTTP3_INTEROP_TESTS
+    "Enable optional outbound HTTP/3 v1/v2 tests using aioquic 1.3.0" OFF)
+function(eventloop_register_http3_interop_tests)
+    if(BUILD_TESTING AND EVENTLOOP_HTTP3_INTEROP_TESTS)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c
+                "import aioquic; assert aioquic.__version__ == '1.3.0', 'aioquic 1.3.0 required'"
+            RESULT_VARIABLE aioquic_import_result
+            ERROR_VARIABLE aioquic_import_error)
+        if(NOT aioquic_import_result EQUAL 0)
+            message(FATAL_ERROR
+                "HTTP/3 interop tests require aioquic==1.3.0 in Python3_EXECUTABLE: ${aioquic_import_error}")
+        endif()
+        foreach(version v1 v2)
+            add_test(NAME http3_outbound_${version}
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http3_outbound.py"
+                    --client $<TARGET_FILE:http3_client> --version ${version})
+            set_tests_properties(http3_outbound_${version} PROPERTIES
+                TIMEOUT 60 LABELS "http3;interop")
+        endforeach()
+    endif()
+endfunction()
+
 if(WIN32)
     include(CTest)
     find_package(Threads REQUIRED)
@@ -664,6 +689,7 @@ if(WIN32)
         "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfigVersion.cmake"
         DESTINATION "${eventloop_package_dir}"
     )
+    eventloop_register_http3_interop_tests()
     return()
 endif()
 
@@ -1413,3 +1439,5 @@ if(BUILD_TESTING)
     )
     set_tests_properties(http_server PROPERTIES TIMEOUT 15)
 endif()
+
+eventloop_register_http3_interop_tests()

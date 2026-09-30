@@ -73,6 +73,7 @@ static auto transfer(connection_core& sender, connection_core& receiver,
     fields.kind = level == tls_level::initial ? packet_kind::initial :
         level == tls_level::handshake ? packet_kind::handshake : packet_kind::short_header;
     fields.destination_cid = dcid;
+    fields.source_cid = dcid;
     const auto size = sender.build(fields, std::span(buffer.frame).first(*frame_size),
                                     buffer.encoded, buffer.build_scratch);
     check(size.has_value());
@@ -88,10 +89,21 @@ static auto transfer(connection_core& sender, connection_core& receiver,
     }
     if (level == tls_level::handshake && sender.level_discarded(tls_level::initial))
         check(!sender.keys_available(tls_level::initial,tls_direction::write));
+    if (level == tls_level::initial && !receiver.peer_initial_source_cid()) {
+        buffer.encoded[*size - 1] ^= 1;
+        const auto forged = receiver.receive(std::span(buffer.encoded).first(*size), 0,
+            dcid.size(), buffer.packet_scratch, buffer.plaintext, buffer.auth_scratch,
+            now, std::chrono::milliseconds(10));
+        check(!forged && forged.error() == connection_error::authentication_failed);
+        check(!receiver.peer_initial_source_cid());
+        buffer.encoded[*size - 1] ^= 1;
+    }
     const auto opened = receiver.receive(std::span(buffer.encoded).first(*size), 0,
         dcid.size(), buffer.packet_scratch, buffer.plaintext, buffer.auth_scratch,
         now, std::chrono::milliseconds(10));
     check(opened.has_value());
+    const auto first_source = receiver.peer_initial_source_cid();
+    check(first_source && std::ranges::equal(*first_source, std::as_bytes(std::span(dcid))));
     if (!receiver.level_discarded(level)) {
         const auto duplicate = receiver.receive(std::span(buffer.encoded).first(*size), 0,
             dcid.size(), buffer.packet_scratch, buffer.plaintext, buffer.auth_scratch,

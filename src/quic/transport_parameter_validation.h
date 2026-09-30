@@ -74,6 +74,8 @@ struct parameter_handshake_observations {
     }
     const auto versions = find(parameter_id::version_information);
     if (!versions) {
+        if (seen.client_chosen_version == version_2 || seen.negotiated_version == version_2)
+            return std::unexpected(error::missing_version_information);
         if (seen.peer_role == parameter_sender::server && seen.acted_on_version_negotiation)
             return std::unexpected(error::missing_version_information);
         if (seen.client_chosen_version != seen.negotiated_version)

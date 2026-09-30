@@ -4,6 +4,7 @@
 #include "quic/connection_driver.h"
 #include "quic/stream_registry.h"
 #include "quic/transport_parameters.h"
+#include "quic/transport_parameter_validation.h"
 #include "quic/udp_endpoint.h"
 
 #include <openssl/ssl.h>
@@ -119,6 +120,8 @@ public:
         std::array<std::byte, short_cid_length> local_cid {};
         std::array<std::byte, 20> original_dcid {};
         std::size_t original_dcid_size {0};
+        std::uint32_t version {version_1};
+        bool client {false};
         std::array<std::uint8_t, parameter_buffer_size> parameters {};
         std::size_t parameters_size {0};
         std::array<std::uint64_t, 32> accepted_streams {};
@@ -233,6 +236,8 @@ public:
         entry.generation = ++next_generation_;
         entry.terminal_error = {};
         entry.peer = server;
+        entry.client = true;
+        entry.version = to_internal_version(client_options_.version);
         if (RAND_bytes(reinterpret_cast<unsigned char*>(entry.local_cid.data()),
                 static_cast<int>(entry.local_cid.size())) != 1) {
             entry.clear();
@@ -244,12 +249,14 @@ public:
             entry.clear();
             return false;
         }
+        entry.original_dcid_size = initial_dcid.size();
+        std::copy(initial_dcid.begin(), initial_dcid.end(), entry.original_dcid.begin());
         if (!build_parameters(entry, true)) {
             entry.clear();
             return false;
         }
         entry.connection.emplace(endpoint_role::client,
-            connection_callbacks {this, validate_peer, accept_frame},
+            connection_callbacks {&entry, validate_peer, accept_frame},
             lifecycle_time_point::clock::now());
         quic::detail::tls_options tls;
         tls.server = false;
@@ -376,6 +383,8 @@ private:
         entry->generation = ++self.next_generation_;
         entry->terminal_error = {};
         entry->peer = source;
+        entry->client = false;
+        entry->version = header.version;
         if (RAND_bytes(reinterpret_cast<unsigned char*>(entry->local_cid.data()),
                 static_cast<int>(entry->local_cid.size())) != 1) {
             entry->clear();
@@ -389,7 +398,7 @@ private:
             return false;
         }
         entry->connection.emplace(endpoint_role::server,
-            connection_callbacks {&self, validate_peer, accept_frame},
+            connection_callbacks {entry, validate_peer, accept_frame},
             lifecycle_time_point::clock::now());
         quic::detail::tls_options tls;
         tls.server = true;
@@ -432,8 +441,22 @@ private:
         self.reap();
     }
 
-    static auto validate_peer(void*, std::span<const std::uint8_t>) noexcept -> bool
-    { return true; }
+    static auto validate_peer(void* argument, std::span<const std::uint8_t> bytes) noexcept -> bool
+    {
+        auto& entry = *static_cast<slot*>(argument);
+        const auto peer_role = entry.client ? parameter_sender::server : parameter_sender::client;
+        const auto parameters = decode_transport_parameters(std::as_bytes(bytes), peer_role);
+        const auto source = entry.connection->core().peer_initial_source_cid();
+        if (!parameters || !source) return false;
+        const std::array available {entry.version};
+        parameter_handshake_observations seen;
+        seen.peer_role = peer_role;
+        seen.peer_first_initial_scid = *source;
+        seen.original_initial_dcid = std::span(entry.original_dcid).first(entry.original_dcid_size);
+        seen.client_chosen_version = seen.negotiated_version = entry.version;
+        seen.client_available_versions = available;
+        return validate_peer_transport_parameters(*parameters, seen).has_value();
+    }
     static auto accept_frame(void*, tls_level, const decoded_frame&) noexcept -> bool
     { return true; }
 
@@ -484,6 +507,13 @@ private:
             !add_number(static_cast<std::uint64_t>(parameter_id::max_datagram_frame_size),
                 settings.max_datagram_frame_size))
             return false;
+        // A v2-capable endpoint sends this on v1 sessions too (RFC 9369 Section 4).
+        std::array<std::byte, 12> version_information {};
+        const auto version_size = encode_fixed_version_information(entry.version, client,
+                                                                   version_information);
+        if (!version_size) return false;
+        add_bytes(static_cast<std::uint64_t>(parameter_id::version_information),
+                  std::span(version_information).first(*version_size));
         const auto encoded = encode_transport_parameters(
             {entries.data(), count},
             client ? parameter_sender::client : parameter_sender::server,

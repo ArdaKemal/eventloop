@@ -119,6 +119,13 @@ public:
     [[nodiscard]] auto next_deadline(lifecycle_duration current_pto) const noexcept
         -> std::optional<lifecycle_time_point>;
     [[nodiscard]] auto failure() const noexcept -> std::optional<connection_error>;
+    // Available before authenticated TLS transport-parameter validation runs.
+    [[nodiscard]] auto peer_initial_source_cid() const noexcept
+        -> std::optional<std::span<const std::byte>>
+    {
+        if (!peer_initial_source_cid_seen_) return {};
+        return std::span(peer_initial_source_cid_).first(peer_initial_source_cid_size_);
+    }
 
 private:
     auto check_owner() const noexcept -> void;
@@ -159,6 +166,9 @@ private:
                        {this, send_crypto, install_secret}};
     std::optional<connection_error> failure_;
     std::uint32_t version_ {version_1};
+    std::array<std::byte, 20> peer_initial_source_cid_ {};
+    std::size_t peer_initial_source_cid_size_ {0};
+    bool peer_initial_source_cid_seen_ {false};
     lifecycle_duration local_idle_timeout_ {};
     bool initialized_ {false};
     bool confirmed_ {false};
