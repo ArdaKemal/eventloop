@@ -7,6 +7,16 @@ detail; applications register the library's TCP, TLS, and UDP objects with
 `eventloop::event_loop`, then await their operations. `post()` and executor
 submissions remain bounded command and background-work APIs.
 
+QUIC endpoints reserve 80 stream slots per connection: 32 bidirectional and
+8 unidirectional streams for each initiator. Requested advertised counts are
+capped to those peer reservations; local opens obey the peer's grant and the
+separate local reservation. Increasing peer `MAX_STREAMS` grants cannot
+enlarge local storage. These are cumulative lifetime limits: completed and
+reset streams retain their slots, and closing a stream does not replenish its
+quota. The aggregate receive-data window remains at most 128 KiB, independently
+of stream count, with at most 4 KiB buffered per stream. No stream storage falls
+back to an unbounded allocation.
+
 ## Ownership and thread affinity
 
 - A coroutine function returning `eventloop::task<T>` takes its owning

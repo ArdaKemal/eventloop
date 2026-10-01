@@ -59,6 +59,10 @@ public:
     // Inspect before build(); successful build() consumes this number.
     [[nodiscard]] auto next_packet_number(tls_level) const noexcept
         -> std::optional<std::uint64_t>;
+    // Apply a validated Retry before any authenticated response, preserving
+    // TLS's exact ClientHello and the Initial packet-number send sequence.
+    [[nodiscard]] auto apply_retry(std::span<const std::uint8_t>)
+        -> std::expected<void, connection_error>;
     [[nodiscard]] auto initiate_key_update(lifecycle_time_point, lifecycle_duration)
         -> std::expected<void, key_update_error>;
     // ACKs must first be checked against successfully transmitted history.
@@ -119,6 +123,13 @@ public:
     [[nodiscard]] auto next_deadline(lifecycle_duration current_pto) const noexcept
         -> std::optional<lifecycle_time_point>;
     [[nodiscard]] auto failure() const noexcept -> std::optional<connection_error>;
+    // Available before authenticated TLS transport-parameter validation runs.
+    [[nodiscard]] auto peer_initial_source_cid() const noexcept
+        -> std::optional<std::span<const std::byte>>
+    {
+        if (!peer_initial_source_cid_seen_) return {};
+        return std::span(peer_initial_source_cid_).first(peer_initial_source_cid_size_);
+    }
 
 private:
     auto check_owner() const noexcept -> void;
@@ -159,8 +170,12 @@ private:
                        {this, send_crypto, install_secret}};
     std::optional<connection_error> failure_;
     std::uint32_t version_ {version_1};
+    std::array<std::byte, 20> peer_initial_source_cid_ {};
+    std::size_t peer_initial_source_cid_size_ {0};
+    bool peer_initial_source_cid_seen_ {false};
     lifecycle_duration local_idle_timeout_ {};
     bool initialized_ {false};
+    bool retry_applied_ {false};
     bool confirmed_ {false};
     // RFC 9287 QUIC-bit greasing. A xorshift stream seeded once avoids a CSPRNG
     // call per packet; the bit is not security sensitive.

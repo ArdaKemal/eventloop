@@ -42,6 +42,13 @@ public:
     // the endpoint uses them to resume ready public-API waiters.
     auto set_progress(void* argument, void (*callback)(void*) noexcept) noexcept
     { check_owner(); progress_argument_=argument; progress_=callback; }
+    // The hook runs from the pump, outside router dispatch, in receive order.
+    // Returning true asks the owner to restart after run() has retired.
+    auto set_retry_handler(void* argument,
+        bool (*callback)(void*, std::span<const std::uint8_t>) noexcept) noexcept -> void
+    { check_owner(); retry_argument_=argument; retry_=callback; }
+    auto set_initial_token(std::span<const std::uint8_t> token) noexcept -> void
+    { check_owner(); initial_token_=token; }
     [[nodiscard]] auto retired() const noexcept -> bool { return started_ && !running_; }
     [[nodiscard]] auto run_active() const noexcept -> bool { return running_; }
     [[nodiscard]] auto initiate_key_update() -> std::expected<void, key_update_error>
@@ -89,6 +96,17 @@ private:
     {            while (count_) {
                 const auto& packet=queue_[head_];
                 const auto source=packet.peer;
+                const auto header=parse_packet_header(
+                    std::as_bytes(std::span(packet.bytes).first(packet.size)),0,local_size_,true);
+                if (header && header->kind==packet_kind::retry) {
+                    head_=(head_+1)%queue_capacity; --count_;
+                    if (!authenticated_packet_seen_ && retry_ &&
+                        retry_(retry_argument_,std::span(packet.bytes).first(packet.size))) {
+                        stopped_=true;
+                        return {};
+                    }
+                    continue;
+                }
                 const auto received=connection_.receive(std::span(packet.bytes).first(packet.size),0,
                     local_size_,packet_scratch_,plaintext_,auth_scratch_,
                     lifecycle_time_point::clock::now(),std::chrono::seconds(1));
@@ -99,15 +117,29 @@ private:
                         received.error()==connection_error::malformed_packet) continue;
                     return std::unexpected(received.error());
                 }
+                // A peer close enters draining during receive(). Retire before
+                // processing queued/coalesced packets or preparing another send.
+                const auto state=connection_.core().state();
+                if (state==connection_state::closing || state==connection_state::draining ||
+                    state==connection_state::closed) {
+                    stopped_=true;
+                    return {};
+                }
+                authenticated_packet_seen_=true;
                 // Learn the peer's source connection ID from an authenticated
                 // long header. A client uses this to address the server's
                 // chosen connection ID after the first response.
                 const auto learned=parse_packet_header(
                     std::as_bytes(std::span(packet.bytes).first(packet.size)),0,local_size_,true);
                 if (learned && (learned->kind==packet_kind::initial||learned->kind==packet_kind::handshake) &&
-                    !learned->source_cid.empty() && learned->source_cid.size()<=peer_.size()) {
-                    peer_size_=learned->source_cid.size();
-                    std::memcpy(peer_.data(),learned->source_cid.data(),peer_size_);
+                    learned->source_cid.size()<=peer_.size()) {
+                    if (!connection_.peer_ids().selected() &&
+                        !connection_.peer_ids().set_initial(learned->source_cid))
+                        return std::unexpected(connection_error::invalid_state);
+                    if (!learned->source_cid.empty()) {
+                        peer_size_=learned->source_cid.size();
+                        std::memcpy(peer_.data(),learned->source_cid.data(),peer_size_);
+                    }
                 }
                 if (!connection_.synchronize_discarded_spaces())
                     return std::unexpected(connection_error::invalid_state);
@@ -160,6 +192,7 @@ private:
     {
         protected_packet_fields fields;
         fields.destination_cid={peer_.data(),peer_size_};
+        if (level==tls_level::initial) fields.token=initial_token_;
         if (level != tls_level::application) fields.source_cid={local_.data(),local_size_};
         return scheduler_.prepare(level,fields,lifecycle_time_point::clock::now(),output_,build_scratch_,probe);
     }
@@ -288,6 +321,7 @@ private:
             co_return std::unexpected(synchronized.error());
         while (!self.stopped_) {
             if (const auto result=self.tick(); !result) co_return std::unexpected(result.error());
+            if (self.stopped_) break;
             if (const auto result=unwrap_task(co_await send_pending_path_responses(loop,self)); !result)
                 co_return std::unexpected(result.error());
             if (const auto result=unwrap_task(co_await send_candidate_probe(loop,self,lifecycle_time_point::clock::now())); !result)
@@ -333,6 +367,10 @@ private:
     std::uint8_t probes_{};
     void* progress_argument_{};
     void (*progress_)(void*) noexcept {};
+    void* retry_argument_{};
+    bool (*retry_)(void*,std::span<const std::uint8_t>) noexcept {};
+    std::span<const std::uint8_t> initial_token_{};
+    bool authenticated_packet_seen_{};
     bool running_{},stopped_{},started_{},handshake_done_{},candidate_challenge_active_{};
 };
 } // namespace eventloop::quic::detail

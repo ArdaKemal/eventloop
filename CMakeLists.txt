@@ -5,6 +5,31 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+option(EVENTLOOP_HTTP3_INTEROP_TESTS
+    "Enable optional outbound HTTP/3 v1/v2 tests using aioquic 1.3.0" OFF)
+function(eventloop_register_http3_interop_tests)
+    if(BUILD_TESTING AND EVENTLOOP_HTTP3_INTEROP_TESTS)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c
+                "import aioquic; assert aioquic.__version__ == '1.3.0', 'aioquic 1.3.0 required'"
+            RESULT_VARIABLE aioquic_import_result
+            ERROR_VARIABLE aioquic_import_error)
+        if(NOT aioquic_import_result EQUAL 0)
+            message(FATAL_ERROR
+                "HTTP/3 interop tests require aioquic==1.3.0 in Python3_EXECUTABLE: ${aioquic_import_error}")
+        endif()
+        foreach(version v1 v2)
+            add_test(NAME http3_outbound_${version}
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http3_outbound.py"
+                    --client $<TARGET_FILE:http3_client> --version ${version})
+            set_tests_properties(http3_outbound_${version} PROPERTIES
+                TIMEOUT 60 LABELS "http3;interop")
+        endforeach()
+    endif()
+endfunction()
+
 if(WIN32)
     include(CTest)
     find_package(Threads REQUIRED)
@@ -458,6 +483,26 @@ if(WIN32)
         target_link_libraries(quic_connection_driver_test PRIVATE eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
         add_test(NAME quic_connection_driver COMMAND quic_connection_driver_test)
         set_tests_properties(quic_connection_driver PROPERTIES TIMEOUT 15 ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(quic_driver_failure_test tests/quic_driver_failure.cc)
+        target_link_libraries(quic_driver_failure_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME quic_driver_failure COMMAND quic_driver_failure_test)
+        set_tests_properties(quic_driver_failure PROPERTIES TIMEOUT 15
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
+        add_executable(http3_frames_test tests/http3_frames.cc)
+        target_include_directories(http3_frames_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(http3_frames_test PRIVATE eventloop::eventloop)
+        add_test(NAME http3_frames COMMAND http3_frames_test)
+
+        add_executable(http3_qpack_test tests/http3_qpack.cc src/http3/qpack.cc)
+        target_include_directories(http3_qpack_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(http3_qpack_test PRIVATE eventloop::eventloop)
+        add_test(NAME http3_qpack COMMAND http3_qpack_test)
+
         add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
         target_include_directories(quic_udp_endpoint_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -583,6 +628,16 @@ if(WIN32)
         target_link_libraries(http_client PRIVATE eventloop::eventloop)
     endif()
 
+    add_executable(http3_client
+        examples/http3_client.cc
+        examples/http3_client_session.cc
+        examples/http_client_url.cc
+        examples/http_client_resolve.cc
+        src/http3/qpack.cc)
+    target_include_directories(http3_client PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_client PRIVATE eventloop::eventloop)
+
     add_executable(executor_benchmark benchmark/executor_benchmark.cc)
     target_link_libraries(executor_benchmark PRIVATE eventloop::eventloop)
     add_executable(event_loop_benchmark benchmark/event_loop_benchmark.cc)
@@ -634,6 +689,7 @@ if(WIN32)
         "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfigVersion.cmake"
         DESTINATION "${eventloop_package_dir}"
     )
+    eventloop_register_http3_interop_tests()
     return()
 endif()
 
@@ -767,6 +823,17 @@ add_executable(http_client
 )
 target_link_libraries(http_client PRIVATE eventloop::eventloop)
 target_compile_options(http_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(http3_client
+    examples/http3_client.cc
+    examples/http3_client_session.cc
+    examples/http_client_url.cc
+    examples/http_client_resolve.cc
+    src/http3/qpack.cc)
+target_include_directories(http3_client PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(http3_client PRIVATE eventloop::eventloop)
+target_compile_options(http3_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(http_benchmark_server examples/http_benchmark_server.cc)
 target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
@@ -1264,6 +1331,31 @@ if(BUILD_TESTING)
     target_link_libraries(quic_connection_driver_test PRIVATE eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME quic_connection_driver COMMAND quic_connection_driver_test)
     set_tests_properties(quic_connection_driver PROPERTIES TIMEOUT 15)
+
+    add_executable(quic_driver_failure_test tests/quic_driver_failure.cc)
+    target_link_libraries(quic_driver_failure_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(quic_driver_failure_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME quic_driver_failure COMMAND quic_driver_failure_test)
+    set_tests_properties(quic_driver_failure PROPERTIES TIMEOUT 15)
+
+    add_executable(http3_frames_test tests/http3_frames.cc)
+    target_include_directories(http3_frames_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_frames_test PRIVATE eventloop::eventloop)
+    target_compile_options(http3_frames_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http3_frames COMMAND http3_frames_test)
+
+    add_executable(http3_qpack_test tests/http3_qpack.cc src/http3/qpack.cc)
+    target_include_directories(http3_qpack_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_qpack_test PRIVATE eventloop::eventloop)
+    target_compile_options(http3_qpack_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http3_qpack COMMAND http3_qpack_test)
+
     add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
     target_include_directories(quic_udp_endpoint_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1347,3 +1439,5 @@ if(BUILD_TESTING)
     )
     set_tests_properties(http_server PROPERTIES TIMEOUT 15)
 endif()
+
+eventloop_register_http3_interop_tests()

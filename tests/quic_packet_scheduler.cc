@@ -42,7 +42,7 @@ struct contexts {
 
 
 static constexpr std::array<std::uint8_t, 4> protocol {'t','e','s','t'};
-static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x44,0,5,2,0x44,0,6,2,0x44,0,7,2,0x44,0,8,1,32,9,1,32,0x20,2,0x44,0xb0};
+static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x44,0,5,2,0x44,0,6,2,0x44,0,7,2,0x44,0,8,1,32,9,1,8,0x20,2,0x44,0xb0};
 static constexpr std::array<std::uint8_t, 8> dcid {1,2,3,4,5,6,7,8};
 static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcept
 {
@@ -80,8 +80,51 @@ int main()
         auto server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks);
         check(client->initialize(context.client.get(),{false,"localhost",protocol,parameters},version,dcid).has_value());
         check(server->initialize(context.server.get(),{true,{},protocol,parameters},version,dcid).has_value());
+        // A zero-length Retry SCID becomes an empty destination CID. The
+        // client keeps its route/SCID; only Initial key input and wire DCID
+        // change. Verify the packet with independently derived empty-CID keys.
+        {
+            auto retry_client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks);
+            check(retry_client->initialize(context.client.get(),
+                {false,"localhost",protocol,parameters},version,dcid).has_value());
+            check(retry_client->core().advance(lifecycle_time_point{}).has_value());
+            const auto hello=retry_client->core().next_crypto(tls_level::initial,2048);
+            std::array<std::byte,2048> saved {};
+            std::ranges::copy(hello.data,saved.begin());
+            const auto hello_size=hello.data.size();
+            packet_scheduler scheduler(*retry_client);
+            protected_packet_fields fields; fields.destination_cid=dcid; fields.source_cid=dcid;
+            buffers buffer;
+            check(scheduler.prepare(tls_level::initial,fields,lifecycle_time_point{},
+                buffer.encoded,buffer.build_scratch).has_value());
+            check(scheduler.complete(true,lifecycle_time_point{}).has_value());
+            const auto next=retry_client->core().next_packet_number(tls_level::initial);
+            check(retry_client->apply_retry({}).has_value());
+            check(retry_client->core().next_packet_number(tls_level::initial)==next);
+            const auto repeated=retry_client->core().next_crypto(tls_level::initial,2048);
+            check(std::ranges::equal(repeated.data,std::span(saved).first(hello_size)));
+            fields.destination_cid={};
+            const auto size=scheduler.prepare(tls_level::initial,fields,lifecycle_time_point{},
+                buffer.encoded,buffer.build_scratch);
+            check(size && *size==1200);
+            const auto header=parse_packet_header(std::as_bytes(std::span(buffer.encoded).first(*size)));
+            check(header && header->destination_cid.empty() &&
+                std::ranges::equal(header->source_cid,std::as_bytes(std::span(dcid))));
+            const auto secrets=derive_initial_secrets(version,{});
+            check(secrets.has_value());
+            const auto keys=derive_aes_128_gcm_keys(version,secrets->client);
+            check(keys.has_value());
+            packet_protection_context protection;
+            const auto opened=open_protected_packet(protection,std::span(buffer.encoded).first(*size),
+                0,dcid.size(),version,*keys,{},buffer.packet_scratch,buffer.plaintext,buffer.auth_scratch);
+            check(opened && opened->packet_number==next);
+        }
         packet_scheduler outgoing(*client), incoming(*server);
         buffers buffer;
+        // A bounded maximum Retry token leaves less CRYPTO room per Initial.
+        // The handshake must still progress through multiple bounded packets.
+        std::array<std::uint8_t,512> retry_token {};
+        std::ranges::fill(retry_token,0xa5);
         std::size_t last_plaintext_size=0;
         auto now=lifecycle_time_point{};
         check(client->core().advance(now).has_value());
@@ -90,10 +133,19 @@ int main()
                       packet_scheduler& receiver, tls_level level, bool fail=false, bool probe=false) {
             if (!to.core().keys_available(level,tls_direction::read)) return false;
             protected_packet_fields fields; fields.destination_cid=dcid;
+            if (level==tls_level::initial && &from==client.get()) {
+                fields.source_cid=dcid;
+                fields.token=retry_token;
+            }
             auto size=scheduler.prepare(level,fields,now,buffer.encoded,buffer.build_scratch,probe);
             if (!size) return false;
             check(scheduler.pending());
-            if (level==tls_level::initial) check(*size==1200);
+            if (level==tls_level::initial) {
+                check(*size==1200);
+                const auto header=parse_packet_header(std::as_bytes(std::span(buffer.encoded).first(*size)),0,dcid.size(),true);
+                check(header.has_value());
+                check(std::ranges::equal(header->token,std::as_bytes(fields.token)));
+            }
             check(!scheduler.prepare(level,fields,now,buffer.encoded,buffer.build_scratch));
             check(scheduler.complete(!fail,now).has_value());
             if (fail) return true;
@@ -114,6 +166,23 @@ int main()
         // Failed submission keeps Initial CRYPTO pending and consumes no history.
         check(send(*client,*server,outgoing,incoming,tls_level::initial,true));
         check(client->recovery().history(packet_number_space::initial)->size()==0);
+        // Retry preserves the exact ClientHello, including bytes already sent,
+        // and consumes no Initial packet number. The endpoint validates the
+        // Retry SCID separately; this core test reuses the same key input.
+        const auto hello=client->core().next_crypto(tls_level::initial,2048);
+        check(hello.offset==0 && !hello.data.empty());
+        std::array<std::byte,2048> saved_hello {};
+        std::ranges::copy(hello.data,saved_hello.begin());
+        const auto hello_size=hello.data.size();
+        const auto next_number=client->core().next_packet_number(tls_level::initial);
+        check(client->core().mark_crypto_sent(tls_level::initial,0,hello_size).has_value());
+        check(client->core().next_crypto(tls_level::initial,2048).data.empty());
+        check(client->apply_retry(dcid).has_value());
+        check(client->core().next_packet_number(tls_level::initial)==next_number);
+        const auto repeated=client->core().next_crypto(tls_level::initial,2048);
+        check(repeated.offset==0 && std::ranges::equal(repeated.data,
+            std::span(saved_hello).first(hello_size)));
+        check(!client->apply_retry(dcid));
         // A PTO sends outstanding CRYPTO even though it is no longer pending.
         // Failed probe submissions neither retire the original nor change it.
         check(send(*client,*server,outgoing,incoming,tls_level::initial));
