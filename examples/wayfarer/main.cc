@@ -37,6 +37,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+#include <vector>
 
 namespace {
 using namespace eventloop;
@@ -138,8 +140,8 @@ auto parse_options(int argc, char** argv) -> request_options
         throw std::invalid_argument("request body exceeds 4 MiB");
     if (options.protocol == 3 && (options.method != "GET" || options.body_supplied || !options.headers.empty() || options.show_headers))
         throw std::invalid_argument("HTTP/3 currently supports GET and body output only");
-    if (options.follow_redirects && options.protocol != 2)
-        throw std::invalid_argument("-L currently requires --http2");
+    if (options.follow_redirects && options.protocol == 3)
+        throw std::invalid_argument("-L is unsupported for HTTP/3");
     if (options.protocol == 1 && !options.body_file.empty()) {
         options.body = read_bounded_body_file(options.body_file);
         options.body_file.clear();
@@ -157,13 +159,18 @@ auto io_result(std::expected<std::expected<T, std::error_code>, task_result> res
         ? std::errc::not_enough_memory : std::errc::operation_canceled));
 }
 
+auto redirect_status(unsigned status) -> bool;
+auto redirect_url(const url_parts& current, std::string_view location) -> url_parts;
+auto same_origin(const url_parts& left, const url_parts& right) -> bool;
+
 struct response_reader {
     enum class phase { headers, body, chunk_size, chunk_data, chunk_end, trailers, done } current {phase::headers};
     std::string pending;
     std::optional<std::uint64_t> remaining;
     std::uint64_t chunk_remaining {};
     unsigned status {};
-    bool chunked {}, saw_final {};
+    bool chunked {}, saw_final {}, follow_redirects {}, redirect_response {};
+    std::string location;
     std::FILE* output {};
     bool show_headers {}, head_request {};
 
@@ -188,11 +195,11 @@ struct response_reader {
                     std::from_chars(first.data() + 9, first.data() + 12, status).ec != std::errc{}) return fail_response("invalid HTTP status");
                 if (status >= 100 && status < 200) {
                     if (status == 101) return fail_response("protocol upgrade is unsupported");
+                    if (show_headers && !write(block)) return fail_response("output write failed");
                     continue;
                 }
                 saw_final = true;
                 chunked = false; remaining.reset();
-                if (show_headers && !write(block)) return fail_response("output write failed");
                 std::size_t start = line_end + 2;
                 while (start < end) {
                     const auto finish = block.find("\r\n", start);
@@ -215,10 +222,16 @@ struct response_reader {
                         std::transform(transfer.begin(), transfer.end(), transfer.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                         if (transfer != "chunked") return fail_response("unsupported Transfer-Encoding");
                         chunked = true;
+                    } else if (name == "location" && location.empty()) {
+                        location = value;
                     }
                     start = finish + 2;
                 }
+                redirect_response = follow_redirects &&
+                    (status == 301 || status == 302 || status == 303 || status == 307 || status == 308);
+                if (show_headers && !write(block)) return fail_response("output write failed");
                 std::cerr << "HTTP/1.1 " << status << '\n';
+                if (redirect_response) { current = phase::done; return true; }
                 if (head_request || status == 204 || status == 304) current = phase::done;
                 else if (chunked) current = phase::chunk_size;
                 else if (remaining && *remaining == 0) current = phase::done;
@@ -266,12 +279,12 @@ struct response_reader {
 
 template<class Stream>
 auto exchange(event_loop& loop, Stream& stream, const url_parts& url, const request_options& options,
-              std::FILE* output, unsigned& final_status) -> task<bool>
+              std::FILE* output, unsigned& final_status, std::string& location) -> task<bool>
 {
     (void)loop;
     std::string request = options.method + " " + url.target + " HTTP/1.1\r\nHost: " + url.host_header + "\r\nConnection: close\r\n";
     for (const auto& [name, value] : options.headers) request += name + ": " + value + "\r\n";
-    if (!options.body.empty()) request += "Content-Length: " + std::to_string(options.body.size()) + "\r\n";
+    if (options.body_supplied) request += "Content-Length: " + std::to_string(options.body.size()) + "\r\n";
     request += "\r\n";
     request += options.body;
     auto bytes = std::as_bytes(std::span(request.data(), request.size()));
@@ -282,6 +295,7 @@ auto exchange(event_loop& loop, Stream& stream, const url_parts& url, const requ
     }
     response_reader reader;
     reader.output = output; reader.show_headers = options.show_headers;
+    reader.follow_redirects = options.follow_redirects;
     reader.head_request = options.method == "HEAD";
     std::array<std::byte, 1024> buffer {};
     for (;;) {
@@ -292,40 +306,82 @@ auto exchange(event_loop& loop, Stream& stream, const url_parts& url, const requ
         if (reader.current == response_reader::phase::done) break;
     }
     if (!reader.complete()) { fail("truncated HTTP response"); co_return false; }
-    if (std::fflush(output) != 0) { fail("output flush failed"); co_return false; }
+    if (!reader.redirect_response && std::fflush(output) != 0) { fail("output flush failed"); co_return false; }
     final_status = reader.status;
+    location = std::move(reader.location);
     co_return true;
 }
 
 auto fetch_http1(event_loop& loop, const url_parts& url, const request_options& options,
                  std::FILE* output, request_state& state, bool& success, unsigned& final_status) -> task<void>
 {
-    auto addresses = co_await run_blocking(loop, [host = url.hostname, port = url.port]() noexcept {
-        return http_client_example::resolve_addresses(host, port);
-    });
-    if (!addresses || addresses->error || addresses->count == 0) { fail("DNS lookup failed"); co_return; }
-    std::shared_ptr<tls_context> tls;
-    if (url.secure) tls = options.ca_file.empty() ? tls_context::make_system_client() : tls_context::make_client(options.ca_file);
-    for (std::size_t i = 0; i < addresses->count && !state.expired; ++i) {
-        if (url.secure) {
-            auto socket = std::make_unique<tls_stream>(loop, addresses->endpoints[i], tls,
-                tls_client_options {.hostname = url.hostname, .application_protocols = {"http/1.1"}});
-            auto* stream = socket.get(); loop.add(std::move(socket)); state.socket = stream;
-            const auto connected = co_await stream->async_connect();
-            if (!connected) { stream->close(); state.socket = nullptr; continue; }
-            const auto handshake = io_result(co_await stream->async_handshake());
-            if (!handshake) { fail("TLS handshake failed: " + handshake.error().message()); stream->close(); state.socket = nullptr; co_return; }
-            const auto result = co_await exchange(loop, *stream, url, options, output, final_status);
-            success = result && *result; stream->close(); state.socket = nullptr; co_return;
+    url_parts current = url;
+    request_options request = options;
+    std::unordered_set<std::string> visited;
+    for (unsigned hop = 0; hop <= 10 && !state.expired; ++hop) {
+        std::string host = current.hostname;
+        std::transform(host.begin(), host.end(), host.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        const std::string identity = (current.secure ? "https://" : "http://") + host +
+            ':' + std::to_string(current.port) + current.target + '\n' + request.method;
+        if (!visited.insert(identity).second) { fail("redirect loop detected"); co_return; }
+        auto addresses = co_await run_blocking(loop, [host = current.hostname, port = current.port]() noexcept {
+            return http_client_example::resolve_addresses(host, port);
+        });
+        if (!addresses || addresses->error || addresses->count == 0) { fail("DNS lookup failed"); co_return; }
+        std::shared_ptr<tls_context> tls;
+        if (current.secure) tls = options.ca_file.empty() ? tls_context::make_system_client() : tls_context::make_client(options.ca_file);
+        bool connected_and_exchanged = false;
+        std::string location;
+        for (std::size_t i = 0; i < addresses->count && !state.expired; ++i) {
+            if (current.secure) {
+                auto socket = std::make_unique<tls_stream>(loop, addresses->endpoints[i], tls,
+                    tls_client_options {.hostname = current.hostname, .application_protocols = {"http/1.1"}});
+                auto* stream = socket.get(); loop.add(std::move(socket)); state.socket = stream;
+                const auto connected = co_await stream->async_connect();
+                if (!connected) { stream->close(); state.socket = nullptr; continue; }
+                const auto handshake = io_result(co_await stream->async_handshake());
+                if (!handshake) { fail("TLS handshake failed: " + handshake.error().message()); stream->close(); state.socket = nullptr; co_return; }
+                const auto result = co_await exchange(loop, *stream, current, request, output, final_status, location);
+                connected_and_exchanged = result && *result;
+                stream->close(); state.socket = nullptr;
+            } else {
+                auto socket = std::make_unique<tcp_stream>(loop, addresses->endpoints[i]);
+                auto* stream = socket.get(); loop.add(std::move(socket)); state.socket = stream;
+                const auto connected = co_await stream->async_connect();
+                if (!connected) { stream->close(); state.socket = nullptr; continue; }
+                const auto result = co_await exchange(loop, *stream, current, request, output, final_status, location);
+                connected_and_exchanged = result && *result;
+                stream->close(); state.socket = nullptr;
+            }
+            if (!connected_and_exchanged) co_return;
+            break;
         }
-        auto socket = std::make_unique<tcp_stream>(loop, addresses->endpoints[i]);
-        auto* stream = socket.get(); loop.add(std::move(socket)); state.socket = stream;
-        const auto connected = co_await stream->async_connect();
-        if (!connected) { stream->close(); state.socket = nullptr; continue; }
-        const auto result = co_await exchange(loop, *stream, url, options, output, final_status);
-        success = result && *result; stream->close(); state.socket = nullptr; co_return;
+        if (!connected_and_exchanged) { if (!state.expired) fail("all connection attempts failed"); co_return; }
+        if (!options.follow_redirects || !redirect_status(final_status)) { success = true; co_return; }
+        if (location.empty()) { fail("redirect response has no Location"); co_return; }
+        if (hop == 10) { fail("redirect limit of 10 reached"); co_return; }
+        url_parts next;
+        try { next = redirect_url(current, location); }
+        catch (const std::exception& error) { fail(error.what()); co_return; }
+        if (current.secure && !next.secure) { fail("HTTPS to HTTP redirect is unsupported"); co_return; }
+        if (!same_origin(current, next)) {
+            std::erase_if(request.headers, [](const auto& field) {
+                return field.first == "authorization" || field.first == "cookie" || field.first == "proxy-authorization";
+            });
+        }
+        if ((final_status == 303 && request.method != "HEAD") ||
+            ((final_status == 301 || final_status == 302) && request.method == "POST")) {
+            request.method = "GET"; request.body.clear(); request.body_file.clear();
+            request.body_supplied = false;
+            std::erase_if(request.headers, [](const auto& field) {
+                return field.first == "content-type" || field.first == "content-encoding" ||
+                    field.first == "content-length" || field.first == "transfer-encoding";
+            });
+        }
+        current = std::move(next);
     }
-    if (!state.expired) fail("all connection attempts failed");
 }
 
 auto redirect_status(unsigned status) -> bool
@@ -336,13 +392,23 @@ auto redirect_status(unsigned status) -> bool
 auto redirect_url(const url_parts& current, std::string_view location) -> url_parts
 {
     if (location.empty()) throw std::invalid_argument("empty redirect Location");
-    const std::string origin = "https://" + current.host_header;
-    if (location.starts_with("https://") || location.starts_with("http://"))
-        return http_client_example::parse_url(location);
+    const std::string scheme = current.secure ? "https:" : "http:";
+    const std::string origin = scheme + "//" + current.host_header;
+    const auto separator = location.find(':');
+    const auto path_start = location.find_first_of("/?#");
+    if (separator != std::string_view::npos &&
+        (path_start == std::string_view::npos || separator < path_start)) {
+        std::string absolute(location);
+        std::transform(absolute.begin(), absolute.begin() + separator, absolute.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return http_client_example::parse_url(absolute);
+    }
     if (location.starts_with("//"))
-        return http_client_example::parse_url("https:" + std::string(location));
+        return http_client_example::parse_url(scheme + std::string(location));
     if (location.starts_with('/'))
         return http_client_example::parse_url(origin + std::string(location));
+    if (location.starts_with('#'))
+        return http_client_example::parse_url(origin + current.target + std::string(location));
     if (location.starts_with('?')) {
         const auto question = current.target.find('?');
         return http_client_example::parse_url(origin + current.target.substr(0, question) + std::string(location));
@@ -350,7 +416,30 @@ auto redirect_url(const url_parts& current, std::string_view location) -> url_pa
     const auto question = current.target.find('?');
     const auto path = current.target.substr(0, question);
     const auto slash = path.rfind('/');
-    return http_client_example::parse_url(origin + path.substr(0, slash + 1) + std::string(location));
+    std::string combined = path.substr(0, slash + 1) + std::string(location);
+    const auto suffix = combined.find_first_of("?#");
+    const std::string path_only = combined.substr(0, suffix);
+    std::vector<std::string_view> segments;
+    std::string_view remainder(path_only);
+    while (!remainder.empty()) {
+        const auto separator = remainder.find('/', 1);
+        const auto segment = remainder.substr(1, separator == std::string_view::npos
+            ? std::string_view::npos : separator - 1);
+        if (segment == "..") { if (!segments.empty()) segments.pop_back(); }
+        else if (segment != "." && !segment.empty()) segments.push_back(segment);
+        if (separator == std::string_view::npos) break;
+        remainder.remove_prefix(separator);
+    }
+    std::string normalized = "/";
+    for (const auto segment : segments) {
+        if (normalized.size() > 1) normalized += '/';
+        normalized += segment;
+    }
+    if (path_only.ends_with('/') || path_only.ends_with("/.") || path_only.ends_with("/..")) {
+        if (!normalized.ends_with('/')) normalized += '/';
+    }
+    if (suffix != std::string::npos) normalized += combined.substr(suffix);
+    return http_client_example::parse_url(origin + normalized);
 }
 
 auto same_origin(const url_parts& left, const url_parts& right) -> bool

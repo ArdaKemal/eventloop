@@ -28,6 +28,7 @@ subdirectory and links `eventloop::eventloop`. No root CMake changes are needed.
 /tmp/wayfarer-build/wayfarer --http2 -X POST -H 'Content-Type: text/plain' -d 'hello' -o response.txt https://example.org/echo
 /tmp/wayfarer-build/wayfarer --http2 -X PUT --data-binary @upload.bin https://example.org/object
 /tmp/wayfarer-build/wayfarer --http2 -L -i -o response-with-headers.txt https://example.org/redirect
+/tmp/wayfarer-build/wayfarer --http1.1 -L -i http://example.org/redirect
 /tmp/wayfarer-build/wayfarer --http2 -i -H 'Accept: text/html' https://example.org/
 /tmp/wayfarer-build/wayfarer --http3 --timeout-ms 5000 https://cloudflare.com/
 /tmp/wayfarer-build/wayfarer --http3-v2 --ca-file cert.pem https://127.0.0.1:4433/
@@ -60,15 +61,21 @@ HTTP/2 request task, or closing the QUIC endpoint on deadline wakes pending I/O.
 buffers that file with a 4 MiB limit. HTTP/2 streams the file with a 1 TiB
 limit set by the public API.
 
-`-L` follows up to ten HTTP/2 redirects to HTTPS URLs. For 301/302, POST
+`-L` follows up to ten HTTP/1.1 or HTTP/2 redirects. HTTP/1.1 accepts relative
+and absolute Location values, including redirects from HTTP to HTTPS. HTTPS to
+HTTP downgrades are rejected. For 301/302, POST
 becomes GET; for 303, all methods except HEAD become GET; 307/308 preserve
-method and body. File bodies are reopened for preserved uploads. A redirect
+method and body. HTTP/1.1 replays its bounded 4 MiB file body; HTTP/2 reopens
+the file for each preserved upload. A redirect
 to another origin drops Authorization, Cookie, and Proxy-Authorization headers.
 Intermediate redirect bodies are discarded; `-i` still writes their headers.
+The body output is from the final response. Missing Location, redirect loops,
+and the ten-hop limit are reported as errors. A failed `-o` transfer leaves the
+existing destination intact even if earlier hops produced headers.
 
 | Version | Implemented | Deliberate limits / failure |
 | --- | --- | --- |
-| HTTP/1.1 | HTTP and HTTPS; GET, HEAD, POST and other token methods with `-X`; repeatable `-H`; `-d` or `--data-binary @FILE` body up to 4 MiB; body or headers plus body output; Content-Length, chunked, and connection-close responses | One request and connection per run; no redirect following, compression decoding, proxy, cookies, multipart, or upload streaming. Response fields are capped at 64 KiB; chunk size lines at 128 bytes. Other Transfer-Encoding values fail. |
+| HTTP/1.1 | HTTP and HTTPS; GET, HEAD, POST and other token methods with `-X`; repeatable `-H`; `-d` or `--data-binary @FILE` body up to 4 MiB; body or headers plus body output; Content-Length, chunked, and connection-close responses; `-L` redirects | One connection per request or redirect hop; no compression decoding, proxy, cookies, multipart, or upload streaming. Response fields are capped at 64 KiB; chunk size lines at 128 bytes. Other Transfer-Encoding values fail. |
 | HTTP/2 | HTTPS methods including GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS; request headers; `-d` body up to 4 MiB; `--data-binary @FILE` streamed upload up to 1 TiB; TLS verification and ALPN `h2`; streamed stdout or `-o` output; `-i` streams headers, body, and trailers; `-L` follows redirects | One connection per request or redirect hop. The sink API accepts up to 1 TiB of response DATA. Header blocks are limited to 64 KiB and 128 fields; incoming frames to 16 KiB. No cleartext h2c, connection reuse, or push. Capacity and protocol errors come from the public API. |
 | HTTP/3 | HTTPS GET over public QUIC v1 or v2; TLS verification; body output | Request HEADERS are capped at 4 KiB. The response parser accepts a static QPACK `:status` as the first field, including literal decimal Huffman status values; other QPACK forms fail. Each complete response frame is capped at 64 KiB and total DATA at 16 MiB. Custom method, headers, body and `-i` fail at argument parsing. No redirect following, push, dynamic QPACK, trailers, or response field reporting. |
 
@@ -103,7 +110,7 @@ Exit status is 0 for a completed response, 1 for transport/protocol/output
 failure, and 2 for invalid or unsupported command line options. HTTP error
 statuses such as 404 still count as completed responses by default. `--fail`
 returns 22 for a completed final response with status 400–599 across HTTP/1.1,
-HTTP/2 and HTTP/3. With `-L`, HTTP/2 applies this rule to the final redirect
+HTTP/2 and HTTP/3. With `-L`, HTTP/1.1 and HTTP/2 apply this rule to the final redirect
 response. Error response bodies still stream to stdout; with `-o`, they are
 discarded along with the temporary file. HTTP/3 can apply `--fail` only when its
 bounded QPACK decoder recognizes the response status; unsupported status
