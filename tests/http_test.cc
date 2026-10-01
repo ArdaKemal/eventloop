@@ -1,3 +1,5 @@
+#include "posix_socket_helpers.h"
+
 #include "eventloop/http/mime_types.h"
 #include "eventloop/http/request.h"
 #include "eventloop/http/server.h"
@@ -27,6 +29,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/resource.h>
+#endif
 
 using namespace eventloop;
 
@@ -353,7 +358,7 @@ auto request_after_listener_removal(event_loop& loop,
                     &endpoint_size) == -1) return false;
     loop.add(std::move(listener));
 
-    unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    unique_fd client(test_socket::socket(AF_INET, SOCK_STREAM));
     if (!client || connect(client.get(), reinterpret_cast<sockaddr*>(&endpoint),
                            endpoint_size) == -1) return false;
 
@@ -361,7 +366,7 @@ auto request_after_listener_removal(event_loop& loop,
     bool sent = false;
     if (!loop.post(execution_task([&]() noexcept {
             owner->close();
-            sent = send(client.get(), request.data(), request.size(), MSG_NOSIGNAL) ==
+            sent = send(client.get(), request.data(), request.size(), test_socket::no_signal) ==
                    static_cast<ssize_t>(request.size());
         }))) return false;
     task_handle<void> stop_task;
@@ -434,14 +439,14 @@ auto pipelined_sendfile_test() -> bool
                     &endpoint_size) == -1) return false;
     loop.add(std::move(listener));
 
-    unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    unique_fd client(test_socket::socket(AF_INET, SOCK_STREAM));
     if (!client || connect(client.get(), reinterpret_cast<sockaddr*>(&endpoint),
                            endpoint_size) == -1) return false;
     constexpr std::string_view requests =
         "GET /large.bin HTTP/1.1\r\nHost: localhost\r\n\r\n"
         "GET /small.txt HTTP/1.1\r\nHost: localhost\r\n"
         "Connection: close\r\n\r\n";
-    if (send(client.get(), requests.data(), requests.size(), MSG_NOSIGNAL) !=
+    if (send(client.get(), requests.data(), requests.size(), test_socket::no_signal) !=
         static_cast<ssize_t>(requests.size())) return false;
     if (loop.spawn(active->run()) != task_spawn_result::accepted) return false;
     std::array<char, 80 * 1024> response {};
@@ -495,6 +500,25 @@ auto pipelined_sendfile_test() -> bool
 
 auto concurrent_connection_capacity_test() -> bool
 {
+#ifdef __APPLE__
+    // Each connection needs a client and a server descriptor. macOS commonly
+    // starts with a soft limit of 256, too small for this 128-connection test.
+    struct descriptor_limit_scope {
+        rlimit original {};
+        bool changed {false};
+        ~descriptor_limit_scope()
+        {
+            if (changed) (void)setrlimit(RLIMIT_NOFILE, &original);
+        }
+    } descriptor_limit;
+    if (getrlimit(RLIMIT_NOFILE, &descriptor_limit.original) == -1) return false;
+    if (descriptor_limit.original.rlim_cur < 512) {
+        auto limit = descriptor_limit.original;
+        limit.rlim_cur = 512;
+        if (setrlimit(RLIMIT_NOFILE, &limit) == -1) return false;
+        descriptor_limit.changed = true;
+    }
+#endif
     char directory_name[] = "/tmp/eventloop-http-capacity-XXXXXX";
     if (mkdtemp(directory_name) == nullptr) return false;
     unique_fd directory(open(directory_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -519,11 +543,11 @@ auto concurrent_connection_capacity_test() -> bool
     clients.reserve(connection_count);
     bool connected = true;
     for (std::size_t index = 0; index < connection_count; ++index) {
-        unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        unique_fd client(test_socket::socket(AF_INET, SOCK_STREAM));
         if (!client ||
             connect(client.get(), reinterpret_cast<sockaddr*>(&endpoint),
                     endpoint_size) == -1 ||
-            send(client.get(), request.data(), request.size(), MSG_NOSIGNAL) !=
+            send(client.get(), request.data(), request.size(), test_socket::no_signal) !=
                 static_cast<ssize_t>(request.size())) {
             connected = false;
             break;

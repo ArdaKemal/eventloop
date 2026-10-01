@@ -1,3 +1,5 @@
+#include "posix_socket_helpers.h"
+
 #include "eventloop/event_loop.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/task.h"
@@ -50,7 +52,7 @@ struct connected_pair {
 
 [[nodiscard]] auto connect_loopback() -> connected_pair
 {
-    unique_fd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    unique_fd listener(test_socket::socket(AF_INET, SOCK_STREAM));
     if (!listener) throw system_error("socket");
 
     sockaddr_in address {};
@@ -65,14 +67,13 @@ struct connected_pair {
                     &address_size) == -1) {
         throw system_error("getsockname");
     }
-    unique_fd client(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    unique_fd client(test_socket::socket(AF_INET, SOCK_STREAM));
     if (!client) throw system_error("socket");
     if (connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
                 sizeof(address)) == -1) {
         throw system_error("connect");
     }
-    unique_fd server(accept4(listener.get(), nullptr, nullptr,
-                             SOCK_NONBLOCK | SOCK_CLOEXEC));
+    unique_fd server(test_socket::accept(listener.get(), true));
     if (!server) throw system_error("accept4");
     make_nonblocking(client.get());
     return {std::move(client), std::move(server)};

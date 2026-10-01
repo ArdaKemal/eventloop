@@ -1,3 +1,5 @@
+#include "posix_socket_helpers.h"
+
 #include "eventloop/tcp_acceptor.h"
 #include "eventloop/tcp_stream.h"
 #include "eventloop/task.h"
@@ -52,7 +54,7 @@ struct winsock_scope {
 #ifdef _WIN32
     return static_cast<native_socket>(::socket(family, SOCK_STREAM, 0));
 #else
-    return ::socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    return test_socket::socket(family, SOCK_STREAM);
 #endif
 }
 
@@ -307,7 +309,7 @@ struct tcp_pair {
     result.server.reset(::accept(static_cast<SOCKET>(listener.get()),
                                  nullptr, nullptr));
 #else
-    result.server.reset(::accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC));
+    result.server.reset(test_socket::accept(listener.get()));
 #endif
     return result;
 }
@@ -373,6 +375,11 @@ auto fill_send_queue(native_socket descriptor) -> bool
     if (::ioctlsocket(static_cast<SOCKET>(descriptor), FIONBIO, &nonblocking) != 0)
         return false;
 #endif
+#ifdef __APPLE__
+    const int flags = ::fcntl(descriptor, F_GETFL);
+    if (flags == -1 ||
+        ::fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == -1) return false;
+#endif
     for (int attempts = 0; attempts < 1024; ++attempts) {
 #ifdef _WIN32
         const auto written = ::send(static_cast<SOCKET>(descriptor),
@@ -382,7 +389,7 @@ auto fill_send_queue(native_socket descriptor) -> bool
         return ::WSAGetLastError() == WSAEWOULDBLOCK;
 #else
         const auto written = ::send(descriptor, buffer.data(), buffer.size(),
-                                    MSG_DONTWAIT | MSG_NOSIGNAL);
+                                    MSG_DONTWAIT | test_socket::no_signal);
         if (written >= 0) continue;
         if (errno == EINTR) continue;
         return errno == EAGAIN || errno == EWOULDBLOCK;

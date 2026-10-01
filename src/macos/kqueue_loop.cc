@@ -200,6 +200,23 @@ auto kqueue_loop::poll(std::span<ready_event> events, bool nonblocking)
             continue;
         }
         if (native.filter == EVFILT_SIGNAL) {
+            // EVFILT_SIGNAL observes a blocked signal without consuming it.
+            // Retire the pending signal before restoring the owner's mask,
+            // otherwise its default disposition would run on loop destruction.
+            // Darwin has no sigtimedwait; only call sigwait after sigpending
+            // confirms this blocked signal is already available.
+            sigset_t pending {};
+            const int signal = static_cast<int>(native.ident);
+            if (::sigpending(&pending) == -1) throw system_error("sigpending");
+            if (sigismember(&pending, signal) == 1) {
+                sigset_t selected {};
+                sigemptyset(&selected);
+                sigaddset(&selected, signal);
+                int received = 0;
+                const int error = ::sigwait(&selected, &received);
+                if (error != 0)
+                    throw std::system_error(error, std::system_category(), "sigwait");
+            }
             result.signal_requested = true;
             continue;
         }

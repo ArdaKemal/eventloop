@@ -10,7 +10,9 @@
 #include <thread>
 
 #ifndef _WIN32
+#if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
 #include <sys/timerfd.h>
+#endif
 #include <unistd.h>
 #endif
 
