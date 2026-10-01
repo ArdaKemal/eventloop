@@ -49,7 +49,18 @@ auto get_file_info(native_socket file) noexcept -> std::optional<file_info>
         S_ISREG(info.st_mode) ? file_info::type::regular :
         S_ISDIR(info.st_mode) ? file_info::type::directory : file_info::type::other,
         info.st_size < 0 ? 0U : static_cast<std::uint64_t>(info.st_size),
-        static_cast<std::int64_t>(info.st_mtime)};
+        static_cast<std::int64_t>(info.st_mtime),
+#if defined(__APPLE__)
+        static_cast<std::uint32_t>(info.st_mtimespec.tv_nsec),
+        static_cast<std::int64_t>(info.st_ctimespec.tv_sec),
+        static_cast<std::uint32_t>(info.st_ctimespec.tv_nsec),
+#else
+        static_cast<std::uint32_t>(info.st_mtim.tv_nsec),
+        static_cast<std::int64_t>(info.st_ctim.tv_sec),
+        static_cast<std::uint32_t>(info.st_ctim.tv_nsec),
+#endif
+        static_cast<std::uint64_t>(info.st_dev),
+        static_cast<std::uint64_t>(info.st_ino)};
 }
 
 auto read_file(native_socket file, std::span<std::byte> output) noexcept -> bool

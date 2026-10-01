@@ -107,6 +107,35 @@ auto request::header_value(std::string_view name) const noexcept
     return std::nullopt;
 }
 
+auto request::header_occurrences(std::string_view name) const noexcept -> std::size_t
+{
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < header_count; ++index) {
+        if (ascii_equal(headers[index].name, name)) ++count;
+    }
+    return count;
+}
+
+auto request::joined_header_value(std::string_view name, std::string& storage) const
+    -> std::string_view
+{
+    std::string_view single;
+    std::size_t found = 0;
+    for (std::size_t index = 0; index < header_count; ++index) {
+        if (!ascii_equal(headers[index].name, name)) continue;
+        if (found == 0) single = headers[index].value;
+        ++found;
+    }
+    if (found <= 1) return single;
+    storage.clear();
+    for (std::size_t index = 0; index < header_count; ++index) {
+        if (!ascii_equal(headers[index].name, name)) continue;
+        if (!storage.empty()) storage += ',';
+        storage += headers[index].value;
+    }
+    return storage;
+}
+
 auto parse_request(std::string_view input, request& output) noexcept -> parse_result
 {
     output = {};

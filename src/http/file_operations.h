@@ -17,6 +17,11 @@ struct file_info {
     enum class type { other, regular, directory } kind {type::other};
     std::uint64_t size {0};
     std::int64_t modified {0}; // Unix seconds.
+    std::uint32_t modified_nanoseconds {0};
+    std::int64_t changed {0}; // Last metadata change, Unix seconds.
+    std::uint32_t changed_nanoseconds {0};
+    std::uint64_t volume {0};
+    std::uint64_t identity {0};
 };
 
 struct directory_entry {

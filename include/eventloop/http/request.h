@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace eventloop::http {
@@ -39,6 +40,14 @@ struct request {
 
     [[nodiscard]] auto header_value(std::string_view name) const noexcept
         -> std::optional<std::string_view>;
+    [[nodiscard]] auto header_occurrences(std::string_view name) const noexcept
+        -> std::size_t;
+    // Comma-joins every matching field into storage when there is more than one
+    // and returns a view of the result; otherwise returns a view of the single
+    // value (or an empty view) without touching storage.
+    [[nodiscard]] auto joined_header_value(std::string_view name,
+                                           std::string& storage) const
+        -> std::string_view;
 };
 
 enum class parse_status {

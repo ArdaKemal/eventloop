@@ -178,6 +178,22 @@ back to an unbounded allocation.
   shares HTTP/1.1's component-by-component `O_NOFOLLOW` checks. Cleartext
   prior-knowledge HTTP/2, h2c upgrade, CONNECT tunnels, and extended CONNECT are
   not supported. Plain `http::server` continues to serve HTTP/1.1.
+- Built-in static-file GET and HEAD responses over HTTP/1.1, HTTP/2, and
+  HTTP/3 include a weak metadata ETag, Last-Modified, and
+  `Accept-Ranges: bytes`. `If-None-Match` takes precedence over
+  `If-Modified-Since`; a matching validator returns 304 with no body.
+  `If-Modified-Since` accepts the emitted IMF-fixdate form. A single valid
+  `bytes` range (closed, open-ended, or suffix) returns 206 with
+  `Content-Range`; an unsatisfiable single range returns 416 with
+  `Content-Range: bytes */<full-size>` and no body. Malformed or multiple
+  ranges are ignored and receive the full 200 response. Range evaluation
+  follows conditional evaluation. HEAD returns the GET status and headers
+  without a body. Directory listings and redirects are unaffected. The
+  weak ETag uses file size, nanosecond modification and change timestamps,
+  and file identity where available. This catches ordinary same-size writes
+  even if the modification time is restored. It is not a content digest;
+  filesystems with coarse or synthetic change timestamps can still produce
+  the same validator for different bytes.
 - Include `eventloop/http2/client.h` for one outbound HTTPS HTTP/2 request.
   `http2::async_request(loop, endpoint, context, hostname, request)` owns the
   TLS socket from connect through close. `hostname` is used for certificate

@@ -118,9 +118,7 @@ template<typename Stream>
 
         // The parser and I/O buffers live outside the bounded coroutine frame.
         auto state = std::make_unique<session>(root->get(), options.directory_listing);
-#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         std::unique_ptr<std::byte[]> tls_file_buffer;
-#endif
         while (!state->closed()) {
             while (!state->has_response() && !state->closed()) {
                 auto buffer = state->read_space();
@@ -151,49 +149,53 @@ template<typename Stream>
             }
 
             const auto file_size = state->file_size();
+            const auto file_offset = state->file_offset();
             auto file = state->take_file();
             if (file) {
                 if constexpr (std::is_same_v<Stream, tcp_stream>) {
-                    auto sent = co_await peer->async_send_file({}, std::move(file),
-                                                               file_size);
-                    if (!operation_succeeded(sent)) {
+                    if (file_offset == 0) {
+                        auto sent = co_await peer->async_send_file({}, std::move(file),
+                                                                   file_size);
+                        if (!operation_succeeded(sent)) {
+                            peer->close();
+                            co_return;
+                        }
+                        state->finish_response();
+                        continue;
+                    }
+                }
+                if (!tls_file_buffer) {
+                    tls_file_buffer.reset(
+                        new (std::nothrow) std::byte[4096]);
+                    if (!tls_file_buffer) {
                         peer->close();
                         co_return;
                     }
-#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
-                } else {
-                    if (!tls_file_buffer) {
-                        tls_file_buffer.reset(
-                            new (std::nothrow) std::byte[4096]);
-                        if (!tls_file_buffer) {
-                            peer->close();
-                            co_return;
-                        }
-                    }
-                    const std::span<std::byte> file_buffer {
-                        tls_file_buffer.get(), 4096};
-                    std::size_t remaining = file_size;
-                    while (remaining != 0) {
-                        const auto bytes = std::min(remaining, file_buffer.size());
-                        if (!detail::read_file(file.get(), file_buffer.first(bytes))) {
-                            peer->close();
-                            co_return;
-                        }
-                        auto chunk = file_buffer.first(bytes);
-                        while (!chunk.empty()) {
-                            auto written = operation_result(
-                                co_await peer->async_write_some(chunk));
-                            if (!written || *written == 0) {
-                                peer->close();
-                                co_return;
-                            }
-                            chunk = chunk.subspan(*written);
-                        }
-                        remaining -= bytes;
-                    }
-                    tls_file_buffer.reset();
-#endif
                 }
+                const std::span<std::byte> file_buffer {
+                    tls_file_buffer.get(), 4096};
+                std::size_t remaining = file_size;
+                std::uint64_t offset = file_offset;
+                while (remaining != 0) {
+                    const auto bytes = std::min(remaining, file_buffer.size());
+                    if (!detail::read_file_at(file.get(), offset, file_buffer.first(bytes))) {
+                        peer->close();
+                        co_return;
+                    }
+                    auto chunk = file_buffer.first(bytes);
+                    while (!chunk.empty()) {
+                        auto written = operation_result(
+                            co_await peer->async_write_some(chunk));
+                        if (!written || *written == 0) {
+                            peer->close();
+                            co_return;
+                        }
+                        chunk = chunk.subspan(*written);
+                    }
+                    remaining -= bytes;
+                    offset += bytes;
+                }
+                tls_file_buffer.reset();
             }
             state->finish_response();
         }

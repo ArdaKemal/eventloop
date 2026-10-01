@@ -149,11 +149,21 @@ auto get_file_info(native_socket file) noexcept -> std::optional<file_info>
             &basic, sizeof(basic))) return std::nullopt;
     if (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) return std::nullopt;
     constexpr std::int64_t epoch_offset = 116444736000000000LL;
+    BY_HANDLE_FILE_INFORMATION identity {};
+    const bool have_identity = GetFileInformationByHandle(handle, &identity) != 0;
+    const auto modified_ticks = basic.LastWriteTime.QuadPart - epoch_offset;
+    const auto changed_ticks = basic.ChangeTime.QuadPart - epoch_offset;
     return file_info {
         standard.Directory ? file_info::type::directory : file_info::type::regular,
         standard.EndOfFile.QuadPart < 0 ? 0U :
             static_cast<std::uint64_t>(standard.EndOfFile.QuadPart),
-        (basic.LastWriteTime.QuadPart - epoch_offset) / 10000000LL};
+        modified_ticks / 10000000LL,
+        static_cast<std::uint32_t>((modified_ticks % 10000000LL + 10000000LL) % 10000000LL * 100),
+        changed_ticks / 10000000LL,
+        static_cast<std::uint32_t>((changed_ticks % 10000000LL + 10000000LL) % 10000000LL * 100),
+        have_identity ? identity.dwVolumeSerialNumber : 0,
+        have_identity ? (static_cast<std::uint64_t>(identity.nFileIndexHigh) << 32 |
+                         identity.nFileIndexLow) : 0};
 }
 
 auto read_file(native_socket file, std::span<std::byte> output) noexcept -> bool

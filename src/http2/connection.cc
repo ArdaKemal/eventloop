@@ -4,6 +4,7 @@
 #include "eventloop/http/mime_types.h"
 #include "../http/resource.h"
 #include "../http/file_operations.h"
+#include "../http/file_response.h"
 #include "session.h"
 
 #include <algorithm>
@@ -43,6 +44,26 @@ auto respond_empty(session& state, std::uint32_t stream_id,
         const std::array<field, 1> headers {field {"content-length", "0"}};
         (void)state.respond(stream_id, status, headers, {});
     }
+}
+
+auto respond_static_file(session& state, const request& incoming, unique_fd descriptor,
+                         const http::detail::file_info& info, std::string_view path) -> void
+{
+    const auto selected = http::detail::choose_file_response(info, {
+        incoming.if_none_match, incoming.if_modified_since, incoming.range});
+    std::array<field, 6> headers {
+        field {"content-length", std::to_string(selected.length)},
+        field {"content-type", std::string(http::mime_type_from_path(path))},
+        field {"etag", std::string(selected.etag.data(), selected.etag_size)},
+        field {"last-modified", std::string(selected.modified.data(), selected.modified_size)},
+        field {"accept-ranges", "bytes"},
+        field {"content-range", std::string(selected.content_range.data(), selected.content_range_size)},
+    };
+    const auto count = selected.content_range_size == 0 ? 5 : 6;
+    (void)state.respond_file(incoming.stream_id, selected.status,
+        std::span(headers).first(count), std::move(descriptor), selected.length,
+        !incoming.method.empty() && incoming.method == "GET" &&
+            (selected.status == 200 || selected.status == 206), selected.offset);
 }
 
 [[nodiscard]] auto path_without_suffix(std::string_view target) noexcept
@@ -95,11 +116,7 @@ auto serve_request(session& state, request incoming, native_socket root,
     }
 
     if (info->kind == http::detail::file_info::type::regular) {
-        const auto size = info->size;
-        const auto fields = status_fields(size,
-            http::mime_type_from_path(incoming.target));
-        (void)state.respond_file(incoming.stream_id, 200, fields,
-                                 std::move(descriptor), size, !headers_only);
+        respond_static_file(state, incoming, std::move(descriptor), *info, incoming.target);
         return;
     }
 
@@ -115,11 +132,7 @@ auto serve_request(session& state, request incoming, native_socket root,
     unique_fd index = http::detail::open_child(descriptor.get(), "index.html", false);
     auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
     if (index_info && index_info->kind == http::detail::file_info::type::regular) {
-        const auto size = index_info->size;
-        const auto fields = status_fields(size,
-            http::mime_type_from_path("index.html"));
-        (void)state.respond_file(incoming.stream_id, 200, fields,
-                                 std::move(index), size, !headers_only);
+        respond_static_file(state, incoming, std::move(index), *index_info, "index.html");
         return;
     }
 

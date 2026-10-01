@@ -22,6 +22,9 @@ struct request {
     std::uint32_t stream_id = 0;
     std::string method;
     std::string target;
+    std::string if_none_match;
+    std::string if_modified_since;
+    std::string range;
     std::uint64_t body_size = 0;
 };
 
@@ -42,7 +45,7 @@ public:
         std::span<const field> headers, std::vector<std::byte> body) -> bool;
     [[nodiscard]] auto respond_file(std::uint32_t stream_id, unsigned status,
         std::span<const field> headers, unique_fd file, std::uint64_t size,
-        bool send_body) -> bool;
+        bool send_body, std::uint64_t offset = 0) -> bool;
 
     [[nodiscard]] auto closed() const noexcept -> bool;
 
@@ -55,6 +58,11 @@ private:
         std::optional<std::uint64_t> content_length;
         std::string method;
         std::string target;
+        std::string if_none_match;
+        std::string if_modified_since;
+        std::string range;
+        bool duplicate_range = false;
+        std::uint64_t response_file_start = 0;
         std::vector<std::byte> response_body;
         unique_fd response_file;
         std::uint64_t response_size = 0;

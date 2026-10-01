@@ -5,6 +5,7 @@
 #include "eventloop/unique_fd.h"
 #include "../http/file_operations.h"
 #include "../http/resource.h"
+#include "../http/file_response.h"
 #include "frames.h"
 #include "qpack.h"
 
@@ -15,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace eventloop::http {
@@ -107,13 +109,14 @@ auto read_control_settings(event_loop& loop, quic_connection& connection,
 // 1 KiB size class matters because each active request holds one.
 auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t id,
                   unsigned status, std::uint64_t length, std::string_view mime,
-                  bool fin, std::span<std::byte> buffer) -> task<bool>
+                  bool fin, std::span<std::byte> buffer,
+                  const detail::file_response* selected = nullptr) -> task<bool>
 {
     std::array<char, 32> status_text {}, length_text {};
     auto status_end = std::to_chars(status_text.data(), status_text.data() + status_text.size(), status);
     auto length_end = std::to_chars(length_text.data(), length_text.data() + length_text.size(), length);
     if (status_end.ec != std::errc{} || length_end.ec != std::errc{}) co_return false;
-    std::array<h3::field, 4> fields {};
+    std::array<h3::field, 8> fields {};
     std::size_t field_count = 0;
     fields[field_count++] = {":status", {status_text.data(), status_end.ptr}};
     if (status != 204) {
@@ -122,6 +125,13 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
     }
     if (status == 204 || status == 405)
         fields[field_count++] = {"allow", "GET, HEAD, OPTIONS"};
+    if (selected != nullptr) {
+        fields[field_count++] = {"etag", {selected->etag.data(), selected->etag_size}};
+        fields[field_count++] = {"last-modified", {selected->modified.data(), selected->modified_size}};
+        fields[field_count++] = {"accept-ranges", "bytes"};
+        if (selected->content_range_size != 0)
+            fields[field_count++] = {"content-range", {selected->content_range.data(), selected->content_range_size}};
+    }
     auto encoded = h3::qpack_encode(std::span(fields).first(field_count),
                                     buffer.subspan(16));
     if (!encoded) co_return false;
@@ -150,6 +160,9 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         co_return;
     }
     std::string_view method, path, scheme, authority;
+    std::string if_none_match;
+    std::string_view if_modified_since, range;
+    bool duplicate_range = false;
     bool regular = false;
     for (const auto& field : std::span(s.fields).first(*decoded)) {
         bool invalid = field.name.empty() || field.name == "connection" ||
@@ -169,11 +182,25 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
             else if (field.name == ":scheme" && scheme.empty()) scheme = field.value;
             else if (field.name == ":authority" && authority.empty()) authority = field.value;
             else { connection.close(std::make_error_code(std::errc::protocol_error)); co_return; }
-        } else regular = true;
+        } else {
+            regular = true;
+            if (field.name == "if-none-match") {
+                if (!if_none_match.empty()) if_none_match += ',';
+                if_none_match += field.value;
+            }
+            else if (field.name == "if-modified-since") if_modified_since = field.value;
+            else if (field.name == "range") {
+                if (!range.empty()) duplicate_range = true;
+                else range = field.value;
+            }
+        }
     }
     unsigned status = 200;
     unique_fd file;
     std::uint64_t size = 0;
+    std::uint64_t offset = 0;
+    detail::file_response selected;
+    bool have_file = false;
     std::string_view mime = "text/plain";
     if (method.empty() || path.empty() || scheme != "https" || authority.empty()) status = 400;
     else if (method == "OPTIONS") status = 204;
@@ -190,22 +217,29 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
                 auto index = http::detail::open_child(file.get(), "index.html", false);
                 auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
                 if (!index_info || index_info->kind != http::detail::file_info::type::regular) status = 403;
-                else { file = std::move(index); size = index_info->size; mime = http::mime_type_from_path("index.html"); }
+                else { file = std::move(index); selected = detail::choose_file_response(*index_info,
+                    {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
+                    size = selected.length; offset = selected.offset; status = selected.status;
+                    have_file = true; mime = http::mime_type_from_path("index.html"); }
             } else if (info->kind == http::detail::file_info::type::regular) {
-                size = info->size; mime = http::mime_type_from_path(path);
+                selected = detail::choose_file_response(*info,
+                    {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
+                size = selected.length; offset = selected.offset; status = selected.status;
+                have_file = true; mime = http::mime_type_from_path(path);
             } else status = 404;
         }
     }
     if (!(co_await send_headers(loop, connection, id, status, size, mime,
-                               status != 200 || method == "HEAD", s.io)).value_or(false)) {
+                               (status != 200 && status != 206) || method == "HEAD",
+                               s.io, have_file ? &selected : nullptr)).value_or(false)) {
         connection.close(std::make_error_code(std::errc::io_error));
         co_return;
     }
-    if (status != 200 || method == "HEAD") co_return;
-    std::uint64_t offset = 0;
-    while (offset < size) {
-        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(s.io.size(), size - offset));
-        if (!http::detail::read_file_at(file.get(), offset, std::span(s.io).first(count))) {
+    if ((status != 200 && status != 206) || method == "HEAD") co_return;
+    std::uint64_t sent = 0;
+    while (sent < size) {
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(s.io.size(), size - sent));
+        if (!http::detail::read_file_at(file.get(), offset + sent, std::span(s.io).first(count))) {
             connection.close(std::make_error_code(std::errc::io_error)); co_return;
         }
         std::array<std::byte, 16> frame_header {};
@@ -214,7 +248,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
                 std::span(frame_header).first(*header_size), false)).value_or(false) ||
             !(co_await write_all(loop, connection, id, std::span(s.io).first(count), false)).value_or(false))
             co_return;
-        offset += count;
+        sent += count;
     }
     (void)co_await write_all(loop, connection, id, {}, true);
 }

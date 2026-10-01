@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -30,6 +31,7 @@ public:
     [[nodiscard]] auto has_response() const noexcept -> bool { return responding_; }
     [[nodiscard]] auto response() const noexcept -> std::span<const char>;
     [[nodiscard]] auto file_size() const noexcept -> std::size_t { return file_size_; }
+    [[nodiscard]] auto file_offset() const noexcept -> std::uint64_t { return file_offset_; }
     [[nodiscard]] auto take_file() noexcept -> unique_fd { return std::move(file_); }
     [[nodiscard]] auto closed() const noexcept -> bool { return closed_; }
     auto finish_response() -> void;
@@ -38,7 +40,7 @@ private:
     auto process_requests() -> void;
     auto handle_request(const request& parsed) -> void;
     auto serve_resource(const request& parsed, bool headers_only) -> void;
-    auto serve_file(unique_fd descriptor, const detail::file_info& info,
+    auto serve_file(const request& parsed, unique_fd descriptor, const detail::file_info& info,
                     bool headers_only, std::string_view mime_path) -> void;
     auto serve_directory(unique_fd descriptor, bool headers_only) -> void;
     auto send_directory_redirect(std::string_view target) -> void;
@@ -61,6 +63,7 @@ private:
     std::string_view static_response_;
     unique_fd file_;
     std::size_t file_size_ {0};
+    std::uint64_t file_offset_ {0};
     std::size_t input_size_ {0};
     std::size_t request_size_ {0};
     bool directory_listing_ {false};

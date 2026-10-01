@@ -263,12 +263,13 @@ auto session::respond(std::uint32_t stream_id, unsigned status,
 
 auto session::respond_file(std::uint32_t stream_id, unsigned status,
                            std::span<const field> headers, unique_fd file,
-                           std::uint64_t size, bool send_body) -> bool
+                           std::uint64_t size, bool send_body, std::uint64_t offset) -> bool
 {
     auto* value = find_stream(stream_id);
     if (value == nullptr || value->response_started || fatal_) return false;
     value->response_size = send_body ? size : 0;
     value->response_offset = 0;
+    value->response_file_start = offset;
     if (send_body) value->response_file = std::move(file);
     if (!append_response_headers(*value, status, headers)) {
         reset_stream(*value);
@@ -747,6 +748,9 @@ auto session::finish_request(stream& value) -> void
         .stream_id = value.id,
         .method = std::move(value.method),
         .target = std::move(value.target),
+        .if_none_match = std::move(value.if_none_match),
+        .if_modified_since = std::move(value.if_modified_since),
+        .range = value.duplicate_range ? std::string {} : std::move(value.range),
         .body_size = value.request_body_size,
     });
 }
@@ -811,6 +815,15 @@ auto session::validate_initial_headers(stream& value,
             if (!parse_decimal(entry.value, parsed) ||
                 (content_length && *content_length != parsed)) return false;
             content_length = parsed;
+        }
+        if (entry.name == "if-none-match") {
+            if (!value.if_none_match.empty()) value.if_none_match += ',';
+            value.if_none_match += entry.value;
+        } else if (entry.name == "if-modified-since") {
+            if (value.if_modified_since.empty()) value.if_modified_since = entry.value;
+        } else if (entry.name == "range") {
+            if (!value.range.empty()) value.duplicate_range = true;
+            else value.range = entry.value;
         }
     }
 
@@ -883,6 +896,10 @@ auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
     found->content_length.reset();
     found->method.clear();
     found->target.clear();
+    found->if_none_match.clear();
+    found->if_modified_since.clear();
+    found->range.clear();
+    found->duplicate_range = false;
     found->response_body.clear();
     found->response_file.reset();
     found->response_size = 0;
@@ -1040,7 +1057,7 @@ auto session::pump_responses() -> void
             std::span<const std::byte> body;
             if (value.response_file) {
                 if (!http::detail::read_file_at(value.response_file.get(),
-                        value.response_offset,
+                        value.response_file_start + value.response_offset,
                         std::span {frame_payload_}.first(count))) {
                     stream_error(value.id, internal_error);
                     progressed = true;

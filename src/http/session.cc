@@ -4,6 +4,7 @@
 #include "eventloop/http/mime_types.h"
 #include "resource.h"
 #include "file_operations.h"
+#include "file_response.h"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +15,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace eventloop::http {
@@ -167,7 +169,7 @@ auto session::serve_resource(const request& parsed, bool headers_only) -> void
         return;
     }
     if (info->kind == detail::file_info::type::regular) {
-        serve_file(std::move(descriptor), *info, headers_only, parsed.target);
+        serve_file(parsed, std::move(descriptor), *info, headers_only, parsed.target);
         return;
     }
 
@@ -183,7 +185,7 @@ auto session::serve_resource(const request& parsed, bool headers_only) -> void
     auto index_info = index ? detail::get_file_info(index.get()) : std::nullopt;
     if (index_info && index_info->kind == detail::file_info::type::regular) {
         descriptor.reset();
-        serve_file(std::move(index), *index_info, headers_only, "index.html");
+        serve_file(parsed, std::move(index), *index_info, headers_only, "index.html");
         return;
     }
     index.reset();
@@ -196,7 +198,7 @@ auto session::serve_resource(const request& parsed, bool headers_only) -> void
     serve_directory(std::move(descriptor), headers_only);
 }
 
-auto session::serve_file(unique_fd descriptor, const detail::file_info& info,
+auto session::serve_file(const request& parsed, unique_fd descriptor, const detail::file_info& info,
                          bool headers_only, std::string_view mime_path) -> void
 {
     if (info.size > (std::numeric_limits<std::size_t>::max)()) {
@@ -207,20 +209,34 @@ auto session::serve_file(unique_fd descriptor, const detail::file_info& info,
     }
 
     std::array<char, 64> date {};
-    std::array<char, 64> modified {};
+    std::string joined_none_match;
+    const auto selection = detail::choose_file_response(info, {
+        parsed.joined_header_value("If-None-Match", joined_none_match),
+        parsed.header_value("If-Modified-Since").value_or(std::string_view {}),
+        parsed.header_occurrences("Range") > 1
+            ? std::string_view {}
+            : parsed.header_value("Range").value_or(std::string_view {})});
     const auto date_size = detail::format_http_time(std::time(nullptr), date);
-    const auto modified_size = detail::format_http_time(info.modified, modified);
     const auto mime = mime_type_from_path(mime_path);
     std::array<char, 1024> header {};
+    const auto status_text = selection.status == 304 ? "304 Not Modified" :
+        selection.status == 206 ? "206 Partial Content" :
+        selection.status == 416 ? "416 Range Not Satisfiable" : "200 OK";
     const int header_size = std::snprintf(
         header.data(), header.size(),
-        "HTTP/1.1 200 OK\r\nDate: %.*s\r\nLast-Modified: %.*s\r\n"
-        "Content-Length: %jd\r\nContent-Type: %.*s\r\n"
+        "HTTP/1.1 %s\r\nDate: %.*s\r\nLast-Modified: %.*s\r\n"
+        "ETag: %.*s\r\nAccept-Ranges: bytes\r\n"
+        "Content-Length: %llu\r\nContent-Type: %.*s\r\n%s%.*s%s"
         "Connection: %s\r\n\r\n",
+        status_text,
         static_cast<int>(date_size), date.data(),
-        static_cast<int>(modified_size), modified.data(),
-        static_cast<std::intmax_t>(info.size),
+        static_cast<int>(selection.modified_size), selection.modified.data(),
+        static_cast<int>(selection.etag_size), selection.etag.data(),
+        static_cast<unsigned long long>(selection.length),
         static_cast<int>(mime.size()), mime.data(),
+        selection.content_range_size == 0 ? "" : "Content-Range: ",
+        static_cast<int>(selection.content_range_size), selection.content_range.data(),
+        selection.content_range_size == 0 ? "" : "\r\n",
         close_after_response_ ? "close" : "keep-alive");
     if (header_size < 0 || static_cast<std::size_t>(header_size) >= header.size()) {
         descriptor.reset();
@@ -229,7 +245,7 @@ auto session::serve_file(unique_fd descriptor, const detail::file_info& info,
     }
 
     const auto body_size = headers_only ? std::size_t {0}
-                                        : static_cast<std::size_t>(info.size);
+                                        : static_cast<std::size_t>(selection.length);
     const auto header_length = static_cast<std::size_t>(header_size);
     if (body_size > (std::numeric_limits<std::size_t>::max)() - header_length) {
         descriptor.reset();
@@ -243,14 +259,15 @@ auto session::serve_file(unique_fd descriptor, const detail::file_info& info,
         send_response(std::span {header}.first(header_length));
         file_ = std::move(descriptor);
         file_size_ = body_size;
+        file_offset_ = selection.offset;
         return;
     }
 
     try {
         auto response = allocate_response(response_size);
         std::memcpy(response.data(), header.data(), header_length);
-        if (!headers_only && !detail::read_file(descriptor.get(), std::as_writable_bytes(
-                response.subspan(header_length, body_size)))) {
+        if (!headers_only && !detail::read_file_at(descriptor.get(), selection.offset,
+                std::as_writable_bytes(response.subspan(header_length, body_size)))) {
             descriptor.reset();
             file_output_.reset();
             file_output_size_ = 0;
@@ -395,6 +412,7 @@ auto session::finish_response() -> void
     static_response_ = {};
     file_.reset();
     file_size_ = 0;
+    file_offset_ = 0;
     if (close_after_response_) {
         closed_ = true;
         return;
