@@ -65,6 +65,16 @@ public:
             return std::unexpected(connection_error::output_too_small);
         fields.kind = level == tls_level::initial ? packet_kind::initial :
             level == tls_level::handshake ? packet_kind::handshake : packet_kind::short_header;
+        payload_limit_ = payload_limit;
+        if (level == tls_level::initial) {
+            // Retry tokens consume Initial wire space. Split CRYPTO across
+            // packets rather than selecting a chunk that cannot fit afterward.
+            const auto overhead = 7 + fields.destination_cid.size() + fields.source_cid.size() +
+                varint_size(fields.token.size()) + fields.token.size() + 2 + fields.packet_number_length + 16;
+            if (overhead >= maximum_packet)
+                return std::unexpected(connection_error::output_too_small);
+            payload_limit_ = std::min(payload_limit, maximum_packet - overhead);
+        }
         const auto number = connection_.core().next_packet_number(level);
         if (!number) return std::unexpected(connection_error::unavailable_keys);
         ack_generation_ = ack_pending_[index]; used_ = range_count_ = control_count_ = 0;
@@ -82,7 +92,7 @@ public:
         const auto append_controls = [&] {
         for (std::size_t i = 0; i < controls_.size(); ++i) {
             const auto& c = controls_[i];
-            if (!c.occupied || (!c.ready && !(probe && c.transmitted)) || c.level != level || used_ + c.size > payload_limit) continue;
+            if (!c.occupied || (!c.ready && !(probe && c.transmitted)) || c.level != level || used_ + c.size > payload_limit_) continue;
             std::copy_n(c.bytes.begin(), c.size, payload_.begin() + used_); used_ += c.size;
             control_indices_[control_count_++] = i; eliciting |= c.eliciting;
         }
@@ -200,9 +210,10 @@ private:
     auto discard_control(tls_level level, std::uint64_t number) noexcept -> void
     { for (auto& c : controls_) if (c.occupied && c.transmitted && c.level == level && c.sent == number) c = {}; }
     static constexpr std::size_t payload_limit = 1100;
-    auto remaining() const noexcept -> std::size_t { return used_ + 32 < payload_limit ? payload_limit-used_-32 : 0; }
+    std::size_t payload_limit_ {payload_limit};
+    auto remaining() const noexcept -> std::size_t { return used_ + 32 < payload_limit_ ? payload_limit_-used_-32 : 0; }
     auto append(const decoded_frame& frame) -> bool
-    { const auto size=encode_frame(frame,std::span(payload_).subspan(used_,payload_limit-used_)); if (!size) return false; used_+=*size; return true; }
+    { const auto size=encode_frame(frame,std::span(payload_).subspan(used_,payload_limit_-used_)); if (!size) return false; used_+=*size; return true; }
     struct control_slot { std::array<std::byte,128> bytes{}; std::size_t size{}; tls_level level{}; std::uint64_t sent{}, type{}, stream_id{}; bool occupied{}, ready{}, transmitted{}, eliciting{}; };
     bounded_connection& connection_;
     std::array<std::byte,maximum_packet> payload_{};

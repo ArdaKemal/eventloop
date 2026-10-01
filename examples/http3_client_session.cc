@@ -68,7 +68,20 @@ struct frame_reader {
     auto complete() const noexcept -> bool { return used == 0 && !payload; }
 };
 
-// One setup allocation owns all large fixed buffers and stable task handles.
+struct request_state {
+    std::uint64_t request_id {std::numeric_limits<std::uint64_t>::max()};
+    std::uint64_t request_field_size {}, received_body {};
+    std::optional<std::uint64_t> content_length;
+    bool final_headers {}, trailers {}, decoder_cancelled {};
+    unsigned informational {};
+    std::array<std::byte, 4096> request {};
+    std::array<std::byte, section_limit> headers {};
+    std::size_t header_used {};
+    std::FILE* output {};
+    task_handle<std::expected<void, std::error_code>> operation;
+};
+
+// Setup owns fixed connection buffers and one bounded array of request buffers.
 // Nothing is allocated according to lengths advertised by the peer.
 struct session {
     explicit session(quic_connection& c) noexcept : connection(c) {}
@@ -79,17 +92,18 @@ struct session {
     bool acceptor_started {}, deadline_started {}, stopping {};
     bool have_control {}, have_encoder {}, have_decoder {}, have_settings {};
     std::uint64_t peer_field_limit {std::numeric_limits<std::uint64_t>::max()};
-    std::uint64_t request_id {}, request_field_size {}, received_body {};
-    std::optional<std::uint64_t> content_length, goaway_id;
+    std::optional<std::uint64_t> goaway_id;
     std::error_code failure;
-    bool final_headers {}, trailers {}, decoder_cancelled {};
-    unsigned informational {};
-    std::array<std::byte, 4096> request {};
-    std::array<std::byte, section_limit> headers {};
+    // Header decoding is synchronous on the owning loop, so scratch is shared
+    // while encoded partial field sections remain private to each request.
     std::array<char, section_limit> strings {};
     std::array<h3::field, h3::qpack_max_fields> fields {};
     std::array<std::byte, 1024> settings {};
-    std::size_t header_used {}, settings_used {};
+    std::size_t settings_used {};
+    std::uint64_t cancellation_id {};
+    unsigned cancellation_shift {};
+    bool cancellation_pending {};
+    std::span<request_state> requests;
 
     auto fail(std::error_code error = std::make_error_code(std::errc::protocol_error)) -> void
     {
@@ -117,15 +131,15 @@ auto safe_field(const h3::field& f) -> bool
         f.name != "keep-alive" && f.name != "transfer-encoding" && f.name != "upgrade";
 }
 
-auto response_headers(session& s) -> bool
+auto response_headers(session& shared, request_state& s) -> bool
 {
-    const auto decoded = h3::qpack_decode(std::span(s.headers).first(s.header_used), s.fields, s.strings);
+    const auto decoded = h3::qpack_decode(std::span(s.headers).first(s.header_used), shared.fields, shared.strings);
     if (!decoded) return false;
     std::optional<unsigned> status;
     std::optional<std::uint64_t> length;
     bool regular = false;
     std::size_t field_size = 0;
-    for (const auto& f : std::span(s.fields).first(*decoded)) {
+    for (const auto& f : std::span(shared.fields).first(*decoded)) {
         if (!safe_field(f)) return false;
         if (f.name.size() + f.value.size() + 32 > section_limit - field_size) return false;
         field_size += f.name.size() + f.value.size() + 32;
@@ -167,7 +181,7 @@ auto response_headers(session& s) -> bool
         s.trailers = true;
         std::fprintf(stderr, "HTTP/3 trailers\n");
     }
-    for (const auto& f : std::span(s.fields).first(*decoded)) if (f.name.front() != ':')
+    for (const auto& f : std::span(shared.fields).first(*decoded)) if (f.name.front() != ':')
         std::fprintf(stderr, "%.*s: %.*s\n", static_cast<int>(f.name.size()), f.name.data(),
             static_cast<int>(f.value.size()), f.value.empty() ? "" : f.value.data());
     std::fputc('\n', stderr);
@@ -195,8 +209,12 @@ auto control_frame_end(session& s, std::uint64_t type) -> bool
     if (type == h3::goaway_frame) {
         const auto id = wire::decode_varint(bytes);
         if (!id || id->encoded_size != bytes.size() || (id->value & 3u) != 0 ||
-            (s.goaway_id && id->value > *s.goaway_id) || id->value <= s.request_id) return false;
+            (s.goaway_id && id->value > *s.goaway_id)) return false;
         s.goaway_id = id->value;
+        for (const auto& request : s.requests)
+            if (request.request_id != std::numeric_limits<std::uint64_t>::max() &&
+                request.request_id >= id->value)
+                s.fail(std::make_error_code(std::errc::operation_canceled));
     }
     return true;
 }
@@ -256,14 +274,34 @@ auto read_peer_stream(event_loop& loop, session& s, std::uint64_t id) -> task<vo
             // octet 0x20. Chunk boundaries cannot split a valid instruction.
             if (!h3::qpack_validate_encoder_instructions(bytes)) { s.fail(); co_return; }
         } else if (*type == 3 && !bytes.empty()) {
-            // This one-shot client uses request stream 0 and never references
-            // the dynamic table. Accept its Stream Cancellation; other QPACK
-            // decoder instructions cannot be valid for this request.
-            if (s.request_id != 0 || s.decoder_cancelled || bytes.size() != 1 ||
-                bytes.front() != std::byte{0x40}) {
-                s.fail(); co_return;
+            // The static encoder never needs acknowledgements. Cancellation
+            // is accepted only for an existing request and once per request.
+            for (auto byte : bytes) {
+                const auto instruction = std::to_integer<unsigned>(byte);
+                if (!s.cancellation_pending) {
+                    if ((instruction & 0xc0) != 0x40) { s.fail(); co_return; }
+                    s.cancellation_id = instruction & 0x3f;
+                    s.cancellation_shift = 0;
+                    s.cancellation_pending = s.cancellation_id == 0x3f;
+                    if (s.cancellation_pending) continue;
+                } else {
+                    const auto part = static_cast<std::uint64_t>(instruction & 0x7f);
+                    if (s.cancellation_shift > 56 ||
+                        part > ((((std::uint64_t{1} << 62) - 1) - s.cancellation_id) >> s.cancellation_shift)) {
+                        s.fail(); co_return;
+                    }
+                    s.cancellation_id += part << s.cancellation_shift;
+                    s.cancellation_shift += 7;
+                    if (instruction & 0x80) continue;
+                    s.cancellation_pending = false;
+                }
+                auto request = std::find_if(s.requests.begin(), s.requests.end(),
+                    [&](const request_state& r) { return r.request_id == s.cancellation_id; });
+                if (request == s.requests.end() || request->decoder_cancelled) {
+                    s.fail(); co_return;
+                }
+                request->decoder_cancelled = true;
             }
-            s.decoder_cancelled = true;
         }
         // Unknown uni stream types are drained and ignored in fixed storage.
     }
@@ -315,7 +353,7 @@ auto write_all(event_loop& loop, session& s, std::uint64_t id,
     co_return std::expected<void, std::error_code>{};
 }
 
-auto exchange(event_loop& loop, session& s, std::string_view authority, std::string_view path)
+auto setup(event_loop& loop, session& s)
     -> task<std::expected<void, std::error_code>>
 {
     if (s.failure || !s.connection.valid())
@@ -349,83 +387,125 @@ auto exchange(event_loop& loop, session& s, std::string_view authority, std::str
             co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
     }
     if (s.failure) co_return std::unexpected(s.failure);
+    co_return std::expected<void, std::error_code>{};
+}
+
+auto exchange(event_loop& loop, session& s, request_state& r,
+    std::string_view authority, std::string_view path)
+    -> task<std::expected<void, std::error_code>>
+{
+    const auto reject = [&s](std::error_code error) -> std::expected<void, std::error_code> {
+        s.fail(error);
+        return std::unexpected(error);
+    };
     const std::array<h3::field, 5> request {{{":method", "GET"}, {":scheme", "https"},
         {":authority", authority}, {":path", path}, {"user-agent", "eventloop-http3-example"}}};
-    for (const auto& f : request) s.request_field_size += f.name.size() + f.value.size() + 32;
-    if (s.request_field_size > s.peer_field_limit)
-        co_return std::unexpected(std::make_error_code(std::errc::message_size));
-    const auto qpack_size = h3::qpack_encode(request, std::span(s.request).subspan(16));
-    if (!qpack_size) co_return std::unexpected(std::make_error_code(std::errc::message_size));
+    for (const auto& f : request) r.request_field_size += f.name.size() + f.value.size() + 32;
+    if (r.request_field_size > s.peer_field_limit)
+        co_return reject(std::make_error_code(std::errc::message_size));
+    const auto qpack_size = h3::qpack_encode(request, std::span(r.request).subspan(16));
+    if (!qpack_size) co_return reject(std::make_error_code(std::errc::message_size));
     const auto request_size = h3::encode_frame(h3::headers_frame,
-        std::span(s.request).subspan(16, *qpack_size), s.request);
-    if (!request_size) co_return std::unexpected(std::make_error_code(std::errc::message_size));
-    stream = flatten_result(co_await s.connection.async_open_stream(quic_stream_direction::bidirectional));
-    if (!stream) co_return std::unexpected(stream.error());
-    s.request_id = *stream;
-    written = flatten_result(co_await write_all(loop, s, *stream, std::span(s.request).first(*request_size), true));
-    if (!written) co_return std::unexpected(written.error());
+        std::span(r.request).subspan(16, *qpack_size), r.request);
+    if (!request_size) co_return reject(std::make_error_code(std::errc::message_size));
+    auto stream = flatten_result(co_await s.connection.async_open_stream(quic_stream_direction::bidirectional));
+    if (!stream) co_return reject(stream.error());
+    r.request_id = *stream;
+    if (s.goaway_id && *stream >= *s.goaway_id)
+        co_return reject(std::make_error_code(std::errc::operation_canceled));
+    auto written = flatten_result(co_await write_all(loop, s, *stream, std::span(r.request).first(*request_size), true));
+    if (!written) co_return reject(written.error());
     std::array<std::byte, 256> buffer {};
     frame_reader frames;
     for (;;) {
         if (s.failure || !s.connection.valid())
-            co_return std::unexpected(s.failure ? s.failure : make_error_code(quic_errc::peer_closed));
+            co_return reject(s.failure ? s.failure : make_error_code(quic_errc::peer_closed));
         const auto count = flatten_result(co_await s.connection.async_read(*stream, buffer));
-        if (!count) co_return std::unexpected(count.error());
+        if (!count) co_return reject(count.error());
         if (*count == 0) break;
         const auto ok = frames.feed(std::span(buffer).first(*count),
             [&](std::uint64_t f, std::uint64_t n) {
                 if (f == h3::headers_frame) {
-                    if (s.trailers || n > s.headers.size()) return false;
-                    s.header_used = 0;
+                    if (r.trailers || n > r.headers.size()) return false;
+                    r.header_used = 0;
                 } else if (f == h3::data_frame) {
-                    if (!s.final_headers || s.trailers || n > body_limit - s.received_body ||
-                        (s.content_length && n > *s.content_length - s.received_body)) return false;
+                    if (!r.final_headers || r.trailers || n > body_limit - r.received_body ||
+                        (r.content_length && n > *r.content_length - r.received_body)) return false;
                 } else if (h3::known_frame_type(f) || n > body_limit) return false;
                 return true;
             },
             [&](std::uint64_t f, std::span<const std::byte> part) {
                 if (f == h3::headers_frame) {
-                    std::copy(part.begin(), part.end(), s.headers.begin() + static_cast<std::ptrdiff_t>(s.header_used));
-                    s.header_used += part.size();
+                    std::copy(part.begin(), part.end(), r.headers.begin() + static_cast<std::ptrdiff_t>(r.header_used));
+                    r.header_used += part.size();
                 } else if (f == h3::data_frame) {
-                    if (std::fwrite(part.data(), 1, part.size(), stdout) != part.size()) return false;
-                    s.received_body += part.size();
+                    if (std::fwrite(part.data(), 1, part.size(), r.output) != part.size()) return false;
+                    r.received_body += part.size();
                 }
                 return true;
-            }, [&](std::uint64_t f) { return f != h3::headers_frame || response_headers(s); });
+            }, [&](std::uint64_t f) { return f != h3::headers_frame || response_headers(s, r); });
         if (!ok) {
-            co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
+            co_return reject(std::make_error_code(std::errc::protocol_error));
         }
     }
-    if (!frames.complete() || !s.final_headers ||
-        (s.content_length && *s.content_length != s.received_body)) {
-        co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
+    if (!frames.complete() || !r.final_headers ||
+        (r.content_length && *r.content_length != r.received_body)) {
+        co_return reject(std::make_error_code(std::errc::protocol_error));
     }
-    if (std::fflush(stdout) != 0) co_return std::unexpected(std::make_error_code(std::errc::io_error));
+    if (std::fflush(r.output) != 0) co_return reject(std::make_error_code(std::errc::io_error));
     co_return std::expected<void, std::error_code>{};
 }
 } // namespace
 
-auto perform_get(eventloop::event_loop& loop, eventloop::quic_connection& connection,
-    std::string_view authority, std::string_view path)
+auto perform_gets(eventloop::event_loop& loop, eventloop::quic_connection& connection,
+    std::string_view authority, std::span<const get_request> requests)
     -> eventloop::task<std::expected<void, std::error_code>>
 {
-    if (!connection.valid() || authority.empty() || path.empty() || path.front() != '/' ||
-        authority.size() > 512 || path.size() > 2048)
+    if (!connection.valid() || authority.empty() || authority.size() > 512 ||
+        requests.empty() || requests.size() > max_requests)
         co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
-    for (const auto text : {authority, path}) for (const auto c : text)
-        if (static_cast<unsigned char>(c) <= 0x20 || static_cast<unsigned char>(c) == 0x7f)
+    for (const auto& request : requests) {
+        const auto path = request.path;
+        if (path.empty() || path.front() != '/' || path.size() > 2048 || !request.output)
             co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+        for (const auto text : {authority, path}) for (const auto c : text)
+            if (static_cast<unsigned char>(c) <= 0x20 || static_cast<unsigned char>(c) == 0x7f)
+                co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+    }
     // String views supplied by the caller must live until this task returns.
     std::unique_ptr<session> state(new (std::nothrow) session(connection));
     if (!state) co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+    std::unique_ptr<request_state[]> request_states(new (std::nothrow) request_state[requests.size()]);
+    if (!request_states) co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
     auto& s = *state;
+    s.requests = std::span(request_states.get(), requests.size());
     s.deadline_started = loop.spawn(timeout(loop, s), s.deadline) == task_spawn_result::accepted;
     s.acceptor_started = loop.spawn(accept_peer_streams(loop, s), s.acceptor) == task_spawn_result::accepted;
     std::expected<void, std::error_code> result;
     if (!s.deadline_started || !s.acceptor_started)
         result = std::unexpected(std::make_error_code(std::errc::not_enough_memory));
-    else result = flatten_result(co_await exchange(loop, s, authority, path));
+    else result = flatten_result(co_await setup(loop, s));
+    std::size_t started = 0;
+    if (result) {
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            auto& r = s.requests[i];
+            r.output = requests[i].output;
+            if (loop.spawn(exchange(loop, s, r, authority, requests[i].path), r.operation) !=
+                task_spawn_result::accepted) {
+                result = std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+                s.fail(result.error());
+                break;
+            }
+            ++started;
+        }
+    }
+    for (std::size_t i = 0; i < started; ++i) {
+        const auto completed = flatten_result(co_await s.requests[i].operation);
+        if (!completed && result) {
+            result = std::unexpected(completed.error());
+            s.fail(completed.error());
+        }
+    }
     if (s.failure) result = std::unexpected(s.failure);
     s.stopping = true;
     connection.close();
@@ -436,5 +516,13 @@ auto perform_get(eventloop::event_loop& loop, eventloop::quic_connection& connec
     }
     if (s.deadline_started) { (void)s.deadline.cancel(); (void)co_await s.deadline; }
     co_return result;
+}
+
+auto perform_get(eventloop::event_loop& loop, eventloop::quic_connection& connection,
+    std::string_view authority, std::string_view path)
+    -> eventloop::task<std::expected<void, std::error_code>>
+{
+    const std::array<get_request, 1> requests {{{path, stdout}}};
+    co_return flatten_result(co_await perform_gets(loop, connection, authority, requests));
 }
 } // namespace http3_client_example

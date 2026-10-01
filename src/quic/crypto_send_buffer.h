@@ -54,6 +54,18 @@ public:
         flags_.fill(0);
     }
 
+    // Retry occurs before any authenticated response can acknowledge CRYPTO.
+    // Preserve the exact TLS bytes while making the whole first flight pending.
+    [[nodiscard]] constexpr auto retransmit_initial() noexcept -> bool
+    {
+        if (base_ != 0) return false;
+        for (auto offset = base_; offset < end_; ++offset)
+            if (flags_[offset % Capacity] & acked_flag) return false;
+        for (auto offset = base_; offset < end_; ++offset)
+            flags_[offset % Capacity] = pending_flag;
+        return true;
+    }
+
     // Returns the offset assigned to the first appended byte. Failure leaves
     // both offsets and contents unchanged.
     [[nodiscard]] constexpr auto append(std::span<const std::byte> data) noexcept

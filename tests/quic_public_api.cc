@@ -211,6 +211,10 @@ auto scenario(quic_version version, const std::filesystem::path& certificate,
     if (small_windows) {
         server_options.limits.max_data = client_options.limits.max_data = 1024;
         server_options.limits.max_stream_data = client_options.limits.max_stream_data = 512;
+        // Oversized requested counts must be capped before serialization and
+        // accepted by the bounded connection on both sides of the handshake.
+        server_options.limits.max_streams_bidi = client_options.limits.max_streams_bidi = UINT64_MAX;
+        server_options.limits.max_streams_uni = client_options.limits.max_streams_uni = UINT64_MAX;
     }
 
     quic_endpoint server(loop, ip_endpoint::loopback_v4(0),

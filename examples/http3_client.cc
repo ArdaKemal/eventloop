@@ -48,7 +48,8 @@ auto deadline(event_loop& loop, request_state& state,
 
 auto fetch(event_loop& loop, http_client_example::url_parts url,
            quic_version version, const std::filesystem::path& ca_file,
-           request_state& state, bool& success) -> task<void>
+           request_state& state, bool& success,
+           std::span<const http3_client_example::get_request> requests) -> task<void>
 {
     try {
         const auto addresses = co_await run_blocking(
@@ -104,8 +105,8 @@ auto fetch(event_loop& loop, http_client_example::url_parts url,
             }
 
             auto connection = std::move(**connected);
-            const auto response = co_await http3_client_example::perform_get(
-                loop, connection, url.host_header, url.target);
+            const auto response = co_await http3_client_example::perform_gets(
+                loop, connection, url.host_header, requests);
             success = response && response->has_value();
             if (!success) {
                 std::cerr << "HTTP/3 exchange failed: "
@@ -128,14 +129,15 @@ auto fetch(event_loop& loop, http_client_example::url_parts url,
 
 auto run_request(event_loop& loop, http_client_example::url_parts url,
                  quic_version version, std::filesystem::path ca_file,
-                 std::chrono::milliseconds duration, bool& success) -> task<void>
+                 std::chrono::milliseconds duration, bool& success,
+                 std::span<const http3_client_example::get_request> requests) -> task<void>
 {
     request_state state;
     task_handle<void> operation, timer;
     const auto timer_started = loop.spawn(deadline(loop, state, duration), timer) ==
                               task_spawn_result::accepted;
     const auto operation_started = timer_started &&
-        loop.spawn(fetch(loop, std::move(url), version, ca_file, state, success), operation) ==
+        loop.spawn(fetch(loop, std::move(url), version, ca_file, state, success, requests), operation) ==
             task_spawn_result::accepted;
     if (operation_started) (void)co_await operation;
     if (timer_started) {
@@ -154,9 +156,12 @@ auto main(int argc, char* argv[]) -> int
     std::filesystem::path ca_file;
     std::chrono::milliseconds duration {30000};
     const char* input = nullptr;
+    std::array<http3_client_example::get_request, http3_client_example::max_requests> requests {};
+    std::size_t request_count = 0;
+    std::filesystem::path output_directory;
     const auto usage = [] {
         std::cerr << "usage: http3_client [--version v1|v2] [--ca-file PEM] "
-                     "[--timeout-ms 1..3600000] <https:// URL>\n";
+                     "[--timeout-ms 1..3600000] [--request-path PATH ... --output-dir DIR] <https:// URL>\n";
     };
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
@@ -174,12 +179,17 @@ auto main(int argc, char* argv[]) -> int
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
                 milliseconds == 0 || milliseconds > 3600000) { usage(); return 2; }
             duration = std::chrono::milliseconds(milliseconds);
+        } else if (argument == "--request-path" && index + 1 < argc) {
+            if (request_count == requests.size()) { usage(); return 2; }
+            requests[request_count++].path = argv[++index];
+        } else if (argument == "--output-dir" && index + 1 < argc) {
+            output_directory = argv[++index];
         } else if (argument.starts_with("--") || input) {
             usage();
             return 2;
         } else input = argv[index];
     }
-    if (!input) { usage(); return 2; }
+    if (!input || (request_count && output_directory.empty())) { usage(); return 2; }
     try {
 #ifdef _WIN32
         if (::_setmode(::_fileno(stdout), _O_BINARY) == -1)
@@ -191,12 +201,34 @@ auto main(int argc, char* argv[]) -> int
             std::cerr << "HTTP/3 requires an https:// URL\n";
             return 2;
         }
+        struct outputs {
+            std::array<std::FILE*, http3_client_example::max_requests> files {};
+            ~outputs() { for (auto* file : files) if (file) std::fclose(file); }
+        } owned_outputs;
+        if (request_count == 0) {
+            request_count = 1;
+            requests[0] = {url.target, stdout};
+        } else {
+            std::filesystem::create_directories(output_directory);
+            for (std::size_t i = 0; i < request_count; ++i) {
+                const auto filename = output_directory / (std::to_string(i) + ".body");
+#ifdef _WIN32
+                auto* file = ::_wfopen(filename.c_str(), L"wb");
+#else
+                auto* file = std::fopen(filename.c_str(), "wb");
+#endif
+                if (!file) throw std::system_error(errno, std::generic_category(), "open response output");
+                owned_outputs.files[i] = file;
+                requests[i].output = file;
+            }
+        }
         event_loop_options options;
         options.worker_count = 1;
         event_loop loop(options);
         bool success = false;
-        if (loop.spawn(run_request(loop, std::move(url), version,
-                                  std::move(ca_file), duration, success)) !=
+        if (loop.spawn(run_request(loop, url, version,
+                                  std::move(ca_file), duration, success,
+                                  std::span(requests).first(request_count))) !=
             task_spawn_result::accepted)
             throw std::runtime_error("cannot start HTTP/3 client task");
         if (loop.run() == event_loop_result::interrupted) {

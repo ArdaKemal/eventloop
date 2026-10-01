@@ -42,7 +42,7 @@ struct contexts {
 
 
 static constexpr std::array<std::uint8_t, 4> protocol {'t','e','s','t'};
-static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,1,32,9,1,32,0x20,2,0x44,0xb0};
+static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,1,32,9,1,8,0x20,2,0x44,0xb0};
 static constexpr std::array<std::uint8_t, 8> dcid {1,2,3,4,5,6,7,8};
 static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcept
 {
@@ -66,8 +66,31 @@ static auto receiver(event_loop&,udp_endpoint& endpoint) -> task<void>
 { (void)co_await endpoint.run(); }
 static auto drive(event_loop&,connection_driver& driver,bool& clean) -> task<void>
 { const auto result=co_await driver.run(); clean=result && result->has_value(); if (!clean) std::fprintf(stderr,"driver failure %d\n", result ? static_cast<int>(result->error()) : -1); }
+static auto queue_peer_close(bounded_connection& server,udp_endpoint& client_endpoint,
+                             ip_endpoint server_peer) -> void
+{
+    // Queue a close and another authenticated packet before the client
+    // pump runs. The second packet must not turn peer closure into an
+    // invalid-state driver failure or cause another transmission.
+    buffers buffer;
+    protected_packet_fields fields; fields.kind=packet_kind::short_header;
+    fields.destination_cid=dcid;
+    for (const auto type : {0x1cU,0x01U}) {
+        decoded_frame frame; frame.type=type;
+        const auto encoded=encode_frame(frame,std::as_writable_bytes(std::span(buffer.frame)));
+        check(encoded.has_value());
+        const auto built=server.core().build(fields,std::span(buffer.frame).first(*encoded),
+            buffer.encoded,buffer.build_scratch);
+        check(built.has_value());
+        const auto dispatched=client_endpoint.router().dispatch(
+            std::as_bytes(std::span(buffer.encoded).first(*built)),
+            server_peer);
+        check(dispatched && *dispatched==1);
+    }
+}
 static auto observe(event_loop& loop,bounded_connection& client,bounded_connection& server,
-    connection_driver& client_driver,connection_driver& server_driver,bool& delivered) -> task<void>
+    connection_driver& client_driver,connection_driver& server_driver,
+    udp_endpoint& client_endpoint,ip_endpoint server_peer,bool& delivered) -> task<void>
 {
     std::optional<std::uint64_t> id;
     constexpr std::array<std::byte,3> data{std::byte{1},std::byte{2},std::byte{3}};
@@ -84,9 +107,15 @@ static auto observe(event_loop& loop,bounded_connection& client,bounded_connecti
         }
         if (co_await sleep_for(loop,1ms)!=timer_wait_result::expired) co_return;
     }
-    client_driver.stop(); server_driver.stop();
+    if (delivered) queue_peer_close(server,client_endpoint,server_peer);
+    else client_driver.stop();
+    server_driver.stop();
     // Drivers must retire their pending sends before endpoint shutdown.
     (void)co_await sleep_for(loop,10ms);
+    if (delivered) {
+        check(client_driver.retired());
+        check(client.core().state()==connection_state::draining);
+    }
     loop.shutdown(event_loop::clock::duration::zero());
 }
 int main()
@@ -112,7 +141,7 @@ int main()
         check(loop.spawn(receiver(loop,server_endpoint))==task_spawn_result::accepted);
         check(loop.spawn(drive(loop,*client_driver,client_clean))==task_spawn_result::accepted);
         check(loop.spawn(drive(loop,*server_driver,server_clean))==task_spawn_result::accepted);
-        check(loop.spawn(observe(loop,*client,*server,*client_driver,*server_driver,delivered))==task_spawn_result::accepted);
+        check(loop.spawn(observe(loop,*client,*server,*client_driver,*server_driver,client_endpoint,server_endpoint.local_endpoint(),delivered))==task_spawn_result::accepted);
         (void)loop.run();
         if (!delivered) std::fprintf(stderr,"delivery failure state %d/%d dropped %zu/%zu\n",static_cast<int>(client->core().state()),static_cast<int>(server->core().state()),client_driver->dropped_packets(),server_driver->dropped_packets()); check(delivered && client_clean && server_clean);
         check(loop.coroutine_statistics().live==0);

@@ -42,7 +42,7 @@ struct contexts {
 
 
 static constexpr std::array<std::uint8_t, 4> protocol {'t','e','s','t'};
-static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,1,32,9,1,32,0x20,2,0x44,0xb0};
+static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,1,32,9,1,8,0x20,2,0x44,0xb0};
 static constexpr std::array<std::uint8_t, 8> dcid {1,2,3,4,5,6,7,8};
 static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcept
 {
@@ -95,6 +95,15 @@ static auto transfer(bounded_connection& sender, bounded_connection& receiver,
 int main()
 {
     contexts context;
+    for (const auto index : {21u, 24u}) {
+        auto unsafe = parameters;
+        unsafe[index] = index == 21 ? 33 : 9;
+        connection_callbacks callbacks {nullptr, valid_parameters, nullptr};
+        auto connection = std::make_unique<bounded_connection>(endpoint_role::client, callbacks);
+        const auto initialized = connection->initialize(context.client.get(),
+            {false,"localhost",protocol,unsafe},version_1,dcid);
+        check(!initialized && initialized.error() == connection_error::invalid_configuration);
+    }
     // Internal callers must not bypass the endpoint's storage caps by passing
     // raw transport parameters with an unsafe stream or connection window.
     for (const auto index : {8u, 12u, 16u}) {
@@ -307,6 +316,82 @@ int main()
         check(client->cancel_path_candidate().has_value());
         check(client->path_recovery().active_handle() == 1 &&
               client->path_recovery().find(2) == nullptr);
+
+        // Filling local lifetime quotas must leave every advertised peer slot
+        // available, for both initiators and directions. Higher peer IDs arrive
+        // first so implicit opening cannot hide an admission failure later.
+        const auto deliver_frame = [&](bounded_connection& sender,
+                                       bounded_connection& receiver,
+                                       const decoded_frame& frame) {
+            const auto size = encode_frame(frame,
+                std::as_writable_bytes(std::span(buffer.frame)));
+            check(size.has_value());
+            protected_packet_fields packet;
+            packet.kind = packet_kind::short_header; packet.destination_cid = dcid;
+            const auto encoded = sender.core().build(packet,
+                std::span(buffer.frame).first(*size), buffer.encoded, buffer.build_scratch);
+            check(encoded.has_value());
+            return receiver.receive(std::span(buffer.encoded).first(*encoded), 0,
+                dcid.size(), buffer.packet_scratch, buffer.plaintext,
+                buffer.auth_scratch, now, std::chrono::milliseconds(10));
+        };
+        // Even larger authenticated peer grants cannot expand local storage or
+        // consume the independently reserved peer slots.
+        for (const auto type : {0x12u, 0x13u}) {
+            decoded_frame grant; grant.type = type; grant.limit = 100;
+            check(deliver_frame(*server, *client, grant).has_value());
+            check(deliver_frame(*client, *server, grant).has_value());
+        }
+        const auto opened_before = client->streams().local_opened(stream_direction::bidirectional);
+        check(!client->open_stream(stream_direction::bidirectional));
+        check(client->streams().local_opened(stream_direction::bidirectional) == opened_before);
+        for (auto* connection : {client.get(), server.get()}) {
+            while (connection->streams().local_opened(stream_direction::bidirectional) <
+                   bounded_connection::bidi_stream_capacity)
+                check(connection->open_stream(stream_direction::bidirectional).has_value());
+            for (std::size_t i = 0; i < bounded_connection::uni_stream_capacity; ++i)
+                check(connection->open_stream(stream_direction::unidirectional).has_value());
+            check(!connection->open_stream(stream_direction::bidirectional));
+            check(!connection->open_stream(stream_direction::unidirectional));
+        }
+        const auto deliver_streams = [&](bounded_connection& sender,
+                                         bounded_connection& receiver,
+                                         std::uint64_t initiator) {
+            for (auto direction : {stream_direction::bidirectional,
+                                   stream_direction::unidirectional}) {
+                const auto capacity = direction == stream_direction::bidirectional
+                    ? bounded_connection::bidi_stream_capacity
+                    : bounded_connection::uni_stream_capacity;
+                for (std::size_t i = capacity; i > 0; --i) {
+                    const auto id = 4 * (i - 1) + initiator +
+                        (direction == stream_direction::unidirectional ? 2 : 0);
+                    if (receiver.stream(id)) continue; // Existing traffic above.
+                    decoded_frame stream;
+                    stream.type = 0x0b; stream.stream_id = id; stream.fin = true;
+                    check(deliver_frame(sender, receiver, stream).has_value());
+                    check(receiver.stream(id) != nullptr);
+                    check(receiver.stream(id)->receive->complete());
+                }
+            }
+        };
+        deliver_streams(*client, *server, 0);
+        deliver_streams(*server, *client, 1);
+        for (auto* connection : {client.get(), server.get()}) {
+            check(connection->streams().size() == bounded_connection::stream_capacity);
+            check(std::ranges::count_if(connection->stream_slots(),
+                [](const auto& slot) { return slot.occupied; }) ==
+                bounded_connection::stream_capacity);
+            // FIN-complete peer streams retain their lifetime reservation.
+            check(!connection->open_stream(stream_direction::bidirectional));
+            check(!connection->open_stream(stream_direction::unidirectional));
+            check(connection->core().state() == connection_state::active);
+        }
+        decoded_frame excessive;
+        excessive.type = 0x0b; excessive.fin = true;
+        excessive.stream_id = version == version_1
+            ? 4 * bounded_connection::bidi_stream_capacity
+            : 4 * bounded_connection::uni_stream_capacity + 2;
+        check(!deliver_frame(*client, *server, excessive));
     }
     std::puts("QUIC bounded connection tests passed");
 }

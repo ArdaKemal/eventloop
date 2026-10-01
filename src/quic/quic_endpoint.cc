@@ -2,6 +2,7 @@
 
 #include "quic/connection.h"
 #include "quic/connection_driver.h"
+#include "quic/retry_packet.h"
 #include "quic/stream_registry.h"
 #include "quic/transport_parameters.h"
 #include "quic/transport_parameter_validation.h"
@@ -122,6 +123,13 @@ public:
         std::size_t original_dcid_size {0};
         std::uint32_t version {version_1};
         bool client {false};
+        bool retry_used {false};
+        bool retry_pending {false};
+        std::array<std::byte, 20> retry_scid {};
+        std::size_t retry_scid_size {0};
+        // Bound accepted tokens so a restarted Initial fits the driver's packet.
+        std::array<std::uint8_t, 512> retry_token {};
+        std::size_t retry_token_size {0};
         std::array<std::uint8_t, parameter_buffer_size> parameters {};
         std::size_t parameters_size {0};
         std::array<std::uint64_t, 32> accepted_streams {};
@@ -137,6 +145,8 @@ public:
             closing = false;
             driver_finished = false;
             original_dcid_size = 0;
+            retry_used = retry_pending = false;
+            retry_scid_size = retry_token_size = 0;
             parameters_size = 0;
             accepted_count = 0;
             route = 0;
@@ -255,32 +265,12 @@ public:
             entry.clear();
             return false;
         }
-        entry.connection.emplace(endpoint_role::client,
-            connection_callbacks {&entry, validate_peer, accept_frame},
-            lifecycle_time_point::clock::now());
-        quic::detail::tls_options tls;
-        tls.server = false;
-        tls.server_name = server_name;
-        tls.alpn = {alpn_.data(), alpn_size_};
-        tls.transport_parameters = {entry.parameters.data(), entry.parameters_size};
-        if (!entry.connection->initialize(context_, tls,
-                to_internal_version(client_options_.version),
-                as_u8(std::span<const std::byte>(initial_dcid))).has_value()) {
-            entry.clear();
-            return false;
-        }
-        entry.driver.emplace(loop_, endpoint_, *entry.connection,
-            as_u8(std::span<const std::byte>(entry.local_cid)),
-            as_u8(std::span<const std::byte>(initial_dcid)), server, true);
-        entry.route = endpoint_.router().lookup(
-            std::span<const std::byte>(entry.local_cid));
-        if (entry.route == 0) {
+        if (!initialize_client(entry, as_u8(std::span<const std::byte>(initial_dcid)), server_name)) {
             entry.clear();
             return false;
         }
         if (loop_.spawn(drive(loop_, *this, entry)) !=
             task_spawn_result::accepted) {
-            (void)endpoint_.router().remove(entry.route);
             entry.clear();
             return false;
         }
@@ -306,6 +296,48 @@ public:
     std::size_t waiter_count_ {0};
 
 private:
+    static auto accept_retry(void* argument, std::span<const std::uint8_t> packet) noexcept -> bool
+    {
+        auto& entry = *static_cast<slot*>(argument);
+        if (!entry.client || entry.retry_used || entry.closing) return false;
+        const auto retry = parse_and_validate_retry_packet(packet, entry.version,
+            as_u8(std::span(entry.original_dcid).first(entry.original_dcid_size)));
+        if (!retry || !std::ranges::equal(retry->destination_cid, entry.local_cid) ||
+            retry->token.size() > entry.retry_token.size())
+            return false;
+        std::copy(retry->source_cid.begin(), retry->source_cid.end(), entry.retry_scid.begin());
+        entry.retry_scid_size = retry->source_cid.size();
+        std::ranges::copy(as_u8(retry->token), entry.retry_token.begin());
+        entry.retry_token_size = retry->token.size();
+        entry.retry_used = entry.retry_pending = true;
+        return true;
+    }
+
+    auto initialize_client(slot& entry, std::span<const std::uint8_t> dcid,
+                           std::string_view server_name) noexcept -> bool
+    {
+        entry.connection.emplace(endpoint_role::client,
+            connection_callbacks {&entry, validate_peer, accept_frame},
+            lifecycle_time_point::clock::now());
+        quic::detail::tls_options tls;
+        tls.server_name = server_name;
+        tls.alpn = {alpn_.data(), alpn_size_};
+        tls.transport_parameters = {entry.parameters.data(), entry.parameters_size};
+        if (!entry.connection->initialize(context_, tls, entry.version, dcid)) return false;
+        return initialize_client_driver(entry, dcid);
+    }
+
+    auto initialize_client_driver(slot& entry, std::span<const std::uint8_t> dcid) noexcept -> bool
+    {
+        entry.driver.emplace(loop_, endpoint_, *entry.connection,
+            as_u8(std::span<const std::byte>(entry.local_cid)), dcid, entry.peer, true);
+        entry.route = endpoint_.router().lookup(entry.local_cid);
+        entry.driver->set_retry_handler(&entry, accept_retry);
+        entry.driver->set_initial_token(std::span(entry.retry_token).first(entry.retry_token_size));
+        entry.driver->set_progress(this, &implementation::on_progress);
+        return entry.route != 0;
+    }
+
     auto common_init() noexcept -> void
     {
         const auto alpn = client_mode_ ? client_options_.alpn : server_options_.alpn;
@@ -351,14 +383,29 @@ private:
 
     static auto drive(event_loop&, implementation& self, slot& entry) -> task<void>
     {
-        const auto result = co_await entry.driver->run();
+        auto result = co_await entry.driver->run();
+        while (entry.retry_pending && result && *result && !self.closing_ && !entry.closing) {
+            // Awaited run() and its suspended sends have retired. The destructor
+            // removes the old route before new Initial keys are installed.
+            entry.driver.reset();
+            entry.route = 0;
+            entry.retry_pending = false;
+            const auto dcid = as_u8(std::span(entry.retry_scid).first(entry.retry_scid_size));
+            if (!entry.connection->apply_retry(dcid) || !self.initialize_client_driver(entry, dcid)) {
+                entry.terminal_error = make_error_code(quic_errc::tls_failure);
+                break;
+            }
+            result = co_await entry.driver->run();
+        }
         entry.driver_finished = true;
-        if (!result)
-            entry.terminal_error = detail::task_error_code(result.error());
-        else if (!*result)
-            entry.terminal_error = driver_error_code(result->error());
-        else
-            entry.terminal_error = make_error_code(quic_errc::peer_closed);
+        if (!entry.terminal_error) {
+            if (!result)
+                entry.terminal_error = detail::task_error_code(result.error());
+            else if (!*result)
+                entry.terminal_error = driver_error_code(result->error());
+            else
+                entry.terminal_error = make_error_code(quic_errc::peer_closed);
+        }
         entry.closing = true;
         // run() has retired before resuming this wrapper. Reap before waking:
         // resumed operations may close and destroy the endpoint inline.
@@ -453,6 +500,8 @@ private:
         seen.peer_role = peer_role;
         seen.peer_first_initial_scid = *source;
         seen.original_initial_dcid = std::span(entry.original_dcid).first(entry.original_dcid_size);
+        seen.retry_used = entry.retry_used;
+        seen.retry_scid = std::span(entry.retry_scid).first(entry.retry_scid_size);
         seen.client_chosen_version = seen.negotiated_version = entry.version;
         seen.client_available_versions = available;
         return validate_peer_transport_parameters(*parameters, seen).has_value();
@@ -499,9 +548,11 @@ private:
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_stream_data_uni),
                 receive_stream_data) ||
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_streams_bidi),
-                settings.max_streams_bidi) ||
+                std::min<std::uint64_t>(settings.max_streams_bidi,
+                    bounded_connection::bidi_stream_capacity)) ||
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_streams_uni),
-                settings.max_streams_uni))
+                std::min<std::uint64_t>(settings.max_streams_uni,
+                    bounded_connection::uni_stream_capacity)))
             return false;
         if (settings.max_datagram_frame_size > 0 &&
             !add_number(static_cast<std::uint64_t>(parameter_id::max_datagram_frame_size),

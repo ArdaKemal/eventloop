@@ -59,6 +59,10 @@ public:
     // Inspect before build(); successful build() consumes this number.
     [[nodiscard]] auto next_packet_number(tls_level) const noexcept
         -> std::optional<std::uint64_t>;
+    // Apply a validated Retry before any authenticated response, preserving
+    // TLS's exact ClientHello and the Initial packet-number send sequence.
+    [[nodiscard]] auto apply_retry(std::span<const std::uint8_t>)
+        -> std::expected<void, connection_error>;
     [[nodiscard]] auto initiate_key_update(lifecycle_time_point, lifecycle_duration)
         -> std::expected<void, key_update_error>;
     // ACKs must first be checked against successfully transmitted history.
@@ -171,6 +175,7 @@ private:
     bool peer_initial_source_cid_seen_ {false};
     lifecycle_duration local_idle_timeout_ {};
     bool initialized_ {false};
+    bool retry_applied_ {false};
     bool confirmed_ {false};
     // RFC 9287 QUIC-bit greasing. A xorshift stream seeded once avoids a CSPRNG
     // call per packet; the bit is not security sensitive.

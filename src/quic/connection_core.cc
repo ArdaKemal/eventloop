@@ -188,6 +188,28 @@ auto connection_core::next_packet_number(tls_level level) const noexcept
     return next_packet_number_[index(level)];
 }
 
+auto connection_core::apply_retry(std::span<const std::uint8_t> dcid)
+    -> std::expected<void, connection_error>
+{
+    check_owner();
+    if (!initialized_ || failure_ || role_ != endpoint_role::client || retry_applied_ ||
+        peer_initial_source_cid_seen_ || dcid.size() > 20 ||
+        keys_available(tls_level::handshake,tls_direction::read) ||
+        keys_available(tls_level::application,tls_direction::read))
+        return std::unexpected(connection_error::invalid_state);
+    const auto secrets = derive_initial_secrets(version_, dcid);
+    if (!secrets) return std::unexpected(connection_error::provider_failure);
+    const auto client = derive_aes_128_gcm_keys(version_, secrets->client);
+    const auto server = derive_aes_128_gcm_keys(version_, secrets->server);
+    if (!client || !server) return std::unexpected(connection_error::provider_failure);
+    if (!output_[0].retransmit_initial())
+        return std::unexpected(connection_error::invalid_state);
+    keys_[0][0] = *server;
+    keys_[0][1] = *client;
+    retry_applied_ = true;
+    return {};
+}
+
 auto connection_core::initiate_key_update(lifecycle_time_point now, lifecycle_duration pto)
     -> std::expected<void, key_update_error>
 {

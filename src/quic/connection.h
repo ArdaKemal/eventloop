@@ -20,9 +20,14 @@ namespace eventloop::quic::detail {
 // Control-frame retransmission, migration and key updates remain endpoint work.
 class bounded_connection {
 public:
-    static constexpr std::size_t stream_capacity = 32;
+    // Each initiator has a lifetime reservation, across both directions. Local
+    // opens cannot consume storage promised to the peer in transport parameters.
+    static constexpr std::size_t bidi_stream_capacity = 32;
+    static constexpr std::size_t uni_stream_capacity = 8;
+    static constexpr std::size_t stream_capacity =
+        2 * (bidi_stream_capacity + uni_stream_capacity);
     static constexpr std::size_t stream_bytes = 4096;
-    static constexpr std::size_t receive_bytes = stream_capacity * stream_bytes;
+    static constexpr std::size_t receive_bytes = 32 * stream_bytes;
     static constexpr std::size_t packet_capacity = 128;
     static constexpr std::size_t frames_per_packet = 8;
     struct transmitted_range {
@@ -74,7 +79,8 @@ public:
         // Every byte of advertised receive credit must fit reserved storage,
         // including sparse STREAM ranges while the application is suspended.
         if (local_.data > receive_bytes || local_.bidi_local > stream_bytes ||
-            local_.bidi_remote > stream_bytes || local_.stream_uni > stream_bytes)
+            local_.bidi_remote > stream_bytes || local_.stream_uni > stream_bytes ||
+            local_.bidi > bidi_stream_capacity || local_.uni > uni_stream_capacity)
             return std::unexpected(connection_error::invalid_configuration);
         if (!registry_.set_local_limit(stream_direction::bidirectional, local_.bidi) ||
             !registry_.set_local_limit(stream_direction::unidirectional, local_.uni))
@@ -83,6 +89,17 @@ public:
         datagrams_.reset(local_.datagram);
         return core_.initialize(context, options, version, dcid);
     }
+    // Caller has retired the driver and all sends before replacing Initial keys.
+    [[nodiscard]] auto apply_retry(std::span<const std::uint8_t> dcid)
+        -> std::expected<void, connection_error>
+    {
+        check_owner();
+        if (const auto applied = core_.apply_retry(dcid); !applied) return applied;
+        if (!recovery_.reset(1200)) return std::unexpected(connection_error::invalid_state);
+        for (auto& record : sent_) record = {};
+        return {};
+    }
+
     [[nodiscard]] auto core() noexcept -> connection_core& { check_owner(); return core_; }
     [[nodiscard]] auto streams() const noexcept -> const stream_registry<stream_capacity>&
     { check_owner(); return registry_; }
@@ -131,6 +148,10 @@ public:
         check_owner();
         if (core_.state() != connection_state::active)
             return std::unexpected(connection_error::invalid_state);
+        const auto capacity = direction == stream_direction::bidirectional
+            ? bidi_stream_capacity : uni_stream_capacity;
+        if (registry_.local_opened(direction) >= capacity)
+            return std::unexpected(connection_error::capacity_exceeded);
         const auto id = registry_.open_local(direction);
         if (!id) return std::unexpected(connection_error::capacity_exceeded);
         if (!admit(*id)) return std::unexpected(connection_error::capacity_exceeded);

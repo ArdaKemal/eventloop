@@ -1,10 +1,40 @@
 # Optional outbound HTTP/3 verification
 
-The standalone `http3_client` performs one HTTPS GET over the explicitly selected
+The standalone `http3_client` performs HTTPS GETs over the explicitly selected
 QUIC version (`v1` by default). It verifies the certificate identity using system
 trust or `--ca-file PEM`. Status and headers go to stderr and the binary body goes
 to stdout. A complete HTTP 404 response is a successful exchange and exits zero;
 tests must assert the expected status separately. It does not follow redirects.
+
+Pass repeated `--request-path` arguments and `--output-dir` to issue concurrent
+GETs on a single connection. Paths use the origin from the URL; the URL's own
+path is used only when no request paths are supplied. Each request has an
+independent response parser, body accounting, coroutine, and output file
+(`0.body`, `1.body`, and so on in argument order). Connection control streams,
+SETTINGS, QPACK, and cleanup are shared once per batch.
+
+```sh
+./build/http3_client --version v2 --output-dir /tmp/http3-responses \
+  --request-path / --request-path /large https://example.org/
+```
+
+The example accepts at most 32 requests per batch, matching the transport's
+local bidirectional lifetime reservation. The transport reserves 80 total
+stream slots: 32 bidirectional and 8 unidirectional for each initiator. HTTP/3's
+local and peer control/QPACK streams use their respective unidirectional
+reservations, independently of the request streams. The peer's stream grant
+may impose a smaller request limit. The
+example closes the connection after the batch and returns an error if any
+request fails. Request and output views supplied to `perform_gets()` must remain
+valid through task completion. Payloads stream directly to each file without
+retaining complete response bodies.
+
+Stream slots remain reserved for the connection lifetime after completion or
+reset. Advertised peer limits are capped to the corresponding reservations;
+larger peer `MAX_STREAMS` grants cannot enlarge the local reservation. The
+aggregate receive-data window remains capped at 128 KiB. The former shared
+32-slot limit, which left only 26 requests after normal HTTP/3 critical streams,
+was corrected before raising this example's batch ceiling.
 
 `--timeout-ms 1..3600000` sets the overall connection/exchange deadline (default
 30000 ms). The existing HTTP session also has a 30-second response deadline.
@@ -46,6 +76,17 @@ wrong certificate IP identity, and deadlines during handshake and HTTP exchange.
 The large binary body exceeds the 4 KiB per-stream receive window and requires
 credit replenishment. All success responses are compared byte for byte, and
 server request records independently verify the path and exact wire version.
+
+The same fixture verifies 18 simultaneous requests with boundary payload sizes
+from 0 to 262,143 bytes (539,598 total bytes), then 26 and 32 requests using
+repeated sizes through 65,537 bytes (322,628 and 430,148 total bytes). Delayed
+headers and 317-byte DATA chunks force
+interleaving and completion outside request order. Server records establish one
+connection and distinct request stream IDs for each batch. Binary bodies are
+compared exactly, including zero and 0xff bytes. QPACK cancellations include
+multi-octet stream IDs split across delivery boundaries. A protocol failure in
+one request wakes a stalled sibling, and an overall deadline closes concurrent
+requests; 33 requested paths are explicitly rejected before connecting.
 
 Certificates and ports are isolated per run. The generated certificate includes
 `DNS:localhost` and `IP:127.0.0.1`; the matrix uses the numeric loopback address to
