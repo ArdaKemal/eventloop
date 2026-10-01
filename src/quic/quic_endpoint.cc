@@ -243,6 +243,7 @@ public:
     {
         entry.occupied = true;
         entry.accepted = true;
+        entry.closing = false;
         entry.generation = ++next_generation_;
         entry.terminal_error = {};
         entry.peer = server;
@@ -427,6 +428,7 @@ private:
         if (entry == nullptr) return false;
 
         entry->occupied = true;
+        entry->closing = false;
         entry->generation = ++self.next_generation_;
         entry->terminal_error = {};
         entry->peer = source;
@@ -924,6 +926,11 @@ auto quic_connection::close(std::error_code) noexcept -> void
 {
     if (!valid()) return;
     auto& slot = endpoint_->implementation_->slots_[slot_];
+    // A retired slot retains its terminal error so an old handle can observe
+    // completion. Its later cleanup must not poison a slot reused by a new
+    // connection.
+    if (!slot.occupied || !slot.connection || slot.generation != generation_)
+        return;
     slot.closing = true;
     if (slot.driver) slot.driver->stop();
 }

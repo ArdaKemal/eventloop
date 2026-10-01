@@ -217,3 +217,14 @@ back to an unbounded allocation.
   A TLS connect, handshake, read, or write error is returned directly; task
   cancellation closes the owned transport. All I/O and resumption occur on
   `loop`, and the outer task result remains distinct from the operation error.
+- `eventloop::http::http3_server` listens on a QUIC UDP endpoint with ALPN
+  `h3`, a certificate/key pair, and an owned document-root descriptor. Its
+  `run()` task accepts connections; `close()` stops acceptance and
+  `async_close()` waits for endpoint retirement. Keep the server and its
+  observed `run()` task alive until both operations complete. GET, HEAD, and
+  OPTIONS serve static files or `index.html` using the shared secure resource
+  walk. Request header blocks are capped at 16 KiB and 128 fields, dynamic
+  QPACK tables are disabled, and QUIC caps each connection at 32 peer
+  bidirectional and eight peer unidirectional streams. A request that exceeds
+  the header cap closes its connection. Directory listings, request bodies,
+  HTTP/3 server push, and WebTransport are not supported.

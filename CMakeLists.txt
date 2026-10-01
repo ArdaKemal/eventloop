@@ -49,6 +49,8 @@ if(WIN32)
         src/quic/retry_token.cc
         src/quic/tls_provider.cc
         src/quic/quic_endpoint.cc
+        src/http3/server.cc
+        src/http3/qpack.cc
         src/windows/file_operation.cc
         src/executor/single_thread_executor.cc
         src/executor/multi_thread_executor.cc
@@ -651,6 +653,8 @@ if(WIN32)
     target_include_directories(http3_client PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(http3_client PRIVATE eventloop::eventloop)
+    add_executable(http3_file_server examples/http3_file_server.cc)
+    target_link_libraries(http3_file_server PRIVATE eventloop::eventloop)
 
     add_executable(executor_benchmark benchmark/executor_benchmark.cc)
     target_link_libraries(executor_benchmark PRIVATE eventloop::eventloop)
@@ -721,6 +725,7 @@ add_library(eventloop
     include/eventloop/http/request.h
     include/eventloop/http2/client.h
     include/eventloop/http/server.h
+    include/eventloop/http/http3_server.h
     include/eventloop/http/session.h
     include/eventloop/ip_endpoint.h
     include/eventloop/tcp_acceptor.h
@@ -745,6 +750,8 @@ add_library(eventloop
     src/quic/retry_token.cc
     src/quic/tls_provider.cc
     src/quic/quic_endpoint.cc
+    src/http3/server.cc
+    src/http3/qpack.cc
     src/executor/single_thread_executor.cc
     src/executor/multi_thread_executor.cc
     src/http/directory_listing.cc
@@ -878,6 +885,9 @@ target_include_directories(http3_client PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(http3_client PRIVATE eventloop::eventloop)
 target_compile_options(http3_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+add_executable(http3_file_server examples/http3_file_server.cc)
+target_link_libraries(http3_file_server PRIVATE eventloop::eventloop)
+target_compile_options(http3_file_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(http_benchmark_server examples/http_benchmark_server.cc)
 target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
@@ -1507,6 +1517,15 @@ if(BUILD_TESTING)
                      ${CURL_EXECUTABLE}
     )
     set_tests_properties(http2_server PROPERTIES TIMEOUT 30)
+
+    add_test(
+        NAME http3_server
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http3_server.sh
+                     $<TARGET_FILE:http3_file_server>
+                     ${OPENSSL_EXECUTABLE}
+                     ${CURL_EXECUTABLE}
+    )
+    set_tests_properties(http3_server PROPERTIES TIMEOUT 30)
 endif()
 
 eventloop_register_http3_interop_tests()
