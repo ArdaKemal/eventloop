@@ -29,6 +29,11 @@ constexpr std::string_view forbidden =
     "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
 constexpr std::string_view internal_error =
     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+constexpr std::string_view directory_too_large =
+    "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n"
+    "Content-Type: text/plain\r\nContent-Length: 28\r\n\r\n"
+    "directory listing too large\n";
+static_assert(directory_too_large.ends_with(directory_listing_error_body));
 constexpr std::string_view method_not_allowed =
     "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, OPTIONS\r\nContent-Length: 0\r\n\r\n";
 constexpr std::string_view payload_too_large =
@@ -292,14 +297,15 @@ auto session::serve_file(const request& parsed, unique_fd descriptor, const deta
 
 auto session::serve_directory(unique_fd descriptor, bool headers_only) -> void
 {
+    auto listing = detail::render_directory_listing(std::move(descriptor));
+    if (!listing) {
+        close_after_response_ = true;
+        send_static_response(listing.error() == directory_listing_error::list_failed
+                                 ? internal_error
+                                 : directory_too_large);
+        return;
+    }
     try {
-        auto listing = detail::render_directory_listing(std::move(descriptor));
-        if (!listing) {
-            close_after_response_ = true;
-            send_static_response(internal_error);
-            return;
-        }
-
         const auto body_size = listing->size();
         std::array<char, 512> header {};
         const int header_size = std::snprintf(

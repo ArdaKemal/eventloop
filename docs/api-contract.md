@@ -194,6 +194,15 @@ back to an unbounded allocation.
   even if the modification time is restored. It is not a content digest;
   filesystems with coarse or synthetic change timestamps can still produce
   the same validator for different bytes.
+- Built-in directory listings list a directory's own children except `.` and
+  `..`, including hidden (dot) names, in stable byte-wise name order. Link text
+  is HTML-escaped and `href` values are percent-encoded; directories get a
+  trailing `/`. A directory with a regular `index.html` serves that file
+  instead. Listings are bounded to 4096 entries and 1 MiB of generated HTML;
+  exceeding either returns 500 with a short plain-text body. HTTP/1.1 and
+  HTTP/2 list when `server_options::directory_listing` is set; HTTP/3 lists
+  when `http3_server` is constructed with `directory_listing`. The
+  component-by-component `O_NOFOLLOW` document-root walk is unchanged.
 - Include `eventloop/http2/client.h` for one outbound HTTPS HTTP/2 request.
   `http2::async_request(loop, endpoint, context, hostname, request)` owns the
   TLS socket from connect through close. `hostname` is used for certificate
@@ -252,5 +261,6 @@ back to an unbounded allocation.
   SETTINGS are limited to 1024 payload bytes and 64 entries; malformed or
   oversized SETTINGS close the connection. Control SETTINGS are validated
   incrementally using bounded frame storage, which is released after
-  validation. Directory listings, request bodies, HTTP/3 server push, and
-  WebTransport are not supported.
+  validation. Directory listings are available when the server is constructed
+  with `directory_listing` and follow the shared bounded renderer. Request
+  bodies, HTTP/3 server push, and WebTransport are not supported.

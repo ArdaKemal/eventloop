@@ -203,7 +203,7 @@ auto read_file_at(native_socket file, std::uint64_t offset,
     return true;
 }
 
-auto list_directory(native_socket directory)
+auto list_directory(native_socket directory, std::size_t limit)
     -> std::optional<std::vector<directory_entry>>
 {
     auto path = final_path(as_handle(directory));
@@ -229,6 +229,7 @@ auto list_directory(native_socket directory)
         entries.push_back({std::move(name),
             (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
             (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0});
+        if (entries.size() > limit) return std::optional {std::move(entries)};
     } while (FindNextFileW(search, &data));
     return GetLastError() == ERROR_NO_MORE_FILES ?
         std::optional {std::move(entries)} : std::nullopt;

@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace eventloop::http {
 namespace {
@@ -142,7 +143,8 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
 }
 
 auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
-                   native_socket root, std::unique_ptr<stream_storage> storage)
+                   native_socket root, std::unique_ptr<stream_storage> storage,
+                   bool directory_listing)
     -> task<void>
 {
     auto& s = *storage;
@@ -201,6 +203,8 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     std::uint64_t offset = 0;
     detail::file_response selected;
     bool have_file = false;
+    bool have_listing = false;
+    std::vector<char> listing;
     std::string_view mime = "text/plain";
     if (method.empty() || path.empty() || scheme != "https" || authority.empty()) status = 400;
     else if (method == "OPTIONS") status = 204;
@@ -216,11 +220,28 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
             else if (info->kind == http::detail::file_info::type::directory) {
                 auto index = http::detail::open_child(file.get(), "index.html", false);
                 auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
-                if (!index_info || index_info->kind != http::detail::file_info::type::regular) status = 403;
-                else { file = std::move(index); selected = detail::choose_file_response(*index_info,
-                    {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
+                if (index_info && index_info->kind == http::detail::file_info::type::regular) {
+                    file = std::move(index);
+                    selected = detail::choose_file_response(*index_info,
+                        {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
                     size = selected.length; offset = selected.offset; status = selected.status;
-                    have_file = true; mime = http::mime_type_from_path("index.html"); }
+                    have_file = true; mime = http::mime_type_from_path("index.html");
+                } else if (!directory_listing) {
+                    status = 403;
+                } else {
+                    auto rendered = http::detail::render_directory_listing(std::move(file));
+                    if (!rendered) {
+                        status = 500;
+                        mime = "text/plain";
+                        listing.assign(directory_listing_error_body.begin(),
+                                       directory_listing_error_body.end());
+                    } else {
+                        listing = std::move(*rendered);
+                        mime = "text/html; charset=utf-8";
+                    }
+                    size = listing.size();
+                    have_listing = true;
+                }
             } else if (info->kind == http::detail::file_info::type::regular) {
                 selected = detail::choose_file_response(*info,
                     {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
@@ -229,13 +250,27 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
             } else status = 404;
         }
     }
-    if (!(co_await send_headers(loop, connection, id, status, size, mime,
-                               (status != 200 && status != 206) || method == "HEAD",
+    const bool body_expected = have_listing || (have_file && (status == 200 || status == 206));
+    const bool finish = !body_expected || method == "HEAD";
+    if (!(co_await send_headers(loop, connection, id, status, size, mime, finish,
                                s.io, have_file ? &selected : nullptr)).value_or(false)) {
         connection.close(std::make_error_code(std::errc::io_error));
         co_return;
     }
-    if ((status != 200 && status != 206) || method == "HEAD") co_return;
+    if (finish) co_return;
+    if (have_listing) {
+        std::array<std::byte, 16> frame_header {};
+        const auto header_size = h3::encode_frame_header(h3::data_frame, listing.size(), frame_header);
+        if (!header_size ||
+            !(co_await write_all(loop, connection, id,
+                    std::span(frame_header).first(*header_size), false)).value_or(false) ||
+            !(co_await write_all(loop, connection, id,
+                    std::span(reinterpret_cast<const std::byte*>(listing.data()),
+                              listing.size()), false)).value_or(false))
+            co_return;
+        (void)co_await write_all(loop, connection, id, {}, true);
+        co_return;
+    }
     std::uint64_t sent = 0;
     while (sent < size) {
         const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(s.io.size(), size - sent));
@@ -282,7 +317,7 @@ auto drain_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t
 
 auto serve_connection(event_loop& loop, quic_connection connection,
                       std::shared_ptr<unique_fd> root,
-                      stream_handlers& handlers) -> task<void>
+                      stream_handlers& handlers, bool directory_listing) -> task<void>
 {
     std::size_t used = 0;
     bool have_control = false;
@@ -313,7 +348,7 @@ auto serve_connection(event_loop& loop, quic_connection connection,
             spawned = loop.spawn(drain_peer_uni(loop, connection, id, have_control), *handlers[used]);
         } else if ((id & 3u) == 0u) {
             auto storage = std::make_unique<stream_storage>();
-            spawned = loop.spawn(serve_request(loop, connection, id, root->get(), std::move(storage)), *handlers[used]);
+            spawned = loop.spawn(serve_request(loop, connection, id, root->get(), std::move(storage), directory_listing), *handlers[used]);
         }
         if (spawned != task_spawn_result::accepted) {
             handlers[used].reset();
@@ -339,23 +374,27 @@ public:
     };
 
     implementation(event_loop& loop, ip_endpoint local, std::string_view root,
-                   std::filesystem::path cert, std::filesystem::path key)
+                   std::filesystem::path cert, std::filesystem::path key,
+                   bool directory_listing)
         : loop_(loop), root_(std::make_shared<unique_fd>(http::detail::open_root(root))),
           endpoint_(loop, local, quic_server_options{std::move(cert), std::move(key),
-              std::span(alpn_)}) {}
+              std::span(alpn_)}),
+          directory_listing_(directory_listing) {}
 
     event_loop& loop_;
     std::shared_ptr<unique_fd> root_;
     const std::array<std::uint8_t, 2> alpn_ {'h', '3'};
     quic_endpoint endpoint_;
+    bool directory_listing_ {false};
     std::array<connection_slot, max_connections> connections_;
 };
 
 http3_server::http3_server(event_loop& loop, ip_endpoint local, std::string_view root,
                            std::filesystem::path certificate_chain,
-                           std::filesystem::path private_key)
+                           std::filesystem::path private_key,
+                           bool directory_listing)
     : implementation_(std::make_unique<implementation>(loop, local, root,
-          std::move(certificate_chain), std::move(private_key))) {}
+          std::move(certificate_chain), std::move(private_key), directory_listing)) {}
 http3_server::~http3_server() = default;
 auto http3_server::local_endpoint() const noexcept -> ip_endpoint
 { return implementation_->endpoint_.local_endpoint(); }
@@ -377,7 +416,7 @@ auto http3_server::run_loop(event_loop& loop, http3_server& server) -> task<void
         if (slot == impl.connections_.end()) { accepted->close(); continue; }
         slot->handle.emplace();
         const auto spawned = loop.spawn(serve_connection(loop, std::move(*accepted), impl.root_,
-                slot->handlers), *slot->handle);
+                slot->handlers, impl.directory_listing_), *slot->handle);
         if (spawned != task_spawn_result::accepted) {
             slot->handle.reset();
             if (spawned == task_spawn_result::frame_allocation_failure) {

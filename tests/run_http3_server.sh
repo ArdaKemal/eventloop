@@ -40,13 +40,19 @@ trap cleanup EXIT INT TERM
 mkdir -p "$work_dir/www"
 printf 'http3 slot reuse\n' > "$work_dir/www/index.html"
 "$openssl" rand 65536 > "$work_dir/www/large.bin"
+mkdir -p "$work_dir/www/files" "$work_dir/www/withindex"
+printf 'z\n' > "$work_dir/www/files/z.txt"
+printf 'a\n' > "$work_dir/www/files/a&b.txt"
+printf 'h\n' > "$work_dir/www/files/.hidden"
+mkdir "$work_dir/www/files/sub"
+printf 'index body\n' > "$work_dir/www/withindex/index.html"
 "$openssl" req -x509 -newkey rsa:2048 -nodes -days 1 \
     -subj /CN=localhost -keyout "$work_dir/key.pem" \
     -out "$work_dir/cert.pem" > /dev/null 2>&1
 
 port=$((40000 + $$ % 20000))
 "$server" "$port" "$work_dir/www" "$work_dir/cert.pem" "$work_dir/key.pem" \
-    > "$work_dir/server.log" 2>&1 &
+    --directory-listing > "$work_dir/server.log" 2>&1 &
 server_pid=$!
 
 ready=false
@@ -119,4 +125,22 @@ for _ in {1..3}; do
     if grep -qi '^content-length:' "$work_dir/options.out"; then exit 1; fi
 done
 echo 'HTTP/3 regression passed: three fresh GET/HEAD/OPTIONS cycles'
+
+# Directory listings use the shared bounded renderer: stable byte-wise order,
+# hidden names included, HTML-escaped text, percent-encoded hrefs, and an
+# index.html preference.
+listing=$(
+    "$curl" --http3-only --silent --insecure --max-time 4 \
+        "https://127.0.0.1:$port/files/")
+grep -Fq 'href="a%26b.txt"' <<<"$listing"
+grep -Fq 'a&amp;b.txt' <<<"$listing"
+grep -Fq 'href="sub/"' <<<"$listing"
+grep -Fq '.hidden' <<<"$listing"
+ordered=$(grep -o '[^<>]*</a>' <<<"$listing" | sed 's#</a>$##' | paste -sd, -)
+[[ "$ordered" == '.hidden,a&amp;b.txt,sub/,z.txt' ]]
+index=$(
+    "$curl" --http3-only --silent --insecure --max-time 4 \
+        "https://127.0.0.1:$port/withindex/")
+[[ "$index" == 'index body' ]]
+echo 'HTTP/3 directory listing: PASS'
 echo 'HTTP/3 eventloop client followed by fresh curl clients: PASS'

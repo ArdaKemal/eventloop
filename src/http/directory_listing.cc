@@ -1,6 +1,7 @@
 #include "eventloop/http/directory_listing.h"
 #include "file_operations.h"
 
+#include <algorithm>
 #include <string_view>
 
 namespace eventloop::http {
@@ -57,10 +58,16 @@ auto append_html_escaped(std::vector<char>& output,
 } // namespace
 
 auto detail::render_directory_listing(unique_fd descriptor)
-    -> std::optional<std::vector<char>>
+    -> std::expected<std::vector<char>, directory_listing_error>
 {
-    auto entries = list_directory(descriptor.get());
-    if (!entries) return std::nullopt;
+    auto entries = list_directory(descriptor.get(), directory_listing_max_entries);
+    if (!entries) return std::unexpected(directory_listing_error::list_failed);
+    if (entries->size() > directory_listing_max_entries)
+        return std::unexpected(directory_listing_error::too_many_entries);
+    std::sort(entries->begin(), entries->end(),
+              [](const directory_entry& left, const directory_entry& right) {
+                  return left.name < right.name;
+              });
 
     std::vector<char> output;
     output.reserve(4096);
@@ -78,14 +85,18 @@ auto detail::render_directory_listing(unique_fd descriptor)
         append_html_escaped(output, name);
         if (is_directory) append(output, '/');
         append(output, "</a></li>\n");
+        if (output.size() > directory_listing_max_bytes)
+            return std::unexpected(directory_listing_error::too_large);
     }
 
     append(output, "</ul></body></html>\n");
+    if (output.size() > directory_listing_max_bytes)
+        return std::unexpected(directory_listing_error::too_large);
     return output;
 }
 
 auto make_directory_listing(native_socket descriptor)
-    -> std::optional<std::vector<char>>
+    -> std::expected<std::vector<char>, directory_listing_error>
 {
 #ifdef _WIN32
     return detail::render_directory_listing(

@@ -143,7 +143,19 @@ auto serve_request(session& state, request incoming, native_socket root,
     try {
         auto listing = http::make_directory_listing(descriptor.release());
         if (!listing) {
-            respond_empty(state, incoming.stream_id, 500);
+            if (listing.error() == http::directory_listing_error::list_failed) {
+                respond_empty(state, incoming.stream_id, 500);
+                return;
+            }
+            std::vector<std::byte> body(http::directory_listing_error_body.size());
+            if (!body.empty()) {
+                std::memcpy(body.data(), http::directory_listing_error_body.data(),
+                            body.size());
+            }
+            const std::array<field, 2> fields {
+                field {"content-length", std::to_string(body.size())},
+                field {"content-type", "text/plain"}};
+            (void)state.respond(incoming.stream_id, 500, fields, std::move(body));
             return;
         }
         const auto size = listing->size();

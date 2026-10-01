@@ -97,7 +97,7 @@ auto read_file_at(native_socket file, std::uint64_t position,
     return true;
 }
 
-auto list_directory(native_socket descriptor)
+auto list_directory(native_socket descriptor, std::size_t limit)
     -> std::optional<std::vector<directory_entry>>
 {
     const int duplicate = dup(descriptor);
@@ -122,6 +122,7 @@ auto list_directory(native_socket descriptor)
                                    AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(info.st_mode);
         }
         entries.push_back({entry->d_name, is_directory});
+        if (entries.size() > limit) return std::optional {std::move(entries)};
     }
 }
 

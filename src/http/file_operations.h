@@ -2,9 +2,11 @@
 
 #include "eventloop/native_socket.h"
 #include "eventloop/unique_fd.h"
+#include "eventloop/http/directory_listing.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -38,13 +40,14 @@ struct directory_entry {
     -> bool;
 [[nodiscard]] auto read_file_at(native_socket file, std::uint64_t offset,
                                 std::span<std::byte> output) noexcept -> bool;
-[[nodiscard]] auto list_directory(native_socket directory)
+[[nodiscard]] auto list_directory(native_socket directory, std::size_t limit)
     -> std::optional<std::vector<directory_entry>>;
 [[nodiscard]] auto format_http_time(std::int64_t unix_seconds,
                                     std::span<char> output) noexcept -> std::size_t;
 
 // Shared directory HTML renderer, with ownership of the directory handle.
+// Applies the directory_listing_max_* bounds and stable byte-wise name order.
 [[nodiscard]] auto render_directory_listing(unique_fd directory)
-    -> std::optional<std::vector<char>>;
+    -> std::expected<std::vector<char>, directory_listing_error>;
 
 } // namespace eventloop::http::detail

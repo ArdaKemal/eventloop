@@ -5,11 +5,15 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <string_view>
 
 auto main(int argc, char** argv) -> int
 {
-    if (argc != 5) {
-        std::fprintf(stderr, "usage: %s <port> <root> <cert.pem> <key.pem>\n", argv[0]);
+    bool directory_listing = false;
+    if (argc == 6 && std::string_view(argv[5]) == "--directory-listing") directory_listing = true;
+    else if (argc != 5) {
+        std::fprintf(stderr,
+            "usage: %s <port> <root> <cert.pem> <key.pem> [--directory-listing]\n", argv[0]);
         return 2;
     }
     unsigned port = 0;
@@ -26,7 +30,7 @@ auto main(int argc, char** argv) -> int
         eventloop::event_loop loop(options);
         eventloop::http::http3_server server(loop,
             eventloop::ip_endpoint::any_v4(static_cast<std::uint16_t>(port)),
-            argv[2], argv[3], argv[4]);
+            argv[2], argv[3], argv[4], directory_listing);
         if (loop.spawn(server.run()) != eventloop::task_spawn_result::accepted)
             return 1;
         (void)loop.run();
