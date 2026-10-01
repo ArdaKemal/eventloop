@@ -31,11 +31,13 @@ subdirectory and links `eventloop::eventloop`. No root CMake changes are needed.
 /tmp/wayfarer-build/wayfarer --http1.1 -L -i http://example.org/redirect
 /tmp/wayfarer-build/wayfarer --http2 -i -H 'Accept: text/html' https://example.org/
 /tmp/wayfarer-build/wayfarer --http3 --timeout-ms 5000 https://cloudflare.com/
+/tmp/wayfarer-build/wayfarer --http3 -L -i https://example.org/redirect
+/tmp/wayfarer-build/wayfarer --http3-v2 -X HEAD -i https://example.org/
 /tmp/wayfarer-build/wayfarer --http3-v2 --ca-file cert.pem https://127.0.0.1:4433/
 /tmp/wayfarer-build/wayfarer --fail -o page.html https://example.org/page.html
 ```
 
-`-i` includes HTTP/1.1 or HTTP/2 response headers in the output. Status and errors go
+`-i` includes HTTP/1.1, HTTP/2, or HTTP/3 response headers in the output. Status and errors go
 to stderr. `-o` writes binary response output to an exclusive sibling temporary
 file, then replaces the named file after the complete response, successful
 flush and close. A failed transfer, HTTP error with `--fail`, or failed file
@@ -61,7 +63,7 @@ HTTP/2 request task, or closing the QUIC endpoint on deadline wakes pending I/O.
 buffers that file with a 4 MiB limit. HTTP/2 streams the file with a 1 TiB
 limit set by the public API.
 
-`-L` follows up to ten HTTP/1.1 or HTTP/2 redirects. HTTP/1.1 accepts relative
+`-L` follows up to ten HTTP/1.1, HTTP/2, or HTTP/3 redirects. HTTP/1.1 and HTTP/3 accept relative
 and absolute Location values, including redirects from HTTP to HTTPS. HTTPS to
 HTTP downgrades are rejected. For 301/302, POST
 becomes GET; for 303, all methods except HEAD become GET; 307/308 preserve
@@ -77,7 +79,7 @@ existing destination intact even if earlier hops produced headers.
 | --- | --- | --- |
 | HTTP/1.1 | HTTP and HTTPS; GET, HEAD, POST and other token methods with `-X`; repeatable `-H`; `-d` or `--data-binary @FILE` body up to 4 MiB; body or headers plus body output; Content-Length, chunked, and connection-close responses; `-L` redirects | One connection per request or redirect hop; no compression decoding, proxy, cookies, multipart, or upload streaming. Response fields are capped at 64 KiB; chunk size lines at 128 bytes. Other Transfer-Encoding values fail. |
 | HTTP/2 | HTTPS methods including GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS; request headers; `-d` body up to 4 MiB; `--data-binary @FILE` streamed upload up to 1 TiB; TLS verification and ALPN `h2`; streamed stdout or `-o` output; `-i` streams headers, body, and trailers; `-L` follows redirects | One connection per request or redirect hop. The sink API accepts up to 1 TiB of response DATA. Header blocks are limited to 64 KiB and 128 fields; incoming frames to 16 KiB. No cleartext h2c, connection reuse, or push. Capacity and protocol errors come from the public API. |
-| HTTP/3 | HTTPS GET over public QUIC v1 or v2; TLS verification; body output | Request HEADERS are capped at 4 KiB. The response parser accepts a static QPACK `:status` as the first field, including literal decimal Huffman status values; other QPACK forms fail. Each complete response frame is capped at 64 KiB and total DATA at 16 MiB. Custom method, headers, body and `-i` fail at argument parsing. No redirect following, push, dynamic QPACK, trailers, or response field reporting. |
+| HTTP/3 | HTTPS GET and HEAD over public QUIC v1 or v2; TLS verification; body output; `-i` response fields; `-L` follows up to ten 301/302/303/307/308 redirects | Request HEADERS are capped at 4 KiB. Response fields accept static QPACK indexed fields, static-name literal values, and literal names and values, including fixed Huffman encoding. Field sections are capped at 64 KiB and 128 decoded fields; each complete response frame is capped at 64 KiB and total DATA at 16 MiB. A present Content-Length is checked against the received DATA, so truncated or overlong bodies fail. Custom methods, request headers, and request bodies fail at argument parsing. Dynamic QPACK and trailers fail as protocol errors; server push is unsupported. |
 
 HTTP/3 uses a fixed static QPACK request header block and opens client control,
 encoder, and decoder streams. It does not include or link any private eventloop
@@ -85,6 +87,29 @@ headers or source. The narrow response decoder makes it useful for exercising
 public QUIC as a real HTTP/3 caller, but it is not a complete HTTP/3 client.
 The complete in-tree `http3_client` example uses private HTTP/3 codec headers;
 that implementation is outside this program's public-API-only constraint.
+
+## Automated W3 checks
+
+`tests/run_w3_aioquic.py` drives a controlled aioquic 1.3.0 peer and checks the
+HTTP/3 client. Wayfarer is a standalone example project, so the root eventloop
+test suite does not build it; enable the checks in the Wayfarer build instead:
+
+```sh
+python3 -m venv /tmp/wayfarer-aioquic
+/tmp/wayfarer-aioquic/bin/python -m pip install 'aioquic==1.3.0'
+cmake -S examples/wayfarer -B /tmp/wayfarer-build -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF -DWAYFARER_HTTP3_TESTS=ON \
+  -DPython3_EXECUTABLE=/tmp/wayfarer-aioquic/bin/python
+cmake --build /tmp/wayfarer-build --target wayfarer
+ctest --test-dir /tmp/wayfarer-build -R wayfarer_http3_w3 --output-on-failure
+```
+
+The same runner works standalone:
+
+```sh
+/tmp/wayfarer-aioquic/bin/python examples/wayfarer/tests/run_w3_aioquic.py \
+  --wayfarer /tmp/wayfarer-build/wayfarer --version both
+```
 
 ## Checks and observed failures
 
@@ -99,19 +124,30 @@ that implementation is outside this program's public-API-only constraint.
   bodies; `-L -i` header ordering; same-origin credential preservation;
   cross-origin credential removal; redirects without Location; the ten-hop
   limit; and rejection of redirects to plain HTTP.
-- Public `https://cloudflare.com/` with `--http3 --timeout-ms 5000` completed
-  a QUIC/TLS handshake, decoded an HTTP/3 301 response, and wrote its body.
-  The program does not follow that redirect.
-- The first HTTP/3 public attempt failed on a literal QPACK status field;
-  the bounded decoder now recognizes the observed form. Other dynamic or
-  unsupported QPACK forms still fail explicitly.
+- The controlled aioquic fixture passes 44 checks for each QUIC version (88
+  total): GET and HEAD; status and `-i` field output; split DATA; 128 KiB and
+  200 KiB binary bodies; Content-Length truncation and overlong rejection; a
+  304 with a representation Content-Length; the 64 KiB frame, 16 MiB body, and
+  128-field caps; dynamic, post-base, and dynamic-name QPACK rejection;
+  trailers; malformed and incomplete frames; the exchange deadline; relative,
+  absolute, and protocol-relative redirects; redirect loops; missing Location;
+  HTTPS-to-HTTP downgrade rejection; the ten-hop limit; `--fail` on the final
+  redirected status; argument rejection for methods, bodies, and headers; and
+  `-o` preservation on failure. The fixture verifies the negotiated QUIC
+  version and `h3` ALPN on every handshake.
+- The earlier public `https://cloudflare.com/` `--http3` run decoded an HTTP/3
+  301 response before redirects were implemented. The controlled fixture is now
+  the recorded acceptance source; a fresh public-network run has not been
+  repeated.
+- The first public HTTP/3 attempt failed on a literal QPACK status field; the
+  bounded decoder now recognizes that form plus static and literal response
+  fields. Dynamic QPACK references still fail explicitly.
 
 Exit status is 0 for a completed response, 1 for transport/protocol/output
 failure, and 2 for invalid or unsupported command line options. HTTP error
 statuses such as 404 still count as completed responses by default. `--fail`
 returns 22 for a completed final response with status 400–599 across HTTP/1.1,
-HTTP/2 and HTTP/3. With `-L`, HTTP/1.1 and HTTP/2 apply this rule to the final redirect
+HTTP/2 and HTTP/3. With `-L`, all supported protocols apply this rule to the final redirect
 response. Error response bodies still stream to stdout; with `-o`, they are
-discarded along with the temporary file. HTTP/3 can apply `--fail` only when its
-bounded QPACK decoder recognizes the response status; unsupported status
+discarded along with the temporary file. Unsupported HTTP/3 QPACK
 representations fail as protocol errors (exit 1).
