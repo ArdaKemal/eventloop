@@ -626,6 +626,12 @@ if(WIN32)
             examples/http_client_url.cc
             examples/http_client_resolve.cc)
         target_link_libraries(http_client PRIVATE eventloop::eventloop)
+
+        add_executable(websocket_client
+            examples/websocket_client.cc
+            examples/http_client_url.cc
+            examples/http_client_resolve.cc)
+        target_link_libraries(websocket_client PRIVATE eventloop::eventloop OpenSSL::Crypto)
     endif()
 
     add_executable(http3_client
@@ -835,6 +841,14 @@ add_executable(http_client
 )
 target_link_libraries(http_client PRIVATE eventloop::eventloop)
 target_compile_options(http_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(websocket_client
+    examples/websocket_client.cc
+    examples/http_client_url.cc
+    examples/http_client_resolve.cc
+)
+target_link_libraries(websocket_client PRIVATE eventloop::eventloop OpenSSL::Crypto)
+target_compile_options(websocket_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(http3_client
     examples/http3_client.cc
