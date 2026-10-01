@@ -605,6 +605,11 @@ if(WIN32)
     add_executable(tcp_echo examples/tcp_echo.cc)
     target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)
 
+    if(EVENTLOOP_WINDOWS_TLS)
+        add_executable(websocket_echo_server examples/websocket_echo_server.cc)
+        target_link_libraries(websocket_echo_server PRIVATE eventloop::eventloop OpenSSL::Crypto)
+    endif()
+
     add_executable(quic_echo_server examples/quic_echo_server.cc)
     target_link_libraries(quic_echo_server PRIVATE eventloop::eventloop)
 
@@ -818,6 +823,10 @@ install(FILES
 add_executable(tcp_echo examples/tcp_echo.cc)
 target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)
 target_compile_options(tcp_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(websocket_echo_server examples/websocket_echo_server.cc)
+target_link_libraries(websocket_echo_server PRIVATE eventloop::eventloop OpenSSL::Crypto)
+target_compile_options(websocket_echo_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(quic_echo_server examples/quic_echo_server.cc)
 target_link_libraries(quic_echo_server PRIVATE eventloop::eventloop)
@@ -1465,6 +1474,22 @@ if(BUILD_TESTING)
                      ${CURL_EXECUTABLE}
     )
     set_tests_properties(http_server PROPERTIES TIMEOUT 15)
+
+    option(EVENTLOOP_WEBSOCKET_INTEROP_TESTS
+        "Enable Python websockets interoperability test" OFF)
+    if(EVENTLOOP_WEBSOCKET_INTEROP_TESTS)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import websockets"
+            RESULT_VARIABLE websocket_python_result)
+        if(NOT websocket_python_result EQUAL 0)
+            message(FATAL_ERROR "WebSocket interop test requires Python websockets")
+        endif()
+        add_test(NAME websocket_server_interop
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_websocket_server.py"
+                $<TARGET_FILE:websocket_echo_server>)
+        set_tests_properties(websocket_server_interop PROPERTIES TIMEOUT 20)
+    endif()
 endif()
 
 eventloop_register_http3_interop_tests()
