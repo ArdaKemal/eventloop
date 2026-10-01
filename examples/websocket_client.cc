@@ -99,6 +99,33 @@ auto fill(eventloop::event_loop& loop, Stream& stream,
     return text;
 }
 
+[[nodiscard]] auto ascii_equal(std::string_view left,
+                               std::string_view right) noexcept -> bool
+{
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        auto lower = [](unsigned char value) -> unsigned char {
+            return value >= 'A' && value <= 'Z'
+                ? static_cast<unsigned char>(value - 'A' + 'a') : value;
+        };
+        if (lower(static_cast<unsigned char>(left[index])) !=
+            lower(static_cast<unsigned char>(right[index]))) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] auto has_token(std::string_view list,
+                             std::string_view token) noexcept -> bool
+{
+    while (!list.empty()) {
+        const auto separator = list.find(',');
+        if (ascii_equal(trim(list.substr(0, separator)), token)) return true;
+        if (separator == std::string_view::npos) break;
+        list.remove_prefix(separator + 1);
+    }
+    return false;
+}
+
 [[nodiscard]] auto header(std::string_view response, std::string_view name)
     -> std::string_view
 {
@@ -110,7 +137,8 @@ auto fill(eventloop::event_loop& loop, Stream& stream,
         if (end == std::string_view::npos || end == start) break;
         auto line = response.substr(start, end - start);
         auto colon = line.find(':');
-        if (colon != std::string_view::npos && line.substr(0, colon) == name)
+        if (colon != std::string_view::npos &&
+            ascii_equal(line.substr(0, colon), name))
             return trim(line.substr(colon + 1));
         start = end + 2;
     }
@@ -179,7 +207,7 @@ auto exchange(eventloop::event_loop& loop, Stream& stream,
                    &digest_size, EVP_sha1(), nullptr) != 1 ||
         header(response, "Sec-WebSocket-Accept") !=
             base64(std::span<const unsigned char>(digest.data(), digest_size)) ||
-        header(response, "Upgrade") != "websocket") {
+        !has_token(header(response, "Upgrade"), "websocket")) {
         std::cerr << "invalid upgrade response\n"; co_return false;
     }
     input.erase(input.begin(), input.begin() + static_cast<std::ptrdiff_t>(end + 4));
@@ -218,9 +246,10 @@ auto exchange(eventloop::event_loop& loop, Stream& stream,
         if (opcode == 1) {
             bool match = payload.size() == message.size() &&
                 std::equal(payload.begin(), payload.end(), bytes(message).begin());
-            if (!match) { std::cerr << "echo mismatch\n"; co_return false; }
-            std::cout << "echo: " << message << '\n';
-            co_return true;
+            if (match) {
+                std::cout << "echo: " << message << '\n';
+                co_return true;
+            }
         }
         if (opcode == 8) { std::cerr << "server closed before echo\n"; co_return false; }
         if (opcode == 9) {

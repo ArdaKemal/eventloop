@@ -8,9 +8,9 @@ import sys
 DEFAULT_URLS = [
     "wss://echo.websocket.org/",
     "wss://ws.postman-echo.com/raw",
-    "wss://echo.websocket.events/",
     "wss://ws.ifelse.io/",
-    "wss://echo.ably.io/",
+    "wss://echo.rapidtoolset.com/ws",
+    "wss://echo-websocket.fly.dev/",
 ]
 
 
