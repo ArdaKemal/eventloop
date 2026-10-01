@@ -29,6 +29,9 @@ mkdir "$work/root"
 printf 'stonegate-ok\n' > "$work/root/index.html"
 mkdir "$work/root/files"
 printf 'listed\n' > "$work/root/files/asset.txt"
+: > "$work/root/files/empty.bin"
+awk 'BEGIN { for (i = 0; i < 20000; ++i) printf "%c", 65 + i % 26 }' \
+    > "$work/root/files/large.txt"
 printf 'outside\n' > "$work/outside.txt"
 ln -s "$work/outside.txt" "$work/root/leak.txt"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
@@ -137,7 +140,130 @@ header_value() {
     ' "$1"
 }
 
+check_static_file_headers() {
+    local label=$1
+    shift
+    local url="https://localhost:$https_port/files/asset.txt"
+    local -a transport=("$@")
+    local common=(--silent --show-error --max-time 8 --cacert "$work/cert.pem"
+        --resolve "localhost:$https_port:127.0.0.1")
+    local status etag modified actual
+    status=$(curl "${common[@]}" "${transport[@]}" --dump-header "$work/headers" \
+        --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 200 && $(cat "$work/body") == listed ]] || {
+        echo "$label baseline response failed: $status" >&2; exit 1;
+    }
+    etag=$(header_value "$work/headers" etag)
+    modified=$(header_value "$work/headers" last-modified)
+    [[ -n "$etag" && -n "$modified" ]] || {
+        echo "$label validators missing" >&2; exit 1;
+    }
+    : > "$work/body"
+    status=$(curl "${common[@]}" "${transport[@]}" -H "If-None-Match: $etag" \
+        --dump-header "$work/headers" --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 304 && ! -s "$work/body" ]] || {
+        echo "$label If-None-Match failed: $status" >&2; exit 1;
+    }
+    : > "$work/body"
+    status=$(curl "${common[@]}" "${transport[@]}" -H "If-None-Match: ${etag#W/}" \
+        -H 'Range: bytes=1-3' --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 304 && ! -s "$work/body" ]] || {
+        echo "$label weak ETag comparison or conditional precedence failed: $status" >&2; exit 1;
+    }
+    : > "$work/body"
+    status=$(curl "${common[@]}" "${transport[@]}" -H "If-Modified-Since: $modified" \
+        --dump-header "$work/headers" --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 304 && ! -s "$work/body" ]] || {
+        echo "$label If-Modified-Since failed: $status" >&2; exit 1;
+    }
+    status=$(curl "${common[@]}" "${transport[@]}" -H 'If-None-Match: "different"' \
+        -H "If-Modified-Since: $modified" --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 200 ]] || { echo "$label validator precedence failed: $status" >&2; exit 1; }
+    : > "$work/body"
+    status=$(curl "${common[@]}" "${transport[@]}" -H 'If-None-Match: "nope"' \
+        -H "If-None-Match: $etag" --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 304 && ! -s "$work/body" ]] || {
+        echo "$label repeated If-None-Match fallback failed: $status" >&2; exit 1;
+    }
+    status=$(curl "${common[@]}" "${transport[@]}" -H 'Range: bytes=0-0' \
+        -H 'Range: bytes=2-3' --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 200 && $(cat "$work/body") == listed ]] || {
+        echo "$label repeated Range fallback failed: $status" >&2; exit 1;
+    }
+    for range in 'bytes=1-3' 'bytes=1-' 'bytes=-3'; do
+        status=$(curl "${common[@]}" "${transport[@]}" -H "Range: $range" \
+            --dump-header "$work/headers" --output "$work/body" --write-out '%{http_code}' "$url")
+        case "$range" in
+            'bytes=1-3') actual=ist;;
+            'bytes=1-') actual=$'isted\n';;
+            'bytes=-3') actual=$'ed\n';;
+        esac
+        [[ "$status" == 206 && $(cat "$work/body"; printf x) == "${actual}x" ]] || {
+            echo "$label range $range failed: $status" >&2; exit 1;
+        }
+        [[ -n $(header_value "$work/headers" content-range) ]] || {
+            echo "$label Content-Range missing" >&2; exit 1;
+        }
+    done
+    : > "$work/body"
+    status=$(curl "${common[@]}" "${transport[@]}" -H 'Range: bytes=99-' \
+        --dump-header "$work/headers" --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 416 && ! -s "$work/body" &&
+       $(header_value "$work/headers" content-range) == 'bytes */7' ]] || {
+        echo "$label unsatisfiable range failed: $status" >&2; exit 1;
+    }
+    status=$(curl "${common[@]}" "${transport[@]}" -H 'Range: bytes=0-1,3-4' \
+        --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 200 && $(cat "$work/body") == listed ]] || {
+        echo "$label multiple range fallback failed: $status" >&2; exit 1;
+    }
+    status=$(curl "${common[@]}" "${transport[@]}" --head -H 'Range: bytes=1-3' \
+        --dump-header "$work/headers" --output /dev/null --write-out '%{http_code} %{size_download}' "$url")
+    [[ "$status" == '206 0' && $(header_value "$work/headers" content-length) == 3 ]] || {
+        echo "$label HEAD range failed: $status" >&2; exit 1;
+    }
+    status=$(curl "${common[@]}" "${transport[@]}" -H 'Range: bytes=10000-12000' \
+        --output "$work/body" --write-out '%{http_code}' \
+        "https://localhost:$https_port/files/large.txt")
+    dd if="$work/root/files/large.txt" of="$work/expected" bs=1 skip=10000 count=2001 \
+        status=none
+    [[ "$status" == 206 ]] && cmp -s "$work/expected" "$work/body" || {
+        echo "$label streamed range failed: $status" >&2; exit 1;
+    }
+    touch -r "$work/root/files/asset.txt" "$work/mtime-reference"
+    printf 'edited\n' > "$work/root/files/asset.txt"
+    touch -r "$work/mtime-reference" "$work/root/files/asset.txt"
+    status=$(curl "${common[@]}" "${transport[@]}" -H "If-None-Match: $etag" \
+        --dump-header "$work/headers" --output "$work/body" --write-out '%{http_code}' "$url")
+    [[ "$status" == 200 && $(cat "$work/body") == edited &&
+       $(header_value "$work/headers" etag) != "$etag" ]] || {
+        echo "$label stale ETag after same-size replacement and restored mtime" >&2; exit 1;
+    }
+    printf 'listed\n' > "$work/root/files/asset.txt"
+    touch -r "$work/mtime-reference" "$work/root/files/asset.txt"
+    local empty_url="https://localhost:$https_port/files/empty.bin"
+    status=$(curl "${common[@]}" "${transport[@]}" --dump-header "$work/headers" \
+        --output "$work/body" --write-out '%{http_code}' "$empty_url")
+    [[ "$status" == 200 && ! -s "$work/body" &&
+       $(header_value "$work/headers" content-length) == 0 ]] || {
+        echo "$label empty file baseline failed: $status" >&2; exit 1;
+    }
+    status=$(curl "${common[@]}" "${transport[@]}" -H 'Range: bytes=0-' \
+        --dump-header "$work/headers" --output "$work/body" --write-out '%{http_code}' "$empty_url")
+    [[ "$status" == 416 && ! -s "$work/body" &&
+       $(header_value "$work/headers" content-range) == 'bytes */0' ]] || {
+        echo "$label empty file range failed: $status" >&2; exit 1;
+    }
+    echo "$label conditional and range responses: PASS"
+}
+
+check_static_file_headers 'HTTP/1.1' --http1.1
+if curl --version | grep -q HTTP2; then
+    check_static_file_headers 'HTTP/2' --http2
+fi
+
 if curl --version | grep -Eq '(^|[[:space:]])HTTP3([[:space:]]|$)'; then
+    check_static_file_headers 'HTTP/3' --http3-only
     h3_url="https://localhost:$http3_port/"
     h3_resolve="localhost:$http3_port:127.0.0.1"
     for round in 1 2 3; do
@@ -290,6 +416,24 @@ code=$(curl --silent --output "$work/symlink.body" --write-out '%{http_code}' \
     "http://127.0.0.1:$http_port/leak.txt")
 [[ "$code" == 404 ]] && ! grep -q outside "$work/symlink.body" || {
     echo "symlink outside document root unexpectedly served (status $code)" >&2; exit 1;
+}
+plain_url="http://127.0.0.1:$http_port/files/asset.txt"
+plain_code=$(curl --silent --output "$work/plain-full.body" --write-out '%{http_code}' \
+    -H 'Range: bytes=0-' "$plain_url")
+[[ "$plain_code" == 206 && $(cat "$work/plain-full.body") == listed ]] || {
+    echo "plain HTTP/1.1 open range failed: $plain_code" >&2; exit 1;
+}
+plain_code=$(curl --silent --output "$work/plain-range.body" --write-out '%{http_code}' \
+    -H 'Range: bytes=1-3' "$plain_url")
+[[ "$plain_code" == 206 && $(cat "$work/plain-range.body") == ist ]] || {
+    echo "plain HTTP/1.1 suffix range failed: $plain_code" >&2; exit 1;
+}
+curl --silent --dump-header "$work/plain-headers" --output /dev/null "$plain_url"
+plain_etag=$(header_value "$work/plain-headers" etag)
+plain_code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "If-None-Match: $plain_etag" "$plain_url")
+[[ -n "$plain_etag" && "$plain_code" == 304 ]] || {
+    echo "plain HTTP/1.1 If-None-Match failed: $plain_code" >&2; exit 1;
 }
 echo 'Plain HTTP/1.1 response: PASS'
 echo 'HEAD and directory listing: PASS'

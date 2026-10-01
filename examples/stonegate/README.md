@@ -5,6 +5,12 @@ It can serve plain HTTP/1.1, TLS HTTP/1.1 or HTTP/2, and UDP HTTP/3. It can
 optionally redirect HTTP to HTTPS and list directories on HTTP/1.1 and HTTP/2.
 The built-in servers own their sockets and document-root descriptors and use
 secure path traversal; this program does not implement file walking.
+Static files include ETag and Last-Modified validators and support single
+byte ranges on all three HTTP versions. A matching `If-None-Match` (which
+takes precedence over `If-Modified-Since`) or `If-Modified-Since` returns
+304. Closed, open-ended, and suffix ranges return 206; unsatisfiable single
+ranges return 416. Multiple ranges are ignored and return the full file.
+HEAD sends the corresponding GET status and headers without a body.
 
 ## Build
 
@@ -118,6 +124,9 @@ Stonegate process. It checks statuses 200/200/204/200, version 3, GET bodies,
 HEAD Content-Length and no body, OPTIONS Allow and no Content-Length or body.
 Without curl HTTP3 support, that portion reports SKIP; it does not silently
 accept a failed HTTP/3 request.
+The smoke check also exercises validators, range forms, unsatisfiable and
+multiple ranges, HEAD ranges, a large streamed range, and a same-size file
+rewrite with restored modification time on every available HTTP version.
 The three-round smoke sequence and a separate ten-round
 GET→HEAD→OPTIONS→GET sequence passed with curl 8.14.1 against the HTTP/3 API
 at commit `4d4b74e`. See [TEST_REPORT.md](TEST_REPORT.md) for the observed
