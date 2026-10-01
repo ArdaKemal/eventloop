@@ -321,7 +321,8 @@ auto main(int argc, char** argv) -> int
         if (settings.http3_port != 0) {
             http3 = std::make_unique<eventloop::http::http3_server>(
                 loop, eventloop::ip_endpoint::parse(settings.bind, settings.http3_port),
-                settings.root, settings.certificate, settings.private_key);
+                settings.root, settings.certificate, settings.private_key,
+                settings.directory_listing);
             if (loop.spawn(http3->run(), http3_run) !=
                 eventloop::task_spawn_result::accepted)
                 throw std::runtime_error("HTTP/3 listener task capacity exhausted");

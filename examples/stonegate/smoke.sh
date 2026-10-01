@@ -34,6 +34,14 @@ awk 'BEGIN { for (i = 0; i < 20000; ++i) printf "%c", 65 + i % 26 }' \
     > "$work/root/files/large.txt"
 printf 'outside\n' > "$work/outside.txt"
 ln -s "$work/outside.txt" "$work/root/leak.txt"
+mkdir "$work/root/listing" "$work/root/withindex" "$work/root/huge"
+printf 'b\n' > "$work/root/listing/b.txt"
+printf 'a\n' > "$work/root/listing/a&b.txt"
+printf 'h\n' > "$work/root/listing/.hidden"
+mkdir "$work/root/listing/sub"
+ln -s "$work/outside.txt" "$work/root/listing/leak"
+printf 'index body\n' > "$work/root/withindex/index.html"
+for index in $(seq -w 1 4097); do : > "$work/root/huge/f$index"; done
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
     -keyout "$work/key.pem" -out "$work/cert.pem" >/dev/null 2>&1
 
@@ -81,6 +89,7 @@ http3_port=$https_port
 "$server" --root "$work/root" --bind 127.0.0.1 \
     --http-mode redirect --redirect-host localhost \
     --http-port "$http_port" --https-port "$https_port" --http3-port "$http3_port" \
+    --directory-listing \
     --certificate "$work/cert.pem" --private-key "$work/key.pem" \
     >"$work/server.log" 2>&1 &
 server_pid=$!
@@ -257,13 +266,58 @@ check_static_file_headers() {
     echo "$label conditional and range responses: PASS"
 }
 
+check_directory_listing() {
+    local label=$1
+    shift
+    local common=(--silent --show-error --max-time 8 --cacert "$work/cert.pem"
+        --resolve "localhost:$https_port:127.0.0.1")
+    curl "${common[@]}" "$@" --output "$work/listing-$label.body" \
+        "https://localhost:$https_port/listing/"
+    local body; body=$(<"$work/listing-$label.body")
+    [[ "$body" == *'href="a%26b.txt"'* && "$body" == *'a&amp;b.txt'* &&
+       "$body" == *'.hidden'* && "$body" == *'href="sub/"'* &&
+       "$body" == *'leak'* ]] || {
+        echo "$label listing entry or escaping failed" >&2; exit 1;
+    }
+    local ordered
+    ordered=$(grep -o '[^<>]*</a>' "$work/listing-$label.body" | sed 's#</a>$##' | paste -sd, -)
+    [[ "$ordered" == '.hidden,a&amp;b.txt,b.txt,leak,sub/' ]] || {
+        echo "$label listing order failed: $ordered" >&2; exit 1;
+    }
+    if [[ -f "$work/listing-reference.body" ]]; then
+        cmp "$work/listing-reference.body" "$work/listing-$label.body" || {
+            echo "$label listing differs from the first protocol" >&2; exit 1;
+        }
+    else
+        cp "$work/listing-$label.body" "$work/listing-reference.body"
+    fi
+    local index
+    index=$(curl "${common[@]}" "$@" "https://localhost:$https_port/withindex/")
+    [[ "$index" == 'index body' ]] || { echo "$label index preference failed" >&2; exit 1; }
+    local code
+    code=$(curl "${common[@]}" "$@" --output "$work/link.body" --write-out '%{http_code}' \
+        "https://localhost:$https_port/listing/leak")
+    [[ "$code" == 404 ]] && ! grep -q outside "$work/link.body" || {
+        echo "$label symlink entry exposed content" >&2; exit 1;
+    }
+    code=$(curl "${common[@]}" "$@" --output "$work/huge.body" --write-out '%{http_code}' \
+        "https://localhost:$https_port/huge/")
+    [[ "$code" == 500 ]] && grep -q 'directory listing too large' "$work/huge.body" || {
+        echo "$label listing limit failed: $code" >&2; exit 1;
+    }
+    echo "$label directory listing: PASS"
+}
+
 check_static_file_headers 'HTTP/1.1' --http1.1
+check_directory_listing http1 --http1.1
 if curl --version | grep -q HTTP2; then
     check_static_file_headers 'HTTP/2' --http2
+    check_directory_listing http2 --http2
 fi
 
 if curl --version | grep -Eq '(^|[[:space:]])HTTP3([[:space:]]|$)'; then
     check_static_file_headers 'HTTP/3' --http3-only
+    check_directory_listing http3 --http3-only
     h3_url="https://localhost:$http3_port/"
     h3_resolve="localhost:$http3_port:127.0.0.1"
     for round in 1 2 3; do

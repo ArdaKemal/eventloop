@@ -2,7 +2,8 @@
 
 Stonegate is a static file server built only with the public `eventloop` API.
 It can serve plain HTTP/1.1, TLS HTTP/1.1 or HTTP/2, and UDP HTTP/3. It can
-optionally redirect HTTP to HTTPS and list directories on HTTP/1.1 and HTTP/2.
+optionally redirect HTTP to HTTPS and list directories on all three HTTP
+versions when the directory has no index file.
 The built-in servers own their sockets and document-root descriptors and use
 secure path traversal; this program does not implement file walking.
 Static files include ETag and Last-Modified validators and support single
@@ -127,6 +128,9 @@ accept a failed HTTP/3 request.
 The smoke check also exercises validators, range forms, unsatisfiable and
 multiple ranges, HEAD ranges, a large streamed range, and a same-size file
 rewrite with restored modification time on every available HTTP version.
+It also compares the generated directory listing byte for byte across HTTP/1.1,
+HTTP/2, and HTTP/3, including escaped hrefs and text, hidden entries, stable
+name order, index preference, a symlink entry, and the entry-limit error.
 The three-round smoke sequence and a separate ten-round
 GET→HEAD→OPTIONS→GET sequence passed with curl 8.14.1 against the HTTP/3 API
 at commit `4d4b74e`. See [TEST_REPORT.md](TEST_REPORT.md) for the observed
@@ -135,8 +139,9 @@ coverage and the earlier OPTIONS failure resolved by that API fix.
 ## Boundaries and unsupported features
 
 - HTTP/3 uses the public `http3_server` API and supports static GET, HEAD, and
-  OPTIONS for files and `index.html`. It does not support directory listings,
-  request bodies, server push, or WebTransport. The HTTP/3 API currently caps
+  OPTIONS for files, `index.html`, and (when constructed with
+  `directory_listing`) bounded directory listings. It does not support request
+  bodies, server push, or WebTransport. The HTTP/3 API currently caps
   active connections at eight, peer bidirectional streams at 32 per
   connection, and peer unidirectional streams at eight. Request headers are
   capped at 16 KiB and 128 fields; QPACK dynamic tables are disabled. The
