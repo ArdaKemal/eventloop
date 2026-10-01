@@ -1474,7 +1474,6 @@ if(BUILD_TESTING)
                      ${CURL_EXECUTABLE}
     )
     set_tests_properties(http_server PROPERTIES TIMEOUT 15)
-
     option(EVENTLOOP_WEBSOCKET_INTEROP_TESTS
         "Enable Python websockets interoperability test" OFF)
     if(EVENTLOOP_WEBSOCKET_INTEROP_TESTS)
@@ -1490,6 +1489,15 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:websocket_echo_server>)
         set_tests_properties(websocket_server_interop PROPERTIES TIMEOUT 20)
     endif()
+
+    add_test(
+        NAME http2_server
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http2_server.sh
+                     $<TARGET_FILE:http_server>
+                     ${OPENSSL_EXECUTABLE}
+                     ${CURL_EXECUTABLE}
+    )
+    set_tests_properties(http2_server PROPERTIES TIMEOUT 30)
 endif()
 
 eventloop_register_http3_interop_tests()
