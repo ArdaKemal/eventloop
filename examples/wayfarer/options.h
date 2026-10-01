@@ -24,6 +24,7 @@ struct request_options {
     int protocol = 1;
     bool show_headers = false;
     bool follow_redirects = false;
+    bool fail_http_errors = false;
 };
 
 struct request_state {

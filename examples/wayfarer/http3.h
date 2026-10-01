@@ -12,4 +12,4 @@ struct request_state;
 auto fetch_http3(eventloop::event_loop& loop,
                  const http_client_example::url_parts& url,
                  const request_options& options, std::FILE* output,
-                 request_state& state, bool& success) -> eventloop::task<void>;
+                 request_state& state, bool& success, unsigned& final_status) -> eventloop::task<void>;

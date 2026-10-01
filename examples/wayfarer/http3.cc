@@ -159,7 +159,7 @@ auto qpack_status(std::span<const std::byte> header) -> unsigned
 }
 
 auto exchange(event_loop& loop, quic_connection& connection, const http_client_example::url_parts& url,
-              std::FILE* output) -> task<bool>
+              std::FILE* output, unsigned& final_status) -> task<bool>
 {
     (void)loop;
     const std::array<std::byte, 3> settings {std::byte{0}, std::byte{4}, std::byte{0}};
@@ -214,7 +214,7 @@ auto exchange(event_loop& loop, quic_connection& connection, const http_client_e
                         std::cerr << ' ' << std::hex << std::to_integer<unsigned>(byte) << std::dec;
                     std::cerr << ")\n"; co_return false;
                 }
-                std::cerr << "HTTP/3 " << status << '\n'; have_status = true;
+                std::cerr << "HTTP/3 " << status << '\n'; have_status = true; final_status = status;
             } else if (type == 0) {
                 if (!have_status || body_count > 16 * 1024 * 1024 - length) co_return false;
                 body_count += length;
@@ -233,7 +233,7 @@ auto exchange(event_loop& loop, quic_connection& connection, const http_client_e
 
 auto fetch_http3(event_loop& loop, const http_client_example::url_parts& url,
                  const request_options& options, std::FILE* output,
-                 request_state& state, bool& success) -> task<void>
+                 request_state& state, bool& success, unsigned& final_status) -> task<void>
 {
     auto addresses = co_await run_blocking(loop, [host = url.hostname, port = url.port]() noexcept {
         return http_client_example::resolve_addresses(host, port);
@@ -254,7 +254,7 @@ auto fetch_http3(event_loop& loop, const http_client_example::url_parts& url,
             continue;
         }
         auto connection = std::move(*connected);
-        const auto done = co_await exchange(loop, connection, url, output);
+        const auto done = co_await exchange(loop, connection, url, output, final_status);
         success = done && *done;
         if (!done) std::cerr << "HTTP/3 request coroutine unavailable or cancelled\n";
         connection.close();

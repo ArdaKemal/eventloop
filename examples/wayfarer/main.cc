@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #else
 #include <netdb.h>
 #endif
@@ -23,6 +24,7 @@
 #include <charconv>
 #include <chrono>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
@@ -114,6 +116,7 @@ auto parse_options(int argc, char** argv) -> request_options
         else if (arg == "-o" || arg == "--output") options.output = value();
         else if (arg == "-i" || arg == "--include") options.show_headers = true;
         else if (arg == "-L" || arg == "--location") options.follow_redirects = true;
+        else if (arg == "--fail") options.fail_http_errors = true;
         else if (arg == "--ca-file") options.ca_file = value();
         else if (arg == "--timeout-ms") {
             const auto input = value();
@@ -263,7 +266,7 @@ struct response_reader {
 
 template<class Stream>
 auto exchange(event_loop& loop, Stream& stream, const url_parts& url, const request_options& options,
-              std::FILE* output) -> task<bool>
+              std::FILE* output, unsigned& final_status) -> task<bool>
 {
     (void)loop;
     std::string request = options.method + " " + url.target + " HTTP/1.1\r\nHost: " + url.host_header + "\r\nConnection: close\r\n";
@@ -290,11 +293,12 @@ auto exchange(event_loop& loop, Stream& stream, const url_parts& url, const requ
     }
     if (!reader.complete()) { fail("truncated HTTP response"); co_return false; }
     if (std::fflush(output) != 0) { fail("output flush failed"); co_return false; }
+    final_status = reader.status;
     co_return true;
 }
 
 auto fetch_http1(event_loop& loop, const url_parts& url, const request_options& options,
-                 std::FILE* output, request_state& state, bool& success) -> task<void>
+                 std::FILE* output, request_state& state, bool& success, unsigned& final_status) -> task<void>
 {
     auto addresses = co_await run_blocking(loop, [host = url.hostname, port = url.port]() noexcept {
         return http_client_example::resolve_addresses(host, port);
@@ -311,14 +315,14 @@ auto fetch_http1(event_loop& loop, const url_parts& url, const request_options& 
             if (!connected) { stream->close(); state.socket = nullptr; continue; }
             const auto handshake = io_result(co_await stream->async_handshake());
             if (!handshake) { fail("TLS handshake failed: " + handshake.error().message()); stream->close(); state.socket = nullptr; co_return; }
-            const auto result = co_await exchange(loop, *stream, url, options, output);
+            const auto result = co_await exchange(loop, *stream, url, options, output, final_status);
             success = result && *result; stream->close(); state.socket = nullptr; co_return;
         }
         auto socket = std::make_unique<tcp_stream>(loop, addresses->endpoints[i]);
         auto* stream = socket.get(); loop.add(std::move(socket)); state.socket = stream;
         const auto connected = co_await stream->async_connect();
         if (!connected) { stream->close(); state.socket = nullptr; continue; }
-        const auto result = co_await exchange(loop, *stream, url, options, output);
+        const auto result = co_await exchange(loop, *stream, url, options, output, final_status);
         success = result && *result; stream->close(); state.socket = nullptr; co_return;
     }
     if (!state.expired) fail("all connection attempts failed");
@@ -358,7 +362,7 @@ auto same_origin(const url_parts& left, const url_parts& right) -> bool
 }
 
 auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& options,
-                 std::FILE* output, request_state& state, bool& success) -> task<void>
+                 std::FILE* output, request_state& state, bool& success, unsigned& final_status) -> task<void>
 {
     auto tls = options.ca_file.empty() ? tls_context::make_system_client() : tls_context::make_client(options.ca_file);
     url_parts current = url;
@@ -434,6 +438,7 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
             std::cerr << "HTTP/2 " << response->status << '\n';
             if (!redirect_response) {
                 if (std::fflush(output) != 0) { fail("output flush failed"); co_return; }
+                final_status = response->status;
                 success = true;
                 co_return;
             }
@@ -475,22 +480,70 @@ auto deadline(event_loop& loop, request_state& state, std::chrono::milliseconds 
 }
 
 auto run_request(event_loop& loop, url_parts url, const request_options& options,
-                 std::FILE* output, bool& success) -> task<void>
+                 std::FILE* output, bool& success, unsigned& final_status) -> task<void>
 {
     request_state state;
     task_handle<void> timer, operation;
     state.operation = &operation;
     const bool timer_started = loop.spawn(deadline(loop, state, options.timeout), timer) == task_spawn_result::accepted;
     const bool operation_started = timer_started && loop.spawn(
-        options.protocol == 3 ? fetch_http3(loop, url, options, output, state, success)
-        : options.protocol == 2 ? fetch_http2(loop, url, options, output, state, success)
-                                : fetch_http1(loop, url, options, output, state, success), operation) == task_spawn_result::accepted;
+        options.protocol == 3 ? fetch_http3(loop, url, options, output, state, success, final_status)
+        : options.protocol == 2 ? fetch_http2(loop, url, options, output, state, success, final_status)
+                                : fetch_http1(loop, url, options, output, state, success, final_status), operation) == task_spawn_result::accepted;
     if (operation_started) (void)co_await operation;
     if (timer_started) { (void)timer.cancel(); (void)co_await timer; }
     if (!operation_started) fail("request task capacity exhausted");
     if (!operation_started || state.expired) success = false;
     loop.stop();
 }
+
+struct temporary_output {
+    struct file_closer {
+        auto operator()(std::FILE* file) const -> void { if (file) (void)std::fclose(file); }
+    };
+    std::filesystem::path target, temporary;
+    std::unique_ptr<std::FILE, file_closer> file;
+
+    explicit temporary_output(const std::filesystem::path& path) : target(path)
+    {
+        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (unsigned attempt = 0; attempt < 100; ++attempt) {
+            temporary = target;
+            temporary += ".wayfarer-" + std::to_string(nonce) + "-" + std::to_string(attempt) + ".tmp";
+#ifdef _WIN32
+            file.reset(::_wfopen(temporary.c_str(), L"wbx"));
+#else
+            file.reset(std::fopen(temporary.c_str(), "wbx"));
+#endif
+            if (file) return;
+            if (errno != EEXIST) break;
+        }
+        throw std::runtime_error("cannot create temporary output file");
+    }
+
+    ~temporary_output()
+    {
+        file.reset();
+        if (!temporary.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+        }
+    }
+
+    auto commit() -> void
+    {
+        if (std::fclose(file.release()) != 0) throw std::runtime_error("output close failed");
+#ifdef _WIN32
+        if (!::MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING))
+            throw std::runtime_error("cannot replace output file");
+#else
+        std::error_code error;
+        std::filesystem::rename(temporary, target, error);
+        if (error) throw std::runtime_error("cannot replace output file: " + error.message());
+#endif
+        temporary.clear();
+    }
+};
 } // namespace
 
 auto main(int argc, char** argv) -> int
@@ -498,7 +551,7 @@ auto main(int argc, char** argv) -> int
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--help") {
             std::cout << "usage: wayfarer [--http1.1|--http2|--http3|--http3-v2] "
-                         "[-X METHOD] [-H 'Name: value']... [-d BODY|--data-binary @FILE] [-o FILE] [-i] [-L] "
+                         "[-X METHOD] [-H 'Name: value']... [-d BODY|--data-binary @FILE] [-o FILE] [-i] [-L] [--fail] "
                          "[--ca-file PEM] [--timeout-ms N] URL\n";
             return 0;
         }
@@ -509,28 +562,32 @@ auto main(int argc, char** argv) -> int
 #ifdef _WIN32
         if (options.output.empty()) (void)::_setmode(::_fileno(stdout), _O_BINARY);
 #endif
-        struct file_closer { auto operator()(std::FILE* file) const -> void { if (file) (void)std::fclose(file); } };
-        std::unique_ptr<std::FILE, file_closer> owned;
+        std::unique_ptr<temporary_output> owned;
         std::FILE* output = stdout;
         if (!options.output.empty()) {
-#ifdef _WIN32
-            owned.reset(::_wfopen(options.output.c_str(), L"wb"));
-#else
-            owned.reset(std::fopen(options.output.c_str(), "wb"));
-#endif
-            if (!owned) throw std::runtime_error("cannot open output file");
-            output = owned.get();
+            owned = std::make_unique<temporary_output>(options.output);
+            output = owned->file.get();
         }
         event_loop_options settings; settings.worker_count = 1;
         event_loop loop(settings);
         bool success = false;
-        if (loop.spawn(run_request(loop, url, options, output, success)) != task_spawn_result::accepted)
+        unsigned final_status = 0;
+        if (loop.spawn(run_request(loop, url, options, output, success, final_status)) != task_spawn_result::accepted)
             throw std::runtime_error("cannot start request task");
         if (loop.run() == event_loop_result::interrupted) {
             loop.shutdown(std::chrono::seconds{0});
             (void)loop.run();
         }
-        return success ? 0 : 1;
+        if (!success) return 1;
+        if (options.fail_http_errors && final_status >= 400 && final_status <= 599) {
+            fail("HTTP status " + std::to_string(final_status));
+            return 22;
+        }
+        if (owned) owned->commit();
+        return 0;
+    } catch (const std::runtime_error& error) {
+        std::cerr << "wayfarer: " << error.what() << '\n';
+        return 1;
     } catch (const std::exception& error) {
         std::cerr << "wayfarer: " << error.what() << '\n';
         return 2;
