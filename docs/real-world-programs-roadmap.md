@@ -78,13 +78,16 @@ GET client built on public QUIC APIs.
 Stonegate's current example serves a document root over plain HTTP/1.1, TLS
 HTTP/1.1 and HTTP/2, and optional HTTP/3. It supports index files and directory
 listing on the HTTP/1.1 and HTTP/2 built-in servers. The repeated HTTP/3 OPTIONS
-timeout is the first reliability gate; its trace currently points to a timer
-wakeup issue in the event loop.
+timeout is the first reliability gate. The latest trace identifies stale
+connection cleanup: a retired `quic_connection` remains valid for
+terminal-error observation, and a later `close()` can mark its cleared slot as
+closing just before that slot is reused. The next connection then aborts stream
+acceptance before preparing a response.
 
 ### S1 — Reliable HTTP/3 request completion
 
-- Fix the event-loop timer wakeup issue with the smallest supported change and
-  add a regression check for the timer behavior.
+- Guard stale connection cleanup and reset slot state on reuse; add a focused
+  regression for retired-handle cleanup poisoning a newly accepted connection.
 - Require repeated fresh HTTP/3 connections to complete GET, HEAD, and OPTIONS,
   including GET after OPTIONS. Verify the 204 response and `Allow` semantics.
 - Recheck plain HTTP/1.1, TLS HTTP/1.1, TLS HTTP/2, redirects, traversal and
