@@ -1,3 +1,5 @@
+#include "posix_socket_helpers.h"
+
 #include "eventloop/udp_socket.h"
 
 #include <array>
@@ -55,13 +57,11 @@ struct winsock_scope {
 
 [[nodiscard]] auto ipv6_loopback_available() -> bool
 {
-    unique_fd descriptor(::socket(AF_INET6,
 #ifdef _WIN32
-                                  SOCK_DGRAM,
+    unique_fd descriptor(::socket(AF_INET6, SOCK_DGRAM, 0));
 #else
-                                  SOCK_DGRAM | SOCK_CLOEXEC,
+    unique_fd descriptor(test_socket::socket(AF_INET6, SOCK_DGRAM));
 #endif
-                                  0));
     if (!descriptor) {
 #ifdef _WIN32
         const int error = ::WSAGetLastError();
@@ -339,7 +339,12 @@ auto send_errors(event_loop& loop, udp_socket& socket, ip_endpoint destination,
         std::array<std::byte, 1> {std::byte {'x'}},
         ip_endpoint::loopback_v4());
     passed = !too_large && too_large.error().value() == EMSGSIZE &&
+#ifdef __APPLE__
+             // Darwin accepts a UDP datagram addressed to port zero.
+             invalid && *invalid == 1;
+#else
              !invalid && invalid.error().value() == EINVAL;
+#endif
     if (!passed) {
         std::cerr << "send errors: oversized="
                   << (too_large ? 0 : too_large.error().value())
