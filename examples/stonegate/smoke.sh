@@ -34,6 +34,44 @@ ln -s "$work/outside.txt" "$work/root/leak.txt"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
     -keyout "$work/key.pem" -out "$work/cert.pem" >/dev/null 2>&1
 
+mkdir "$work/config"
+expect_config_error() {
+    local expected=$1 contents=$2
+    printf '%s\n' "$contents" > "$work/config/invalid.conf"
+    if "$server" --config "$work/config/invalid.conf" >"$work/config-error.log" 2>&1; then
+        echo "config unexpectedly accepted: $expected" >&2
+        exit 1
+    fi
+    if ! grep -Fq -- "$expected" "$work/config-error.log"; then
+        echo "config error missing: $expected" >&2
+        cat "$work/config-error.log" >&2
+        exit 1
+    fi
+    if grep -Fq 'PRIVATE_SENTINEL_739' "$work/config-error.log"; then
+        echo 'config error exposed a private value' >&2
+        exit 1
+    fi
+}
+expect_config_error 'duplicate config key on line 2' $'root=../root\nroot=../root'
+expect_config_error 'unknown setting' $'root=../root\nunknown=on'
+expect_config_error 'needs key=value' $'root=../root\nhttp-port'
+expect_config_error 'invalid key' $'root=../root\nhttp port=8080'
+expect_config_error 'http-port has an invalid value' $'root=../root\nhttp-port=abc'
+expect_config_error 'http2 must be on or off' $'root=../root\nhttp2=yes'
+expect_config_error 'key-password requires TLS credentials' $'root=../root\nkey-password=PRIVATE_SENTINEL_739'
+expect_config_error 'must be supplied together' $'root=../root\ncertificate=../cert.pem'
+expect_config_error 'requires --certificate and --private-key' $'root=../root\nhttp3-port=8444'
+expect_config_error 'TLS credentials are required' $'root=../root\nhttp-mode=redirect'
+expect_config_error 'HTTP and HTTPS ports must differ' $'root=../root\ncertificate=../cert.pem\nprivate-key=../key.pem\nhttp-port=8443'
+if "$server" --config "$work/config/invalid.conf" --config "$work/config/invalid.conf" \
+    >"$work/config-error.log" 2>&1; then
+    echo 'duplicate --config unexpectedly accepted' >&2; exit 1
+fi
+grep -Fq 'duplicate --config' "$work/config-error.log" || {
+    cat "$work/config-error.log" >&2; exit 1;
+}
+echo 'Config validation and secret redaction: PASS'
+
 http_port=$((20000 + RANDOM % 20000))
 https_port=$((40000 + RANDOM % 20000))
 http3_port=$https_port
@@ -173,9 +211,17 @@ else
 fi
 server_pid=
 
-"$server" --root "$work/root" --bind 127.0.0.1 --http-mode off \
-    --https-port "$https_port" --http2 off \
-    --certificate "$work/cert.pem" --private-key "$work/key.pem" \
+cat > "$work/config/tls.conf" <<EOF
+root=../root
+bind=127.0.0.1
+http-mode=redirect
+http-port=$http_port
+https-port=$https_port
+certificate=../cert.pem
+private-key=../key.pem
+http2=on
+EOF
+"$server" --http2 off --config "$work/config/tls.conf" --http-mode off \
     >"$work/server2.log" 2>&1 &
 server_pid=$!
 ready=0
@@ -196,6 +242,7 @@ version=$(curl --silent --fail --http1.1 --cacert "$work/cert.pem" \
     "https://localhost:$https_port/")
 [[ "$version" == 1.1 ]] || { echo "HTTP/1.1 expected, got $version" >&2; exit 1; }
 echo 'TLS HTTP/1.1 only: PASS'
+echo 'Config-relative root and TLS paths with CLI overrides: PASS'
 
 if ! kill -INT "$server_pid"; then
     cat "$work/server2.log" >&2
@@ -247,3 +294,54 @@ code=$(curl --silent --output "$work/symlink.body" --write-out '%{http_code}' \
 echo 'Plain HTTP/1.1 response: PASS'
 echo 'HEAD and directory listing: PASS'
 echo 'Path traversal and outside-root symlink rejection: PASS'
+
+if ! kill -INT "$server_pid" || ! wait "$server_pid"; then
+    cat "$work/server3.log" >&2; exit 1
+fi
+server_pid=
+cat > "$work/config/plain.conf" <<EOF
+# Plain server equivalent to the preceding CLI run.
+root = ../root
+bind = 127.0.0.1
+http-port = $http_port
+directory-listing = on
+reuse-port = on
+EOF
+"$server" --config "$work/config/plain.conf" >"$work/server4.log" 2>&1 &
+server_pid=$!
+ready=0
+for _ in {1..100}; do
+    if curl --silent --fail "http://127.0.0.1:$http_port/" >"$work/config-body"; then
+        ready=1; break
+    fi
+    sleep 0.1
+done
+(( ready )) || { cat "$work/server4.log" >&2; exit 1; }
+cmp -s "$work/root/index.html" "$work/config-body" || {
+    echo 'config response differs from CLI response' >&2; exit 1;
+}
+listing=$(curl --silent --fail "http://127.0.0.1:$http_port/files/")
+[[ "$listing" == *asset.txt* ]] || { echo 'config directory listing missing asset' >&2; exit 1; }
+echo 'Config and CLI plain HTTP equivalence: PASS'
+
+if ! kill -INT "$server_pid" || ! wait "$server_pid"; then
+    cat "$work/server4.log" >&2; exit 1
+fi
+server_pid=
+mkdir "$work/other-root"
+printf 'override-ok\n' > "$work/other-root/index.html"
+"$server" --config "$work/config/plain.conf" --root "$work/other-root" \
+    --no-directory-listing --no-reuse-port >"$work/server5.log" 2>&1 &
+server_pid=$!
+ready=0
+for _ in {1..100}; do
+    if [[ $(curl --silent --max-time 1 "http://127.0.0.1:$http_port/" || true) == override-ok ]]; then
+        ready=1; break
+    fi
+    sleep 0.1
+done
+(( ready )) || { cat "$work/server5.log" >&2; exit 1; }
+code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    "http://127.0.0.1:$http_port/files/")
+[[ "$code" != 200 ]] || { echo 'CLI directory-listing override failed' >&2; exit 1; }
+echo 'CLI root and boolean overrides: PASS'

@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -38,7 +40,8 @@ auto usage() -> void
 {
     std::cout <<
         "Stonegate: bounded static HTTP server\n"
-        "usage: stonegate --root DIR [options]\n"
+        "usage: stonegate --root DIR [options] | --config FILE [options]\n"
+        "  --config FILE           load key=value settings before CLI options\n"
         "  --bind ADDRESS          numeric IPv4/IPv6 bind address (default 127.0.0.1)\n"
         "  --http-port PORT        plain HTTP port (default 8080)\n"
         "  --http-mode MODE        serve, redirect, or off (default serve)\n"
@@ -50,7 +53,9 @@ auto usage() -> void
         "  --redirect-host HOST    host in HTTP to HTTPS redirect (default localhost)\n"
         "  --http2 on|off         TLS HTTP/2 ALPN (default on)\n"
         "  --directory-listing     list directories without index files\n"
+        "  --no-directory-listing  disable directory listing\n"
         "  --reuse-port            allow multiple listeners to reuse a port\n"
+        "  --no-reuse-port         disable port reuse\n"
         "  --shutdown-seconds N    shutdown deadline (default 5)\n"
         "  --help                  show this message\n";
 }
@@ -67,43 +72,129 @@ auto number(std::string_view text, std::string_view name, T minimum, T maximum) 
     return result;
 }
 
-auto parse(int argc, char** argv) -> config
+auto trim(std::string_view text) -> std::string_view
 {
-    config settings;
-    for (int index = 1; index < argc; ++index) {
-        const std::string_view option = argv[index];
-        if (option == "--help") {
-            usage();
-            std::exit(0);
-        }
-        if (option == "--directory-listing") { settings.directory_listing = true; continue; }
-        if (option == "--reuse-port") { settings.reuse_port = true; continue; }
-        if (index + 1 >= argc) throw std::invalid_argument("missing value for " + std::string(option));
-        const std::string_view value = argv[++index];
-        if (option == "--root") settings.root = value;
-        else if (option == "--bind") settings.bind = value;
-        else if (option == "--certificate") settings.certificate = value;
-        else if (option == "--private-key") settings.private_key = value;
-        else if (option == "--key-password") settings.key_password = value;
-        else if (option == "--redirect-host") settings.redirect_host = value;
-        else if (option == "--http-port")
-            settings.http_port = number<int>(value, option, 1, 65535);
-        else if (option == "--https-port")
-            settings.https_port = number<int>(value, option, 1, 65535);
-        else if (option == "--http3-port")
-            settings.http3_port = number<int>(value, option, 1, 65535);
-        else if (option == "--shutdown-seconds")
-            settings.shutdown_seconds = number<int>(value, option, 0, 3600);
-        else if (option == "--http-mode") {
+    const auto first = text.find_first_not_of(" \t");
+    if (first == std::string_view::npos) return {};
+    return text.substr(first, text.find_last_not_of(" \t") - first + 1);
+}
+
+auto on_off(std::string_view value, std::string_view name) -> bool
+{
+    if (value == "on") return true;
+    if (value == "off") return false;
+    throw std::invalid_argument(std::string(name) + " must be on or off");
+}
+
+auto apply(config& settings, std::string_view key, std::string_view value,
+           const std::filesystem::path* config_dir = nullptr) -> void
+{
+    const auto path_value = [&] {
+        const std::filesystem::path path {value};
+        return (config_dir != nullptr && path.is_relative()
+            ? (*config_dir / path).lexically_normal() : path).string();
+    };
+    if (value.empty()) throw std::invalid_argument(std::string(key) + " has an empty value");
+    if (key == "root") settings.root = path_value();
+    else if (key == "bind") settings.bind = value;
+    else if (key == "certificate") settings.certificate = path_value();
+    else if (key == "private-key") settings.private_key = path_value();
+    else if (key == "key-password") settings.key_password = value;
+    else if (key == "redirect-host") settings.redirect_host = value;
+    else if (key == "http-port") settings.http_port = number<int>(value, key, 1, 65535);
+    else if (key == "https-port") settings.https_port = number<int>(value, key, 1, 65535);
+    else if (key == "http3-port") settings.http3_port = number<int>(value, key, 1, 65535);
+    else if (key == "shutdown-seconds")
+        settings.shutdown_seconds = number<int>(value, key, 0, 3600);
+    else if (key == "http-mode") {
             if (value == "serve") settings.mode = config::http_mode::serve;
             else if (value == "redirect") settings.mode = config::http_mode::redirect;
             else if (value == "off") settings.mode = config::http_mode::off;
-            else throw std::invalid_argument("--http-mode must be serve, redirect, or off");
-        } else if (option == "--http2") {
-            if (value == "on") settings.http2 = true;
-            else if (value == "off") settings.http2 = false;
-            else throw std::invalid_argument("--http2 must be on or off");
-        } else throw std::invalid_argument("unknown option: " + std::string(option));
+            else throw std::invalid_argument("http-mode must be serve, redirect, or off");
+    } else if (key == "http2") settings.http2 = on_off(value, key);
+    else if (key == "directory-listing") settings.directory_listing = on_off(value, key);
+    else if (key == "reuse-port") settings.reuse_port = on_off(value, key);
+    else throw std::invalid_argument("unknown setting");
+}
+
+auto load_config(config& settings, const std::filesystem::path& path) -> void
+{
+    std::ifstream file(path);
+    if (!file) throw std::invalid_argument("cannot open config file");
+    const auto directory = path.parent_path();
+    std::set<std::string> keys;
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto content = trim(line);
+        if (content.empty() || content.front() == '#') continue;
+        const auto equal = content.find('=');
+        if (equal == std::string_view::npos)
+            throw std::invalid_argument("config line " + std::to_string(line_number) + " needs key=value");
+        const auto key = trim(content.substr(0, equal));
+        const auto value = trim(content.substr(equal + 1));
+        if (key.empty() || key.find_first_of(" \t") != std::string_view::npos)
+            throw std::invalid_argument("invalid key on config line " + std::to_string(line_number));
+        if (!keys.insert(std::string(key)).second)
+            throw std::invalid_argument("duplicate config key on line " + std::to_string(line_number));
+        try {
+            apply(settings, key, value, &directory);
+        } catch (const std::invalid_argument& error) {
+            throw std::invalid_argument("config line " + std::to_string(line_number) + ": " + error.what());
+        }
+    }
+    if (file.bad()) throw std::invalid_argument("error reading config file");
+}
+
+auto parse(int argc, char** argv) -> config
+{
+    config settings;
+    std::string_view config_path;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view option = argv[index];
+        if (option == "--help") { usage(); std::exit(0); }
+        if (option == "--config") {
+            if (!config_path.empty()) throw std::invalid_argument("duplicate --config");
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument("missing value for --config");
+            config_path = argv[++index];
+            if (config_path.empty()) throw std::invalid_argument("empty value for --config");
+        } else if (option == "--directory-listing" || option == "--no-directory-listing" ||
+                   option == "--reuse-port" || option == "--no-reuse-port") {
+            continue;
+        } else if (option == "--root" || option == "--bind" || option == "--certificate" ||
+                   option == "--private-key" || option == "--key-password" ||
+                   option == "--redirect-host" || option == "--http-port" ||
+                   option == "--https-port" || option == "--http3-port" ||
+                   option == "--shutdown-seconds" || option == "--http-mode" ||
+                   option == "--http2") {
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument("missing value for " + std::string(option));
+            ++index;
+        } else {
+            throw std::invalid_argument("unknown option: " + std::string(option));
+        }
+    }
+    if (!config_path.empty()) load_config(settings, std::filesystem::path(config_path));
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view option = argv[index];
+        if (option == "--help") { usage(); std::exit(0); }
+        if (option == "--config") { ++index; continue; }
+        if (option == "--directory-listing") { settings.directory_listing = true; continue; }
+        if (option == "--no-directory-listing") { settings.directory_listing = false; continue; }
+        if (option == "--reuse-port") { settings.reuse_port = true; continue; }
+        if (option == "--no-reuse-port") { settings.reuse_port = false; continue; }
+        if (option != "--root" && option != "--bind" && option != "--certificate" &&
+            option != "--private-key" && option != "--key-password" &&
+            option != "--redirect-host" && option != "--http-port" &&
+            option != "--https-port" && option != "--http3-port" &&
+            option != "--shutdown-seconds" && option != "--http-mode" && option != "--http2")
+            throw std::invalid_argument("unknown option: " + std::string(option));
+        if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+            throw std::invalid_argument("missing value for " + std::string(option));
+        apply(settings, option.substr(2), argv[++index]);
     }
 
     if (settings.root.empty() || !std::filesystem::is_directory(settings.root))
@@ -111,6 +202,8 @@ auto parse(int argc, char** argv) -> config
     const bool tls = !settings.certificate.empty() && !settings.private_key.empty();
     if (settings.certificate.empty() != settings.private_key.empty())
         throw std::invalid_argument("--certificate and --private-key must be supplied together");
+    if (!settings.key_password.empty() && !tls)
+        throw std::invalid_argument("--key-password requires TLS credentials");
     if (settings.http3_port != 0 && !tls)
         throw std::invalid_argument("--http3-port requires --certificate and --private-key");
     if (settings.http3_port != 0 && !settings.key_password.empty())

@@ -37,6 +37,31 @@ printf 'hello\n' > /tmp/stonegate-root/index.html
 curl --http1.1 http://127.0.0.1:8080/
 ```
 
+## Configuration file
+
+Copy [stonegate.conf.example](stonegate.conf.example) to a local config file,
+create its `public` directory, and run `stonegate --config /path/to/stonegate.conf`.
+`--root` or `--config` must provide an existing document root. CLI options may
+appear before or after `--config`; Stonegate loads the file first and then
+applies CLI options in their written order, so a CLI value overrides the file.
+For example, `stonegate --config stonegate.conf --http-port 9090` changes the
+port without editing the file.
+
+Each nonblank line is `key=value`. Spaces and tabs around the key, `=`, and
+value are ignored. Lines whose first nonwhitespace character is `#` are
+comments. There are no inline comments, quotes, or escape sequences; a `#` or
+`=` inside a value is literal. Keys use the CLI names without `--`, including
+`root`, `bind`, `http-port`, `http-mode`, `https-port`, `http3-port`,
+`certificate`, `private-key`, `key-password`, `redirect-host`, `http2`,
+`directory-listing`, `reuse-port`, and `shutdown-seconds`. The three boolean
+keys use `on` or `off`. Duplicate keys, unknown keys, empty values, and
+malformed values are errors with a line number. Relative `root`, `certificate`,
+and `private-key` paths in the file resolve relative to the config file's
+directory; CLI paths resolve relative to the current working directory.
+`--no-directory-listing` and `--no-reuse-port` can override enabled file
+settings. Keep private key passwords in a protected local config file; the
+example has no credentials and error messages do not print setting values.
+
 To serve TLS HTTP/1.1 and HTTP/2 and redirect the plain listener:
 
 ```sh
@@ -84,6 +109,9 @@ HTTP/1.1, HTTP-to-HTTPS redirect, TLS HTTP/1.1, and TLS HTTP/2 when the local
 curl supports HTTP/2. It also checks that `--http2 off` negotiates HTTP/1.1,
 and exercises HEAD, directory listing, path traversal and outside-root symlink
 rejection, the `--reuse-port` setting, and a TLS listener rebind after SIGINT.
+It checks config and CLI equivalence, config-relative paths, CLI overrides,
+duplicate and malformed settings, missing TLS credentials, conflicting ports,
+and error messages that do not echo a private key password.
 When curl advertises HTTP3, the script makes three rounds of fresh HTTP/3
 GET, HEAD, OPTIONS, and GET-after-OPTIONS requests against one running
 Stonegate process. It checks statuses 200/200/204/200, version 3, GET bodies,
