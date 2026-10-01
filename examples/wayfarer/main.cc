@@ -138,10 +138,10 @@ auto parse_options(int argc, char** argv) -> request_options
     if (options.body_supplied && options.method == "GET") options.method = "POST";
     if (options.body.size() > 4 * 1024 * 1024)
         throw std::invalid_argument("request body exceeds 4 MiB");
-    if (options.protocol == 3 && (options.method != "GET" || options.body_supplied || !options.headers.empty() || options.show_headers))
-        throw std::invalid_argument("HTTP/3 currently supports GET and body output only");
-    if (options.follow_redirects && options.protocol == 3)
-        throw std::invalid_argument("-L is unsupported for HTTP/3");
+    if (options.protocol == 3 && (options.method != "GET" && options.method != "HEAD"))
+        throw std::invalid_argument("HTTP/3 supports GET and HEAD only");
+    if (options.protocol == 3 && (options.body_supplied || !options.headers.empty()))
+        throw std::invalid_argument("HTTP/3 request bodies and custom headers are unsupported");
     if (options.protocol == 1 && !options.body_file.empty()) {
         options.body = read_bounded_body_file(options.body_file);
         options.body_file.clear();
