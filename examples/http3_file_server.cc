@@ -18,7 +18,12 @@ auto main(int argc, char** argv) -> int
     if (parsed.ec != std::errc{} || parsed.ptr != end || port == 0 || port > 65535)
         return 2;
     try {
-        eventloop::event_loop loop;
+        // Each active HTTP/3 request holds one 2 KiB-class serve_request frame.
+        // Size the loop for the server's concurrent connection slots; index 4 is
+        // the 2048-byte class in coroutine_frame_sizes.
+        eventloop::event_loop_options options;
+        options.coroutine_frame_capacities[4] = 32;
+        eventloop::event_loop loop(options);
         eventloop::http::http3_server server(loop,
             eventloop::ip_endpoint::any_v4(static_cast<std::uint16_t>(port)),
             argv[2], argv[3], argv[4]);

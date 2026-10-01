@@ -4,6 +4,7 @@ set -euo pipefail
 server=$1
 openssl=$2
 curl=$3
+client=$4
 
 if ! "$curl" --version | grep -q HTTP3; then
     echo 'curl lacks HTTP/3; HTTP/3 server interoperability cannot run' >&2
@@ -38,6 +39,7 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "$work_dir/www"
 printf 'http3 slot reuse\n' > "$work_dir/www/index.html"
+"$openssl" rand 65536 > "$work_dir/www/large.bin"
 "$openssl" req -x509 -newkey rsa:2048 -nodes -days 1 \
     -subj /CN=localhost -keyout "$work_dir/key.pem" \
     -out "$work_dir/cert.pem" > /dev/null 2>&1
@@ -61,6 +63,34 @@ if [[ $ready != true ]]; then
     exit 1
 fi
 echo 'HTTP/3 server ready: GET 200'
+
+# Exercise another implementation's control and QPACK streams before curl
+# opens fresh connections to the same server process.
+"$client" --version v1 --ca-file "$work_dir/cert.pem" \
+    "https://localhost:$port/" > "$work_dir/client.out"
+cmp "$work_dir/www/index.html" "$work_dir/client.out"
+
+# Active responses each hold a 2 KiB-class request frame. Exercise the server's
+# full eight-connection slot count with all transfers overlapping.
+pids=()
+for index in {1..8}; do
+    "$curl" --http3-only --silent --show-error --insecure --max-time 20 \
+        --limit-rate 16k --resolve "localhost:$port:127.0.0.1" \
+        --output "$work_dir/large-$index.out" \
+        --write-out '%{http_code} %{http_version}' \
+        "https://localhost:$port/large.bin" > "$work_dir/large-$index.status" &
+    pids+=("$!")
+done
+failed=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then failed=1; fi
+done
+[[ $failed == 0 ]]
+for index in {1..8}; do
+    [[ $(<"$work_dir/large-$index.status") == '200 3' ]]
+    cmp "$work_dir/www/large.bin" "$work_dir/large-$index.out"
+done
+echo 'HTTP/3 eight overlapping fresh clients: PASS'
 
 # Separate curl processes force slot retirement and reuse. A retired handle's
 # later close must not mark the next accepted connection as closing.
@@ -89,3 +119,4 @@ for _ in {1..3}; do
     if grep -qi '^content-length:' "$work_dir/options.out"; then exit 1; fi
 done
 echo 'HTTP/3 regression passed: three fresh GET/HEAD/OPTIONS cycles'
+echo 'HTTP/3 eventloop client followed by fresh curl clients: PASS'

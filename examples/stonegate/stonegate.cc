@@ -287,7 +287,12 @@ auto main(int argc, char** argv) -> int
             .reuse_port = settings.reuse_port,
             .enable_http2 = settings.http2,
         };
-        eventloop::event_loop loop;
+        // HTTP/3 and redirect requests hold 2 KiB-class coroutine frames. Size
+        // the loop for the aggregate connection concurrency; index 4 is the
+        // 2048-byte class in coroutine_frame_sizes.
+        eventloop::event_loop_options loop_options;
+        loop_options.coroutine_frame_capacities[4] = 32;
+        eventloop::event_loop loop(loop_options);
         std::unique_ptr<eventloop::http::http3_server> http3;
         eventloop::task_handle<void> http3_run;
         if (settings.mode == config::http_mode::serve) {

@@ -1524,6 +1524,7 @@ if(BUILD_TESTING)
                      $<TARGET_FILE:http3_file_server>
                      ${OPENSSL_EXECUTABLE}
                      ${CURL_EXECUTABLE}
+                     $<TARGET_FILE:http3_client>
     )
     set_tests_properties(http3_server PROPERTIES TIMEOUT 30)
 endif()

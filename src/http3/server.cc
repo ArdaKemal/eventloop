@@ -24,6 +24,7 @@ namespace wire = eventloop::quic::detail;
 constexpr std::size_t max_connections = 8;
 constexpr std::size_t max_streams = 40;
 constexpr std::size_t header_limit = 16 * 1024;
+using stream_handlers = std::array<std::optional<task_handle<void>>, max_streams>;
 
 struct stream_storage {
     std::array<std::byte, header_limit> headers {};
@@ -60,25 +61,54 @@ auto read_exact(event_loop& loop, quic_connection& connection, std::uint64_t id,
     co_return true;
 }
 
-auto read_varint(event_loop& loop, quic_connection& connection, std::uint64_t id)
+auto read_varint(event_loop& loop, quic_connection& connection, std::uint64_t id,
+                 std::size_t* remaining = nullptr)
     -> task<std::expected<std::uint64_t, std::error_code>>
 {
     std::array<std::byte, 8> input {};
+    if (remaining && *remaining == 0)
+        co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
     if (!(co_await read_exact(loop, connection, id, std::span(input).first(1))).value_or(false))
         co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
     const auto size = std::size_t{1} << (std::to_integer<unsigned>(input[0]) >> 6);
+    if (remaining && size > *remaining)
+        co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
     if (size > 1 && !(co_await read_exact(loop, connection, id, std::span(input).subspan(1, size - 1))).value_or(false))
         co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
     auto decoded = wire::decode_varint(std::span(input).first(size));
     if (!decoded) co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
+    if (remaining) *remaining -= size;
     co_return decoded->value;
 }
 
+auto read_control_settings(event_loop& loop, quic_connection& connection,
+                           std::uint64_t id, std::size_t remaining) -> task<bool>
+{
+    // Keep the 64 identifiers in a short-lived frame. The peer SETTINGS
+    // payload is consumed incrementally, so no 1 KiB receive buffer remains
+    // pinned while the long-lived unidirectional stream waits for input.
+    std::array<std::uint64_t, 64> identifiers {};
+    std::size_t count = 0;
+    while (remaining != 0) {
+        if (count == identifiers.size()) co_return false;
+        const auto identifier = flatten_result(co_await read_varint(loop, connection, id, &remaining));
+        if (!identifier || h3::forbidden_setting(*identifier)) co_return false;
+        const auto value = flatten_result(co_await read_varint(loop, connection, id, &remaining));
+        if (!value || std::find(identifiers.begin(), identifiers.begin() +
+                static_cast<std::ptrdiff_t>(count), *identifier) !=
+                identifiers.begin() + static_cast<std::ptrdiff_t>(count)) co_return false;
+        identifiers[count++] = *identifier;
+    }
+    co_return true;
+}
+
+// Header encoding uses a caller-owned scratch buffer so the 512-byte encode
+// area does not enlarge this coroutine's frame. Keeping the frame within the
+// 1 KiB size class matters because each active request holds one.
 auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t id,
                   unsigned status, std::uint64_t length, std::string_view mime,
-                  bool fin) -> task<bool>
+                  bool fin, std::span<std::byte> buffer) -> task<bool>
 {
-    std::array<std::byte, 512> buffer {};
     std::array<char, 32> status_text {}, length_text {};
     auto status_end = std::to_chars(status_text.data(), status_text.data() + status_text.size(), status);
     auto length_end = std::to_chars(length_text.data(), length_text.data() + length_text.size(), length);
@@ -93,12 +123,12 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
     if (status == 204 || status == 405)
         fields[field_count++] = {"allow", "GET, HEAD, OPTIONS"};
     auto encoded = h3::qpack_encode(std::span(fields).first(field_count),
-                                    std::span(buffer).subspan(16));
+                                    buffer.subspan(16));
     if (!encoded) co_return false;
     auto framed = h3::encode_frame(h3::headers_frame,
-        std::span(buffer).subspan(16, *encoded), buffer);
+        buffer.subspan(16, *encoded), buffer);
     if (!framed) co_return false;
-    co_return (co_await write_all(loop, connection, id, std::span(buffer).first(*framed), fin)).value_or(false);
+    co_return (co_await write_all(loop, connection, id, buffer.first(*framed), fin)).value_or(false);
 }
 
 auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
@@ -167,7 +197,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         }
     }
     if (!(co_await send_headers(loop, connection, id, status, size, mime,
-                               status != 200 || method == "HEAD")).value_or(false)) {
+                               status != 200 || method == "HEAD", s.io)).value_or(false)) {
         connection.close(std::make_error_code(std::errc::io_error));
         co_return;
     }
@@ -202,9 +232,8 @@ auto drain_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t
         if (!frame_type || !length || *frame_type != h3::settings_frame || *length > 1024) {
             connection.close(std::make_error_code(std::errc::protocol_error)); co_return;
         }
-        std::array<std::byte, 1024> settings {};
-        if (!(co_await read_exact(loop, connection, id, std::span(settings).first(*length))).value_or(false) ||
-            !h3::validate_settings(std::span(settings).first(*length), 64)) {
+        if (!(co_await read_control_settings(loop, connection, id,
+                static_cast<std::size_t>(*length))).value_or(false)) {
             connection.close(std::make_error_code(std::errc::protocol_error)); co_return;
         }
     }
@@ -218,9 +247,9 @@ auto drain_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t
 }
 
 auto serve_connection(event_loop& loop, quic_connection connection,
-                      std::shared_ptr<unique_fd> root) -> task<void>
+                      std::shared_ptr<unique_fd> root,
+                      stream_handlers& handlers) -> task<void>
 {
-    std::array<task_handle<void>, max_streams> handlers;
     std::size_t used = 0;
     bool have_control = false;
     auto control = flatten_result(co_await connection.async_open_stream(quic_stream_direction::unidirectional));
@@ -245,25 +274,36 @@ auto serve_connection(event_loop& loop, quic_connection connection,
         if (!accepted) break;
         const auto id = *accepted;
         task_spawn_result spawned = task_spawn_result::invalid_task;
+        handlers[used].emplace();
         if ((id & 3u) == 2u) {
-            spawned = loop.spawn(drain_peer_uni(loop, connection, id, have_control), handlers[used]);
+            spawned = loop.spawn(drain_peer_uni(loop, connection, id, have_control), *handlers[used]);
         } else if ((id & 3u) == 0u) {
             auto storage = std::make_unique<stream_storage>();
-            spawned = loop.spawn(serve_request(loop, connection, id, root->get(), std::move(storage)), handlers[used]);
+            spawned = loop.spawn(serve_request(loop, connection, id, root->get(), std::move(storage)), *handlers[used]);
         }
-        if (spawned != task_spawn_result::accepted) { connection.close(); break; }
+        if (spawned != task_spawn_result::accepted) {
+            handlers[used].reset();
+            connection.close();
+            break;
+        }
         ++used;
     }
     connection.close();
     for (std::size_t i = 0; i < used; ++i) {
-        (void)handlers[i].cancel();
-        (void)co_await handlers[i];
+        (void)handlers[i]->cancel();
+        (void)co_await *handlers[i];
+        handlers[i].reset();
     }
 }
 } // namespace
 
 class http3_server::implementation {
 public:
+    struct connection_slot {
+        stream_handlers handlers;
+        std::optional<task_handle<void>> handle;
+    };
+
     implementation(event_loop& loop, ip_endpoint local, std::string_view root,
                    std::filesystem::path cert, std::filesystem::path key)
         : loop_(loop), root_(std::make_shared<unique_fd>(http::detail::open_root(root))),
@@ -274,7 +314,7 @@ public:
     std::shared_ptr<unique_fd> root_;
     const std::array<std::uint8_t, 2> alpn_ {'h', '3'};
     quic_endpoint endpoint_;
-    std::array<std::unique_ptr<task_handle<void>>, max_connections> connections_;
+    std::array<connection_slot, max_connections> connections_;
 };
 
 http3_server::http3_server(event_loop& loop, ip_endpoint local, std::string_view root,
@@ -299,19 +339,29 @@ auto http3_server::run_loop(event_loop& loop, http3_server& server) -> task<void
             continue;
         }
         auto slot = std::find_if(impl.connections_.begin(), impl.connections_.end(),
-            [](const auto& handle) { return !handle || handle->done(); });
+            [](const auto& entry) { return !entry.handle || entry.handle->done(); });
         if (slot == impl.connections_.end()) { accepted->close(); continue; }
-        slot->reset();
-        *slot = std::make_unique<task_handle<void>>();
-        if (loop.spawn(serve_connection(loop, std::move(*accepted), impl.root_), **slot)
-            != task_spawn_result::accepted) { slot->reset(); break; }
+        slot->handle.emplace();
+        const auto spawned = loop.spawn(serve_connection(loop, std::move(*accepted), impl.root_,
+                slot->handlers), *slot->handle);
+        if (spawned != task_spawn_result::accepted) {
+            slot->handle.reset();
+            if (spawned == task_spawn_result::frame_allocation_failure) {
+                // The connection task frame was never created, so the accepted
+                // connection is untouched. Reject only this connection instead
+                // of tearing down the listener and every live connection.
+                accepted->close();
+                continue;
+            }
+            break;
+        }
     }
     impl.endpoint_.close();
-    for (auto& handle : impl.connections_) {
-        if (!handle) continue;
-        (void)handle->cancel();
-        (void)co_await *handle;
-        handle.reset();
+    for (auto& slot : impl.connections_) {
+        if (!slot.handle) continue;
+        (void)slot.handle->cancel();
+        (void)co_await *slot.handle;
+        slot.handle.reset();
     }
     (void)co_await impl.endpoint_.async_close();
 }

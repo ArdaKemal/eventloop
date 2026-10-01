@@ -225,6 +225,16 @@ back to an unbounded allocation.
   OPTIONS serve static files or `index.html` using the shared secure resource
   walk. Request header blocks are capped at 16 KiB and 128 fields, dynamic
   QPACK tables are disabled, and QUIC caps each connection at 32 peer
-  bidirectional and eight peer unidirectional streams. A request that exceeds
-  the header cap closes its connection. Directory listings, request bodies,
-  HTTP/3 server push, and WebTransport are not supported.
+  bidirectional and eight peer unidirectional streams. The server has eight
+  concurrent connection slots, each with storage for 40 observed stream tasks;
+  connections beyond that limit are rejected. Each active request holds one
+  coroutine frame from the loop's 2048-byte size class, so callers should size
+  `eventloop::event_loop_options::coroutine_frame_capacities` for the expected
+  request concurrency; the shipped HTTP/3 examples use 32. A frame-allocation
+  failure rejects only the affected connection instead of stopping the
+  listener. A request that exceeds the header cap closes its connection. Peer
+  SETTINGS are limited to 1024 payload bytes and 64 entries; malformed or
+  oversized SETTINGS close the connection. Control SETTINGS are validated
+  incrementally using bounded frame storage, which is released after
+  validation. Directory listings, request bodies, HTTP/3 server push, and
+  WebTransport are not supported.
