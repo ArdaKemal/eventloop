@@ -73,6 +73,7 @@ path, repeated query parameters, discarded fragment, 32 KiB binary response,
 204 and 404 status/body behavior, tolerance of `Content-Length: 0` on 204,
 rejection of nonzero 204 lengths or bodies, rejected untrusted certificates and
 wrong certificate IP identity, and deadlines during handshake and HTTP exchange.
+It also requires and verifies a Retry handshake for both QUIC versions.
 The large binary body exceeds the 4 KiB per-stream receive window and requires
 credit replenishment. All success responses are compared byte for byte, and
 server request records independently verify the path and exact wire version.
@@ -109,26 +110,15 @@ python3 tests/probe_http3_live.py --client build/http3_client \
   --version v1 --expect-status 204 https://www.google.com/generate_204
 ```
 
-On 2026-10-01, explicit v1 and v2 GETs both passed against `www.haproxy.org`
-and `quic.aiortc.org`; v1 also passed against Google and Cloudflare. Explicit v2
-to Google and Cloudflare did not complete before the configured deadline. An
-independent aioquic v2-only attempt to Google reported no common version. These
-are point-in-time observations, not release gates; public support and routing
-can change. A failed v2 probe never retries with v1. HTTP/3 ALPN and Alt-Svc
-alone do not prove a transport version. The live runner prints the requested
-version, exit status, byte count, body hash, and client diagnostics. Use
-`--expect-status`, `--contains`, or `--sha256` for stable assertions; avoid
+Public support and routing can change. A failed v2 probe never retries with v1.
+HTTP/3 ALPN and Alt-Svc alone do not prove a transport version. The live runner
+prints the requested version, exit status, byte count, body hash, and client
+diagnostics. Use `--expect-status`, `--contains`, or `--sha256` for stable assertions; avoid
 hashes for changing public HTML. Network restrictions, remote changes, and DNS
 failures make live results unsuitable as deterministic release gates.
 
-Google returned `Content-Length: 0` on a 204 in one live response. RFC 9110
-prohibits that field on 204 responses, but the client now tolerates exactly zero
-for interoperability. It continues to reject nonzero lengths and any body. The
-explicit Google probe passed after this change.
-
-See the [2026-10-01 public HTTP/3 interoperability sweep](http3-public-interoperability-2026-10-01.md)
-for the broader endpoint matrix, the QPACK Stream Cancellation fix, and current
-unresolved endpoint/version results.
+The client tolerates `Content-Length: 0` on a 204 response for interoperability.
+It rejects nonzero lengths and any body.
 
 Sources: [aioquic configuration](https://github.com/aiortc/aioquic/blob/1.3.0/src/aioquic/quic/configuration.py),
 [Cloudflare trace endpoint](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/),

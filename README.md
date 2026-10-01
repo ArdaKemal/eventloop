@@ -1,229 +1,204 @@
-# Event loop
+# eventloop
 
-A small C++23 coroutine-native networking library with a Linux epoll event
-loop, bounded coroutine runtime, TCP/TLS/UDP sockets, HTTP/1.1, TLS HTTP/2, and
-WebSocket support. The echo protocols are examples built on the public
-awaitable APIs.
+**C++23 networking with coroutines, explicit ownership, and memory limits you can plan around.**
 
-## Layout
+`eventloop` lets a connection read, write, wait, and recover in ordinary
+coroutine control flow. The event loop keeps I/O and resumption on the owning
+thread; bounded frame pools and queues make resource exhaustion visible instead
+of allowing an unplanned heap fallback. The result is a useful foundation for
+network services that need both straightforward application code and predictable
+behavior under load.
 
-```text
-include/eventloop/  Public event loop and TCP transport API
-src/                Platform-independent implementations
-src/linux/          Private Linux epoll backend
-examples/           Programs built on top of the library
-tests/              Plain/TLS transport integration coverage
+The library includes awaitable TCP, TLS, and UDP sockets; HTTP/1.1 and TLS
+HTTP/2 servers; WebSocket framing; bounded file I/O; and a public QUIC v1/v2
+endpoint API. It has Linux epoll, macOS kqueue, and Windows IOCP backends.
+
+## A complete echo server
+
+This small server accepts TCP connections on loopback and echoes each byte
+back. The event loop owns the listener and streams. Each connection gets a
+coroutine with a 512-byte buffer in its bounded frame:
+
+```cpp
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <memory>
+#include <span>
+#include <utility>
+
+#include "eventloop/event_loop.h"
+#include "eventloop/task.h"
+#include "eventloop/tcp_acceptor.h"
+#include "eventloop/tcp_stream.h"
+
+using namespace eventloop;
+
+auto echo_session(event_loop& loop, tcp_stream& stream) -> task<void>
+{
+    (void)loop;
+    std::array<std::byte, 512> buffer{};
+
+    for (;;) {
+        auto received = co_await stream.async_read_some(buffer);
+        if (!received || *received == 0) break;
+
+        std::size_t offset = 0;
+        while (offset < *received) {
+            auto sent = co_await stream.async_write_some(
+                std::span<const std::byte>(buffer)
+                    .first(*received).subspan(offset));
+            if (!sent || *sent == 0) {
+                stream.close();
+                co_return;
+            }
+            offset += *sent;
+        }
+    }
+    stream.close();
+}
+
+auto serve(event_loop& loop, tcp_acceptor& listener) -> task<void>
+{
+    for (;;) {
+        auto accepted = co_await listener.async_accept();
+        if (!accepted) co_return;
+
+        auto stream = std::make_unique<tcp_stream>(loop, std::move(*accepted));
+        auto* session = stream.get();
+        loop.add(std::move(stream));
+        if (loop.spawn(echo_session(loop, *session)) != task_spawn_result::accepted)
+            session->close();
+    }
+}
+
+int main()
+{
+    event_loop loop;
+    auto acceptor = std::make_unique<tcp_acceptor>(
+        loop, ip_endpoint::loopback_v4(7000));
+    auto* listener = acceptor.get();
+    loop.add(std::move(acceptor));
+
+    if (loop.spawn(serve(loop, *listener)) != task_spawn_result::accepted) {
+        listener->close();
+        return 1;
+    }
+    if (loop.run() == event_loop_result::interrupted) {
+        loop.shutdown(std::chrono::seconds{0});
+        (void)loop.run();
+    }
+}
 ```
 
+The read and write calls may complete partially, so the session handles both
+cases. Closing a stream cancels its pending operations and removes it from the
+loop. The full [TCP echo example](examples/tcp_echo.cc) adds port parsing and
+error reporting. Build and run that example with the commands below.
+
+## Build and run
+
+You need a C++23 compiler, CMake 3.20 or newer, OpenSSL 3.5 or newer, and
+thread support.
+
 ```sh
-cmake -S . -B build
-cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+```
+
+Start the echo server on loopback port 7000:
+
+```sh
 ./build/tcp_echo 7000
 ```
 
-The server listens on loopback. Stop it with `Ctrl-C`.
-
-For the TLS echo example, provide a PEM certificate chain and private key:
-
-```sh
-./build/tls_echo certificate.pem private-key.pem 7443
-```
-
-Run the HTTP/1.1 static-file server with a document root and TLS certificate:
-
-```sh
-./build/http_server \
-    --root ./public \
-    --certificate certificate-chain.pem \
-    --private-key private-key.pem \
-    --hostname example.com \
-    --http-port 80 \
-    --https-port 443
-```
-
-The HTTP listener redirects requests to HTTPS. The HTTPS listener serves files
-and uses `index.html` for directories. Pass `--directory-listing` to generate a
-listing when a directory has no index file. Run `http_server --help` for all
-options. `SIGINT` and `SIGTERM` request event-loop shutdown. Active coroutine
-roots are cancelled and built-in socket handlers close immediately, including
-HTTP connections with unfinished responses. `--shutdown-timeout` bounds any
-handlers still registered after shutdown notification; a second signal forces
-their removal immediately.
-
-HTTPS advertises HTTP/2 (`h2`) and HTTP/1.1 through ALPN by default. HTTP/2
-serves GET, HEAD, and OPTIONS requests, supports concurrent streams, and keeps
-request frames, HPACK tables, streams, and queued inline bodies bounded. Large
-regular files stream within HTTP/2 flow control. Cleartext HTTP and HTTP/1.1
-Upgrade to h2c are not supported; the plain HTTP listener remains HTTP/1.1.
-
-To serve plain HTTP without TLS or a redirect listener, certificate files are
-not required:
+Or serve a directory over plain HTTP:
 
 ```sh
 ./build/http_server --root ./public --http-only --http-port 8080
 ```
 
-The standalone HTTP client example sends one HTTP/1.1 GET request and writes
-the complete response to standard output. It accepts `http://` and `https://`
-URLs, including bracketed IPv6 addresses; HTTPS verifies the server using the
-system trust store:
+For HTTPS, provide a PEM certificate chain and private key:
 
 ```sh
-./build/http_client https://example.com/path
-./build/http_client 'http://[::1]:8080/'
+./build/http_server --root ./public \
+  --certificate certificate-chain.pem --private-key private-key.pem \
+  --https-port 8443 --http-port 8080
 ```
 
-The HTTP parser and request/response path use fixed-capacity buffers. Requests
-larger than those limits receive an appropriate 4xx response instead of
-growing buffers dynamically.
+The HTTPS listener negotiates HTTP/2 or HTTP/1.1. In this configuration the
+plain HTTP listener redirects to HTTPS. Run `http_server --help` for the
+available address, hostname, directory listing, and shutdown options. On
+Windows, use a Visual Studio CMake generator and run programs from the build
+configuration directory, such as `build/Release/http_server.exe`.
 
-Run the transport tests with:
+## Use it in your project
+
+Install the library and link the exported CMake target:
 
 ```sh
-ctest --test-dir build --output-on-failure
+cmake --install build --prefix /path/to/eventloop-install
 ```
 
-## Coroutine composition
-
-The [coroutine API contract](docs/api-contract.md) describes ownership,
-results, cancellation, and capacity rules for new coroutine-facing APIs.
-Use `eventloop::task_handle<T>` with
-`eventloop::event_loop::spawn(task<T>, handle)` to observe a root task's result.
-The handle can be awaited once or queried with `done()`
-and `take_result()`. Its `cancel()` method requests cancellation on the owning
-loop thread; keep the handle alive until completion, including when worker or
-file I/O must retire. An active handle cannot be moved or destroyed.
-
-Include `eventloop/task_composition.h` for `when_all(task<T>...)`,
-`race(task<T>...)`, and `with_timeout(loop, task<T>, duration)`.
-`task<T>` returns `std::expected<T, task_result>` when awaited; `task<void>`
-continues to return `task_result`. A child whose value is itself
-`std::expected` retains that value and its error unchanged.
-
-`when_all` returns a tuple of child results after every child has finished.
-`race` returns the first completion's index and result, then requests
-cancellation of the other branches and waits for them to retire before
-returning. An already cancelled parent receives `task_result::cancelled`.
-`with_timeout` returns `completed`, `timed_out`, or `cancelled`; a zero or
-negative duration times out without starting the operation. Cancellation of
-worker or file I/O waits for its completion before releasing the child's
-frame, so a timeout can take longer than its deadline.
-
-Operands must be unstarted tasks belonging to the same loop. Each branch and
-the combinator's parent use that loop's bounded coroutine frames. The arity is
-fixed at compile time; large combinations may exceed the largest frame class
-and report `frame_allocation_failure`. The combinators do not accept arbitrary
-third-party awaitables; use them inside a `task<T>` instead.
-
-## Coroutine file I/O
-
-Include `eventloop/file_io.h` to `co_await` `async_openat`, `async_read_at`, or
-`async_write_at` from a task owned by an `event_loop`. Operations run on a
-dedicated bounded worker and post completion back to the same event loop.
-`file_io_depth` bounds concurrent file operations; a full queue returns
-`EAGAIN`.
-
-The operations return `std::expected` with `std::error_code` on failure.
-`async_openat` returns an owning `unique_fd` and copies paths up to 255 bytes
-into the coroutine frame. The directory and file descriptors passed to these
-operations are borrowed and must remain open and unreused until completion,
-including after cancellation is requested. Read and write buffers must remain
-valid for the same period. Cancellation does not abort an already-running
-syscall; the coroutine resumes with `ECANCELED` after that syscall completes.
-The current event-loop implementation itself remains Linux/epoll-only.
-
-## Coroutine socket I/O
-
-Include `eventloop/tcp_acceptor.h` and `eventloop/tcp_stream.h` for nonblocking
-IPv4 or IPv6 TCP, `eventloop/tls_stream.h` for TLS, or `eventloop/udp_socket.h`
-for datagrams. Public types live in `eventloop`; HTTP and WebSocket types
-live in `eventloop::http` and `eventloop::ws`. TCP and UDP addresses use
-`eventloop::ip_endpoint`, with address octets, a host-order port, and an IPv6
-scope ID. Use its `from_ipv4`/`from_ipv6`, `loopback_v4`/`loopback_v6`,
-`any_v4`/`any_v6`, or numeric `parse` factories. IPv6 sockets are v6-only.
-`eventloop::event_loop::add` takes ownership of supported socket objects.
-Await `async_accept`, `async_connect`, `async_read_some`, `async_write_some`,
-and the UDP send/receive operations. TCP reads and writes may complete
-partially; UDP operations preserve datagram boundaries. Buffers remain
-caller-owned through completion, including cancellation. Call `close()` to
-cancel pending operations and remove a socket from its loop.
-
-The public asynchronous I/O APIs are coroutine based. Readiness dispatch stays
-inside the event-loop implementation. `post()` remains available for bounded
-commands that cross into the loop thread.
-
-The HTTP server also uses connection coroutines. Its parser and response
-buffers live in a session owned by each connection task. Plain HTTP retains
-`sendfile` for larger files; metadata and small-file reads remain synchronous.
-
-`./build/file_io_benchmark` measures cached 4 KiB reads at 16-way concurrency
-and reports operation throughput/latency plus event-loop timer lateness. It is
-an executor and event-loop overhead probe, not a storage-device benchmark.
-
-`./build/coroutine_socket_benchmark both 10000 16` runs 16 concurrent clients
-through 64-byte TCP and UDP loopback echo workloads. Pass `tcp` or `udp` as the
-first argument to profile one transport. This measures coroutine, epoll,
-syscall, and local kernel networking costs; it does not measure NIC throughput.
-For a symbolized CPU profile, build with `RelWithDebInfo` and frame pointers,
-then record either transport with:
-
-```sh
-cmake -S . -B build-profile -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O2 -g -DNDEBUG -fno-omit-frame-pointer'
-cmake --build build-profile --target coroutine_socket_benchmark -j2
-perf record -F 997 -g --call-graph fp -o /tmp/eventloop-tcp.data -- \
-  ./build-profile/coroutine_socket_benchmark tcp 10000 16
-perf report --stdio -i /tmp/eventloop-tcp.data
+```cmake
+find_package(eventloop CONFIG REQUIRED)
+target_link_libraries(your_app PRIVATE eventloop::eventloop)
 ```
 
-## HTTP throughput comparison
+Pass `-DCMAKE_PREFIX_PATH=/path/to/eventloop-install` when configuring a
+consumer outside CMake's usual package search paths. Public headers are under
+`include/eventloop/`.
 
-On Debian/Ubuntu, install `wrk`, `nginx`, and `lighttpd`, then run:
+| Build with | Public entry point | Runnable example |
+| --- | --- | --- |
+| TCP and TLS services | `tcp_acceptor.h`, `tcp_stream.h`, `tls_stream.h` | `tcp_echo`, `tls_echo` |
+| UDP services | `udp_socket.h`, `ip_endpoint.h` | `coroutine_socket_benchmark` |
+| HTTP and WebSocket | `http/server.h`, `ws/web_socket.h` | `http_server`, `websocket_echo_server`, `websocket_client` |
+| Bounded file operations | `file_io.h` | `file_io_benchmark` |
+| QUIC streams and DATAGRAMs | `quic.h` | `quic_echo_server`, `http3_client` |
 
-```sh
-./benchmark/http-throughput.sh
-```
+The library also provides `task<T>`, observed `task_handle<T>` roots,
+`when_all`, `race`, and `with_timeout` for composing loop-owned work.
+The [coroutine API contract](docs/api-contract.md) explains task results,
+cancellation, buffer lifetimes, and capacity errors. The
+[API conventions](docs/api-conventions.md) describe how public operations fit
+together.
 
-The harness builds the HTTP example in `Release` mode if necessary, generates
-one static payload, and runs each server on loopback with one worker and the
-same `wrk` keep-alive workload. It warms each server before reporting `wrk`'s
-requests/sec, transfer/sec, and latency. Defaults are a 4 KiB payload, 128
-connections, one `wrk` thread, and a 15-second measurement. Override them for
-additional profiles, for example:
+## Designed for bounded services
 
-```sh
-FILE_SIZE=1024 CONNECTIONS=256 DURATION=30s ./benchmark/http-throughput.sh
-```
+Coroutine frames come from configurable, per-loop size classes. Socket
+awaiters use caller-owned buffers and frame-local state; file operations run
+on a dedicated bounded worker. Queues and protocol buffers have limits, and
+operations report when a limit is reached. OpenSSL and setup code may allocate,
+so the library does not promise a heap-free process.
 
-Use `SERVER=eventloop`, `SERVER=nginx`, or `SERVER=lighttpd` to repeat one
-participant while diagnosing a result.
+Ownership is visible at the API boundary. For example, accepting a TCP
+connection returns an owning `unique_fd`, while a `std::span` passed to an
+asynchronous read remains the caller's buffer until completion. Cancellation
+is a request; an in-flight worker or I/O operation must retire before its
+frame and borrowed inputs can be released. Event-loop objects and their
+coroutines stay on the owning thread.
 
-This is a local HTTP/1.1 static-file benchmark, not a production tuning guide.
-Plain HTTP file responses use Linux `sendfile`; HTTPS responses pass through
-OpenSSL in user space. Plain HTTP files smaller than 11 KiB use the buffered path;
-larger files use `sendfile`. Treat the comparison as end-to-end baseline data
-and record the command, CPU, and package versions with any result.
+The socket APIs use numeric IPv4 and IPv6 endpoints. Applications resolve DNS
+separately; the HTTP client examples do so on a bounded worker.
 
-### Listener-thread scaling
+## Protocol scope
 
-`http_benchmark_server` accepts an optional thread count. Each listener thread
-runs its own event loop and binds the port with `SO_REUSEPORT`, so the kernel
-spreads accepted connections across the loops. To measure the bundled server as
-that count grows:
+- The static-file server supports HTTP/1.1 and TLS HTTP/2. It uses bounded
+  request and response buffers and a component-by-component path walk that
+  blocks symlink escapes. Linux plain HTTP uses `sendfile` for larger files.
+- WebSocket receive and send are awaitable and bounded by configured message
+  and output limits. The [WebSocket client guide](examples/README-websocket-client.md)
+  covers its outbound echo example.
+- The public QUIC API supports v1/v2 connections, streams, and DATAGRAMs.
+  The standalone `http3_client` exercises outbound HTTP/3. QUIC transport
+  release qualification is still active; see the
+  [milestone and remaining gates](docs/quic-milestone.md) and the
+  [HTTP/3 verification guide](docs/http3-outbound-tests.md). The library does
+  not include an HTTP/3 server.
+- The HTTP server cancels active connection tasks on shutdown; its grace
+  timeout does not drain unfinished responses.
 
-```sh
-SERVER_THREADS="1 2 4 8" ./benchmark/http-scaling.sh
-```
-
-To compare the bundled server with nginx and lighttpd at several worker counts
-under the same workload:
-
-```sh
-WORKERS="1 8" ./benchmark/http-multicore.sh
-```
-
-Both harnesses pin the server to `SERVER_CPUS` (default `0-7`) and `wrk` to
-`CLIENT_CPUS` (default `8-15`) so the load generator and the server do not
-contend for the same cores. They otherwise accept the same `DURATION`,
-`CONNECTIONS`, `WRK_THREADS`, and `FILE_SIZE` overrides as the throughput
-comparison.
+Benchmark programs and harnesses live in `benchmark/`. They exercise local
+workloads and are not throughput guarantees for other machines or networks.

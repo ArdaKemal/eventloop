@@ -2,7 +2,7 @@
 
 Public asynchronous I/O uses C++ coroutines. Core public names live in
 `eventloop`, HTTP names in `eventloop::http`, and WebSocket names in
-`eventloop::ws`. The epoll readiness machinery is an internal implementation
+`eventloop::ws`. Platform readiness machinery is an internal implementation
 detail; applications register the library's TCP, TLS, and UDP objects with
 `eventloop::event_loop`, then await their operations. `post()` and executor
 submissions remain bounded command and background-work APIs.

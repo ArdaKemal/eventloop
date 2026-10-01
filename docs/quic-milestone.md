@@ -1,7 +1,7 @@
 # QUIC transport milestone
 
 **Status:** active  
-**Scope reviewed:** 2026-09-30
+**Implementation notes updated:** 2026-10-01
 
 Deliver an in-house QUIC transport for `eventloop`. The library owns packet
 formatting, connection state, stream multiplexing, loss recovery, congestion
@@ -25,7 +25,8 @@ Implement the published QUIC transport specifications:
 Use [RFC 9308](https://www.rfc-editor.org/rfc/rfc9308.html) and
 [RFC 9312](https://www.rfc-editor.org/rfc/rfc9312.html) as applicability and
 operational guidance. RFC 9114 (HTTP/3) and RFC 9204 (QPACK) are separate
-application protocols and are outside this milestone.
+application protocols. The standalone HTTP/3 client example and its tests are
+tracked in [the outbound verification guide](http3-outbound-tests.md).
 
 The [IETF QUIC working-group index](https://datatracker.ietf.org/wg/quic/documents/)
 was rechecked on 2026-09-30. The published transport RFC baseline above remains
@@ -94,121 +95,36 @@ empty list from an inaccessible page.
 - Demonstrate bounded behavior under connection, stream, datagram, and queue
   exhaustion, plus cancellation and event-loop shutdown with operations in
   flight.
-- Verify Linux epoll and Windows IOCP builds and loopback interoperability.
+- Verify Linux epoll, macOS kqueue, and Windows IOCP builds and loopback
+  interoperability.
   Recheck RFC publication status and verified errata, document known limits,
   then mark the milestone complete.
 
-## Public API target
+## Current implementation
 
-Expose loop-affine `quic_endpoint`, connection, stream, and DATAGRAM operations
-using the library's `task<T>` and `std::expected` conventions. Awaiters own
-operation state in their coroutine frame; caller buffers stay valid until the
-await completes, including cancellation. A single endpoint owns and demuxes
-its UDP socket across connections. No public API shape is frozen until the
-TLS-provider proof of concept and endpoint/connection lifetime design are
-reviewed.
+`include/eventloop/quic.h` exposes loop-affine client and server endpoints,
+move-only connection handles, stream operations, and RFC 9221 DATAGRAMs. The
+implementation uses bounded storage and OpenSSL's external QUIC TLS callbacks.
+`examples/quic_echo_server.cc` exercises the public server API. The
+standalone `http3_client` example uses the public client API and implements
+a bounded HTTP/3 GET session; HTTP/3 is outside the transport release gate.
 
-## Explicit exclusions
+In-house v1/v2 client and server tests cover handshake, bidirectional echo,
+and DATAGRAM exchange. OpenSSL 3.5.6 independently interoperated with the v1
+echo server. The optional aioquic fixture verifies outbound HTTP/3 over v1
+and v2, including concurrent requests and Retry handling; see
+[the verification guide](http3-outbound-tests.md). These checks do not establish
+that every endpoint or network supports both QUIC versions.
 
-- Video capture/encoding, FFmpeg, media framing, chat, or application UI
-- HTTP/3, QPACK, WebTransport, MASQUE, or application-specific protocols
-- 0-RTT data in this milestone
-- Unpublished QUIC extensions or drafts
-- Third-party QUIC protocol engines or handwritten cryptographic primitives
+## Work remaining before transport release
 
-## Current checkpoint
+- Automatic client restart after Version Negotiation.
+- PMTU discovery and ECN handling at the public endpoint boundary.
+- Connection lifetime, cancellation, and shutdown auditing under in-flight
+  work, including error paths and resource exhaustion.
+- Independent-stack checks for the full public transport API in both v1 and
+  v2, including peer stream and DATAGRAM behavior. The HTTP/3 fixture covers
+  an application subset.
 
-The wire and bounded transport groundwork is in progress. The current
-workspace contains:
-
-- QUIC v1/v2 version identifiers, packet-header parsing, bounded transport
-  parameter codecs, frame decoding/encoding, and packet/frame placement rules.
-- RFC 9368 Version Negotiation encode/validation helpers, including downgrade
-  validation and reserved-version handling.
-- OpenSSL EVP-backed v1/v2 Initial secrets, AES-128-GCM keys, payload and
-  header protection, packet-number reconstruction, Retry integrity tags, and
-  key-update secret derivation. A caller-buffer protected-packet codec covers
-  Initial, 0-RTT, Handshake, and 1-RTT packets. It matches the RFC 9001
-  Appendix A.3 server Initial vector.
-- Bounded caller-storage CRYPTO receive reassembly and CRYPTO send/retransmit
-  tracking.
-- Bounded stream receive reassembly, send/retransmit buffering, cumulative
-  stream-ID and `MAX_STREAMS` tracking, aggregate `MAX_DATA`/`MAX_STREAM_DATA`
-  accounting, and final-size checks for FIN and RESET_STREAM.
-- A received-packet ACK-range tracker with packet-number retirement floors,
-  confirmed-ACK retirement, and newest-range generation that fits caller
-  storage.
-- A bounded RFC 9221 DATAGRAM queue that preserves datagram boundaries and
-  enforces the negotiated complete-frame size.
-- A bounded peer connection-ID registry with sequence/token consistency,
-  active-limit enforcement, monotonic retirement, and atomic capacity errors.
-- Semantic transport-parameter validation that binds required connection-ID,
-  Retry, and version-negotiation fields to authenticated handshake observations.
-- A bounded local connection-ID registry, authenticated and expiring Retry
-  address-validation tokens, v1/v2 Retry packet encode/validation, and
-  stateless-reset encoding/detection helpers.
-- A bounded path-validation tracker with challenge matching and per-path server
-  anti-amplification accounting.
-- Stream and connection lifecycle helpers, including final-size checks,
-  negotiated idle timeout, closing/draining deadlines, and send permissions.
-- An internal `connection_core` that composes OpenSSL QUIC TLS, bounded CRYPTO
-  send/receive, packet protection, duplicate tracking, ACK generation,
-  frame-policy validation, and close/drain transitions. Its owner still supplies
-  stream, recovery, path, routing, address-validation, and UDP handling.
-- ACK_ECN validation/accounting and v1/v2 1-RTT key-phase updates with bounded
-  previous-key retention.
-- Reusable OpenSSL EVP contexts and context-aware packet build/open operations
-  with caller-owned authentication scratch.
-- RFC 9002 RTT/PTO helpers, fixed-capacity sent-packet history, loss
-  classification, three-space recovery orchestration, persistent-congestion
-  detection, and a path-scoped NewReno controller.
-- RFC 9287 greasing end to end. The empty `grease_quic_bit` parameter is
-  advertised by the TLS adapter, peer support is recorded only after the
-  peer's authenticated transport parameters are validated, a zero QUIC bit is
-  accepted on receive only when this endpoint advertised support, and the bit
-  is greased on send only after the peer advertised support. Packet parsing,
-  protected-packet opening, endpoint routing, negotiation, and sending are
-  covered by `tests/quic_grease_quic_bit.cc` and `tests/quic_connection_core.cc`.
-- Bounded per-path recovery state for migration
-  (`src/quic/path_recovery_state.h`). A candidate cannot replace the active
-  path until the caller confirms validation; promotion installs fresh
-  path-specific RTT and congestion state while packet-number spaces, ACK
-  ranges, sent-packet history, and loss detection stay connection-wide;
-  cancellation and rejected transitions preserve the active path. Covered by
-  `tests/quic_path_recovery_state.cc` and the migration section of
-  `tests/quic_connection.cc`.
-- A public loop-affine API (`include/eventloop/quic.h`, implemented in
-  `src/quic/quic_endpoint.cc`): server and client `quic_endpoint`, move-only
-  `quic_connection` handles in fixed-capacity slots, stream
-  open/accept/read/write, and RFC 9221 DATAGRAM. TLS contexts are built from
-  cert/key or a trust store. Awaiters are resumed by the `connection_driver`
-  progress hook. `tests/quic_public_api.cc` covers an in-house client/server
-  handshake, bidirectional stream echo, and DATAGRAM exchange for QUIC v1 and
-  v2; `examples/quic_echo_server.cc` is a runnable server.
-
-On 2026-09-30, the Visual Studio 18/MSVC RelWithDebInfo build with OpenSSL
-3.5.6 and the previous TLS provider passed the full Windows CTest suite,
-61/61. A GCC 14.2
-Release build on Linux (epoll) passed the full suite 61/61 as well. The Linux
-build previously failed because `src/http/file_operations.h` used
-`native_socket` without including `eventloop/native_socket.h`; the missing
-includes are now explicit. Earlier failures in `quic_connection`,
-`quic_packet_scheduler`, and `quic_connection_driver` were caused by test
-callbacks comparing transport parameters without the now-required
-`grease_quic_bit` advertisement; the tests were corrected, not weakened.
-
-Independent-stack interoperability is verified for **QUIC v1** with OpenSSL
-3.5.6: `openssl s_client -quic` completes a handshake with
-`examples/quic_echo_server` and a full duplex stream exchange (the server reads
-the client's message and the client receives the echo). OpenSSL 3.5.6 rejects
-`-min_protocol QUICv2`, so its CLI is v1-only and no other independent stack is
-installed; v2 is therefore verified only with the in-house client. The
-following gates remain unverified:
-
-- Independent-stack QUIC v2 interop. OpenSSL 3.5.6 has no QUIC v2 client and no
-  other test peer is available in this environment.
-- Automatic Retry and Version Negotiation client restart, PMTU, and ECN wiring
-  at the endpoint boundary, plus connection lifetime/ownership auditing. These
-  remain unimplemented and unverified; DATAGRAM is verified in-house.
-
-Do not describe the library as QUIC-capable until these gates pass.
+The public QUIC API is available for evaluation while these gates remain
+open. Recheck current RFCs and errata before a transport release.
