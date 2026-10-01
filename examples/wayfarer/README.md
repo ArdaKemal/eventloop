@@ -35,10 +35,15 @@ subdirectory and links `eventloop::eventloop`. No root CMake changes are needed.
 /tmp/wayfarer-build/wayfarer --http3-v2 -X HEAD -i https://example.org/
 /tmp/wayfarer-build/wayfarer --http3-v2 --ca-file cert.pem https://127.0.0.1:4433/
 /tmp/wayfarer-build/wayfarer --fail -o page.html https://example.org/page.html
+/tmp/wayfarer-build/wayfarer --http2 -I https://example.org/
+/tmp/wayfarer-build/wayfarer -O https://example.org/files/report.txt?version=2
+/tmp/wayfarer-build/wayfarer --http3 -O --ca-file cert.pem https://127.0.0.1:4433/file.bin
 ```
 
-`-i` includes HTTP/1.1, HTTP/2, or HTTP/3 response headers in the output. Status and errors go
-to stderr. `-o` writes binary response output to an exclusive sibling temporary
+`-i` includes HTTP/1.1, HTTP/2, or HTTP/3 response headers in the output.
+`-I`/`--head` sends a HEAD request and implies `-i`; it cannot be combined with
+a request body or with a conflicting `-X`. Status and transfer metadata go to
+stderr so stdout stays suitable for pipelines. `-o` writes binary response output to an exclusive sibling temporary
 file, then replaces the named file after the complete response, successful
 flush and close. A failed transfer, HTTP error with `--fail`, or failed file
 operation removes the temporary file and leaves an existing destination intact.
@@ -46,7 +51,12 @@ The sibling rename provides atomic replacement on POSIX filesystems. Windows
 uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`; this preserves the old file
 if replacement fails, but Windows does not promise the same atomic visibility.
 The destination must be in a directory where Wayfarer can create a sibling
-file. This does not guarantee persistence across a system crash. Without `-o`, output streams
+file. `-O`/`--remote-name` derives the destination from the URL instead: the
+query and fragment are dropped, percent escapes are decoded, and the final path
+component is used. Empty and `.`/`..` components become `index.html`; a
+component that still contains a path separator or control byte is rejected as a
+usage error. An existing file is replaced under the same atomic policy as `-o`,
+and `-O` and `-o` are mutually exclusive. This does not guarantee persistence across a system crash. Without `-o`, output streams
 to stdout and may be partial when a request fails. The default timeout
 is 30 seconds; `--timeout-ms` accepts 1 through 3,600,000. URL parsing supports
 `http://` and `https://`, numeric ports, paths, queries, and bracketed IPv6.
@@ -81,6 +91,9 @@ existing destination intact even if earlier hops produced headers.
 | HTTP/2 | HTTPS methods including GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS; request headers; `-d` body up to 4 MiB; `--data-binary @FILE` streamed upload up to 1 TiB; TLS verification and ALPN `h2`; streamed stdout or `-o` output; `-i` streams headers, body, and trailers; `-L` follows redirects | One connection per request or redirect hop. The sink API accepts up to 1 TiB of response DATA. Header blocks are limited to 64 KiB and 128 fields; incoming frames to 16 KiB. No cleartext h2c, connection reuse, or push. Capacity and protocol errors come from the public API. |
 | HTTP/3 | HTTPS GET and HEAD over public QUIC v1 or v2; TLS verification; body output; `-i` response fields; `-L` follows up to ten 301/302/303/307/308 redirects | Request HEADERS are capped at 4 KiB. Response fields accept static QPACK indexed fields, static-name literal values, and literal names and values, including fixed Huffman encoding. Field sections are capped at 64 KiB and 128 decoded fields; each complete response frame is capped at 64 KiB and total DATA at 16 MiB. A present Content-Length is checked against the received DATA, so truncated or overlong bodies fail. Custom methods, request headers, and request bodies fail at argument parsing. Dynamic QPACK and trailers fail as protocol errors; server push is unsupported. |
 
+`-I`/`--head` and `-O`/`--remote-name` are command-line features and apply to
+every supported version.
+
 HTTP/3 uses a fixed static QPACK request header block and opens client control,
 encoder, and decoder streams. It does not include or link any private eventloop
 headers or source. The narrow response decoder makes it useful for exercising
@@ -88,27 +101,32 @@ public QUIC as a real HTTP/3 caller, but it is not a complete HTTP/3 client.
 The complete in-tree `http3_client` example uses private HTTP/3 codec headers;
 that implementation is outside this program's public-API-only constraint.
 
-## Automated W3 checks
+## Automated checks
 
-`tests/run_w3_aioquic.py` drives a controlled aioquic 1.3.0 peer and checks the
-HTTP/3 client. Wayfarer is a standalone example project, so the root eventloop
-test suite does not build it; enable the checks in the Wayfarer build instead:
+`tests/run_w3_aioquic.py` drives a controlled aioquic 1.3.0 peer for the HTTP/3
+response client, and `tests/run_w4.py` adds HTTP/1.1 and TLS HTTP/2 peers plus
+the `-I`/`-O` CLI behavior. Wayfarer is a standalone example project, so the
+root eventloop test suite does not build it; enable the checks in the Wayfarer
+build instead. The W4 HTTP/2 checks need the `h2` package in the same
+interpreter as aioquic:
 
 ```sh
 python3 -m venv /tmp/wayfarer-aioquic
-/tmp/wayfarer-aioquic/bin/python -m pip install 'aioquic==1.3.0'
+/tmp/wayfarer-aioquic/bin/python -m pip install 'aioquic==1.3.0' h2
 cmake -S examples/wayfarer -B /tmp/wayfarer-build -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF -DWAYFARER_HTTP3_TESTS=ON \
   -DPython3_EXECUTABLE=/tmp/wayfarer-aioquic/bin/python
 cmake --build /tmp/wayfarer-build --target wayfarer
-ctest --test-dir /tmp/wayfarer-build -R wayfarer_http3_w3 --output-on-failure
+ctest --test-dir /tmp/wayfarer-build --output-on-failure
 ```
 
-The same runner works standalone:
+The runners also work standalone:
 
 ```sh
 /tmp/wayfarer-aioquic/bin/python examples/wayfarer/tests/run_w3_aioquic.py \
   --wayfarer /tmp/wayfarer-build/wayfarer --version both
+/tmp/wayfarer-aioquic/bin/python examples/wayfarer/tests/run_w4.py \
+  --wayfarer /tmp/wayfarer-build/wayfarer --version all
 ```
 
 ## Checks and observed failures
@@ -135,6 +153,14 @@ The same runner works standalone:
   redirected status; argument rejection for methods, bodies, and headers; and
   `-o` preservation on failure. The fixture verifies the negotiated QUIC
   version and `h3` ALPN on every handshake.
+- The W4 CLI matrix runs against HTTP/1.1, TLS HTTP/2, and QUIC v1 HTTP/3 peers
+  (75 checks): `-I`/`--head` sends HEAD, prints only headers, and implies `-i`;
+  `-O`/`--remote-name` decodes percent escapes, drops queries, maps empty and
+  `.`/`..` components to `index.html`, keeps `.hidden` and `...`, rejects a
+  backslash component as a usage error, replaces an existing file atomically,
+  and preserves it on a failed transfer; `-O`/`-I` keep stdout clean and report
+  the derived name on stderr; `-I` with `-X` or a body and `-O` with `-o` are
+  rejected with exit 2.
 - The earlier public `https://cloudflare.com/` `--http3` run decoded an HTTP/3
   301 response before redirects were implemented. The controlled fixture is now
   the recorded acceptance source; a fresh public-network run has not been

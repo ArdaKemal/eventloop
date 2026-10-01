@@ -25,6 +25,8 @@ struct request_options {
     bool show_headers = false;
     bool follow_redirects = false;
     bool fail_http_errors = false;
+    bool remote_name = false;
+    bool head_request = false;
 };
 
 struct request_state {

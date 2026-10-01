@@ -70,9 +70,66 @@ auto read_bounded_body_file(const std::filesystem::path& path) -> std::string
     return body;
 }
 
+auto percent_decode(std::string_view text) -> std::string
+{
+    std::string decoded;
+    decoded.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (text[index] == '%' && index + 2 < text.size() &&
+            std::isxdigit(static_cast<unsigned char>(text[index + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(text[index + 2]))) {
+            const auto digit = [](char value) {
+                return value <= '9' ? value - '0'
+                    : std::tolower(static_cast<unsigned char>(value)) - 'a' + 10;
+            };
+            decoded.push_back(static_cast<char>(
+                (digit(text[index + 1]) << 4) | digit(text[index + 2])));
+            index += 2;
+        } else {
+            decoded.push_back(text[index]);
+        }
+    }
+    return decoded;
+}
+
+// Derive the -O/--remote-name target from the request target. Percent escapes
+// are decoded, the query and fragment are dropped, and only the final path
+// component is used. Empty and dot components fall back to "index.html" so a
+// directory request lands on a predictable name. Components that still carry a
+// path separator or control byte are rejected rather than silently rewritten.
+auto remote_output_name(std::string_view target) -> std::filesystem::path
+{
+    const auto separator = target.find_first_of("?#");
+    const std::string path = percent_decode(target.substr(0, separator));
+    const auto slash = path.rfind('/');
+    std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (name.empty() || name == "." || name == "..") name = "index.html";
+    for (unsigned char character : name) {
+        if (character < 0x20 || character == 0x7f ||
+            character == '/' || character == '\\')
+            throw std::invalid_argument("cannot derive a safe output name from the URL");
+    }
+#ifdef _WIN32
+    const std::string stem = name.substr(0, name.find('.'));
+    std::string upper(stem);
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+        [](unsigned char character) { return static_cast<char>(std::toupper(character)); });
+    constexpr std::array<std::string_view, 22> reserved {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+    if (name.find_first_of("<>:\"|?*") != std::string::npos ||
+        std::find(reserved.begin(), reserved.end(), upper) != reserved.end() ||
+        name.ends_with('.') || name.ends_with(' '))
+        throw std::invalid_argument("cannot derive a safe output name from the URL");
+#endif
+    return std::filesystem::path(name);
+}
+
 auto parse_options(int argc, char** argv) -> request_options
 {
     request_options options;
+    bool explicit_method = false;
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
         auto value = [&]() -> std::string {
@@ -83,7 +140,7 @@ auto parse_options(int argc, char** argv) -> request_options
         else if (arg == "--http2") options.protocol = 2;
         else if (arg == "--http3") options.protocol = 3;
         else if (arg == "--http3-v2") { options.protocol = 3; options.quic_version = quic_version::v2; }
-        else if (arg == "-X" || arg == "--request") options.method = value();
+        else if (arg == "-X" || arg == "--request") { options.method = value(); explicit_method = true; }
         else if (arg == "-H" || arg == "--header") {
             const auto header = value();
             const auto pos = header.find(':');
@@ -116,6 +173,8 @@ auto parse_options(int argc, char** argv) -> request_options
             options.body_supplied = true;
         }
         else if (arg == "-o" || arg == "--output") options.output = value();
+        else if (arg == "-O" || arg == "--remote-name") options.remote_name = true;
+        else if (arg == "-I" || arg == "--head") options.head_request = true;
         else if (arg == "-i" || arg == "--include") options.show_headers = true;
         else if (arg == "-L" || arg == "--location") options.follow_redirects = true;
         else if (arg == "--fail") options.fail_http_errors = true;
@@ -132,16 +191,26 @@ auto parse_options(int argc, char** argv) -> request_options
         else options.url = arg;
     }
     if (options.url.empty()) throw std::invalid_argument("URL required");
+    if (options.head_request) {
+        if (explicit_method && options.method != "HEAD")
+            throw std::invalid_argument("-I/--head conflicts with -X " + options.method);
+        options.method = "HEAD";
+        options.show_headers = true;
+    }
     if (options.method.empty() || !std::all_of(options.method.begin(), options.method.end(), [](unsigned char c) {
             return std::isupper(c) || std::isdigit(c) || std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) != std::string_view::npos;
         })) throw std::invalid_argument("invalid request method");
     if (options.body_supplied && options.method == "GET") options.method = "POST";
+    if (options.head_request && options.body_supplied)
+        throw std::invalid_argument("-I/--head cannot send a request body");
     if (options.body.size() > 4 * 1024 * 1024)
         throw std::invalid_argument("request body exceeds 4 MiB");
     if (options.protocol == 3 && (options.method != "GET" && options.method != "HEAD"))
         throw std::invalid_argument("HTTP/3 supports GET and HEAD only");
     if (options.protocol == 3 && (options.body_supplied || !options.headers.empty()))
         throw std::invalid_argument("HTTP/3 request bodies and custom headers are unsupported");
+    if (options.remote_name && !options.output.empty())
+        throw std::invalid_argument("-O/--remote-name and -o/--output are mutually exclusive");
     if (options.protocol == 1 && !options.body_file.empty()) {
         options.body = read_bounded_body_file(options.body_file);
         options.body_file.clear();
@@ -640,14 +709,18 @@ auto main(int argc, char** argv) -> int
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--help") {
             std::cout << "usage: wayfarer [--http1.1|--http2|--http3|--http3-v2] "
-                         "[-X METHOD] [-H 'Name: value']... [-d BODY|--data-binary @FILE] [-o FILE] [-i] [-L] [--fail] "
+                         "[-X METHOD] [-H 'Name: value']... [-d BODY|--data-binary @FILE] "
+                         "[-o FILE|-O|--remote-name] [-I|--head] [-i] [-L] [--fail] "
                          "[--ca-file PEM] [--timeout-ms N] URL\n";
             return 0;
         }
-        const auto options = parse_options(argc, argv);
+        auto options = parse_options(argc, argv);
         const auto url = http_client_example::parse_url(options.url);
+        if (options.remote_name) options.output = remote_output_name(url.target);
         if (options.protocol == 3 && !url.secure) throw std::invalid_argument("HTTP/3 requires https://");
         if (options.protocol == 2 && !url.secure) throw std::invalid_argument("HTTP/2 requires https://");
+        if (options.remote_name)
+            std::cerr << "wayfarer: saving to " << options.output.string() << '\n';
 #ifdef _WIN32
         if (options.output.empty()) (void)::_setmode(::_fileno(stdout), _O_BINARY);
 #endif
