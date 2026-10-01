@@ -2,8 +2,9 @@
 
 `examples/probe_http2_client.py` runs the system `curl` HTTP/2 client against
 ten public HTTPS URLs. It is an external interoperability probe, not an
-`eventloop` HTTP/2 client example: the library's current outbound HTTP example
-sends HTTP/1.1, and its HTTP/2 implementation serves inbound requests.
+`eventloop` HTTP/2 client example: [http2_client.cc](../examples/http2_client.cc)
+uses the library's public single-request HTTP/2 API. The older outbound
+`http_client` example sends HTTP/1.1.
 
 Prerequisites: Python 3 and a `curl` build with the `HTTP2` feature (`curl
 --version`). Run from the repository root:

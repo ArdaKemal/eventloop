@@ -10,8 +10,9 @@ network services that need both straightforward application code and predictable
 behavior under load.
 
 The library includes awaitable TCP, TLS, and UDP sockets; HTTP/1.1 and TLS
-HTTP/2 servers; WebSocket framing; bounded file I/O; and a public QUIC v1/v2
-endpoint API. It has Linux epoll, macOS kqueue, and Windows IOCP backends.
+HTTP/2 servers and an HTTP/2 client for one request per connection; WebSocket
+framing; bounded file I/O; and a public QUIC v1/v2 endpoint API. It has Linux
+epoll, macOS kqueue, and Windows IOCP backends.
 
 ## A complete echo server
 
@@ -188,6 +189,11 @@ separately; the HTTP client examples do so on a bounded worker.
 - The static-file server supports HTTP/1.1 and TLS HTTP/2. It uses bounded
   request and response buffers and a component-by-component path walk that
   blocks symlink escapes. Linux plain HTTP uses `sendfile` for larger files.
+- The outbound HTTP/2 client performs one HTTPS request per connection using
+  ALPN `h2`. It supports general methods, bounded owned request bodies,
+  streamed uploads, and streamed response bodies and headers. See
+  [the API contract](docs/api-contract.md) for its limits and
+  [the example](examples/http2_client.cc) for a public-header caller.
 - WebSocket receive and send are awaitable and bounded by configured message
   and output limits. The [WebSocket client guide](examples/README-websocket-client.md)
   covers its outbound echo example.

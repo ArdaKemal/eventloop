@@ -178,3 +178,42 @@ back to an unbounded allocation.
   shares HTTP/1.1's component-by-component `O_NOFOLLOW` checks. Cleartext
   prior-knowledge HTTP/2, h2c upgrade, CONNECT tunnels, and extended CONNECT are
   not supported. Plain `http::server` continues to serve HTTP/1.1.
+- Include `eventloop/http2/client.h` for one outbound HTTPS HTTP/2 request.
+  `http2::async_request(loop, endpoint, context, hostname, request)` owns the
+  TLS socket from connect through close. `hostname` is used for certificate
+  verification, SNI, and the default `:authority`; `endpoint` is a numeric
+  address, so name resolution belongs to the caller. ALPN must select `h2`.
+  Requests own their method, target, authority override, header strings, and
+  body bytes or a `request_body_source` callback. Any valid HTTP method token
+  is accepted, including GET, HEAD, POST, PUT, PATCH, DELETE, and OPTIONS.
+  The owned body is limited to 4 MiB; a source can produce up to 1 TiB in
+  chunks of at most 16 KiB. Set either the owned body or the source. The source
+  is task-owned and called on the loop thread with a writable borrowed span;
+  it returns 0 for EOF, a byte count within the span, or an operation error.
+  Resources captured by the source must remain valid through completion,
+  including cancellation. `Content-Length` is optional and can be supplied as
+  a request header when known. DATA transmission observes the peer's connection
+  and stream flow-control windows. Responses own status and headers. The
+  five-argument operation owns the response body, capped at 4 MiB. Passing a
+  sixth `response_sink` argument
+  streams DATA chunks synchronously to that callback on the loop thread;
+  `response.body` is then empty. A sink receives a borrowed chunk valid only
+  during the call and returns `std::error_code`; a nonzero result aborts the
+  request and becomes the operation error. An optional seventh
+  `response_header_sink` receives each complete header block before subsequent
+  DATA: its status argument is 1xx for informational headers, the final HTTP
+  status for final headers, and zero for trailers. The fields span is borrowed
+  only during the call; a nonzero callback error aborts the request. Final
+  response headers and trailers remain owned in the returned response.
+  Streamed response bodies are limited to 1 TiB while buffering remains one
+  16 KiB frame. The operation uses one
+  stream per connection. Connection reuse and server push are outside its scope.
+  Request and response header blocks are limited to 64 KiB and 128 fields.
+  Frames from the server are limited to 16 KiB as advertised in client
+  SETTINGS. Reaching
+  a limit returns `message_size`; malformed HTTP/2 returns `protocol_error`.
+  Each request allocates its own bounded frame, header, and response storage;
+  TLS and OpenSSL may allocate separately.
+  A TLS connect, handshake, read, or write error is returned directly; task
+  cancellation closes the owned transport. All I/O and resumption occur on
+  `loop`, and the outer task result remains distinct from the operation error.

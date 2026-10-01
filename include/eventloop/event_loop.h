@@ -20,6 +20,7 @@ template<typename T>
 class task;
 template<typename T>
 class task_handle;
+namespace http2::detail { class client_access; }
 
 namespace detail {
 
@@ -215,6 +216,7 @@ private:
     friend class udp_socket;
     friend class tcp_stream;
     friend class tls_stream;
+    friend class http2::detail::client_access;
 
     class handler_call_scope {
     public:

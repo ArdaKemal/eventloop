@@ -72,6 +72,7 @@ if(WIN32)
             src/ws/web_socket.cpp
             src/http2/connection.h
             src/http2/connection.cc
+            src/http2/client.cc
             src/http2/hpack.h
             src/http2/hpack.cc
             src/http2/session.h
@@ -631,6 +632,8 @@ if(WIN32)
             examples/http_client_url.cc
             examples/http_client_resolve.cc)
         target_link_libraries(http_client PRIVATE eventloop::eventloop)
+        add_executable(http2_client examples/http2_client.cc)
+        target_link_libraries(http2_client PRIVATE eventloop::eventloop)
 
         add_executable(websocket_client
             examples/websocket_client.cc
@@ -673,6 +676,7 @@ if(WIN32)
         list(APPEND eventloop_windows_excluded_headers
             PATTERN "tls_context.h" EXCLUDE
             PATTERN "tls_stream.h" EXCLUDE
+            PATTERN "http2" EXCLUDE
             PATTERN "ws" EXCLUDE
         )
     endif()
@@ -715,6 +719,7 @@ add_library(eventloop
     include/eventloop/file_io.h
     include/eventloop/http/mime_types.h
     include/eventloop/http/request.h
+    include/eventloop/http2/client.h
     include/eventloop/http/server.h
     include/eventloop/http/session.h
     include/eventloop/ip_endpoint.h
@@ -751,6 +756,7 @@ add_library(eventloop
     src/http/session.cc
     src/http2/connection.h
     src/http2/connection.cc
+    src/http2/client.cc
     src/http2/hpack.h
     src/http2/hpack.cc
     src/http2/session.h
@@ -850,6 +856,9 @@ add_executable(http_client
 )
 target_link_libraries(http_client PRIVATE eventloop::eventloop)
 target_compile_options(http_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+add_executable(http2_client examples/http2_client.cc)
+target_link_libraries(http2_client PRIVATE eventloop::eventloop)
+target_compile_options(http2_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(websocket_client
     examples/websocket_client.cc
