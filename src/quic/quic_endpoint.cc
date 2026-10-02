@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <vector>
 #include <coroutine>
 #include <cstring>
 #include <optional>
@@ -81,9 +82,7 @@ auto driver_error_code(connection_error value) noexcept -> std::error_code
     return {static_cast<int>(value) + 1, instance};
 }
 
-constexpr std::size_t connection_capacity = 8;
 constexpr std::size_t short_cid_length = 8;
-constexpr std::size_t waiter_capacity = 64;
 constexpr auto close_poll_interval = std::chrono::milliseconds(1);
 constexpr std::size_t parameter_buffer_size = 512;
 
@@ -107,6 +106,42 @@ auto make_error_code(quic_errc value) noexcept -> std::error_code
 
 class quic_endpoint::implementation {
 public:
+    struct waiter_state {
+        explicit waiter_state(std::size_t capacity) : handles(capacity) {}
+
+        auto register_waiter(std::coroutine_handle<> handle) noexcept -> bool
+        {
+            if (count == handles.size()) return false;
+            handles[(head + count) % handles.size()] = handle;
+            ++count;
+            return true;
+        }
+
+        auto wake_all() noexcept -> void
+        {
+            if (waking) { wake_again = true; return; }
+            waking = true;
+            do {
+                wake_again = false;
+                const auto initial = count;
+                for (std::size_t i = 0; i < initial; ++i) {
+                    auto handle = handles[head];
+                    handles[head] = {};
+                    head = (head + 1) % handles.size();
+                    --count;
+                    if (handle && !handle.done()) handle.resume();
+                }
+            } while (wake_again);
+            waking = false;
+        }
+
+        std::vector<std::coroutine_handle<>> handles;
+        std::size_t head {0};
+        std::size_t count {0};
+        bool waking {false};
+        bool wake_again {false};
+    };
+
     struct slot {
         bool occupied {false};
         bool accepted {false};
@@ -132,8 +167,6 @@ public:
         std::size_t retry_token_size {0};
         std::array<std::uint8_t, parameter_buffer_size> parameters {};
         std::size_t parameters_size {0};
-        std::array<std::uint64_t, 32> accepted_streams {};
-        std::size_t accepted_count {0};
         endpoint_connection route {0};
 
         auto clear() noexcept -> void
@@ -148,7 +181,6 @@ public:
             retry_used = retry_pending = false;
             retry_scid_size = retry_token_size = 0;
             parameters_size = 0;
-            accepted_count = 0;
             route = 0;
             peer = {};
         }
@@ -157,8 +189,11 @@ public:
     implementation(event_loop& loop, ip_endpoint local, quic_server_options options)
         : loop_(loop),
           endpoint_(loop, local, path_endpoint_role::server, short_cid_length,
-                    endpoint_accept_callback {this, accept_initial}, true),
-          server_options_(std::move(options))
+                    endpoint_accept_callback {this, accept_initial}, true,
+                    options.connection_capacity),
+          server_options_(std::move(options)),
+          slots_(server_options_.connection_capacity),
+          waiters_(std::make_shared<waiter_state>(server_options_.connection_capacity * 256))
     {
         common_init();
     }
@@ -166,9 +201,10 @@ public:
     implementation(event_loop& loop, ip_endpoint local, quic_client_options options)
         : loop_(loop),
           endpoint_(loop, local, path_endpoint_role::client, short_cid_length,
-                    endpoint_accept_callback {}, true),
+                    endpoint_accept_callback {}, true, 8),
           client_options_(std::move(options)),
-          client_mode_(true)
+          slots_(8), client_mode_(true),
+          waiters_(std::make_shared<waiter_state>(8 * 256))
     {
         common_init();
     }
@@ -193,19 +229,12 @@ public:
     // handle once and is resumed by the connection-driver progress callback, so
     // stream/DATAGRAM operations do not poll on a timer.
     auto register_waiter(std::coroutine_handle<> handle) noexcept -> bool
-    {
-        if (waiter_count_ == waiters_.size()) return false;
-        waiters_[waiter_count_++] = handle;
-        return true;
-    }
+    { return waiters_->register_waiter(handle); }
 
     auto wake_all() noexcept -> void
     {
-        auto local = waiters_;
-        const auto count = waiter_count_;
-        waiter_count_ = 0;
-        for (std::size_t i = 0; i < count; ++i)
-            if (local[i] && !local[i].done()) local[i].resume();
+        auto state = waiters_; // A resumed waiter may destroy this endpoint.
+        state->wake_all();
     }
 
     auto stop_all() noexcept -> void
@@ -286,15 +315,14 @@ public:
     SSL_CTX* context_ {nullptr};
     std::array<std::uint8_t, 255> alpn_ {};
     std::size_t alpn_size_ {0};
-    std::array<slot, connection_capacity> slots_ {};
+    std::vector<slot> slots_;
     quic_endpoint* owner_ {nullptr};
     bool client_mode_ {false};
     bool configured_ {false};
     bool closing_ {false};
     bool receiving_ {false};
     std::uint32_t next_generation_ {0};
-    std::array<std::coroutine_handle<>, waiter_capacity> waiters_ {};
-    std::size_t waiter_count_ {0};
+    std::shared_ptr<waiter_state> waiters_;
 
 private:
     static auto accept_retry(void* argument, std::span<const std::uint8_t> packet) noexcept -> bool
@@ -635,6 +663,11 @@ auto read_stream(event_loop&, quic_endpoint::implementation& impl,
         if (!slot.occupied || slot.generation != generation || !slot.connection)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto* stream = slot.connection->stream(stream_id);
+        const auto local_role = impl.client_mode() ? stream_role::client : stream_role::server;
+        if (stream == nullptr && slot.connection->streams().is_retired(stream_id) &&
+            (stream_type(stream_id) == stream_direction::bidirectional ||
+             stream_initiator(stream_id) != local_role))
+            co_return std::size_t {0};
         if (stream == nullptr || !stream->receive)
             co_return std::unexpected(make_error_code(quic_errc::invalid_argument));
         if (stream->state.receiving() == stream_receive_state::reset_received) {
@@ -650,8 +683,10 @@ auto read_stream(event_loop&, quic_endpoint::implementation& impl,
             co_return count;
         }
         if (stream->receive->complete() ||
-            stream->state.receiving() == stream_receive_state::data_read)
+            stream->state.receiving() == stream_receive_state::data_read) {
+            (void)slot.connection->finish_read(stream_id);
             co_return std::size_t {0};
+        }
         co_await notify(impl);
     }
 }
@@ -709,16 +744,11 @@ auto accept_stream(event_loop&, quic_endpoint::implementation& impl,
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         const auto peer_role = impl.client_mode()
             ? stream_role::server : stream_role::client;
-        const auto accepted_end = slot.accepted_streams.begin() +
-            static_cast<std::ptrdiff_t>(slot.accepted_count);
-        for (const auto& candidate : slot.connection->stream_slots()) {
+        for (auto& candidate : slot.connection->stream_slots()) {
             if (!candidate.occupied || stream_initiator(candidate.id) != peer_role)
                 continue;
-            if (std::find(slot.accepted_streams.begin(), accepted_end, candidate.id) != accepted_end)
-                continue;
-            if (slot.accepted_count == slot.accepted_streams.size())
-                co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
-            slot.accepted_streams[slot.accepted_count++] = candidate.id;
+            if (candidate.accepted) continue;
+            candidate.accepted = true;
             co_return candidate.id;
         }
         if (slot.closing) co_return std::unexpected(make_error_code(quic_errc::peer_closed));

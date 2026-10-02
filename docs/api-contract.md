@@ -7,13 +7,15 @@ detail; applications register the library's TCP, TLS, and UDP objects with
 `eventloop::event_loop`, then await their operations. `post()` and executor
 submissions remain bounded command and background-work APIs.
 
-QUIC endpoints reserve 80 stream slots per connection: 32 bidirectional and
-8 unidirectional streams for each initiator. Requested advertised counts are
-capped to those peer reservations; local opens obey the peer's grant and the
-separate local reservation. Increasing peer `MAX_STREAMS` grants cannot
-enlarge local storage. These are cumulative lifetime limits: completed and
-reset streams retain their slots, and closing a stream does not replenish its
-quota. The aggregate receive-data window remains at most 128 KiB, independently
+QUIC endpoints reserve 80 active stream slots per connection: 32 bidirectional
+and 8 unidirectional streams for each initiator. Requested advertised counts
+are capped to those peer reservations; local opens obey the peer's cumulative
+grant and the separate local active reservation. A stream releases its slot
+after both directions complete and sent data is acknowledged. Retired peer
+streams replenish `MAX_STREAMS` credit. Retired IDs are kept in bounded
+ordinal ranges so delayed packets cannot reopen them; pathological sparse
+retirement can exhaust that range storage and delay further reclamation.
+The aggregate receive-data window remains at most 128 KiB, independently
 of stream count, with at most 4 KiB buffered per stream. No stream storage falls
 back to an unbounded allocation.
 
@@ -250,12 +252,24 @@ back to an unbounded allocation.
   OPTIONS serve static files or `index.html` using the shared secure resource
   walk. Request header blocks are capped at 16 KiB and 128 fields, dynamic
   QPACK tables are disabled, and QUIC caps each connection at 32 peer
-  bidirectional and eight peer unidirectional streams. The server has eight
-  concurrent connection slots, each with storage for 40 observed stream tasks;
-  connections beyond that limit are rejected. Each active request holds one
+  simultaneously active bidirectional and eight peer unidirectional streams.
+  The server has eight
+  concurrent connection slots by default; the constructor accepts a
+  `connection_capacity` from 1 to 256. Endpoint routing, connection state,
+  waiters, and HTTP/3 task handles are allocated at construction in proportion
+  to that capacity. Connections beyond it are rejected. Each connection has
+  storage for 40 concurrent stream tasks. Completed task slots are reused.
+  The `request_capacity` constructor argument reserves reusable request scratch
+  buffers at startup; zero selects four per connection, and explicit values
+  from 1 to 8192 are accepted. Exhaustion closes only the affected connection.
+  Each scratch buffer is about 40 KiB. Ordinary static-file responses use that
+  storage for HTTP/3 headers and I/O; directory listing still allocates its
+  bounded entry and output vectors, and OpenSSL may allocate separately.
+  Each active request holds one
   coroutine frame from the loop's 2048-byte size class, so callers should size
   `eventloop::event_loop_options::coroutine_frame_capacities` for the expected
-  request concurrency; the shipped HTTP/3 examples use 32. A frame-allocation
+  request concurrency; the shipped HTTP/3 examples scale those frame caps with
+  the configured capacity. A frame-allocation
   failure rejects only the affected connection instead of stopping the
   listener. A request that exceeds the header cap closes its connection. Peer
   SETTINGS are limited to 1024 payload bytes and 64 entries; malformed or
@@ -263,4 +277,6 @@ back to an unbounded allocation.
   incrementally using bounded frame storage, which is released after
   validation. Directory listings are available when the server is constructed
   with `directory_listing` and follow the shared bounded renderer. Request
-  bodies, HTTP/3 server push, and WebTransport are not supported.
+  bodies, HTTP/3 server push, and WebTransport are not supported. The server
+  discards up to 1 MiB of request bytes after headers to retire a completed
+  stream; larger remainders close the connection.

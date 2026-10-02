@@ -7,8 +7,10 @@
 namespace eventloop::quic::detail {
 
 udp_endpoint::udp_endpoint(event_loop& loop, ip_endpoint local, path_endpoint_role role,
-    std::size_t short_cid_length, endpoint_accept_callback accept, bool grease_quic_bit)
-    : loop_(loop), router_(role, short_cid_length, grease_quic_bit), accept_(accept)
+    std::size_t short_cid_length, endpoint_accept_callback accept, bool grease_quic_bit,
+    std::size_t connection_capacity)
+    : loop_(loop), router_(role, short_cid_length, grease_quic_bit,
+                          connection_capacity), accept_(accept)
 {
     auto socket = std::make_unique<udp_socket>(loop, local);
     local_ = socket->local_endpoint();

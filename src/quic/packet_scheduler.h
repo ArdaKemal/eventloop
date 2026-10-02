@@ -32,7 +32,8 @@ public:
         if (level != tls_level::application && frame.type != 1 && frame.type != 0x1c)
             return std::unexpected(connection_error::invalid_configuration);
         for (auto& slot : controls_) if (!slot.occupied ||
-            ((frame.type == 0x10 || frame.type == 0x11 || frame.type == 4) &&
+            ((frame.type == 0x10 || frame.type == 0x11 || frame.type == 0x12 ||
+              frame.type == 0x13 || frame.type == 4) &&
              slot.type == frame.type && slot.stream_id == frame.stream_id)) {
             const auto size = encode_frame(frame, slot.bytes);
             if (!size) return std::unexpected(connection_error::output_too_small);

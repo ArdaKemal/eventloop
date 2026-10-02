@@ -113,6 +113,14 @@ int main()
     constexpr std::array other {std::byte {8}};
     check(!router.add(other, peer, {&count, packet}));
 
+    // Runtime reservations extend routing and path state together.
+    endpoint_router larger(path_endpoint_role::server, 2, false, 24);
+    for (unsigned i = 0; i < 24; ++i) {
+        const std::array unique {std::byte {10}, static_cast<std::byte>(i)};
+        check(larger.add(unique, peer, {&count, packet}).has_value());
+    }
+    check(!larger.add(other, peer, {&count, packet}));
+
     std::array<std::byte, 1200> unknown {};
     long_packet(unknown);
     unknown[4] = std::byte {77};

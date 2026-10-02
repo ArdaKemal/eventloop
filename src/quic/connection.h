@@ -20,7 +20,7 @@ namespace eventloop::quic::detail {
 // Control-frame retransmission, migration and key updates remain endpoint work.
 class bounded_connection {
 public:
-    // Each initiator has a lifetime reservation, across both directions. Local
+    // Each initiator has an active reservation, across both directions. Local
     // opens cannot consume storage promised to the peer in transport parameters.
     static constexpr std::size_t bidi_stream_capacity = 32;
     static constexpr std::size_t uni_stream_capacity = 8;
@@ -45,6 +45,7 @@ public:
         stream_state state;
         std::uint64_t sent_highest {}, receive_window {}, receive_limit {}, consumed {};
         bool credit_pending {false}, reset_pending {false};
+        bool accepted {false};
         bool occupied {false};
     };
 
@@ -150,7 +151,12 @@ public:
             return std::unexpected(connection_error::invalid_state);
         const auto capacity = direction == stream_direction::bidirectional
             ? bidi_stream_capacity : uni_stream_capacity;
-        if (registry_.local_opened(direction) >= capacity)
+        const auto role = role_ == endpoint_role::client ? stream_role::client : stream_role::server;
+        std::size_t active = 0;
+        for (const auto& slot : slots_)
+            active += slot.occupied && stream_initiator(slot.id) == role &&
+                stream_type(slot.id) == direction;
+        if (active >= capacity)
             return std::unexpected(connection_error::capacity_exceeded);
         const auto id = registry_.open_local(direction);
         if (!id) return std::unexpected(connection_error::capacity_exceeded);
@@ -159,6 +165,8 @@ public:
     }
     [[nodiscard]] auto stream(std::uint64_t id) noexcept -> stream_slot*
     { check_owner(); for (auto& s : slots_) if (s.occupied && s.id == id) return &s; return nullptr; }
+    [[nodiscard]] auto stream_slots() noexcept -> std::span<stream_slot>
+    { check_owner(); return slots_; }
     [[nodiscard]] auto stream_slots() const noexcept -> std::span<const stream_slot>
     { check_owner(); return slots_; }
     using retirement_callback = void (*)(void*, tls_level, std::uint64_t,
@@ -219,6 +227,7 @@ public:
             return std::unexpected(connection_error::invalid_state);
         if (s->receive->complete() && !s->state.read_all_data())
             return std::unexpected(connection_error::invalid_state);
+        retire_closed_streams();
         return {};
     }
     [[nodiscard]] auto consume_reset(std::uint64_t id)
@@ -237,7 +246,17 @@ public:
         s->consumed = final;
         s->receive.reset();
         flow_ = next_flow;
+        retire_closed_streams();
         return {};
+    }
+    [[nodiscard]] auto finish_read(std::uint64_t id) noexcept -> bool
+    {
+        auto* s = stream(id);
+        if (!s || !s->receive || !s->receive->complete() ||
+            !s->receive->readable().empty()) return false;
+        if (!s->state.read_all_data()) return false;
+        retire_closed_streams();
+        return true;
     }
     // Pending controls stay in fixed connection storage until copied into the
     // scheduler's reliable control queue. New credit supersedes older credit.
@@ -254,19 +273,29 @@ public:
         for (auto& s : slots_) if (s.occupied && s.credit_pending) {
             frame.type = 0x11; frame.stream_id = s.id; frame.limit = s.receive_limit; return frame;
         }
+        for (std::size_t i = 0; i < stream_credit_pending_.size(); ++i)
+            if (stream_credit_pending_[i]) {
+                frame.type = i == 0 ? 0x12 : 0x13;
+                frame.limit = registry_.local_limit(i == 0 ? stream_direction::bidirectional
+                                                      : stream_direction::unidirectional);
+                return frame;
+            }
         return {};
     }
     auto control_queued(const decoded_frame& frame) noexcept -> void
     {
         check_owner();
         if (frame.type == 0x10) data_credit_pending_ = false;
+        else if (frame.type == 0x12 || frame.type == 0x13)
+            stream_credit_pending_[frame.type == 0x12 ? 0 : 1] = false;
         else if (auto* s = stream(frame.stream_id)) {
             if (frame.type == 4) s->reset_pending = false;
             if (frame.type == 0x11) s->credit_pending = false;
         }
     }
     auto control_acked(std::uint64_t type, std::uint64_t id) noexcept -> void
-    { check_owner(); if (type == 4) if (auto* s = stream(id)) (void)s->state.reset_acked(); }
+    { check_owner(); if (type == 4) if (auto* s = stream(id)) {
+        (void)s->state.reset_acked(); retire_closed_streams(); } }
 
     // Synchronize packet-number-space retirement with TLS key retirement.
     // Call after core.advance(), receive(), and a successful Handshake send.
@@ -460,6 +489,36 @@ private:
         }
         return nullptr;
     }
+    auto retire_closed_streams() noexcept -> void
+    {
+        const auto local_role = role_ == endpoint_role::client ? stream_role::client : stream_role::server;
+        for (auto& slot : slots_) {
+            if (!slot.occupied || !slot.state.closed()) continue;
+            bool outstanding = false;
+            for (const auto& packet : sent_) {
+                if (!packet.occupied) continue;
+                for (std::size_t i = 0; i < packet.count; ++i)
+                    outstanding |= !packet.ranges[i].crypto &&
+                                   packet.ranges[i].stream_id == slot.id;
+            }
+            if (outstanding || !registry_.close(slot.id)) continue;
+            const auto peer = stream_initiator(slot.id) != local_role;
+            const auto direction = stream_type(slot.id);
+            (void)flow_.remove_stream(slot.id);
+            slot.receive.reset();
+            slot.send = stream_send_buffer<stream_bytes> {};
+            slot.state = {};
+            slot.id = slot.sent_highest = slot.receive_window = 0;
+            slot.receive_limit = slot.consumed = 0;
+            slot.credit_pending = slot.reset_pending = false;
+            slot.accepted = slot.occupied = false;
+            if (peer && registry_.local_limit(direction) < max_stream_count) {
+                (void)registry_.set_local_limit(direction,
+                    registry_.local_limit(direction) + 1);
+                stream_credit_pending_[direction == stream_direction::bidirectional ? 0 : 1] = true;
+            }
+        }
+    }
     auto retire(std::size_t count) noexcept -> bool
     {
         for (std::size_t i = 0; i < count; ++i) {
@@ -504,12 +563,24 @@ private:
                     retired.reason);
             }
         }
+        retire_closed_streams();
         return true;
     }
     static auto dispatch(void* argument, tls_level level, const decoded_frame& frame) noexcept -> bool
     { return static_cast<bounded_connection*>(argument)->on_frame(level, frame); }
     auto on_frame(tls_level level, const decoded_frame& frame) noexcept -> bool
     {
+        const auto local_role = role_ == endpoint_role::client ? stream_role::client : stream_role::server;
+        const bool local_uni = stream_type(frame.stream_id) == stream_direction::unidirectional &&
+            stream_initiator(frame.stream_id) == local_role;
+        const bool peer_uni = stream_type(frame.stream_id) == stream_direction::unidirectional &&
+            stream_initiator(frame.stream_id) != local_role;
+        if ((((frame.type >= 8 && frame.type <= 15) || frame.type == 4 ||
+              frame.type == 0x15) && local_uni) ||
+            (frame.type == 5 && peer_uni)) return false;
+        if (((frame.type >= 8 && frame.type <= 15) || frame.type == 4 ||
+             frame.type == 5 || frame.type == 0x11 || frame.type == 0x15) &&
+            registry_.is_retired(frame.stream_id)) return true;
         if (frame.type == 2 || frame.type == 3) {
             // ECN marking is not enabled by this owner. Ignore optional counters.
             const auto us = frame.ack_delay > (std::uint64_t(INT64_MAX) >> peer_.ack_exponent)
@@ -572,6 +643,7 @@ private:
     endpoint_role role_;
     connection_callbacks callbacks_;
     bool data_credit_pending_ {false};
+    std::array<bool, 2> stream_credit_pending_ {};
     void* retirement_argument_ {};
     retirement_callback retirement_callback_ {};
     parameter_limits local_, peer_;

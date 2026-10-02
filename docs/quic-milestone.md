@@ -25,8 +25,9 @@ Implement the published QUIC transport specifications:
 Use [RFC 9308](https://www.rfc-editor.org/rfc/rfc9308.html) and
 [RFC 9312](https://www.rfc-editor.org/rfc/rfc9312.html) as applicability and
 operational guidance. RFC 9114 (HTTP/3) and RFC 9204 (QPACK) are separate
-application protocols. The standalone HTTP/3 client example and its tests are
-tracked in [the outbound verification guide](http3-outbound-tests.md).
+application protocols. Wayfarer and Stonegate exercise HTTP/3 through public
+client and server APIs; the root test fixtures are described in
+[the outbound verification guide](http3-outbound-tests.md).
 
 The [IETF QUIC working-group index](https://datatracker.ietf.org/wg/quic/documents/)
 was rechecked on 2026-09-30. The published transport RFC baseline above remains
@@ -105,9 +106,10 @@ empty list from an inaccessible page.
 `include/eventloop/quic.h` exposes loop-affine client and server endpoints,
 move-only connection handles, stream operations, and RFC 9221 DATAGRAMs. The
 implementation uses bounded storage and OpenSSL's external QUIC TLS callbacks.
-`examples/quic_echo_server.cc` exercises the public server API. The
-standalone `http3_client` example uses the public client API and implements
-a bounded HTTP/3 GET session; HTTP/3 is outside the transport release gate.
+`examples/quic_echo_server.cc` exercises the public server API. Wayfarer uses
+the public QUIC client API for bounded HTTP/3 GET and HEAD requests, and
+Stonegate uses the public HTTP/3 server API. HTTP/3 remains outside the QUIC
+transport release gate.
 
 In-house v1/v2 client and server tests cover handshake, bidirectional echo,
 and DATAGRAM exchange. OpenSSL 3.5.6 independently interoperated with the v1

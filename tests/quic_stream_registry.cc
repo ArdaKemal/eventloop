@@ -108,24 +108,22 @@ auto tombstones_and_atomic_failure() -> void
     const auto first = registry.observe_peer(5);
     check(first && registry.observe_peer(5) == first && registry.size() == 1,
           "duplicate access shares record");
-    check(registry.close(5) && registry.find(5)->closed &&
+    check(registry.close(5) && registry.find(5) == nullptr &&
           registry.observe_peer(5).error() == stream_registry_error::closed &&
           registry.close(5).error() == stream_registry_error::closed,
           "closed stream cannot reopen");
     check(registry.open_local(stream_direction::bidirectional) == 0,
           "use second slot");
-    check(registry.observe_peer(9).error() ==
-          stream_registry_error::capacity_exhausted &&
-          registry.peer_opened(stream_direction::bidirectional) == 2 &&
-          !registry.was_opened(9), "failed observation does not advance ordinal");
+    check(registry.observe_peer(9).has_value() &&
+          registry.peer_opened(stream_direction::bidirectional) == 3,
+          "retirement releases the active slot");
     check(registry.open_local(stream_direction::bidirectional).error() ==
           stream_registry_error::capacity_exhausted &&
           registry.local_opened(stream_direction::bidirectional) == 1,
           "failed local open does not consume ID");
-    check(registry.close(0) && registry.size() == 2 &&
-          registry.open_local(stream_direction::bidirectional).error() ==
-          stream_registry_error::capacity_exhausted,
-          "closed tombstones retain fixed capacity");
+    check(registry.close(0) && registry.size() == 1 &&
+          registry.open_local(stream_direction::bidirectional) == 4,
+          "retired local stream releases its slot");
     check(registry.close(1).error() ==
           stream_registry_error::unknown_stream,
           "unknown stream cannot be closed");
@@ -164,6 +162,33 @@ auto invalid_inputs() -> void
           "maximum credit permits local opening");
 }
 
+auto repeated_retirement() -> void
+{
+    stream_registry<2> registry(stream_role::server);
+    check(registry.set_local_limit(stream_direction::bidirectional, 100).has_value(),
+          "configure repeat credit");
+    for (std::uint64_t ordinal = 1; ordinal <= 80; ++ordinal) {
+        const auto id = (ordinal - 1) * 4;
+        check(registry.observe_peer(id).has_value() && registry.close(id) &&
+              registry.is_retired(id) && registry.size() == 0,
+              "sequential streams reuse bounded storage");
+    }
+    check(registry.observe_peer(0).error() == stream_registry_error::closed,
+          "late packet cannot reopen retired stream");
+
+    stream_registry<2> sparse(stream_role::server);
+    check(sparse.set_local_limit(stream_direction::bidirectional, 5).has_value() &&
+          sparse.observe_peer(16).has_value() && sparse.close(16) &&
+          sparse.observe_peer(0).has_value() && sparse.close(0),
+          "implicit lower IDs remain available after high-ID retirement");
+    check(sparse.observe_peer(16).error() == stream_registry_error::closed &&
+          sparse.observe_peer(4).has_value() && sparse.close(4) &&
+          sparse.observe_peer(8).has_value() && sparse.close(8) &&
+          sparse.observe_peer(12).has_value() && sparse.close(12) &&
+          sparse.observe_peer(0).error() == stream_registry_error::closed,
+          "sparse tombstones merge without reopening old IDs");
+}
+
 } // namespace
 
 auto main() -> int
@@ -172,4 +197,5 @@ auto main() -> int
     limits_and_implicit_streams();
     tombstones_and_atomic_failure();
     invalid_inputs();
+    repeated_retirement();
 }

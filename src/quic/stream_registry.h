@@ -2,6 +2,7 @@
 
 #include "quic/varint.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -49,9 +50,9 @@ struct registered_stream {
     bool closed {false};
 };
 
-// Limits are cumulative counts, not simultaneous-open counts. Slots retain
-// closed IDs for the life of the connection. Implicitly opened peer IDs are
-// counted by the high-water mark and acquire a slot only on first access.
+// Limits are cumulative stream ordinals. Active records use bounded slots;
+// compact retired ordinal ranges prevent a delayed packet from reopening an
+// old peer stream. Implicitly opened IDs acquire a record on first access.
 template<std::size_t Capacity>
 class stream_registry {
 public:
@@ -101,11 +102,8 @@ public:
         const auto ordinal = stream_ordinal(id);
         if (ordinal > local_limit_[type])
             return std::unexpected(stream_registry_error::stream_limit);
-        if (auto* existing = find_mutable(id)) {
-            if (existing->closed)
-                return std::unexpected(stream_registry_error::closed);
-            return existing;
-        }
+        if (auto* existing = find_mutable(id)) return existing;
+        if (is_retired(id)) return std::unexpected(stream_registry_error::closed);
         if (size_ == Capacity)
             return std::unexpected(stream_registry_error::capacity_exhausted);
         streams_[size_] = make_stream(id);
@@ -117,10 +115,14 @@ public:
     [[nodiscard]] constexpr auto close(std::uint64_t id) noexcept
         -> std::expected<void, stream_registry_error>
     {
-        auto* stream = find_mutable(id);
-        if (!stream) return std::unexpected(stream_registry_error::unknown_stream);
-        if (stream->closed) return std::unexpected(stream_registry_error::closed);
-        stream->closed = true;
+        std::size_t position = 0;
+        while (position < size_ && streams_[position].id != id) ++position;
+        if (position == size_) return std::unexpected(is_retired(id)
+            ? stream_registry_error::closed : stream_registry_error::unknown_stream);
+        if (stream_initiator(id) != role_ && !remember_retired(id))
+            return std::unexpected(stream_registry_error::capacity_exhausted);
+        streams_[position] = streams_[--size_];
+        streams_[size_] = {};
         return {};
     }
 
@@ -153,7 +155,49 @@ public:
     [[nodiscard]] constexpr auto size() const noexcept -> std::size_t
     { return size_; }
 
+    [[nodiscard]] constexpr auto local_limit(stream_direction direction) const
+        noexcept -> std::uint64_t
+    { return local_limit_[index(direction)]; }
+
+    [[nodiscard]] constexpr auto is_retired(std::uint64_t id) const noexcept -> bool
+    {
+        if (id > max_varint_value || find(id)) return false;
+        const auto ordinal = stream_ordinal(id);
+        if (stream_initiator(id) == role_)
+            return ordinal <= local_opened_[index(stream_type(id))];
+        const auto type = index(stream_type(id));
+        for (std::size_t i = 0; i < retired_count_[type]; ++i)
+            if (ordinal >= retired_[type][i].first &&
+                ordinal <= retired_[type][i].last) return true;
+        return false;
+    }
+
 private:
+    struct ordinal_range { std::uint64_t first {}, last {}; };
+
+    [[nodiscard]] constexpr auto remember_retired(std::uint64_t id) noexcept -> bool
+    {
+        const auto type = index(stream_type(id));
+        const auto ordinal = stream_ordinal(id);
+        auto& count = retired_count_[type];
+        auto& ranges = retired_[type];
+        ordinal_range merged {ordinal, ordinal};
+        bool adjacent = false;
+        for (std::size_t i = 0; i < count; ++i)
+            adjacent |= ranges[i].first <= ordinal + 1 &&
+                        ordinal <= ranges[i].last + 1;
+        if (!adjacent && count == Capacity) return false;
+        for (std::size_t i = 0; i < count;) {
+            if (ranges[i].first > merged.last + 1 ||
+                merged.first > ranges[i].last + 1) { ++i; continue; }
+            merged.first = std::min(merged.first, ranges[i].first);
+            merged.last = std::max(merged.last, ranges[i].last);
+            ranges[i] = ranges[--count];
+            i = 0;
+        }
+        ranges[count++] = merged;
+        return true;
+    }
     [[nodiscard]] constexpr auto find_mutable(std::uint64_t id) noexcept
         -> registered_stream*
     {
@@ -191,6 +235,8 @@ private:
     std::array<std::uint64_t, 2> peer_opened_ {};
     std::array<registered_stream, Capacity> streams_ {};
     std::size_t size_ {0};
+    std::array<std::array<ordinal_range, Capacity>, 2> retired_ {};
+    std::array<std::size_t, 2> retired_count_ {};
 };
 
 } // namespace eventloop::quic::detail

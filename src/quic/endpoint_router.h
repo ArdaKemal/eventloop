@@ -8,6 +8,7 @@
 #include <array>
 #include <exception>
 #include <thread>
+#include <vector>
 
 namespace eventloop::quic::detail {
 
@@ -52,13 +53,15 @@ struct endpoint_callbacks {
 // retains one authenticated candidate per connection while its path is probed.
 class endpoint_router {
 public:
-    static constexpr std::size_t connection_capacity = 16;
-    static constexpr std::size_t cid_capacity = 64;
     explicit endpoint_router(path_endpoint_role role, std::size_t short_cid_length = 8,
-                             bool grease_quic_bit = false)
+                             bool grease_quic_bit = false,
+                             std::size_t connection_capacity = 16)
         : role_(role), short_cid_length_(short_cid_length),
           grease_quic_bit_(grease_quic_bit),
-          paths_(path_slots_, role),
+          connections_(checked_capacity(connection_capacity)),
+          cids_(connection_capacity * 4),
+          path_slots_(connection_capacity), paths_(path_slots_, role),
+          candidate_slots_(connection_capacity),
           candidate_paths_(candidate_slots_, role)
     {
         if (short_cid_length == 0 || short_cid_length > 20)
@@ -315,6 +318,12 @@ public:
     [[nodiscard]] auto role() const noexcept -> path_endpoint_role { return role_; }
 
 private:
+    [[nodiscard]] static auto checked_capacity(std::size_t capacity) -> std::size_t
+    {
+        if (capacity == 0 || capacity > 256)
+            throw std::invalid_argument("QUIC connection capacity must be 1..256");
+        return capacity;
+    }
     struct connection_slot {
         endpoint_connection handle {};
         ip_endpoint peer {};
@@ -357,11 +366,11 @@ private:
     bool grease_quic_bit_ {};
     endpoint_connection next_handle_ {};
     bool dispatching_ {};
-    std::array<connection_slot, connection_capacity> connections_ {};
-    std::array<cid_slot, cid_capacity> cids_ {};
-    std::array<path_validation_slot, connection_capacity> path_slots_ {};
+    std::vector<connection_slot> connections_;
+    std::vector<cid_slot> cids_;
+    std::vector<path_validation_slot> path_slots_;
     path_validation paths_;
-    std::array<path_validation_slot, connection_capacity> candidate_slots_ {};
+    std::vector<path_validation_slot> candidate_slots_;
     path_validation candidate_paths_;
 };
 

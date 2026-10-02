@@ -22,7 +22,8 @@ public:
     udp_endpoint(event_loop&, ip_endpoint local, path_endpoint_role,
                  std::size_t short_cid_length = 8,
                  endpoint_accept_callback accept = {},
-                 bool grease_quic_bit = true);
+                 bool grease_quic_bit = true,
+                 std::size_t connection_capacity = 16);
     ~udp_endpoint();
     udp_endpoint(const udp_endpoint&) = delete;
     auto operator=(const udp_endpoint&) -> udp_endpoint& = delete;

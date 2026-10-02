@@ -5,6 +5,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -29,6 +30,8 @@ struct config {
     std::uint16_t http_port = 8080;
     std::uint16_t https_port = 8443;
     std::uint16_t http3_port = 0;
+    std::size_t http3_connections = 8;
+    std::size_t http3_requests = 0;
     int shutdown_seconds = 5;
     bool directory_listing = false;
     bool reuse_port = false;
@@ -47,6 +50,8 @@ auto usage() -> void
         "  --http-mode MODE        serve, redirect, or off (default serve)\n"
         "  --https-port PORT       TLS port (default 8443)\n"
         "  --http3-port PORT       enable UDP HTTP/3 on this port (default off)\n"
+        "  --http3-connections N  concurrent HTTP/3 connections (1..256; default 8)\n"
+        "  --http3-requests N     concurrent HTTP/3 requests (1..8192; default 4 per connection)\n"
         "  --certificate FILE      PEM certificate chain\n"
         "  --private-key FILE      PEM private key\n"
         "  --key-password TEXT     password for encrypted private key\n"
@@ -104,6 +109,8 @@ auto apply(config& settings, std::string_view key, std::string_view value,
     else if (key == "http-port") settings.http_port = number<int>(value, key, 1, 65535);
     else if (key == "https-port") settings.https_port = number<int>(value, key, 1, 65535);
     else if (key == "http3-port") settings.http3_port = number<int>(value, key, 1, 65535);
+    else if (key == "http3-connections") settings.http3_connections = number<std::size_t>(value, key, 1, 256);
+    else if (key == "http3-requests") settings.http3_requests = number<std::size_t>(value, key, 1, 8192);
     else if (key == "shutdown-seconds")
         settings.shutdown_seconds = number<int>(value, key, 0, 3600);
     else if (key == "http-mode") {
@@ -168,6 +175,8 @@ auto parse(int argc, char** argv) -> config
                    option == "--private-key" || option == "--key-password" ||
                    option == "--redirect-host" || option == "--http-port" ||
                    option == "--https-port" || option == "--http3-port" ||
+                   option == "--http3-connections" ||
+                   option == "--http3-requests" ||
                    option == "--shutdown-seconds" || option == "--http-mode" ||
                    option == "--http2") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -190,6 +199,8 @@ auto parse(int argc, char** argv) -> config
             option != "--private-key" && option != "--key-password" &&
             option != "--redirect-host" && option != "--http-port" &&
             option != "--https-port" && option != "--http3-port" &&
+            option != "--http3-connections" &&
+            option != "--http3-requests" &&
             option != "--shutdown-seconds" && option != "--http-mode" && option != "--http2")
             throw std::invalid_argument("unknown option: " + std::string(option));
         if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -287,11 +298,15 @@ auto main(int argc, char** argv) -> int
             .reuse_port = settings.reuse_port,
             .enable_http2 = settings.http2,
         };
-        // HTTP/3 and redirect requests hold 2 KiB-class coroutine frames. Size
-        // the loop for the aggregate connection concurrency; index 4 is the
-        // 2048-byte class in coroutine_frame_sizes.
+        // Reserve bounded coroutine slots for aggregate HTTP/3 connection
+        // activity. Growth slabs are allocated only when those slots are used.
         eventloop::event_loop_options loop_options;
-        loop_options.coroutine_frame_capacities[4] = 32;
+        for (auto& capacity : loop_options.coroutine_frame_capacities)
+            capacity = std::max(capacity, settings.http3_connections * 8);
+        loop_options.coroutine_frame_capacities[4] = std::max(
+            loop_options.coroutine_frame_capacities[4],
+            settings.http3_requests == 0 ? settings.http3_connections * 4
+                                         : settings.http3_requests);
         eventloop::event_loop loop(loop_options);
         std::unique_ptr<eventloop::http::http3_server> http3;
         eventloop::task_handle<void> http3_run;
@@ -322,7 +337,8 @@ auto main(int argc, char** argv) -> int
             http3 = std::make_unique<eventloop::http::http3_server>(
                 loop, eventloop::ip_endpoint::parse(settings.bind, settings.http3_port),
                 settings.root, settings.certificate, settings.private_key,
-                settings.directory_listing);
+                settings.directory_listing, settings.http3_connections,
+                settings.http3_requests);
             if (loop.spawn(http3->run(), http3_run) !=
                 eventloop::task_spawn_result::accepted)
                 throw std::runtime_error("HTTP/3 listener task capacity exhausted");

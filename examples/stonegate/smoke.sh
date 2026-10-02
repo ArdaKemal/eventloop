@@ -72,6 +72,8 @@ expect_config_error 'http2 must be on or off' $'root=../root\nhttp2=yes'
 expect_config_error 'key-password requires TLS credentials' $'root=../root\nkey-password=PRIVATE_SENTINEL_739'
 expect_config_error 'must be supplied together' $'root=../root\ncertificate=../cert.pem'
 expect_config_error 'requires --certificate and --private-key' $'root=../root\nhttp3-port=8444'
+expect_config_error 'http3-connections has an invalid value' $'root=../root\nhttp3-connections=257'
+expect_config_error 'http3-requests has an invalid value' $'root=../root\nhttp3-requests=8193'
 expect_config_error 'TLS credentials are required' $'root=../root\nhttp-mode=redirect'
 expect_config_error 'HTTP and HTTPS ports must differ' $'root=../root\ncertificate=../cert.pem\nprivate-key=../key.pem\nhttp-port=8443'
 if "$server" --config "$work/config/invalid.conf" --config "$work/config/invalid.conf" \
@@ -89,6 +91,7 @@ http3_port=$https_port
 "$server" --root "$work/root" --bind 127.0.0.1 \
     --http-mode redirect --redirect-host localhost \
     --http-port "$http_port" --https-port "$https_port" --http3-port "$http3_port" \
+    --http3-connections 16 --http3-requests 64 \
     --directory-listing \
     --certificate "$work/cert.pem" --private-key "$work/key.pem" \
     >"$work/server.log" 2>&1 &

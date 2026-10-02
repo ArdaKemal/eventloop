@@ -21,8 +21,8 @@ enum class flow_control_error {
     final_size,
 };
 
-// A slot is retained for the connection lifetime, including after FIN or
-// RESET_STREAM. The caller validates stream IDs and stream state, and supplies
+// Active streams use bounded slots. Aggregate byte counters survive removal;
+// the caller validates stream IDs and stream state, and supplies
 // the correct initial per-stream transport-parameter limit. Range calls may be
 // repeated for retransmissions; consume() requires newly delivered contiguous
 // bytes and must be called exactly once for each byte delivered to the app.
@@ -44,7 +44,7 @@ public:
 
     // Register both directions independently; use a zero limit for a direction
     // that the stream cannot carry. Neither registry nor ID validation lives
-    // here. A duplicate registration is an error, including after closure.
+    // here. A duplicate active registration is an error.
     [[nodiscard]] constexpr auto add_stream(std::uint64_t id,
                                              std::uint64_t send_limit,
                                              std::uint64_t receive_limit) noexcept
@@ -58,6 +58,18 @@ public:
             return std::unexpected(flow_control_error::capacity_exhausted);
         streams_[size_++] = {id, send_limit, receive_limit};
         return {};
+    }
+
+    [[nodiscard]] constexpr auto remove_stream(std::uint64_t id) noexcept
+        -> std::expected<void, flow_control_error>
+    {
+        for (std::size_t i = 0; i < size_; ++i) {
+            if (streams_[i].id != id) continue;
+            streams_[i] = streams_[--size_];
+            streams_[size_] = {};
+            return {};
+        }
+        return std::unexpected(flow_control_error::unknown_stream);
     }
 
     // MAX_DATA and MAX_STREAM_DATA received from the peer. Stale or equal

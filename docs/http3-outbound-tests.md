@@ -1,7 +1,8 @@
-# Optional outbound HTTP/3 verification
+# Optional outbound HTTP/3 fixture verification
 
-The standalone `http3_client` performs HTTPS GETs over the explicitly selected
-QUIC version (`v1` by default). It verifies the certificate identity using system
+The `http3_client` test fixture in `tests/fixtures/` performs HTTPS GETs over
+the explicitly selected QUIC version (`v1` by default). It verifies the
+certificate identity using system
 trust or `--ca-file PEM`. Status and headers go to stderr and the binary body goes
 to stdout. A complete HTTP 404 response is a successful exchange and exits zero;
 tests must assert the expected status separately. It does not follow redirects.
@@ -18,23 +19,24 @@ SETTINGS, QPACK, and cleanup are shared once per batch.
   --request-path / --request-path /large https://example.org/
 ```
 
-The example accepts at most 32 requests per batch, matching the transport's
-local bidirectional lifetime reservation. The transport reserves 80 total
-stream slots: 32 bidirectional and 8 unidirectional for each initiator. HTTP/3's
+The fixture accepts at most 32 concurrent requests per batch, matching the
+transport's active local bidirectional reservation. The transport reserves
+80 active stream slots: 32 bidirectional and 8 unidirectional for each initiator. HTTP/3's
 local and peer control/QPACK streams use their respective unidirectional
 reservations, independently of the request streams. The peer's stream grant
 may impose a smaller request limit. The
-example closes the connection after the batch and returns an error if any
+fixture closes the connection after the batch and returns an error if any
 request fails. Request and output views supplied to `perform_gets()` must remain
 valid through task completion. Payloads stream directly to each file without
 retaining complete response bodies.
 
-Stream slots remain reserved for the connection lifetime after completion or
-reset. Advertised peer limits are capped to the corresponding reservations;
-larger peer `MAX_STREAMS` grants cannot enlarge the local reservation. The
+Completed streams release their slots after final ACK and receive completion.
+The transport issues new `MAX_STREAMS` credit when peer streams retire.
+Advertised peer limits are capped to the corresponding active reservations;
+larger peer `MAX_STREAMS` grants cannot enlarge the local active reservation. The
 aggregate receive-data window remains capped at 128 KiB. The former shared
 32-slot limit, which left only 26 requests after normal HTTP/3 critical streams,
-was corrected before raising this example's batch ceiling.
+was corrected before raising this fixture's batch ceiling.
 
 `--timeout-ms 1..3600000` sets the overall connection/exchange deadline (default
 30000 ms). The existing HTTP session also has a 30-second response deadline.

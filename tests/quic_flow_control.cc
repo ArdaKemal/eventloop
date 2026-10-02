@@ -199,6 +199,23 @@ auto boundaries() -> void
           "peer credit bounds");
 }
 
+auto reclaimed_slot_preserves_connection_credit() -> void
+{
+    auto flow = *flow_control<1>::create(10, 10);
+    check(flow.add_stream(0, 10, 10).has_value() &&
+          flow.send_range(0, 0, 3).has_value() &&
+          flow.receive_range(0, 0, 3).has_value() &&
+          flow.consume(0, 3).has_value(), "first stream transfer");
+    check(flow.remove_stream(0).has_value() &&
+          flow.add_stream(4, 10, 10).has_value() &&
+          flow.sent_total() == 3 && flow.received_total() == 3 &&
+          flow.consumed_total() == 3, "reclaim retains aggregate counters");
+    check(flow.send_range(4, 0, 7).has_value() &&
+          flow.receive_range(4, 0, 7).has_value() &&
+          flow.sent_total() == 10 && flow.received_total() == 10,
+          "reused slot cannot bypass connection credit");
+}
+
 } // namespace
 
 auto main() -> int
@@ -209,4 +226,5 @@ auto main() -> int
     final_size_contract();
     reset_credit_atomicity();
     boundaries();
+    reclaimed_slot_preserves_connection_credit();
 }

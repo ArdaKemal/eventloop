@@ -24,7 +24,6 @@ namespace eventloop::http {
 namespace {
 namespace h3 = eventloop::http3::detail;
 namespace wire = eventloop::quic::detail;
-constexpr std::size_t max_connections = 8;
 constexpr std::size_t max_streams = 40;
 constexpr std::size_t header_limit = 16 * 1024;
 using stream_handlers = std::array<std::optional<task_handle<void>>, max_streams>;
@@ -34,6 +33,26 @@ struct stream_storage {
     std::array<char, header_limit> strings {};
     std::array<h3::field, h3::qpack_max_fields> fields {};
     std::array<std::byte, 4096> io {};
+    bool in_use {false};
+};
+
+struct storage_pool {
+    explicit storage_pool(std::size_t capacity) : slots(checked_capacity(capacity)) {}
+    [[nodiscard]] static auto checked_capacity(std::size_t capacity) -> std::size_t
+    {
+        if (capacity == 0 || capacity > 8192)
+            throw std::invalid_argument("HTTP/3 request capacity must be 1..8192");
+        return capacity;
+    }
+    [[nodiscard]] auto acquire() noexcept -> stream_storage*
+    {
+        for (auto& slot : slots) if (!slot.in_use) {
+            slot.in_use = true;
+            return &slot;
+        }
+        return nullptr;
+    }
+    std::vector<stream_storage> slots;
 };
 
 auto write_all(event_loop& loop, quic_connection& connection, std::uint64_t id,
@@ -142,11 +161,33 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
     co_return (co_await write_all(loop, connection, id, buffer.first(*framed), fin)).value_or(false);
 }
 
+auto discard_request_remainder(event_loop& loop, quic_connection& connection,
+                               std::uint64_t id, std::span<std::byte> scratch)
+    -> task<void>
+{
+    (void)loop;
+    constexpr std::size_t discard_limit = 1024 * 1024;
+    std::size_t discarded = 0;
+    while (connection.valid()) {
+        const auto got = flatten_result(co_await connection.async_read(id, scratch));
+        if (!got || *got == 0) co_return;
+        if (*got > discard_limit - discarded) {
+            connection.close(std::make_error_code(std::errc::message_size));
+            co_return;
+        }
+        discarded += *got;
+    }
+}
+
 auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
-                   native_socket root, std::unique_ptr<stream_storage> storage,
+                   native_socket root, stream_storage* storage,
                    bool directory_listing)
     -> task<void>
 {
+    struct release_storage {
+        stream_storage* storage;
+        ~release_storage() { storage->in_use = false; }
+    } release {storage};
     auto& s = *storage;
     const auto type = flatten_result(co_await read_varint(loop, connection, id));
     const auto length = flatten_result(co_await read_varint(loop, connection, id));
@@ -162,7 +203,8 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         co_return;
     }
     std::string_view method, path, scheme, authority;
-    std::string if_none_match;
+    std::size_t match_size = 0;
+    bool match_overflow = false;
     std::string_view if_modified_since, range;
     bool duplicate_range = false;
     bool regular = false;
@@ -187,8 +229,15 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         } else {
             regular = true;
             if (field.name == "if-none-match") {
-                if (!if_none_match.empty()) if_none_match += ',';
-                if_none_match += field.value;
+                const auto extra = field.value.size() + (match_size != 0 ? 1 : 0);
+                if (extra > s.headers.size() - match_size) match_overflow = true;
+                else {
+                    auto* output = reinterpret_cast<char*>(s.headers.data());
+                    if (match_size != 0) output[match_size++] = ',';
+                    if (!field.value.empty())
+                        std::memcpy(output + match_size, field.value.data(), field.value.size());
+                    match_size += field.value.size();
+                }
             }
             else if (field.name == "if-modified-since") if_modified_since = field.value;
             else if (field.name == "range") {
@@ -197,6 +246,12 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
             }
         }
     }
+    if (match_overflow) {
+        connection.close(std::make_error_code(std::errc::message_size));
+        co_return;
+    }
+    const std::string_view if_none_match {
+        reinterpret_cast<const char*>(s.headers.data()), match_size};
     unsigned status = 200;
     unique_fd file;
     std::uint64_t size = 0;
@@ -257,7 +312,10 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         connection.close(std::make_error_code(std::errc::io_error));
         co_return;
     }
-    if (finish) co_return;
+    if (finish) {
+        (void)co_await discard_request_remainder(loop, connection, id, s.io);
+        co_return;
+    }
     if (have_listing) {
         std::array<std::byte, 16> frame_header {};
         const auto header_size = h3::encode_frame_header(h3::data_frame, listing.size(), frame_header);
@@ -269,6 +327,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
                               listing.size()), false)).value_or(false))
             co_return;
         (void)co_await write_all(loop, connection, id, {}, true);
+        (void)co_await discard_request_remainder(loop, connection, id, s.io);
         co_return;
     }
     std::uint64_t sent = 0;
@@ -286,6 +345,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         sent += count;
     }
     (void)co_await write_all(loop, connection, id, {}, true);
+    (void)co_await discard_request_remainder(loop, connection, id, s.io);
 }
 
 auto drain_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t id,
@@ -317,9 +377,9 @@ auto drain_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t
 
 auto serve_connection(event_loop& loop, quic_connection connection,
                       std::shared_ptr<unique_fd> root,
-                      stream_handlers& handlers, bool directory_listing) -> task<void>
+                      stream_handlers& handlers, storage_pool& pool,
+                      bool directory_listing) -> task<void>
 {
-    std::size_t used = 0;
     bool have_control = false;
     auto control = flatten_result(co_await connection.async_open_stream(quic_stream_direction::unidirectional));
     if (!control) { connection.close(control.error()); co_return; }
@@ -338,30 +398,37 @@ auto serve_connection(event_loop& loop, quic_connection connection,
             connection.close(); co_return;
         }
     }
-    while (connection.valid() && used < handlers.size()) {
+    while (connection.valid()) {
         auto accepted = flatten_result(co_await connection.async_accept_stream());
         if (!accepted) break;
         const auto id = *accepted;
         task_spawn_result spawned = task_spawn_result::invalid_task;
-        handlers[used].emplace();
+        auto slot = std::find_if(handlers.begin(), handlers.end(),
+            [](const auto& handler) { return !handler || handler->done(); });
+        if (slot == handlers.end()) { connection.close(); break; }
+        slot->reset();
+        slot->emplace();
         if ((id & 3u) == 2u) {
-            spawned = loop.spawn(drain_peer_uni(loop, connection, id, have_control), *handlers[used]);
+            spawned = loop.spawn(drain_peer_uni(loop, connection, id, have_control), **slot);
         } else if ((id & 3u) == 0u) {
-            auto storage = std::make_unique<stream_storage>();
-            spawned = loop.spawn(serve_request(loop, connection, id, root->get(), std::move(storage), directory_listing), *handlers[used]);
+            auto* storage = pool.acquire();
+            if (!storage) { slot->reset(); connection.close(); break; }
+            spawned = loop.spawn(serve_request(loop, connection, id, root->get(),
+                storage, directory_listing), **slot);
+            if (spawned != task_spawn_result::accepted) storage->in_use = false;
         }
         if (spawned != task_spawn_result::accepted) {
-            handlers[used].reset();
+            slot->reset();
             connection.close();
             break;
         }
-        ++used;
     }
     connection.close();
-    for (std::size_t i = 0; i < used; ++i) {
-        (void)handlers[i]->cancel();
-        (void)co_await *handlers[i];
-        handlers[i].reset();
+    for (auto& handler : handlers) {
+        if (!handler) continue;
+        (void)handler->cancel();
+        (void)co_await *handler;
+        handler.reset();
     }
 }
 } // namespace
@@ -375,26 +442,33 @@ public:
 
     implementation(event_loop& loop, ip_endpoint local, std::string_view root,
                    std::filesystem::path cert, std::filesystem::path key,
-                   bool directory_listing)
+                   bool directory_listing, std::size_t connection_capacity,
+                   std::size_t request_capacity)
         : loop_(loop), root_(std::make_shared<unique_fd>(http::detail::open_root(root))),
           endpoint_(loop, local, quic_server_options{std::move(cert), std::move(key),
-              std::span(alpn_)}),
-          directory_listing_(directory_listing) {}
+              std::span(alpn_), {}, connection_capacity}),
+          directory_listing_(directory_listing), connections_(connection_capacity),
+          request_storage_(request_capacity == 0 ? connection_capacity * 4
+                                                 : request_capacity) {}
 
     event_loop& loop_;
     std::shared_ptr<unique_fd> root_;
     const std::array<std::uint8_t, 2> alpn_ {'h', '3'};
     quic_endpoint endpoint_;
     bool directory_listing_ {false};
-    std::array<connection_slot, max_connections> connections_;
+    std::vector<connection_slot> connections_;
+    storage_pool request_storage_;
 };
 
 http3_server::http3_server(event_loop& loop, ip_endpoint local, std::string_view root,
                            std::filesystem::path certificate_chain,
                            std::filesystem::path private_key,
-                           bool directory_listing)
+                           bool directory_listing,
+                           std::size_t connection_capacity,
+                           std::size_t request_capacity)
     : implementation_(std::make_unique<implementation>(loop, local, root,
-          std::move(certificate_chain), std::move(private_key), directory_listing)) {}
+          std::move(certificate_chain), std::move(private_key), directory_listing,
+          connection_capacity, request_capacity)) {}
 http3_server::~http3_server() = default;
 auto http3_server::local_endpoint() const noexcept -> ip_endpoint
 { return implementation_->endpoint_.local_endpoint(); }
@@ -416,7 +490,7 @@ auto http3_server::run_loop(event_loop& loop, http3_server& server) -> task<void
         if (slot == impl.connections_.end()) { accepted->close(); continue; }
         slot->handle.emplace();
         const auto spawned = loop.spawn(serve_connection(loop, std::move(*accepted), impl.root_,
-                slot->handlers, impl.directory_listing_), *slot->handle);
+                slot->handlers, impl.request_storage_, impl.directory_listing_), *slot->handle);
         if (spawned != task_spawn_result::accepted) {
             slot->handle.reset();
             if (spawned == task_spawn_result::frame_allocation_failure) {

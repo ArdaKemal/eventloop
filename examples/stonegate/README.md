@@ -15,19 +15,19 @@ HEAD sends the corresponding GET status and headers without a body.
 
 ## Build
 
-From the repository root in a source checkout with the HTTP/3 server API:
+From the repository root:
 
 ```sh
 cmake -S examples/stonegate -B /tmp/stonegate-build -DCMAKE_BUILD_TYPE=Release
 cmake --build /tmp/stonegate-build --target stonegate -j2
 ```
 
-The local CMake file adds the eventloop checkout as a subdirectory. Override
-the source location when the HTTP/3 server API lives in another worktree:
+The local CMake file adds the eventloop checkout as a subdirectory. To build
+against a different checkout, set its source path explicitly:
 
 ```sh
 cmake -S examples/stonegate -B /tmp/stonegate-build -DCMAKE_BUILD_TYPE=Release \
-  -DEVENTLOOP_SOURCE_DIR=/tmp/eventloop-http3-server
+  -DEVENTLOOP_SOURCE_DIR=/path/to/eventloop
 cmake --build /tmp/stonegate-build --target stonegate -j2
 ```
 
@@ -131,22 +131,21 @@ rewrite with restored modification time on every available HTTP version.
 It also compares the generated directory listing byte for byte across HTTP/1.1,
 HTTP/2, and HTTP/3, including escaped hrefs and text, hidden entries, stable
 name order, index preference, a symlink entry, and the entry-limit error.
-The three-round smoke sequence and a separate ten-round
-GET→HEAD→OPTIONS→GET sequence passed with curl 8.14.1 against the HTTP/3 API
-at commit `4d4b74e`. See [TEST_REPORT.md](TEST_REPORT.md) for the observed
-coverage and the earlier OPTIONS failure resolved by that API fix.
 
 ## Boundaries and unsupported features
 
 - HTTP/3 uses the public `http3_server` API and supports static GET, HEAD, and
   OPTIONS for files, `index.html`, and (when constructed with
   `directory_listing`) bounded directory listings. It does not support request
-  bodies, server push, or WebTransport. The HTTP/3 API currently caps
-  active connections at eight, peer bidirectional streams at 32 per
-  connection, and peer unidirectional streams at eight. Request headers are
-  capped at 16 KiB and 128 fields; QPACK dynamic tables are disabled. The
-  public API has no capacity knobs for these limits. The local test report
-  records the repeated HTTP/3 acceptance run against API commit `4d4b74e`.
+  bodies, server push, or WebTransport. `--http3-connections` sets the
+  simultaneous connection capacity from 1 to 256; the default is eight.
+  `--http3-requests` reserves from 1 to 8192 reusable request scratch buffers;
+  the default is four per connection. A full request pool closes the affected
+  connection.
+  The QUIC transport caps simultaneously active peer bidirectional streams
+  at 32 per connection and peer unidirectional streams at eight. Completed
+  streams release storage and replenish the peer's stream credit. Request headers
+  are capped at 16 KiB and 128 fields; QPACK dynamic tables are disabled.
 - This is a static document-root server. The public server API exposes no
   application route handlers, reverse proxy, CGI/FastCGI, virtual hosts,
   access logs, compression, cache controls, upload handling, HTTP/2 tuning,
