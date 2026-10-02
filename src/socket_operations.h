@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <expected>
 #include <span>
+#include <string_view>
 #include <system_error>
 
 namespace eventloop { class tcp_stream; class tcp_acceptor; class udp_socket; }
@@ -112,6 +113,12 @@ public:
                                             ip_endpoint endpoint,
                                             socket_operation& operation) noexcept
         -> socket_result;
+#ifndef _WIN32
+    [[nodiscard]] static auto start_unix_connect(native_socket socket,
+                                                 std::string_view path,
+                                                 socket_operation& operation) noexcept
+        -> socket_result;
+#endif
     [[nodiscard]] static auto finish_connect(native_socket socket) noexcept
         -> std::error_code;
     [[nodiscard]] static auto start_read(native_socket socket, void* buffer,
@@ -146,7 +153,8 @@ inline auto socket_operations::accept_register(tcp_acceptor&, ip_endpoint) noexc
 inline auto socket_operations::accept_bind(tcp_acceptor::accept_awaiter&) noexcept -> void {}
 inline auto socket_operations::accept_start(tcp_acceptor& acceptor,
     tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result
-{ return start_accept(acceptor.descriptor_.get(), 0, {}, awaiter.operation_); }
+{ return start_accept(acceptor.descriptor_.get(), acceptor.unix_socket_ ? 1 : 0,
+                      {}, awaiter.operation_); }
 inline auto socket_operations::accept_try_immediate(tcp_acceptor& acceptor,
     tcp_acceptor::accept_awaiter& awaiter) noexcept -> socket_result
 { return accept_start(acceptor, awaiter); }

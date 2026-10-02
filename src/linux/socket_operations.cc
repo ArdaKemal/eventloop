@@ -10,6 +10,8 @@
 #include <netinet/tcp.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <cstring>
 #include <unistd.h>
 
 namespace eventloop::detail {
@@ -138,7 +140,7 @@ auto socket_operations::pending_error(native_socket socket,
     return code(error);
 }
 
-auto socket_operations::start_accept(native_socket listener, int,
+auto socket_operations::start_accept(native_socket listener, int unix_socket,
                                      std::span<std::byte>,
                                      socket_operation&) noexcept
     -> socket_result
@@ -148,8 +150,8 @@ auto socket_operations::start_accept(native_socket listener, int,
                                        SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (accepted >= 0) {
             const int enabled = 1;
-            if (::setsockopt(accepted, IPPROTO_TCP, TCP_NODELAY, &enabled,
-                             sizeof(enabled)) != 0) {
+            if (!unix_socket && ::setsockopt(accepted, IPPROTO_TCP, TCP_NODELAY,
+                                            &enabled, sizeof(enabled)) != 0) {
                 const int error = errno;
                 ::close(accepted);
                 return {.error = code(error)};
@@ -171,6 +173,24 @@ auto socket_operations::start_connect(native_socket socket,
     const int result = ::connect(socket, address.address(), address.length);
     if (result == 0 || errno == EISCONN) return {};
     if (errno == EINPROGRESS || errno == EINTR) return {.pending = true};
+    return {.error = code(errno)};
+}
+
+auto socket_operations::start_unix_connect(native_socket socket,
+                                           std::string_view path,
+                                           socket_operation&) noexcept
+    -> socket_result
+{
+    sockaddr_un address {};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, path.data(), path.size());
+    const auto length = static_cast<socklen_t>(
+        offsetof(sockaddr_un, sun_path) + path.size() + 1);
+    const int result = ::connect(socket,
+        reinterpret_cast<const sockaddr*>(&address), length);
+    if (result == 0 || errno == EISCONN) return {};
+    if (errno == EINPROGRESS || errno == EINTR || errno == EAGAIN)
+        return {.pending = true};
     return {.error = code(errno)};
 }
 

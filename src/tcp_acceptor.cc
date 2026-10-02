@@ -30,6 +30,15 @@ tcp_acceptor::tcp_acceptor(event_loop& loop, ip_endpoint bind_endpoint,
                                                 bind_endpoint, reuse_port);
 }
 
+tcp_acceptor::tcp_acceptor(event_loop& loop, unique_fd descriptor,
+                           bool unix_socket)
+    : loop_(loop), descriptor_(std::move(descriptor)),
+      unix_socket_(unix_socket)
+{
+    if (!descriptor_) throw std::invalid_argument("listener descriptor is invalid");
+    detail::socket_operations::accept_register(*this, {});
+}
+
 tcp_acceptor::~tcp_acceptor()
 {
     if (waiter_ != nullptr) std::terminate();

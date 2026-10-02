@@ -736,6 +736,7 @@ add_library(eventloop
     include/eventloop/tls_stream.h
     include/eventloop/unique_fd.h
     include/eventloop/udp_socket.h
+    include/eventloop/unix_socket.h
     include/eventloop/util/arg_parser.h
     include/eventloop/ws/web_socket.h
     src/linux/file_operation.cc
@@ -773,6 +774,7 @@ add_library(eventloop
     src/tls_stream.cc
     src/util/arg_parser.cc
     src/udp_socket.cc
+    src/unix_socket.cc
     src/ws/web_socket.cpp
 )
 
@@ -836,6 +838,13 @@ install(FILES
 add_executable(tcp_echo examples/tcp_echo.cc)
 target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)
 target_compile_options(tcp_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(unix_echo examples/unix_echo.cc)
+target_link_libraries(unix_echo PRIVATE eventloop::eventloop)
+target_compile_options(unix_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(unix_echo PRIVATE -Wno-mismatched-new-delete)
+endif()
 
 add_executable(websocket_echo_server examples/websocket_echo_server.cc)
 target_link_libraries(websocket_echo_server PRIVATE eventloop::eventloop OpenSSL::Crypto)
@@ -1475,6 +1484,15 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME coroutine_tcp COMMAND coroutine_tcp_test)
     set_tests_properties(coroutine_tcp PROPERTIES TIMEOUT 10)
+
+    add_executable(coroutine_unix_test tests/unix_socket.cc)
+    target_link_libraries(coroutine_unix_test PRIVATE eventloop::eventloop)
+    target_compile_options(coroutine_unix_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(coroutine_unix_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME coroutine_unix COMMAND coroutine_unix_test)
+    set_tests_properties(coroutine_unix PROPERTIES TIMEOUT 10)
 
     add_executable(coroutine_udp_test tests/udp_coroutine.cc)
     target_link_libraries(coroutine_udp_test PRIVATE eventloop::eventloop)

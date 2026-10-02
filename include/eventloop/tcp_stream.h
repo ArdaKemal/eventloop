@@ -13,6 +13,8 @@
 #include <exception>
 #include <expected>
 #include <span>
+#include <string>
+#include <string_view>
 #include <system_error>
 
 namespace eventloop {
@@ -163,6 +165,8 @@ public:
     virtual auto close() -> void;
 
 protected:
+    // Used by POSIX Unix-domain streams; path is copied for async_connect().
+    tcp_stream(event_loop& loop, std::string_view unix_path);
     [[nodiscard]] auto owner_loop() noexcept -> event_loop& { return loop_; }
     // TLS activates its raw socket awaiters before driving encrypted records.
     [[nodiscard]] auto activate_async_transport() noexcept
@@ -194,6 +198,8 @@ private:
     unique_fd descriptor_;
     bool closed_ {false};
     ip_endpoint remote_ {};
+    std::string unix_path_;
+    bool unix_socket_ {false};
     connect_awaiter* connector_ {nullptr};
     io_awaiter<true>* reader_ {nullptr};
     io_awaiter<false>* writer_ {nullptr};

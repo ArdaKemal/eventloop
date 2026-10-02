@@ -10,6 +10,10 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/un.h>
+#endif
 
 namespace eventloop {
 
@@ -40,6 +44,19 @@ tcp_stream::tcp_stream(event_loop& loop, ip_endpoint remote)
             descriptor_.get(), remote); error)
         throw std::system_error(error, "IPV6_V6ONLY");
 }
+
+#ifndef _WIN32
+tcp_stream::tcp_stream(event_loop& loop, std::string_view unix_path)
+    : loop_(loop), unix_path_(unix_path), unix_socket_(true),
+      connected_(false), transport_activated_(true)
+{
+    if (unix_path.empty() || unix_path.size() >= sizeof(sockaddr_un::sun_path) ||
+        unix_path.find('\0') != std::string_view::npos)
+        throw std::invalid_argument("invalid Unix socket path");
+    descriptor_.reset(detail::socket_operations::create(AF_UNIX, SOCK_STREAM, 0));
+    detail::socket_operations::stream_register(*this);
+}
+#endif
 
 tcp_stream::~tcp_stream()
 {
@@ -258,8 +275,16 @@ auto tcp_stream::connect_awaiter::suspend(
         return false;
     }
     owner_.connector_ = this;
+#ifndef _WIN32
+    const auto result = owner_.unix_socket_
+        ? detail::socket_operations::start_unix_connect(
+            owner_.descriptor_.get(), owner_.unix_path_, operation_)
+        : detail::socket_operations::start_connect(
+            owner_.descriptor_.get(), owner_.remote_, operation_);
+#else
     const auto result = detail::socket_operations::start_connect(
         owner_.descriptor_.get(), owner_.remote_, operation_);
+#endif
     if (!result.pending) {
         owner_.connector_ = nullptr;
         detail::coroutine_frame_access::detach_cancellation(cancellation_);

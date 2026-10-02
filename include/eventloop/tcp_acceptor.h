@@ -27,7 +27,7 @@ public:
     auto operator=(const tcp_acceptor&) -> tcp_acceptor& = delete;
 
     [[nodiscard]] auto descriptor() const noexcept -> native_socket override;
-    auto close() -> void;
+    virtual auto close() -> void;
 
     class accept_awaiter {
     public:
@@ -71,6 +71,8 @@ public:
     }
 
 protected:
+    // Used by other POSIX stream transports with the same accept semantics.
+    tcp_acceptor(event_loop& loop, unique_fd descriptor, bool unix_socket);
     [[nodiscard]] auto owner() noexcept -> event_loop&;
 
 private:
@@ -96,6 +98,7 @@ private:
     accept_awaiter* waiter_ {nullptr};
     bool read_interest_enabled_ {false};
     bool closed_ {false};
+    bool unix_socket_ {false};
     [[no_unique_address]] detail::socket_accept_state backend_state_ {};
 };
 
