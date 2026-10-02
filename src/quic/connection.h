@@ -184,8 +184,7 @@ public:
             return std::unexpected(connection_error::invalid_configuration);
         if (std::ranges::none_of(sent_, [](const auto& r) { return !r.occupied; }))
             return std::unexpected(connection_error::capacity_exceeded);
-        auto preview = recovery_;
-        if (!preview.record(static_cast<packet_number_space>(level), packet, probe))
+        if (!recovery_.preflight_record(static_cast<packet_number_space>(level), packet, probe))
             return std::unexpected(connection_error::capacity_exceeded);
         auto flow = flow_;
         for (const auto& range : ranges) {
@@ -194,9 +193,8 @@ public:
             for (const auto& s : slots_) if (s.occupied && s.id == range.stream_id) slot = &s;
             if (!slot || !flow.send_stream_range(range.stream_id, range.offset, range.size, range.fin))
                 return std::unexpected(connection_error::protocol_violation);
-            auto send = slot->send;
             auto state = slot->state;
-            if (!send.mark_sent(range.offset, range.size, range.fin) ||
+            if (!slot->send.preflight_mark_sent(range.offset, range.size, range.fin) ||
                 !state.send_stream(range.offset, range.size, range.fin))
                 return std::unexpected(connection_error::invalid_state);
         }
@@ -378,9 +376,8 @@ public:
             auto* s = stream(range.stream_id);
             if (!s || !next_flow.send_stream_range(range.stream_id, range.offset, range.size, range.fin))
                 return std::unexpected(connection_error::protocol_violation);
-            auto send = s->send;
             auto state = s->state;
-            if (!send.mark_sent(range.offset, range.size, range.fin) ||
+            if (!s->send.preflight_mark_sent(range.offset, range.size, range.fin) ||
                 !state.send_stream(range.offset, range.size, range.fin))
                 return std::unexpected(connection_error::invalid_state);
         }
@@ -497,9 +494,13 @@ private:
             bool outstanding = false;
             for (const auto& packet : sent_) {
                 if (!packet.occupied) continue;
-                for (std::size_t i = 0; i < packet.count; ++i)
-                    outstanding |= !packet.ranges[i].crypto &&
-                                   packet.ranges[i].stream_id == slot.id;
+                for (std::size_t i = 0; i < packet.count; ++i) {
+                    if (!packet.ranges[i].crypto && packet.ranges[i].stream_id == slot.id) {
+                        outstanding = true;
+                        break;
+                    }
+                }
+                if (outstanding) break;
             }
             if (outstanding || !registry_.close(slot.id)) continue;
             const auto peer = stream_initiator(slot.id) != local_role;
@@ -530,7 +531,7 @@ private:
                     if (retirement_callback_) retirement_callback_(retirement_argument_,
                         static_cast<tls_level>(record.space), record.number,
                         retirement_reason::discarded);
-                    continue;
+                    break;
                 }
                 if (retired.reason == retirement_reason::acknowledged &&
                     record.space == packet_number_space::application_data) {
@@ -561,6 +562,7 @@ private:
                 if (retirement_callback_) retirement_callback_(retirement_argument_,
                     static_cast<tls_level>(record.space), record.number,
                     retired.reason);
+                break; // Packet numbers are unique within their number space.
             }
         }
         retire_closed_streams();

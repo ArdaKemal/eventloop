@@ -45,7 +45,7 @@ enum class sent_packet_error {
 template<std::size_t Capacity, std::size_t SentRangeCapacity = Capacity>
 class sent_packet_history {
 public:
-    [[nodiscard]] constexpr auto record(sent_packet packet) noexcept
+    [[nodiscard]] constexpr auto preflight_record(sent_packet packet) const noexcept
         -> std::expected<void, sent_packet_error>
     {
         if (packet.number > max_varint_value ||
@@ -57,6 +57,14 @@ public:
             packet.number == *highest_sent_ + 1;
         if (!extends_range && sent_range_count_ == SentRangeCapacity)
             return std::unexpected(sent_packet_error::capacity_exhausted);
+        return {};
+    }
+
+    [[nodiscard]] constexpr auto record(sent_packet packet) noexcept
+        -> std::expected<void, sent_packet_error>
+    {
+        if (const auto result = preflight_record(packet); !result) return result;
+        const bool extends_range = highest_sent_ && packet.number == *highest_sent_ + 1;
         if (extends_range)
             sent_ranges_[sent_range_count_ - 1].largest = packet.number;
         else

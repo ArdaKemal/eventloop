@@ -29,6 +29,35 @@ auto packet(std::uint64_t number, std::chrono::milliseconds time,
 auto ack(std::uint64_t number) -> decoded_frame
 { return {.type = 0x02, .largest_acknowledged = number}; }
 
+auto record_preflight_and_failure_atomicity() -> void
+{
+    recovery_orchestration<16> recovery;
+    const auto space = packet_number_space::application_data;
+    check(recovery.preflight_record(space, packet(0, 0ms)).has_value() &&
+          recovery.history(space)->size() == 0 &&
+          recovery.congestion().bytes_in_flight() == 0 && !recovery.next_alarm(),
+          "successful preflight leaves packet, flight, and timer state untouched");
+    for (std::uint64_t n = 0; n < 10; ++n)
+        check(recovery.record(space, packet(n, 0ms)).has_value(),
+              "fill congestion window");
+    const auto rejected = recovery.record(space, packet(10, 1ms));
+    check(!rejected && rejected.error().kind == recovery_error_kind::congestion &&
+          recovery.history(space)->size() == 10 &&
+          recovery.congestion().bytes_in_flight() == 12000,
+          "congestion failure cannot consume a packet number or history slot");
+    const auto preview = recovery.preflight_record(space, packet(10, 1ms));
+    check(!preview && preview.error().kind == rejected.error().kind &&
+          recovery.record(space, packet(10, 1ms), true).has_value() &&
+          recovery.history(space)->size() == 11,
+          "preflight agrees with commit and rejected packet remains recordable");
+    const auto duplicate = recovery.record(space, packet(10, 1ms));
+    check(!duplicate && duplicate.error().kind == recovery_error_kind::history &&
+          duplicate.error().history == sent_packet_error::invalid_packet_number &&
+          recovery.history(space)->size() == 11 &&
+          recovery.congestion().bytes_in_flight() == 13200,
+          "history validation keeps error precedence and preserves flight");
+}
+
 auto shared_flight_and_ack_atomicity() -> void
 {
     recovery_orchestration<4> recovery;
@@ -439,6 +468,7 @@ auto ecn_shares_the_path_controller() -> void
 
 auto main() -> int
 {
+    record_preflight_and_failure_atomicity();
     shared_flight_and_ack_atomicity();
     loss_alarm_and_discard();
     pto_and_bounds();

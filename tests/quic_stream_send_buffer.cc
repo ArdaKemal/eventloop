@@ -248,10 +248,31 @@ auto fin_only_after_data_ack() -> void
           "FIN-only retransmission retires on ACK");
 }
 
+auto send_preflight_preserves_pending_bytes_and_fin() -> void
+{
+    stream_send_buffer<8> stream(8);
+    check(stream.append(input("abcd")).has_value() && stream.close().has_value(),
+          "prepare pending data and FIN");
+    check(stream.preflight_mark_sent(0, 4, true).has_value() &&
+          equals(stream.next_pending(8), 0, "abcd", true),
+          "successful preflight preserves pending bytes and FIN");
+    check(stream.preflight_mark_sent(0, 3, true).error() == stream_send_error::invalid_fin &&
+          stream.mark_sent(0, 3, true).error() == stream_send_error::invalid_fin &&
+          equals(stream.next_pending(8), 0, "abcd", true),
+          "failed preflight and commit leave data and FIN pending");
+    check(stream.mark_sent(0, 4, true).has_value() &&
+          stream.acknowledge(2, 1).has_value() &&
+          stream.preflight_mark_sent(1, 3, true).error() == stream_send_error::invalid_range &&
+          stream.mark_lost(0, 4, true).has_value() &&
+          equals(stream.next_pending(8), 0, "ab", false),
+          "preflight rejects selectively ACKed bytes without consuming retransmissions");
+}
+
 } // namespace
 
 auto main() -> int
 {
+    send_preflight_preserves_pending_bytes_and_fin();
     flow_credit_and_fin();
     partial_ack_loss_and_fin_only();
     ring_wrap_and_capacity();

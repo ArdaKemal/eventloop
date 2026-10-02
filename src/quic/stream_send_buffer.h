@@ -155,6 +155,18 @@ public:
         return {};
     }
 
+    // Read-only validation for owner-thread packet submission preflight.
+    [[nodiscard]] constexpr auto preflight_mark_sent(std::uint64_t offset,
+                                           std::size_t length,
+                                           bool fin = false) const noexcept
+        -> std::expected<void, stream_send_error>
+    {
+        if (const auto result = validate_sent_range(offset, length, fin); !result) return result;
+        if (!bytes_.preflight_mark_sent(offset, length))
+            return std::unexpected(stream_send_error::invalid_range);
+        return {};
+    }
+
     // Called after packet construction succeeds. Repeated transmissions are
     // valid for probes; ACKed bytes and ACKed FIN cannot be sent again.
     [[nodiscard]] constexpr auto mark_sent(std::uint64_t offset,
@@ -162,17 +174,8 @@ public:
                                            bool fin = false) noexcept
         -> std::expected<void, stream_send_error>
     {
-        if (!valid())
-            return std::unexpected(stream_send_error::invalid_flow_limit);
-        if (!valid_range(offset, length))
-            return std::unexpected(stream_send_error::invalid_range);
-        if (offset + length > flow_limit_)
-            return std::unexpected(stream_send_error::flow_blocked);
-        if (fin && (!final_size_ || offset + length != *final_size_ ||
-                    fin_acked_))
-            return std::unexpected(stream_send_error::invalid_fin);
-        const auto result = bytes_.mark_sent(offset, length);
-        if (!result)
+        if (const auto result = validate_sent_range(offset, length, fin); !result) return result;
+        if (!bytes_.mark_sent(offset, length))
             return std::unexpected(stream_send_error::invalid_range);
         if (fin) {
             fin_sent_ = true;
@@ -219,6 +222,22 @@ public:
     }
 
 private:
+    [[nodiscard]] constexpr auto validate_sent_range(std::uint64_t offset,
+        std::size_t length, bool fin) const noexcept
+        -> std::expected<void, stream_send_error>
+    {
+        if (!valid())
+            return std::unexpected(stream_send_error::invalid_flow_limit);
+        if (!valid_range(offset, length))
+            return std::unexpected(stream_send_error::invalid_range);
+        if (offset + length > flow_limit_)
+            return std::unexpected(stream_send_error::flow_blocked);
+        if (fin && (!final_size_ || offset + length != *final_size_ ||
+                    fin_acked_))
+            return std::unexpected(stream_send_error::invalid_fin);
+        return {};
+    }
+
     [[nodiscard]] constexpr auto valid_range(std::uint64_t offset,
                                              std::size_t length) const noexcept
         -> bool

@@ -76,11 +76,13 @@ public:
         if (data.size() > Capacity - buffered_size())
             return std::unexpected(crypto_send_error::capacity_exceeded);
         const auto offset = end_;
-        for (std::size_t i = 0; i < data.size(); ++i) {
-            const auto slot = static_cast<std::size_t>((end_ + i) % Capacity);
-            bytes_[slot] = data[i];
-            flags_[slot] = pending_flag;
-        }
+        if (data.empty()) return offset;
+        const auto slot = static_cast<std::size_t>(end_ % Capacity);
+        const auto first = std::min(data.size(), Capacity - slot);
+        std::copy_n(data.begin(), first, bytes_.begin() + slot);
+        std::fill_n(flags_.begin() + slot, first, pending_flag);
+        std::copy(data.begin() + first, data.end(), bytes_.begin());
+        std::fill_n(flags_.begin(), data.size() - first, pending_flag);
         end_ += data.size();
         return offset;
     }
@@ -124,10 +126,9 @@ public:
         return {};
     }
 
-    // Repeated and overlapping transmissions are legal, including probes.
-    // A later loss can make any unacknowledged byte pending again.
-    [[nodiscard]] constexpr auto mark_sent(std::uint64_t offset,
-                                           std::size_t length) noexcept
+    // Read-only validation for owner-thread packet submission preflight.
+    [[nodiscard]] constexpr auto preflight_mark_sent(std::uint64_t offset,
+                                           std::size_t length) const noexcept
         -> std::expected<void, crypto_send_error>
     {
         if (!valid_range(offset, length))
@@ -138,6 +139,16 @@ public:
             if (flags_[(offset + i) % Capacity] & acked_flag)
                 return std::unexpected(crypto_send_error::invalid_range);
         }
+        return {};
+    }
+
+    // Repeated and overlapping transmissions are legal, including probes.
+    // A later loss can make any unacknowledged byte pending again.
+    [[nodiscard]] constexpr auto mark_sent(std::uint64_t offset,
+                                           std::size_t length) noexcept
+        -> std::expected<void, crypto_send_error>
+    {
+        if (const auto result = preflight_mark_sent(offset, length); !result) return result;
         for (std::size_t i = 0; i < length; ++i) {
             auto& flag = flags_[(offset + i) % Capacity];
             flag = static_cast<std::uint8_t>((flag | sent_flag) & ~pending_flag);

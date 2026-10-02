@@ -158,27 +158,29 @@ public:
         return {};
     }
 
+    // Validate on the owner thread without copying the bounded packet ledger.
+    [[nodiscard]] constexpr auto preflight_record(packet_number_space space,
+        sent_packet packet, bool bypass_window = false) const noexcept
+        -> std::expected<void, recovery_error>
+    {
+        const auto controller = prepare_record(space, packet, bypass_window);
+        if (!controller) return std::unexpected(controller.error());
+        return {};
+    }
+
     [[nodiscard]] constexpr auto record(packet_number_space space,
                                         sent_packet packet,
                                         bool bypass_window = false) noexcept
         -> std::expected<void, recovery_error>
     {
-        const auto index = space_index(space);
-        if (!index) return std::unexpected(invalid_space());
-        if (discarded_[*index])
-            return std::unexpected(recovery_error {
-                recovery_error_kind::space_discarded});
-        auto history = histories_[*index];
-        auto controller = congestion_;
-        if (const auto result = history.record(packet); !result)
-            return std::unexpected(history_failure(result.error()));
-        if (const auto result = controller.on_packet_sent(
-                packet.bytes, packet.in_flight, bypass_window); !result)
-            return std::unexpected(congestion_failure(result.error()));
-        histories_[*index] = history;
-        congestion_ = controller;
+        const auto controller = prepare_record(space, packet, bypass_window);
+        if (!controller) return std::unexpected(controller.error());
+        const auto index = *space_index(space);
+        // prepare_record checks every history/congestion failure before commit.
+        (void)histories_[index].record(packet);
+        congestion_ = *controller;
         if (packet.ack_eliciting) {
-            last_ack_eliciting_sent_[*index] = packet.sent_time;
+            last_ack_eliciting_sent_[index] = packet.sent_time;
             if (client_handshake_probe_)
                 client_handshake_probe_->deadline = packet.sent_time;
         }
@@ -428,6 +430,23 @@ public:
     { return pto_count_; }
 
 private:
+    [[nodiscard]] constexpr auto prepare_record(packet_number_space space,
+        sent_packet packet, bool bypass_window) const noexcept
+        -> std::expected<newreno_congestion_controller, recovery_error>
+    {
+        const auto index = space_index(space);
+        if (!index) return std::unexpected(invalid_space());
+        if (discarded_[*index])
+            return std::unexpected(recovery_error {recovery_error_kind::space_discarded});
+        if (const auto result = histories_[*index].preflight_record(packet); !result)
+            return std::unexpected(history_failure(result.error()));
+        auto controller = congestion_;
+        if (const auto result = controller.on_packet_sent(
+                packet.bytes, packet.in_flight, bypass_window); !result)
+            return std::unexpected(congestion_failure(result.error()));
+        return controller;
+    }
+
     struct persistent_event {
         packet_number_space space {};
         sent_packet packet {};
