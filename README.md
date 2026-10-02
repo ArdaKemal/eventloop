@@ -182,9 +182,17 @@ consumer outside CMake's usual package search paths. Public headers are under
 | WebSocket | `ws/web_socket.h` | `websocket_echo_server`, `websocket_client` |
 | Bounded file operations | `file_io.h` | `file_io_benchmark` |
 | QUIC streams and DATAGRAMs | `quic.h` | `quic_echo_server` |
+| TOML configuration | `util/toml.h` | — |
 
 The older single-protocol HTTP programs needed by the root integration tests
 live under `tests/fixtures/`. Benchmark-only programs live under `benchmark/`.
+
+For configuration files, `eventloop::util::parse_toml` parses
+[TOML 1.1.0](https://toml.io/en/v1.1.0) into caller-provided node and decoded
+string buffers. The document borrows those buffers and the input; exhaustion
+returns an error. Parsing is synchronous and portable. See the
+[TOML API contract](docs/api-contract.md#toml-configuration-parsing) for
+storage lifetimes, limits, and error behavior.
 
 The library also provides `task<T>`, observed `task_handle<T>` roots,
 `when_all`, `race`, and `with_timeout` for composing loop-owned work.

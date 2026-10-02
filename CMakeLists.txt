@@ -58,6 +58,7 @@ if(WIN32)
         src/tcp_stream.cc
         src/udp_socket.cc
         src/util/arg_parser.cc
+        src/util/toml.cc
         src/http/request.cc
         src/http/mime_types.cc
         src/http/resource.cc
@@ -733,6 +734,7 @@ add_library(eventloop
     include/eventloop/udp_socket.h
     include/eventloop/unix_socket.h
     include/eventloop/util/arg_parser.h
+    include/eventloop/util/toml.h
     include/eventloop/ws/web_socket.h
     src/linux/file_operation.cc
     src/linux/http_file_operations.cc
@@ -768,6 +770,7 @@ add_library(eventloop
     src/tcp_stream.cc
     src/tls_stream.cc
     src/util/arg_parser.cc
+    src/util/toml.cc
     src/udp_socket.cc
     src/unix_socket.cc
     src/ws/web_socket.cpp

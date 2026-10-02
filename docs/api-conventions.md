@@ -23,6 +23,12 @@ and result rules when changing a signature.
   socket API does not resolve DNS names.
   AF_INET6 sockets are v6-only.
 - Export the CMake consumer target as `eventloop::eventloop`.
+- Put portable synchronous configuration utilities under `eventloop/util/`
+  with names in `eventloop::util`, as with `util/toml.h`. A parser takes input
+  views and explicit storage spans, returns an expected result with format
+  errors and byte offsets, and documents returned view lifetimes and capacity
+  exhaustion. Synchronous utilities do not require an event loop or `async_*`
+  naming.
 
 ## Ownership, affinity, and errors
 
