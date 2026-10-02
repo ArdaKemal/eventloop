@@ -201,7 +201,11 @@ auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
             .descriptor = native.data.fd,
             .readable = (native.events & (EPOLLIN | EPOLLRDHUP)) != 0,
             .writable = (native.events & EPOLLOUT) != 0,
-            .error = (native.events & (EPOLLERR | EPOLLHUP)) != 0,
+            // EPOLLHUP may accompany readable buffered data. Drain it before
+            // reporting the hangup so a final reply is not lost.
+            .error = (native.events & EPOLLERR) != 0 ||
+                     ((native.events & EPOLLHUP) != 0 &&
+                      (native.events & EPOLLIN) == 0),
         };
     }
     return {.event_count = output_count,
