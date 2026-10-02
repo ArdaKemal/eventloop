@@ -9,15 +9,12 @@ Requested features run through eventloop or return a clear error.
 From the repository root:
 
 ```sh
-cmake -S examples/wayfarer -B /tmp/wayfarer-build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-  -DEVENTLOOP_SOURCE_DIR=/home/anon/eventloop
+cmake -S examples/wayfarer -B /tmp/wayfarer-build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build /tmp/wayfarer-build --target wayfarer -j2
 ```
 
-`EVENTLOOP_SOURCE_DIR` defaults to the repository root of this example's
-checkout. Set it to a checkout with `include/eventloop/http2/client.h` for
-the HTTP/2 build. The local CMake project adds that source tree as a
-subdirectory and links `eventloop::eventloop`. No root CMake changes are needed.
+`EVENTLOOP_SOURCE_DIR` defaults to this checkout's repository root. The local
+CMake project adds it as a subdirectory and links `eventloop::eventloop`.
 
 ## Usage
 
@@ -98,8 +95,8 @@ HTTP/3 uses a fixed static QPACK request header block and opens client control,
 encoder, and decoder streams. It does not include or link any private eventloop
 headers or source. The narrow response decoder makes it useful for exercising
 public QUIC as a real HTTP/3 caller, but it is not a complete HTTP/3 client.
-The complete in-tree `http3_client` example uses private HTTP/3 codec headers;
-that implementation is outside this program's public-API-only constraint.
+The root test suite keeps a broader HTTP/3 client fixture that uses private
+codec headers. Wayfarer itself uses only public eventloop headers.
 
 ## Automated checks
 
@@ -129,45 +126,7 @@ The runners also work standalone:
   --wayfarer /tmp/wayfarer-build/wayfarer --version all
 ```
 
-## Checks and observed failures
-
-- Local Python HTTP server: GET with Content-Length, GET with chunked encoding,
-  POST with `-d payload`, and HEAD returned exit 0 with expected output.
-- Standalone HTTP/2 build against the expanded public API completed without
-  warnings. A local TLS HTTP/2 fixture checked a 6 MiB download to `-o`, a
-  6 MiB sourced upload and echoed response, and `-i` ordering for informational
-  headers, final headers, DATA, and trailers.
-- The same fixture checked POST and PUT through 301, 302, 303, 307, and 308;
-  HEAD through 303; file replay on preserved uploads; discarded intermediate
-  bodies; `-L -i` header ordering; same-origin credential preservation;
-  cross-origin credential removal; redirects without Location; the ten-hop
-  limit; and rejection of redirects to plain HTTP.
-- The controlled aioquic fixture passes 44 checks for each QUIC version (88
-  total): GET and HEAD; status and `-i` field output; split DATA; 128 KiB and
-  200 KiB binary bodies; Content-Length truncation and overlong rejection; a
-  304 with a representation Content-Length; the 64 KiB frame, 16 MiB body, and
-  128-field caps; dynamic, post-base, and dynamic-name QPACK rejection;
-  trailers; malformed and incomplete frames; the exchange deadline; relative,
-  absolute, and protocol-relative redirects; redirect loops; missing Location;
-  HTTPS-to-HTTP downgrade rejection; the ten-hop limit; `--fail` on the final
-  redirected status; argument rejection for methods, bodies, and headers; and
-  `-o` preservation on failure. The fixture verifies the negotiated QUIC
-  version and `h3` ALPN on every handshake.
-- The W4 CLI matrix runs against HTTP/1.1, TLS HTTP/2, and QUIC v1 HTTP/3 peers
-  (75 checks): `-I`/`--head` sends HEAD, prints only headers, and implies `-i`;
-  `-O`/`--remote-name` decodes percent escapes, drops queries, maps empty and
-  `.`/`..` components to `index.html`, keeps `.hidden` and `...`, rejects a
-  backslash component as a usage error, replaces an existing file atomically,
-  and preserves it on a failed transfer; `-O`/`-I` keep stdout clean and report
-  the derived name on stderr; `-I` with `-X` or a body and `-O` with `-o` are
-  rejected with exit 2.
-- The earlier public `https://cloudflare.com/` `--http3` run decoded an HTTP/3
-  301 response before redirects were implemented. The controlled fixture is now
-  the recorded acceptance source; a fresh public-network run has not been
-  repeated.
-- The first public HTTP/3 attempt failed on a literal QPACK status field; the
-  bounded decoder now recognizes that form plus static and literal response
-  fields. Dynamic QPACK references still fail explicitly.
+## Exit status
 
 Exit status is 0 for a completed response, 1 for transport/protocol/output
 failure, and 2 for invalid or unsupported command line options. HTTP error

@@ -9,10 +9,22 @@ of allowing an unplanned heap fallback. The result is a useful foundation for
 network services that need both straightforward application code and predictable
 behavior under load.
 
-The library includes awaitable TCP, TLS, and UDP sockets; HTTP/1.1 and TLS
-HTTP/2 servers and an HTTP/2 client for one request per connection; WebSocket
-framing; bounded file I/O; and a public QUIC v1/v2 endpoint API. It has Linux
-epoll, macOS kqueue, and Windows IOCP backends.
+The library provides awaitable TCP, TLS, UDP, and Unix domain stream operations
+(Unix sockets on Linux and macOS); QUIC endpoints
+and streams; HTTP/1.1, TLS HTTP/2, and HTTP/3 static-file servers; a bounded HTTP/2
+client API; WebSocket framing; and bounded file I/O. It has Linux epoll,
+macOS kqueue, and Windows IOCP backends.
+
+For a local stream service, use `unix_acceptor` and `unix_stream` from
+`eventloop/unix_socket.h`. [unix_echo](examples/unix_echo.cc) shows a complete
+server. The listener removes its socket path on close if that path still names
+its socket; it never removes an existing path before bind.
+
+Two applications show how these pieces work together using public headers:
+[Wayfarer](examples/wayfarer/README.md) fetches over HTTP/1.1, HTTP/2, or
+HTTP/3, while [Stonegate](examples/stonegate/README.md) serves a document root
+over the same protocol generations. They build as separate example projects,
+keeping the core library's examples small.
 
 ## A complete echo server
 
@@ -114,25 +126,35 @@ Start the echo server on loopback port 7000:
 ./build/tcp_echo 7000
 ```
 
-Or serve a directory over plain HTTP:
+For a more complete HTTP example, build Stonegate and Wayfarer from the same
+checkout:
 
 ```sh
-./build/http_server --root ./public --http-only --http-port 8080
+cmake -S examples/stonegate -B /tmp/stonegate-build -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/stonegate-build --target stonegate -j2
+cmake -S examples/wayfarer -B /tmp/wayfarer-build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build /tmp/wayfarer-build --target wayfarer -j2
 ```
 
-For HTTPS, provide a PEM certificate chain and private key:
+Serve a local directory and fetch its index page:
 
 ```sh
-./build/http_server --root ./public \
-  --certificate certificate-chain.pem --private-key private-key.pem \
-  --https-port 8443 --http-port 8080
+mkdir -p /tmp/stonegate-root
+printf 'hello from eventloop\n' > /tmp/stonegate-root/index.html
+/tmp/stonegate-build/stonegate --root /tmp/stonegate-root --http-port 8080
 ```
 
-The HTTPS listener negotiates HTTP/2 or HTTP/1.1. In this configuration the
-plain HTTP listener redirects to HTTPS. Run `http_server --help` for the
-available address, hostname, directory listing, and shutdown options. On
-Windows, use a Visual Studio CMake generator and run programs from the build
-configuration directory, such as `build/Release/http_server.exe`.
+In another terminal:
+
+```sh
+/tmp/wayfarer-build/wayfarer http://127.0.0.1:8080/
+```
+
+Stonegate can also enable TLS HTTP/1.1 and HTTP/2 and serve HTTP/3 over UDP
+with a certificate and private key. Wayfarer can select HTTP/2 or QUIC v1/v2
+HTTP/3 explicitly, follow redirects, and save completed downloads to a file.
+Their guides cover the commands and limits. On Windows, use a Visual Studio
+CMake generator and run programs from the build configuration directory.
 
 ## Use it in your project
 
@@ -155,9 +177,14 @@ consumer outside CMake's usual package search paths. Public headers are under
 | --- | --- | --- |
 | TCP and TLS services | `tcp_acceptor.h`, `tcp_stream.h`, `tls_stream.h` | `tcp_echo`, `tls_echo` |
 | UDP services | `udp_socket.h`, `ip_endpoint.h` | `coroutine_socket_benchmark` |
-| HTTP and WebSocket | `http/server.h`, `ws/web_socket.h` | `http_server`, `websocket_echo_server`, `websocket_client` |
+| HTTP client | `http2/client.h`, TCP/TLS and QUIC APIs | [Wayfarer](examples/wayfarer/README.md) |
+| HTTP server | `http/server.h`, `http/http3_server.h` | [Stonegate](examples/stonegate/README.md) |
+| WebSocket | `ws/web_socket.h` | `websocket_echo_server`, `websocket_client` |
 | Bounded file operations | `file_io.h` | `file_io_benchmark` |
-| QUIC streams and DATAGRAMs | `quic.h` | `quic_echo_server`, `http3_client` |
+| QUIC streams and DATAGRAMs | `quic.h` | `quic_echo_server` |
+
+The older single-protocol HTTP programs needed by the root integration tests
+live under `tests/fixtures/`. Benchmark-only programs live under `benchmark/`.
 
 The library also provides `task<T>`, observed `task_handle<T>` roots,
 `when_all`, `race`, and `with_timeout` for composing loop-owned work.
@@ -182,27 +209,29 @@ frame and borrowed inputs can be released. Event-loop objects and their
 coroutines stay on the owning thread.
 
 The socket APIs use numeric IPv4 and IPv6 endpoints. Applications resolve DNS
-separately; the HTTP client examples do so on a bounded worker.
+separately; Wayfarer and the WebSocket client do so on a bounded worker.
 
 ## Protocol scope
 
-- The static-file server supports HTTP/1.1 and TLS HTTP/2. It uses bounded
-  request and response buffers and a component-by-component path walk that
-  blocks symlink escapes. Linux plain HTTP uses `sendfile` for larger files.
+- The static-file server APIs support HTTP/1.1, TLS HTTP/2, and HTTP/3.
+  Stonegate composes them into one configurable program. File access uses
+  bounded buffers and a component-by-component path walk that blocks symlink
+  escapes. Stonegate supports conditional requests, single byte ranges, and
+  bounded directory listings. Linux plain HTTP uses `sendfile` for larger
+  files.
 - The outbound HTTP/2 client performs one HTTPS request per connection using
   ALPN `h2`. It supports general methods, bounded owned request bodies,
   streamed uploads, and streamed response bodies and headers. See
   [the API contract](docs/api-contract.md) for its limits and
-  [the example](examples/http2_client.cc) for a public-header caller.
+  [Wayfarer](examples/wayfarer/README.md) for a public-header caller.
 - WebSocket receive and send are awaitable and bounded by configured message
   and output limits. The [WebSocket client guide](examples/README-websocket-client.md)
   covers its outbound echo example.
 - The public QUIC API supports v1/v2 connections, streams, and DATAGRAMs.
-  The standalone `http3_client` exercises outbound HTTP/3. QUIC transport
-  release qualification is still active; see the
-  [milestone and remaining gates](docs/quic-milestone.md) and the
-  [HTTP/3 verification guide](docs/http3-outbound-tests.md). The library does
-  not include an HTTP/3 server.
+  Wayfarer and Stonegate exercise the client and server sides of HTTP/3.
+  QUIC transport release qualification is still active; see the
+  [milestone and remaining gates](docs/quic-milestone.md). The root test suite
+  retains a separate [HTTP/3 fixture guide](docs/http3-outbound-tests.md).
 - The HTTP server cancels active connection tasks on shutdown; its grace
   timeout does not drain unfinished responses.
 

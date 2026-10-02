@@ -77,9 +77,9 @@ echo 'HTTP/3 server ready: GET 200'
 cmp "$work_dir/www/index.html" "$work_dir/client.out"
 
 # Active responses each hold a 2 KiB-class request frame. Exercise the server's
-# full eight-connection slot count with all transfers overlapping.
+# More than the old eight-connection limit, with all transfers overlapping.
 pids=()
-for index in {1..8}; do
+for index in {1..12}; do
     "$curl" --http3-only --silent --show-error --insecure --max-time 20 \
         --limit-rate 16k --resolve "localhost:$port:127.0.0.1" \
         --output "$work_dir/large-$index.out" \
@@ -92,11 +92,11 @@ for pid in "${pids[@]}"; do
     if ! wait "$pid"; then failed=1; fi
 done
 [[ $failed == 0 ]]
-for index in {1..8}; do
+for index in {1..12}; do
     [[ $(<"$work_dir/large-$index.status") == '200 3' ]]
     cmp "$work_dir/www/large.bin" "$work_dir/large-$index.out"
 done
-echo 'HTTP/3 eight overlapping fresh clients: PASS'
+echo 'HTTP/3 twelve overlapping fresh clients: PASS'
 
 # Separate curl processes force slot retirement and reuse. A retired handle's
 # later close must not mark the next accepted connection as closing.
@@ -125,6 +125,20 @@ for _ in {1..3}; do
     if grep -qi '^content-length:' "$work_dir/options.out"; then exit 1; fi
 done
 echo 'HTTP/3 regression passed: three fresh GET/HEAD/OPTIONS cycles'
+
+# One curl process reuses one QUIC connection for more than the old lifetime
+# request quota. num_connects is 1 only for the first transfer.
+reuse_args=(--http3-only --silent --show-error --insecure --max-time 30
+    --resolve "localhost:$port:127.0.0.1")
+for _ in {1..40}; do
+    reuse_args+=(--output /dev/null --write-out '%{http_code} %{http_version} %{num_connects}\n'
+        "https://localhost:$port/")
+done
+"$curl" "${reuse_args[@]}" > "$work_dir/reuse.status"
+[[ $(wc -l < "$work_dir/reuse.status") -eq 40 ]]
+[[ $(head -n 1 "$work_dir/reuse.status") == '200 3 1' ]]
+[[ $(tail -n +2 "$work_dir/reuse.status" | sort -u) == '200 3 0' ]]
+echo 'HTTP/3 forty requests on one QUIC connection: PASS'
 
 # Directory listings use the shared bounded renderer: stable byte-wise order,
 # hidden names included, HTML-escaped text, percent-encoded hrefs, and an

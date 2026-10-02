@@ -13,8 +13,8 @@ The client accepts `ws://` and `wss://` URLs, resolves numeric IPv4/IPv6 or DNS 
 Probe five distinct public URLs, or pass your own URL list:
 
 ```sh
-python3 examples/probe_websocket_client.py --client ./build/websocket_client
-python3 examples/probe_websocket_client.py --client ./build/websocket_client \
+python3 tests/probe_websocket_client.py --client ./build/websocket_client
+python3 tests/probe_websocket_client.py --client ./build/websocket_client \
   wss://echo.websocket.org/ wss://your-echo.example/path
 ```
 
@@ -23,5 +23,5 @@ The default list is in the probe script. Public echo services can change or disa
 The local handshake regression accepts lowercase HTTP field names and a mixed-case `Upgrade` token, and sends a greeting before the echo:
 
 ```sh
-python3 examples/test_websocket_client_headers.py --client ./build/websocket_client
+python3 tests/run_websocket_client_headers.py --client ./build/websocket_client
 ```

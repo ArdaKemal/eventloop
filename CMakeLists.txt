@@ -616,44 +616,39 @@ if(WIN32)
     add_executable(quic_echo_server examples/quic_echo_server.cc)
     target_link_libraries(quic_echo_server PRIVATE eventloop::eventloop)
 
-    add_executable(http_benchmark_server examples/http_benchmark_server.cc)
+    add_executable(http_benchmark_server benchmark/http_benchmark_server.cc)
     target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
 
     add_executable(file_io_benchmark benchmark/file_io_benchmark.cc)
     target_link_libraries(file_io_benchmark PRIVATE eventloop::eventloop)
 
     if(EVENTLOOP_WINDOWS_TLS)
-        add_executable(http_server examples/http_server.cc)
+        add_executable(http_server tests/fixtures/http_server.cc)
         target_link_libraries(http_server PRIVATE eventloop::eventloop)
 
         add_executable(tls_echo examples/tls_echo.cc)
         target_link_libraries(tls_echo PRIVATE eventloop::eventloop)
 
-        add_executable(http_client
-            examples/http_client.cc
-            examples/http_client_url.cc
-            examples/http_client_resolve.cc)
-        target_link_libraries(http_client PRIVATE eventloop::eventloop)
-        add_executable(http2_client examples/http2_client.cc)
-        target_link_libraries(http2_client PRIVATE eventloop::eventloop)
-
         add_executable(websocket_client
             examples/websocket_client.cc
-            examples/http_client_url.cc
-            examples/http_client_resolve.cc)
+            examples/common/http_client_url.cc
+            examples/common/http_client_resolve.cc)
+        target_include_directories(websocket_client PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
         target_link_libraries(websocket_client PRIVATE eventloop::eventloop OpenSSL::Crypto)
     endif()
 
     add_executable(http3_client
-        examples/http3_client.cc
-        examples/http3_client_session.cc
-        examples/http_client_url.cc
-        examples/http_client_resolve.cc
+        tests/fixtures/http3_client.cc
+        tests/fixtures/http3_client_session.cc
+        examples/common/http_client_url.cc
+        examples/common/http_client_resolve.cc
         src/http3/qpack.cc)
     target_include_directories(http3_client PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
     target_link_libraries(http3_client PRIVATE eventloop::eventloop)
-    add_executable(http3_file_server examples/http3_file_server.cc)
+    add_executable(http3_file_server tests/fixtures/http3_file_server.cc)
     target_link_libraries(http3_file_server PRIVATE eventloop::eventloop)
 
     add_executable(executor_benchmark benchmark/executor_benchmark.cc)
@@ -861,44 +856,36 @@ add_executable(tls_echo examples/tls_echo.cc)
 target_link_libraries(tls_echo PRIVATE eventloop::eventloop)
 target_compile_options(tls_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
-add_executable(http_server examples/http_server.cc)
+add_executable(http_server tests/fixtures/http_server.cc)
 target_link_libraries(http_server PRIVATE eventloop::eventloop)
 target_compile_options(http_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
-add_executable(http_client
-    examples/http_client.cc
-    examples/http_client_url.cc
-    examples/http_client_resolve.cc
-)
-target_link_libraries(http_client PRIVATE eventloop::eventloop)
-target_compile_options(http_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-add_executable(http2_client examples/http2_client.cc)
-target_link_libraries(http2_client PRIVATE eventloop::eventloop)
-target_compile_options(http2_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-
 add_executable(websocket_client
     examples/websocket_client.cc
-    examples/http_client_url.cc
-    examples/http_client_resolve.cc
+    examples/common/http_client_url.cc
+    examples/common/http_client_resolve.cc
 )
+target_include_directories(websocket_client PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 target_link_libraries(websocket_client PRIVATE eventloop::eventloop OpenSSL::Crypto)
 target_compile_options(websocket_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(http3_client
-    examples/http3_client.cc
-    examples/http3_client_session.cc
-    examples/http_client_url.cc
-    examples/http_client_resolve.cc
+    tests/fixtures/http3_client.cc
+    tests/fixtures/http3_client_session.cc
+    examples/common/http_client_url.cc
+    examples/common/http_client_resolve.cc
     src/http3/qpack.cc)
 target_include_directories(http3_client PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
 target_link_libraries(http3_client PRIVATE eventloop::eventloop)
 target_compile_options(http3_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-add_executable(http3_file_server examples/http3_file_server.cc)
+add_executable(http3_file_server tests/fixtures/http3_file_server.cc)
 target_link_libraries(http3_file_server PRIVATE eventloop::eventloop)
 target_compile_options(http3_file_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
-add_executable(http_benchmark_server examples/http_benchmark_server.cc)
+add_executable(http_benchmark_server benchmark/http_benchmark_server.cc)
 target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
 target_compile_options(http_benchmark_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 

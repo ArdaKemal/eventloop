@@ -80,13 +80,14 @@ ownership, and error visibility.
   recipient in broadcast drops that message without blocking healthy peers.
 - TLS uses OpenSSL 3.5+ with fixed-capacity stream buffers. Do not claim that
   OpenSSL itself is allocation free.
-- HTTP/1.1 and TLS HTTP/2 use secure resource traversal. Plain HTTP uses
-  `sendfile` for larger files on Linux. HTTP/2 supports GET, HEAD, and
-  OPTIONS with bounded streams, headers, and queued output.
+- HTTP/1.1, TLS HTTP/2, and HTTP/3 static-file servers use secure resource
+  traversal. Plain HTTP uses `sendfile` for larger files on Linux. HTTP/2 and
+  HTTP/3 support bounded GET, HEAD, and OPTIONS operations.
 - QUIC v1/v2 public endpoints, streams, and DATAGRAMs are implemented. The
-  standalone HTTP/3 client and optional aioquic v1/v2 tests are documented in
-  [docs/http3-outbound-tests.md](docs/http3-outbound-tests.md). The transport
-  release gates and remaining endpoint work are in
+  Wayfarer and Stonegate examples exercise HTTP/1.1, HTTP/2, and HTTP/3 through
+  public APIs. Root HTTP/3 test fixtures and optional aioquic v1/v2 tests are
+  documented in [docs/http3-outbound-tests.md](docs/http3-outbound-tests.md).
+  Transport release gates and remaining endpoint work are in
   [docs/quic-milestone.md](docs/quic-milestone.md). Keep public claims scoped to
   verified behavior.
 
