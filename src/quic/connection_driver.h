@@ -14,7 +14,7 @@ namespace eventloop::quic::detail {
 class connection_driver {
 public:
     static constexpr std::size_t queue_capacity = 16;
-    static constexpr std::size_t packet_capacity = 2048;
+    static constexpr std::size_t packet_capacity = bounded_connection::datagram_buffer_size;
     connection_driver(event_loop& loop, udp_endpoint& endpoint, bounded_connection& connection,
         std::span<const std::uint8_t> local_cid, std::span<const std::uint8_t> peer_cid,
         ip_endpoint peer, bool validated = false)
@@ -32,12 +32,16 @@ public:
     ~connection_driver()
     {
         check_owner();
-        if (running_) std::terminate();
+        if (running_ || idle_) std::terminate();
         if (!endpoint_.router().remove(route_)) std::terminate();
     }
     connection_driver(const connection_driver&)=delete;
     auto operator=(const connection_driver&)-> connection_driver& = delete;
-    auto stop() noexcept -> void { check_owner(); stopped_=true; }
+    auto stop() noexcept -> void { check_owner(); stopped_=true; notify(); }
+    // New packets or application send/receive credit can interrupt an idle
+    // retry. Resumption remains a timer-loop action, outside router dispatch.
+    auto notify() noexcept -> void
+    { check_owner(); work_pending_=true; if (idle_) idle_->wake(); }
     // Progress notifications run on the owning loop after each pump iteration;
     // the endpoint uses them to resume ready public-API waiters.
     auto set_progress(void* argument, void (*callback)(void*) noexcept) noexcept
@@ -61,6 +65,69 @@ public:
     }
     [[nodiscard]] auto run() -> task<std::expected<void,connection_error>> { return pump(loop_,*this); }
     [[nodiscard]] auto dropped_packets() const noexcept -> std::size_t { return dropped_; }
+    // Internal frame-local wait; the deadline remains bounded polling for
+    // idle/recovery work, but notify() can advance it without inline resume.
+    class idle_wait {
+    public:
+        explicit idle_wait(connection_driver& driver,
+            event_loop::clock::time_point deadline=eventloop::detail::deadline_after(std::chrono::milliseconds(1))) noexcept
+            : driver_(driver)
+        {
+            timer_.deadline=deadline;
+            timer_.cancellation.operation=this;
+            timer_.cancellation.cancel=&cancel;
+        }
+        idle_wait(const idle_wait&)=delete;
+        auto operator=(const idle_wait&) -> idle_wait& = delete;
+        [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+        template<typename Promise>
+        auto await_suspend(std::coroutine_handle<Promise> handle) -> bool
+        {
+            if (handle.promise().owner_loop()!=&driver_.loop_) std::terminate();
+            auto& cancellation=*handle.promise().cancellation_state();
+            if (cancellation.requested) { cancelled_=true; return false; }
+            if (driver_.work_pending_) { driver_.work_pending_=false; return false; }
+            timer_.handle=handle;
+            timer_.owner=&driver_.loop_;
+            if (!eventloop::detail::coroutine_frame_access::attach_cancellation(cancellation,timer_.cancellation)) {
+                timer_.owner=nullptr; cancelled_=true; return false;
+            }
+            try { eventloop::detail::coroutine_frame_access::register_timer(driver_.loop_,timer_); }
+            catch (...) {
+                eventloop::detail::coroutine_frame_access::detach_cancellation(timer_.cancellation);
+                timer_.owner=nullptr; throw;
+            }
+            if (driver_.idle_) std::terminate();
+            driver_.idle_=this;
+            return true;
+        }
+        [[nodiscard]] auto await_resume() noexcept -> bool
+        { driver_.idle_=nullptr; driver_.work_pending_=false; return !cancelled_; }
+        auto wake() noexcept -> void
+        {
+            if (signalled_) return;
+            signalled_=true;
+            auto* cancellation=timer_.cancellation.state;
+            eventloop::detail::coroutine_frame_access::cancel_timer(timer_);
+            timer_.deadline=event_loop::clock::now();
+            timer_.owner=&driver_.loop_;
+            if (!eventloop::detail::coroutine_frame_access::attach_cancellation(*cancellation,timer_.cancellation))
+                cancelled_=true;
+            try { eventloop::detail::coroutine_frame_access::register_timer(driver_.loop_,timer_); }
+            catch (...) { std::terminate(); }
+        }
+    private:
+        static auto cancel(eventloop::detail::coroutine_cancellation_node& node) noexcept -> void
+        {
+            auto& self=*static_cast<idle_wait*>(node.operation);
+            eventloop::detail::coroutine_frame_access::cancel_timer(self.timer_);
+            self.cancelled_=true;
+            self.timer_.handle.resume();
+        }
+        connection_driver& driver_;
+        eventloop::detail::coroutine_timer_node timer_;
+        bool cancelled_ {},signalled_ {};
+    };
 private:
     struct queued_packet { std::array<std::uint8_t,packet_capacity> bytes{}; std::size_t size{}; ip_endpoint peer {}; };
     struct path_response_job { path_challenge token {}; ip_endpoint peer {}; bool occupied {}; };
@@ -83,7 +150,8 @@ private:
         auto& slot=self.queue_[(self.head_+self.count_)%queue_capacity];
         slot.size=header.packet.size();
         slot.peer=peer;
-        std::memcpy(slot.bytes.data(),header.packet.data(),slot.size); ++self.count_; return true;
+        std::memcpy(slot.bytes.data(),header.packet.data(),slot.size); ++self.count_;
+        self.notify(); return true;
     }
     auto check_owner() const noexcept -> void
     { if (owner_!=std::this_thread::get_id()) std::terminate(); }
@@ -320,30 +388,45 @@ private:
         if (const auto synchronized=self.connection_.synchronize_discarded_spaces(); !synchronized)
             co_return std::unexpected(synchronized.error());
         while (!self.stopped_) {
+            self.work_pending_=false;
             if (const auto result=self.tick(); !result) co_return std::unexpected(result.error());
             if (self.stopped_) break;
             if (const auto result=unwrap_task(co_await send_pending_path_responses(loop,self)); !result)
                 co_return std::unexpected(result.error());
             if (const auto result=unwrap_task(co_await send_candidate_probe(loop,self,lifecycle_time_point::clock::now())); !result)
                 co_return std::unexpected(result.error());
+            // Drain a bounded burst rather than charging every packet a
+            // timer tick. Per-packet preflight still enforces congestion,
+            // flow credit and sent-record capacity. Keep the total below
+            // the receive queue capacity and yield before sending more.
+            constexpr std::size_t burst_capacity=queue_capacity/2;
+            std::size_t transmitted=0;
             for (const auto level : {tls_level::initial,tls_level::handshake,tls_level::application}) {
                 if (!self.connection_.core().keys_available(level,tls_direction::write)) continue;
-                const bool probe=self.probes_ && self.probe_level_==level;
-                const auto prepared=self.prepare(level,probe);
-                if (!prepared) {
-                    if (prepared.error()==connection_error::invalid_state || prepared.error()==connection_error::capacity_exceeded) continue;
-                    co_return std::unexpected(prepared.error());
+                while (transmitted<burst_capacity) {
+                    const bool probe=self.probes_ && self.probe_level_==level;
+                    const auto prepared=self.prepare(level,probe);
+                    if (!prepared) {
+                        if (prepared.error()==connection_error::invalid_state || prepared.error()==connection_error::capacity_exceeded) break;
+                        co_return std::unexpected(prepared.error());
+                    }
+                    const auto sent=co_await self.endpoint_.async_send(self.route_,std::as_bytes(std::span(self.output_).first(*prepared)));
+                    const bool success=sent && *sent && **sent==*prepared;
+                    const auto completed=self.scheduler_.complete(success,lifecycle_time_point::clock::now());
+                    if (!completed) co_return std::unexpected(completed.error());
+                    if (success && probe) --self.probes_;
+                    if (!success && (!sent || (sent && !*sent && sent->error().value()!=EAGAIN)))
+                        co_return std::unexpected(connection_error::provider_failure);
+                    if (!success) break;
+                    ++transmitted;
                 }
-                const auto sent=co_await self.endpoint_.async_send(self.route_,std::as_bytes(std::span(self.output_).first(*prepared)));
-                const bool success=sent && *sent && **sent==*prepared;
-                const auto completed=self.scheduler_.complete(success,lifecycle_time_point::clock::now());
-                if (!completed) co_return std::unexpected(completed.error());
-                if (success && probe) --self.probes_;
-                if (!success && (!sent || (sent && !*sent && sent->error().value()!=EAGAIN)))
-                    co_return std::unexpected(connection_error::provider_failure);
             }
             if (self.progress_) self.progress_(self.progress_argument_);
-            if (co_await sleep_for(loop,std::chrono::milliseconds(1))!=timer_wait_result::expired) break;
+            // A progress callback can make more application data ready, and
+            // yielded socket receivers can supply ACKs/credit. Give them a
+            // turn before deciding that this connection needs a timed retry.
+            if (transmitted && co_await yield(loop)) continue;
+            if (!co_await idle_wait(self)) break;
         }
         co_return std::expected<void,connection_error>{};
     }
@@ -366,11 +449,13 @@ private:
     tls_level probe_level_{};
     std::uint8_t probes_{};
     void* progress_argument_{};
+    idle_wait* idle_ {};
     void (*progress_)(void*) noexcept {};
     void* retry_argument_{};
     bool (*retry_)(void*,std::span<const std::uint8_t>) noexcept {};
     std::span<const std::uint8_t> initial_token_{};
     bool authenticated_packet_seen_{};
+    bool work_pending_ {};
     bool running_{},stopped_{},started_{},handshake_done_{},candidate_challenge_active_{};
 };
 } // namespace eventloop::quic::detail

@@ -216,6 +216,94 @@ auto reclaimed_slot_preserves_connection_credit() -> void
           "reused slot cannot bypass connection credit");
 }
 
+auto staged_packet_sends() -> void
+{
+    auto flow = *flow_control<4>::create(12, 12);
+    check(flow.add_stream(0, 10, 10).has_value() &&
+          flow.add_stream(4, 10, 10).has_value() &&
+          flow.add_stream(8, 10, 10).has_value(), "transaction streams");
+    check(flow.receive_range(0, 0, 3).has_value() &&
+          flow.consume(0, 2).has_value(), "independent receive accounting");
+    {
+        auto packet = flow.stage_send<2>();
+        check(packet.send_stream_range(0, 0, 7, false).has_value() &&
+              packet.send_stream_range(0, 5, 5, true).has_value() &&
+              packet.send_stream_range(0, 0, 10, true).has_value() &&
+              packet.send_stream_range(4, 0, 3, false).error() ==
+                  flow_control_error::connection_limit &&
+              flow.sent_total() == 0, "staging overlaps and FIN is invisible");
+        // A later packet validation/recovery failure abandons all staged sends.
+    }
+    check(flow.sent_total() == 0 && flow.send_range(0, 0, 1).has_value(),
+          "abandoned packet preserves counters and final size");
+    {
+        auto packet = flow.stage_send<2>();
+        check(packet.send_stream_range(0, 0, 4, true).has_value() &&
+              packet.send_stream_range(0, 0, 3, true).error() ==
+                  flow_control_error::final_size &&
+              packet.send_stream_range(0, 4, 1, false).error() ==
+                  flow_control_error::final_size &&
+              packet.send_stream_range(4, 0, 8, false).has_value() &&
+              packet.send_stream_range(8, 0, 0, false).error() ==
+                  flow_control_error::capacity_exhausted &&
+              packet.send_stream_range(4, 0, 8, false).has_value() &&
+              flow.sent_total() == 1, "transaction bounds and repeated streams");
+        packet.commit();
+    }
+    check(flow.sent_total() == 12 && flow.received_total() == 3 &&
+          flow.consumed_total() == 2 &&
+          flow.send_stream_range(0, 0, 4, true).has_value() &&
+          flow.send_range(0, 4, 1).error() == flow_control_error::final_size &&
+          flow.send_range(8, 0, 1).error() == flow_control_error::connection_limit,
+          "commit retains exact send and receive accounting");
+    {
+        auto packet = flow.stage_send<1>();
+        check(packet.send_stream_range(12, 0, 0, false).error() ==
+                  flow_control_error::unknown_stream &&
+              packet.send_stream_range(12, max_varint_value, 1, false).error() ==
+                  flow_control_error::invalid_value &&
+              packet.send_stream_range(4, 0, 11, false).error() ==
+                  flow_control_error::stream_limit &&
+              packet.send_stream_range(4, 0, 7, true).error() ==
+                  flow_control_error::final_size &&
+              packet.send_stream_range(4, 0, 8, true).has_value(),
+              "transaction preserves validation order and failed calls");
+        packet.commit();
+    }
+    check(flow.set_send_final_size(4, 8).has_value() &&
+          flow.set_send_final_size(4, 9).error() == flow_control_error::final_size &&
+          flow.sent_total() == 12, "transaction commits final size once");
+    auto empty = flow.stage_send<0>();
+    empty.commit();
+    check(flow.sent_total() == 12, "empty packet preserves flow accounting");
+}
+
+auto preview_packet_sends() -> void
+{
+    auto flow = *flow_control<2>::create(10, 10);
+    check(flow.add_stream(0, 10, 10).has_value() &&
+          flow.add_stream(4, 10, 10).has_value(), "preview streams");
+    const auto& owner = flow;
+    {
+        auto preview = owner.stage_send<2>();
+        check(preview.send_stream_range(0, 0, 6, false).has_value() &&
+              preview.send_stream_range(0, 4, 3, true).has_value() &&
+              preview.send_stream_range(0, 0, 6, true).error() ==
+                  flow_control_error::final_size &&
+              preview.send_stream_range(4, 0, 4, false).error() ==
+                  flow_control_error::connection_limit &&
+              preview.send_stream_range(4, 0, 3, false).has_value(),
+              "const preview accumulates overlaps, FIN, and connection credit");
+    }
+    check(flow.sent_total() == 0 &&
+          flow.send_stream_range(0, 0, 10, true).has_value(),
+          "const preview preserves owner credit and final size");
+    auto empty = owner.stage_send<0>();
+    check(empty.send_stream_range(4, 0, 0, false).error() ==
+              flow_control_error::capacity_exhausted && flow.sent_total() == 10,
+          "const preview preserves staging capacity");
+}
+
 } // namespace
 
 auto main() -> int
@@ -227,4 +315,6 @@ auto main() -> int
     reset_credit_atomicity();
     boundaries();
     reclaimed_slot_preserves_connection_credit();
+    staged_packet_sends();
+    preview_packet_sends();
 }

@@ -27,9 +27,17 @@ public:
     static constexpr std::size_t stream_capacity =
         2 * (bidi_stream_capacity + uni_stream_capacity);
     static constexpr std::size_t stream_bytes = 4096;
+    // Application send queue per stream. Larger than the receive quantum so a
+    // whole datagram can be queued without task churn; keep receive accounting
+    // on stream_bytes.
+    static constexpr std::size_t send_bytes = 16384;
     static constexpr std::size_t receive_bytes = 32 * stream_bytes;
     static constexpr std::size_t packet_capacity = 128;
     static constexpr std::size_t frames_per_packet = 8;
+    // Compile-time bound for a single UDP datagram. The active send size is
+    // negotiated per connection; the member below stays at the QUIC minimum
+    // until peer transport parameters are validated.
+    static constexpr std::size_t datagram_buffer_size = 8448;
     struct transmitted_range {
         bool crypto {false};
         std::uint64_t stream_id {0}, offset {0};
@@ -41,7 +49,7 @@ public:
         std::array<std::byte, stream_bytes> bytes {};
         std::array<std::byte, stream_bytes / 8> coverage {};
         std::optional<stream_receive_buffer> receive;
-        stream_send_buffer<stream_bytes> send;
+        stream_send_buffer<send_bytes> send;
         stream_state state;
         std::uint64_t sent_highest {}, receive_window {}, receive_limit {}, consumed {};
         bool credit_pending {false}, reset_pending {false};
@@ -106,6 +114,8 @@ public:
     { check_owner(); return registry_; }
     [[nodiscard]] auto flow() const noexcept -> const flow_control<stream_capacity>&
     { check_owner(); return flow_; }
+    [[nodiscard]] auto send_datagram_size() const noexcept -> std::size_t
+    { check_owner(); return send_datagram_size_; }
     [[nodiscard]] auto recovery() noexcept -> recovery_orchestration<packet_capacity>&
     { check_owner(); return recovery_; }
     [[nodiscard]] auto peer_ids() noexcept -> peer_connection_id_registry<8>&
@@ -186,11 +196,12 @@ public:
             return std::unexpected(connection_error::capacity_exceeded);
         if (!recovery_.preflight_record(static_cast<packet_number_space>(level), packet, probe))
             return std::unexpected(connection_error::capacity_exceeded);
-        auto flow = flow_;
+        auto flow = flow_.stage_send<frames_per_packet>();
         for (const auto& range : ranges) {
             if (range.crypto) continue;
             const stream_slot* slot = nullptr;
-            for (const auto& s : slots_) if (s.occupied && s.id == range.stream_id) slot = &s;
+            for (const auto& s : slots_)
+                if (s.occupied && s.id == range.stream_id) { slot = &s; break; }
             if (!slot || !flow.send_stream_range(range.stream_id, range.offset, range.size, range.fin))
                 return std::unexpected(connection_error::protocol_violation);
             auto state = slot->state;
@@ -370,9 +381,11 @@ public:
         packet_record* record = nullptr;
         for (auto& candidate : sent_) if (!candidate.occupied) { record = &candidate; break; }
         if (!record) return std::unexpected(connection_error::capacity_exceeded);
-        auto next_flow = flow_;
+        auto next_flow = flow_.stage_send<frames_per_packet>();
+        std::array<stream_slot*, frames_per_packet> range_streams;
+        std::size_t range_index = 0;
         for (const auto& range : ranges) {
-            if (range.crypto) continue;
+            if (range.crypto) { ++range_index; continue; }
             auto* s = stream(range.stream_id);
             if (!s || !next_flow.send_stream_range(range.stream_id, range.offset, range.size, range.fin))
                 return std::unexpected(connection_error::protocol_violation);
@@ -380,24 +393,27 @@ public:
             if (!s->send.preflight_mark_sent(range.offset, range.size, range.fin) ||
                 !state.send_stream(range.offset, range.size, range.fin))
                 return std::unexpected(connection_error::invalid_state);
+            range_streams[range_index++] = s;
         }
         if (!recovery_.record(space, packet, probe))
             return std::unexpected(connection_error::capacity_exceeded);
-        flow_ = next_flow;
+        next_flow.commit();
         record->occupied = true; record->space = space; record->number = packet.number;
         record->carried_ack_largest = carried_ack_largest;
         record->count = ranges.size();
         std::copy(ranges.begin(), ranges.end(), record->ranges.begin());
+        range_index = 0;
         for (const auto& range : ranges) {
             if (range.crypto) {
                 if (!core_.mark_crypto_sent(level, range.offset, range.size))
                     return std::unexpected(connection_error::invalid_state);
             } else {
-                auto* s = stream(range.stream_id);
+                auto* s = range_streams[range_index];
                 (void)s->send.mark_sent(range.offset, range.size, range.fin);
                 (void)s->state.send_stream(range.offset, range.size, range.fin);
                 s->sent_highest = (std::max)(s->sent_highest, range.offset + range.size);
             }
+            ++range_index;
         }
         if (!core_.packet_sent(packet.sent_time, packet.ack_eliciting))
             return std::unexpected(connection_error::invalid_state);
@@ -422,6 +438,7 @@ public:
 private:
     struct parameter_limits {
         std::uint64_t data {}, bidi_local {}, bidi_remote {}, stream_uni {}, bidi {}, uni {}, datagram {};
+        std::uint64_t udp_payload {65527};
         std::uint64_t ack_exponent {3}, ack_delay {25};
     };
     struct packet_record {
@@ -448,6 +465,7 @@ private:
         result.bidi = get(parameter_id::initial_max_streams_bidi);
         result.uni = get(parameter_id::initial_max_streams_uni);
         result.datagram = get(parameter_id::max_datagram_frame_size);
+        result.udp_payload = get(parameter_id::max_udp_payload_size, 65527);
         result.ack_exponent = get(parameter_id::ack_delay_exponent, 3);
         result.ack_delay = get(parameter_id::max_ack_delay, 25);
         return result;
@@ -460,6 +478,11 @@ private:
             self.role_ == endpoint_role::client ? parameter_sender::server : parameter_sender::client);
         if (!parsed) return false;
         self.peer_ = limits(*parsed);
+        const auto buffer_cap = static_cast<std::uint64_t>(datagram_buffer_size);
+        const auto local_cap = std::clamp<std::uint64_t>(self.local_.udp_payload, 1200, buffer_cap);
+        const auto peer_cap = std::clamp<std::uint64_t>(self.peer_.udp_payload, 1200, buffer_cap);
+        self.send_datagram_size_ = static_cast<std::size_t>(std::min(local_cap, peer_cap));
+        if (!self.recovery_.reset(self.send_datagram_size_)) return false;
         self.outgoing_datagrams_.reset(self.peer_.datagram);
         self.recovery_.set_max_ack_delay(std::chrono::milliseconds(self.peer_.ack_delay));
         return self.registry_.set_peer_limit(stream_direction::bidirectional, self.peer_.bidi).has_value() &&
@@ -507,7 +530,7 @@ private:
             const auto direction = stream_type(slot.id);
             (void)flow_.remove_stream(slot.id);
             slot.receive.reset();
-            slot.send = stream_send_buffer<stream_bytes> {};
+            slot.send = stream_send_buffer<send_bytes> {};
             slot.state = {};
             slot.id = slot.sent_highest = slot.receive_window = 0;
             slot.receive_limit = slot.consumed = 0;
@@ -649,6 +672,7 @@ private:
     void* retirement_argument_ {};
     retirement_callback retirement_callback_ {};
     parameter_limits local_, peer_;
+    std::size_t send_datagram_size_ {1200};
     stream_registry<stream_capacity> registry_;
     flow_control<stream_capacity> flow_;
     std::array<stream_slot, stream_capacity> slots_;

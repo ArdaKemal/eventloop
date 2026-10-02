@@ -2,6 +2,8 @@
 #include "quic/connection.h"
 #include "quic/ack_ranges.h"
 
+#include <algorithm>
+
 namespace eventloop::quic::detail {
 
 // One outstanding packet; caller-owned output remains live through UDP send.
@@ -12,6 +14,7 @@ namespace eventloop::quic::detail {
 class packet_scheduler {
 public:
     static constexpr std::size_t maximum_packet = 1200;
+    static constexpr std::size_t maximum_datagram = bounded_connection::datagram_buffer_size;
     explicit packet_scheduler(bounded_connection& connection) : connection_(connection)
     { connection_.set_retirement_observer(this, retire); }
     ~packet_scheduler() { connection_.set_retirement_observer(nullptr, nullptr); }
@@ -62,19 +65,25 @@ public:
             }
         }
         const auto index = static_cast<std::size_t>(level);
-        if (index >= 3 || output.size() < maximum_packet)
+        // Application packets may use the negotiated datagram size; handshake
+        // packets stay at the QUIC minimum so anti-amplification is unaffected.
+        const auto datagram_limit = std::clamp<std::size_t>(
+            connection_.send_datagram_size(), 1200, maximum_datagram);
+        const auto level_max = level == tls_level::application ? datagram_limit : std::size_t {1200};
+        if (index >= 3 || output.size() < level_max)
             return std::unexpected(connection_error::output_too_small);
         fields.kind = level == tls_level::initial ? packet_kind::initial :
             level == tls_level::handshake ? packet_kind::handshake : packet_kind::short_header;
-        payload_limit_ = payload_limit;
+        payload_limit_ = level == tls_level::application && datagram_limit > 100
+            ? datagram_limit - 100 : payload_limit;
         if (level == tls_level::initial) {
             // Retry tokens consume Initial wire space. Split CRYPTO across
             // packets rather than selecting a chunk that cannot fit afterward.
             const auto overhead = 7 + fields.destination_cid.size() + fields.source_cid.size() +
                 varint_size(fields.token.size()) + fields.token.size() + 2 + fields.packet_number_length + 16;
-            if (overhead >= maximum_packet)
+            if (overhead >= level_max)
                 return std::unexpected(connection_error::output_too_small);
-            payload_limit_ = std::min(payload_limit, maximum_packet - overhead);
+            payload_limit_ = std::min(payload_limit_, level_max - overhead);
         }
         const auto number = connection_.core().next_packet_number(level);
         if (!number) return std::unexpected(connection_error::unavailable_keys);
@@ -106,12 +115,16 @@ public:
             if (append(frame)) { ranges_[range_count_++] = {true,0,crypto.offset,crypto.data.size(),false}; eliciting = true; }
         }
         if (level == tls_level::application) {
-            auto flow = connection_.flow();
+            // ACK/control-only packets need no packet-local flow snapshot.
+            // Copy the bounded table only after a STREAM candidate fits.
+            std::optional<flow_control<bounded_connection::stream_capacity>> flow;
+            auto credit = connection_.flow().send_max_data() - connection_.flow().sent_total();
             // Across all streams, transmitted data precedes new data in a PTO
             // packet. Selection does not declare the original packet lost.
-            for (unsigned pass = 0; pass < (probe ? 2u : 1u); ++pass) {
+            for (unsigned pass = 0; pass < (probe ? 2u : 1u) && range_count_ < ranges_.size(); ++pass) {
             for (const auto& stream : connection_.stream_slots()) {
-                if (!stream.occupied || range_count_ == ranges_.size() ||
+                if (range_count_ == ranges_.size()) break;
+                if (!stream.occupied ||
                     stream.state.sending() == stream_send_state::reset_sent ||
                     stream.state.sending() == stream_send_state::reset_received) continue;
                 auto chunk = stream_send_chunk{};
@@ -125,16 +138,23 @@ public:
                         chunk = stream.send.next_pending(remaining());
                     }
                 } else chunk = stream.send.next_pending(remaining());
-                const auto credit = flow.send_max_data() - flow.sent_total();
+                if (chunk.data.empty() && !chunk.fin) continue;
                 const auto retransmitted = stream.sent_highest > chunk.offset ? stream.sent_highest - chunk.offset : 0;
                 const auto allowed = std::min<std::uint64_t>(chunk.data.size(), credit + retransmitted);
                 if (allowed < chunk.data.size()) { chunk.data = chunk.data.first(static_cast<std::size_t>(allowed)); chunk.fin = false; }
                 if (chunk.data.empty() && !chunk.fin) continue;
-                auto preview = flow;
-                if (!preview.send_stream_range(stream.id, chunk.offset, chunk.data.size(), chunk.fin)) continue;
                 decoded_frame frame; frame.type = 0x0e | (chunk.fin ? 1 : 0);
                 frame.stream_id = stream.id; frame.offset = chunk.offset; frame.data = chunk.data; frame.fin = chunk.fin;
-                if (append(frame)) { flow = preview; ranges_[range_count_++] = {false,stream.id,chunk.offset,chunk.data.size(),chunk.fin}; eliciting = true; }
+                // Encode into uncommitted packet space first. Flow updates
+                // are failure-atomic; committing used_ only after both succeed
+                // avoids copying the whole flow table for each STREAM frame.
+                const auto size = encode_frame(frame,std::span(payload_).subspan(used_,payload_limit_-used_));
+                if (!size) continue;
+                if (!flow) flow.emplace(connection_.flow());
+                if (!flow->send_stream_range(stream.id, chunk.offset, chunk.data.size(), chunk.fin)) continue;
+                credit = flow->send_max_data() - flow->sent_total();
+                used_ += *size;
+                ranges_[range_count_++] = {false,stream.id,chunk.offset,chunk.data.size(),chunk.fin}; eliciting = true;
             }
             }
             if (probe) append_controls();
@@ -150,13 +170,13 @@ public:
         if (level == tls_level::initial) {
             const auto overhead = 7 + fields.destination_cid.size() + fields.source_cid.size() +
                 varint_size(fields.token.size()) + fields.token.size() + 2 + fields.packet_number_length + 16;
-            if (overhead > maximum_packet || used_ > maximum_packet - overhead)
+            if (overhead > level_max || used_ > level_max - overhead)
                 return std::unexpected(connection_error::output_too_small);
-            std::fill(payload_.begin() + used_, payload_.begin() + maximum_packet - overhead, std::byte{});
-            used_ = maximum_packet - overhead;
+            std::fill(payload_.begin() + used_, payload_.begin() + level_max - overhead, std::byte{});
+            used_ = level_max - overhead;
         }
         const auto size = connection_.core().build(fields,
-            {reinterpret_cast<const std::uint8_t*>(payload_.data()),used_}, output.first(maximum_packet), scratch);
+            {reinterpret_cast<const std::uint8_t*>(payload_.data()),used_}, output.first(level_max), scratch);
         if (!size) return std::unexpected(size.error());
         packet_ = {*number,now,eliciting,eliciting || level == tls_level::initial,*size};
         const auto preview = connection_.preflight_sent(level, packet_, {ranges_.data(),range_count_},probe);
@@ -217,7 +237,7 @@ private:
     { const auto size=encode_frame(frame,std::span(payload_).subspan(used_,payload_limit_-used_)); if (!size) return false; used_+=*size; return true; }
     struct control_slot { std::array<std::byte,128> bytes{}; std::size_t size{}; tls_level level{}; std::uint64_t sent{}, type{}, stream_id{}; bool occupied{}, ready{}, transmitted{}, eliciting{}; };
     bounded_connection& connection_;
-    std::array<std::byte,maximum_packet> payload_{};
+    std::array<std::byte,maximum_datagram> payload_{};
     std::array<std::byte,1024> ack_storage_{};
     std::array<bounded_connection::transmitted_range,bounded_connection::frames_per_packet> ranges_{};
     std::array<control_slot,16> controls_{};

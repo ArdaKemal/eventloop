@@ -20,12 +20,16 @@ namespace eventloop::http {
 // reserve storage at construction; exhaustion closes the affected connection.
 class http3_server final {
 public:
+    // `max_udp_payload_size` is clamped to 1200..8192 and negotiated down to
+    // the peer's advertised limit. The default is the standard Ethernet payload
+    // because path MTU discovery is not implemented.
     http3_server(event_loop& loop, ip_endpoint local, std::string_view root,
                  std::filesystem::path certificate_chain,
                  std::filesystem::path private_key,
                  bool directory_listing = false,
                  std::size_t connection_capacity = 8,
-                 std::size_t request_capacity = 0);
+                 std::size_t request_capacity = 0,
+                 std::size_t max_udp_payload_size = 1472);
     ~http3_server();
     http3_server(const http3_server&) = delete;
     auto operator=(const http3_server&) -> http3_server& = delete;

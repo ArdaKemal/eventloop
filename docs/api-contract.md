@@ -346,6 +346,11 @@ back to an unbounded allocation.
   The `request_capacity` constructor argument reserves reusable request scratch
   buffers at startup; zero selects four per connection, and explicit values
   from 1 to 8192 are accepted. Exhaustion closes only the affected connection.
+  The `max_udp_payload_size` constructor argument bounds application datagrams
+  to 1200..8192 bytes and is negotiated down to the peer's advertised limit;
+  handshake packets remain at 1200 so anti-amplification is unaffected. It
+  defaults to 1472 (the standard Ethernet payload) because path MTU discovery
+  is not implemented; constrained paths may lower it.
   Each scratch buffer is about 40 KiB. Ordinary static-file responses use that
   storage for HTTP/3 headers and I/O; directory listing still allocates its
   bounded entry and output vectors, and OpenSSL may allocate separately.

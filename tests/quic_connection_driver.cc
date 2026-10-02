@@ -66,6 +66,62 @@ static auto receiver(event_loop&,udp_endpoint& endpoint) -> task<void>
 { (void)co_await endpoint.run(); }
 static auto drive(event_loop&,connection_driver& driver,bool& clean) -> task<void>
 { const auto result=co_await driver.run(); clean=result && result->has_value(); if (!clean) std::fprintf(stderr,"driver failure %d\n", result ? static_cast<int>(result->error()) : -1); }
+struct send_progress {
+    bounded_connection& connection;
+    std::optional<std::uint64_t> id;
+    std::uint64_t previous {}, largest_step {};
+    static auto observe(void* argument) noexcept -> void
+    {
+        auto& self=*static_cast<send_progress*>(argument);
+        if (!self.id) return;
+        const auto highest=self.connection.stream(*self.id)->sent_highest;
+        self.largest_step=std::max(self.largest_step,highest-self.previous);
+        self.previous=highest;
+    }
+};
+static auto wait_for_notification(event_loop& loop,connection_driver& driver,
+    bool& finished,bool& completed) -> task<void>
+{
+    // A distant deadline makes this a signal/cancellation test rather than a
+    // latency threshold test: the ordinary timeout cannot finish this wait.
+    completed=co_await connection_driver::idle_wait(driver,eventloop::detail::deadline_after(1h));
+    finished=true;
+}
+static auto notify_waiter(event_loop& loop,connection_driver& driver,
+    bool& finished,bool& completed,task_handle<void>& cancelled,
+    bool& cancel_finished,bool& cancel_completed) -> task<void>
+{
+    (void)co_await yield(loop);
+    check(!finished);
+    driver.notify();
+    driver.notify(); // Repeated signals must not register the same timer twice.
+    check(!finished); // Never resume the pump inside router/application calls.
+    (void)co_await sleep_for(loop,10ms);
+    check(finished && completed);
+    check(loop.spawn(wait_for_notification(loop,driver,cancel_finished,cancel_completed),cancelled)==task_spawn_result::accepted);
+    (void)co_await yield(loop);
+    check(!cancel_finished);
+    check(cancelled.cancel());
+    check(cancel_finished && !cancel_completed);
+    driver.notify(); // The cancelled frame no longer owns the driver's wait.
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+static auto notification_scenario() -> void
+{
+    event_loop loop;
+    udp_endpoint endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
+    auto connection=std::make_unique<bounded_connection>(endpoint_role::client,connection_callbacks{});
+    connection_driver driver(loop,endpoint,*connection,dcid,dcid,ip_endpoint::loopback_v4(12345),true);
+    bool finished=false,completed=false,cancel_finished=false,cancel_completed=true;
+    task_handle<void> cancelled;
+    check(loop.spawn(wait_for_notification(loop,driver,finished,completed))==task_spawn_result::accepted);
+    check(loop.spawn(notify_waiter(loop,driver,finished,completed,cancelled,cancel_finished,cancel_completed))==task_spawn_result::accepted);
+    (void)loop.run();
+    check(finished && completed && cancel_finished && !cancel_completed);
+    check(cancelled.done());
+    (void)cancelled.take_result();
+    check(loop.coroutine_statistics().live==0);
+}
 static auto queue_peer_close(bounded_connection& server,udp_endpoint& client_endpoint,
                              ip_endpoint server_peer) -> void
 {
@@ -90,10 +146,15 @@ static auto queue_peer_close(bounded_connection& server,udp_endpoint& client_end
 }
 static auto observe(event_loop& loop,bounded_connection& client,bounded_connection& server,
     connection_driver& client_driver,connection_driver& server_driver,
-    udp_endpoint& client_endpoint,ip_endpoint server_peer,bool& delivered) -> task<void>
+    udp_endpoint& client_endpoint,ip_endpoint server_peer,bool& delivered,
+    send_progress& progress) -> task<void>
 {
-    std::optional<std::uint64_t> id;
-    constexpr std::array<std::byte,3> data{std::byte{1},std::byte{2},std::byte{3}};
+    auto& id=progress.id;
+    static constexpr auto data=[] {
+        std::array<std::byte,bounded_connection::stream_bytes> bytes {};
+        for (std::size_t i=0;i<bytes.size();++i) bytes[i]=static_cast<std::byte>(i%251);
+        return bytes;
+    }();
     for (int i=0;i<4000;++i) {
         if (!id && client.core().state()==connection_state::active && server.core().state()==connection_state::active) {
             id=client.open_stream(stream_direction::bidirectional).value();
@@ -124,6 +185,7 @@ int main()
     WSADATA data{}; check(WSAStartup(MAKEWORD(2,2),&data)==0);
 #endif
     contexts context;
+    notification_scenario();
     for (auto version : {version_1,version_2}) {
         event_loop loop;
         udp_endpoint client_endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
@@ -136,15 +198,21 @@ int main()
         check(server->initialize(context.server.get(),{true,{},protocol,parameters},version,dcid).has_value());
         auto client_driver=std::make_unique<connection_driver>(loop,client_endpoint,*client,dcid,dcid,server_endpoint.local_endpoint(),true);
         auto server_driver=std::make_unique<connection_driver>(loop,server_endpoint,*server,dcid,dcid,client_endpoint.local_endpoint());
+        send_progress progress {*client};
+        client_driver->set_progress(&progress,send_progress::observe);
         bool delivered=false,client_clean=false,server_clean=false;
         check(loop.spawn(receiver(loop,client_endpoint))==task_spawn_result::accepted);
         check(loop.spawn(receiver(loop,server_endpoint))==task_spawn_result::accepted);
         check(loop.spawn(drive(loop,*client_driver,client_clean))==task_spawn_result::accepted);
         check(loop.spawn(drive(loop,*server_driver,server_clean))==task_spawn_result::accepted);
-        check(loop.spawn(observe(loop,*client,*server,*client_driver,*server_driver,client_endpoint,server_endpoint.local_endpoint(),delivered))==task_spawn_result::accepted);
+        check(loop.spawn(observe(loop,*client,*server,*client_driver,*server_driver,client_endpoint,server_endpoint.local_endpoint(),delivered,progress))==task_spawn_result::accepted);
         (void)loop.run();
         if (!delivered) std::fprintf(stderr,"delivery failure state %d/%d dropped %zu/%zu\n",static_cast<int>(client->core().state()),static_cast<int>(server->core().state()),client_driver->dropped_packets(),server_driver->dropped_packets()); check(delivered && client_clean && server_clean);
         check(loop.coroutine_statistics().live==0);
+        // Queued data with available congestion/flow credit must make more
+        // than one packet of progress before the pump retries on a timer.
+        // This checks scheduling behavior without a wall-clock threshold.
+        check(progress.largest_step>packet_scheduler::maximum_packet);
     }
 #ifdef _WIN32
     (void)WSACleanup();

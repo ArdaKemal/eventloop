@@ -440,13 +440,20 @@ public:
         std::optional<task_handle<void>> handle;
     };
 
+    static auto make_limits(std::size_t max_udp_payload_size) -> quic_transport_limits
+    {
+        quic_transport_limits limits;
+        limits.max_udp_payload_size = max_udp_payload_size;
+        return limits;
+    }
+
     implementation(event_loop& loop, ip_endpoint local, std::string_view root,
                    std::filesystem::path cert, std::filesystem::path key,
                    bool directory_listing, std::size_t connection_capacity,
-                   std::size_t request_capacity)
+                   std::size_t request_capacity, std::size_t max_udp_payload_size)
         : loop_(loop), root_(std::make_shared<unique_fd>(http::detail::open_root(root))),
           endpoint_(loop, local, quic_server_options{std::move(cert), std::move(key),
-              std::span(alpn_), {}, connection_capacity}),
+              std::span(alpn_), make_limits(max_udp_payload_size), connection_capacity}),
           directory_listing_(directory_listing), connections_(connection_capacity),
           request_storage_(request_capacity == 0 ? connection_capacity * 4
                                                  : request_capacity) {}
@@ -465,10 +472,11 @@ http3_server::http3_server(event_loop& loop, ip_endpoint local, std::string_view
                            std::filesystem::path private_key,
                            bool directory_listing,
                            std::size_t connection_capacity,
-                           std::size_t request_capacity)
+                           std::size_t request_capacity,
+                           std::size_t max_udp_payload_size)
     : implementation_(std::make_unique<implementation>(loop, local, root,
           std::move(certificate_chain), std::move(private_key), directory_listing,
-          connection_capacity, request_capacity)) {}
+          connection_capacity, request_capacity, max_udp_payload_size)) {}
 http3_server::~http3_server() = default;
 auto http3_server::local_endpoint() const noexcept -> ip_endpoint
 { return implementation_->endpoint_.local_endpoint(); }

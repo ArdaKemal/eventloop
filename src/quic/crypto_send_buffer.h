@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <span>
+#include <type_traits>
 
 namespace eventloop::quic::detail {
 
@@ -51,6 +53,7 @@ public:
     {
         base_ = 0;
         end_ = 0;
+        pending_begin_ = 0;
         flags_.fill(0);
     }
 
@@ -63,6 +66,7 @@ public:
             if (flags_[offset % Capacity] & acked_flag) return false;
         for (auto offset = base_; offset < end_; ++offset)
             flags_[offset % Capacity] = pending_flag;
+        pending_begin_ = base_;
         return true;
     }
 
@@ -93,18 +97,13 @@ public:
     [[nodiscard]] constexpr auto next_pending(std::size_t max_size) const noexcept
         -> crypto_send_chunk
     {
-        if (max_size == 0) return {};
-        for (auto offset = base_; offset < end_; ++offset) {
-            const auto slot = static_cast<std::size_t>(offset % Capacity);
-            if ((flags_[slot] & pending_flag) == 0) continue;
-            const auto limit = std::min({max_size, Capacity - slot,
-                                         static_cast<std::size_t>(end_ - offset)});
-            std::size_t length = 0;
-            while (length < limit &&
-                   (flags_[slot + length] & pending_flag) != 0) ++length;
-            return {offset, std::span<const std::byte>(bytes_).subspan(slot, length)};
-        }
-        return {};
+        if (max_size == 0 || pending_begin_ == end_) return {};
+        const auto slot = static_cast<std::size_t>(pending_begin_ % Capacity);
+        const auto limit = std::min({max_size, Capacity - slot,
+                                     static_cast<std::size_t>(end_ - pending_begin_)});
+        const auto length = matching_flags_prefix(
+            std::span(flags_).subspan(slot, limit), pending_flag, pending_flag);
+        return {pending_begin_, std::span<const std::byte>(bytes_).subspan(slot, length)};
     }
 
     // PTO selects transmitted bytes without marking the original packet lost
@@ -135,10 +134,8 @@ public:
             return std::unexpected(crypto_send_error::invalid_range);
         if (offset < base_)
             return std::unexpected(crypto_send_error::invalid_range);
-        for (std::size_t i = 0; i < length; ++i) {
-            if (flags_[(offset + i) % Capacity] & acked_flag)
-                return std::unexpected(crypto_send_error::invalid_range);
-        }
+        if (!range_has_flags(offset, length, acked_flag, 0))
+            return std::unexpected(crypto_send_error::invalid_range);
         return {};
     }
 
@@ -149,10 +146,12 @@ public:
         -> std::expected<void, crypto_send_error>
     {
         if (const auto result = preflight_mark_sent(offset, length); !result) return result;
-        for (std::size_t i = 0; i < length; ++i) {
-            auto& flag = flags_[(offset + i) % Capacity];
-            flag = static_cast<std::uint8_t>((flag | sent_flag) & ~pending_flag);
-        }
+        // Preflight excluded ACKed bytes; every remaining byte becomes sent
+        // and non-pending, including overlapping probes and retransmissions.
+        fill_flags(offset, length, sent_flag);
+        if (pending_begin_ >= offset && pending_begin_ < offset + length)
+            pending_begin_ = offset + length;
+        advance_pending();
         return {};
     }
 
@@ -167,16 +166,29 @@ public:
             return std::unexpected(crypto_send_error::invalid_range);
         const auto start = std::max(offset, base_);
         const auto finish = offset + length;
-        for (auto pos = start; pos < finish; ++pos) {
-            if ((flags_[pos % Capacity] & sent_flag) == 0)
-                return std::unexpected(crypto_send_error::unsent_data);
+        if (start < finish && !range_has_flags(start, static_cast<std::size_t>(finish - start), sent_flag, sent_flag))
+            return std::unexpected(crypto_send_error::unsent_data);
+        if (start < finish) {
+            if (start == base_) {
+                // Validation proved this entire prefix sent. Retire it in
+                // bulk, then inspect any suffix ACKed by an earlier report.
+                fill_flags(start, static_cast<std::size_t>(finish - start), 0);
+                base_ = finish;
+            } else {
+                fill_flags(start, static_cast<std::size_t>(finish - start), acked_flag | sent_flag);
+            }
         }
-        for (auto pos = start; pos < finish; ++pos)
-            flags_[pos % Capacity] = acked_flag | sent_flag;
-        while (base_ < end_ && (flags_[base_ % Capacity] & acked_flag)) {
-            flags_[base_ % Capacity] = 0;
-            ++base_;
+        while (base_ < end_) {
+            const auto slot = static_cast<std::size_t>(base_ % Capacity);
+            const auto limit = std::min(Capacity - slot, static_cast<std::size_t>(end_ - base_));
+            const auto length = matching_flags_prefix(
+                std::span(flags_).subspan(slot, limit), acked_flag, acked_flag);
+            std::fill_n(flags_.begin() + slot, length, 0);
+            base_ += length;
+            if (length != limit) break;
         }
+        pending_begin_ = std::max(pending_begin_, base_);
+        advance_pending();
         return {};
     }
 
@@ -188,18 +200,69 @@ public:
             return std::unexpected(crypto_send_error::invalid_range);
         const auto start = std::max(offset, base_);
         const auto finish = offset + length;
-        for (auto pos = start; pos < finish; ++pos) {
-            if ((flags_[pos % Capacity] & sent_flag) == 0)
-                return std::unexpected(crypto_send_error::unsent_data);
-        }
+        if (start < finish && !range_has_flags(start, static_cast<std::size_t>(finish - start), sent_flag, sent_flag))
+            return std::unexpected(crypto_send_error::unsent_data);
         for (auto pos = start; pos < finish; ++pos) {
             auto& flag = flags_[pos % Capacity];
-            if ((flag & acked_flag) == 0) flag |= pending_flag;
+            if ((flag & acked_flag) == 0) {
+                flag |= pending_flag;
+                pending_begin_ = std::min(pending_begin_, pos);
+            }
         }
         return {};
     }
 
 private:
+    [[nodiscard]] static constexpr auto has_flags(std::span<const std::uint8_t> flags,
+        std::uint8_t mask, std::uint8_t expected) noexcept -> bool
+    {
+        return matching_flags_prefix(flags, mask, expected) == flags.size();
+    }
+    [[nodiscard]] static constexpr auto matching_flags_prefix(std::span<const std::uint8_t> flags,
+        std::uint8_t mask, std::uint8_t expected) noexcept -> std::size_t
+    {
+        std::size_t i = 0;
+        if (!std::is_constant_evaluated()) {
+            // Uniform byte masks work in either endian order. memcpy permits
+            // unaligned loads without aliasing or reading beyond the segment.
+            constexpr std::uint64_t repeat = 0x0101010101010101;
+            const auto word_mask = repeat * mask;
+            const auto word_expected = repeat * expected;
+            for (; flags.size() - i >= sizeof(std::uint64_t); i += sizeof(std::uint64_t)) {
+                std::uint64_t word;
+                std::memcpy(&word, flags.data() + i, sizeof(word));
+                if ((word & word_mask) != word_expected) break;
+            }
+        }
+        for (; i < flags.size(); ++i)
+            if ((flags[i] & mask) != expected) break;
+        return i;
+    }
+    [[nodiscard]] constexpr auto range_has_flags(std::uint64_t offset,
+        std::size_t length, std::uint8_t mask, std::uint8_t expected) const noexcept -> bool
+    {
+        const auto slot = static_cast<std::size_t>(offset % Capacity);
+        const auto first = std::min(length, Capacity - slot);
+        return has_flags(std::span(flags_).subspan(slot, first), mask, expected) &&
+            has_flags(std::span(flags_).first(length - first), mask, expected);
+    }
+    constexpr auto fill_flags(std::uint64_t offset, std::size_t length,
+        std::uint8_t value) noexcept -> void
+    {
+        const auto slot = static_cast<std::size_t>(offset % Capacity);
+        const auto first = std::min(length, Capacity - slot);
+        std::fill_n(flags_.begin() + slot, first, value);
+        std::fill_n(flags_.begin(), length - first, value);
+    }
+    // Lowest pending byte, or end_ when all buffered bytes are in flight.
+    // Retain it across packet selection so an ACK-blocked stream does not
+    // rescan its whole ring for every packet sent on another stream.
+    constexpr auto advance_pending() noexcept -> void
+    {
+        while (pending_begin_ < end_ &&
+               (flags_[pending_begin_ % Capacity] & pending_flag) == 0)
+            ++pending_begin_;
+    }
     [[nodiscard]] constexpr auto valid_range(std::uint64_t offset,
                                               std::size_t length) const noexcept
         -> bool
@@ -214,6 +277,7 @@ private:
     std::array<std::uint8_t, Capacity> flags_ {};
     std::uint64_t base_ {0};
     std::uint64_t end_ {0};
+    std::uint64_t pending_begin_ {0};
 };
 
 } // namespace eventloop::quic::detail

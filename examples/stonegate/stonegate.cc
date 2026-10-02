@@ -32,6 +32,7 @@ struct config {
     std::uint16_t http3_port = 0;
     std::size_t http3_connections = 8;
     std::size_t http3_requests = 0;
+    std::size_t http3_max_datagram = 1472;
     int shutdown_seconds = 5;
     bool directory_listing = false;
     bool reuse_port = false;
@@ -52,6 +53,7 @@ auto usage() -> void
         "  --http3-port PORT       enable UDP HTTP/3 on this port (default off)\n"
         "  --http3-connections N  concurrent HTTP/3 connections (1..256; default 8)\n"
         "  --http3-requests N     concurrent HTTP/3 requests (1..8192; default 4 per connection)\n"
+        "  --http3-max-datagram N max application UDP payload 1200..8192 (default 1472)\n"
         "  --certificate FILE      PEM certificate chain\n"
         "  --private-key FILE      PEM private key\n"
         "  --key-password TEXT     password for encrypted private key\n"
@@ -111,6 +113,8 @@ auto apply(config& settings, std::string_view key, std::string_view value,
     else if (key == "http3-port") settings.http3_port = number<int>(value, key, 1, 65535);
     else if (key == "http3-connections") settings.http3_connections = number<std::size_t>(value, key, 1, 256);
     else if (key == "http3-requests") settings.http3_requests = number<std::size_t>(value, key, 1, 8192);
+    else if (key == "http3-max-datagram")
+        settings.http3_max_datagram = number<std::size_t>(value, key, 1200, 8192);
     else if (key == "shutdown-seconds")
         settings.shutdown_seconds = number<int>(value, key, 0, 3600);
     else if (key == "http-mode") {
@@ -177,6 +181,7 @@ auto parse(int argc, char** argv) -> config
                    option == "--https-port" || option == "--http3-port" ||
                    option == "--http3-connections" ||
                    option == "--http3-requests" ||
+                   option == "--http3-max-datagram" ||
                    option == "--shutdown-seconds" || option == "--http-mode" ||
                    option == "--http2") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -201,6 +206,7 @@ auto parse(int argc, char** argv) -> config
             option != "--https-port" && option != "--http3-port" &&
             option != "--http3-connections" &&
             option != "--http3-requests" &&
+            option != "--http3-max-datagram" &&
             option != "--shutdown-seconds" && option != "--http-mode" && option != "--http2")
             throw std::invalid_argument("unknown option: " + std::string(option));
         if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -338,7 +344,7 @@ auto main(int argc, char** argv) -> int
                 loop, eventloop::ip_endpoint::parse(settings.bind, settings.http3_port),
                 settings.root, settings.certificate, settings.private_key,
                 settings.directory_listing, settings.http3_connections,
-                settings.http3_requests);
+                settings.http3_requests, settings.http3_max_datagram);
             if (loop.spawn(http3->run(), http3_run) !=
                 eventloop::task_spawn_result::accepted)
                 throw std::runtime_error("HTTP/3 listener task capacity exhausted");

@@ -104,6 +104,52 @@ struct outcome {
     bool client_ok {false};
 };
 
+auto accept_sparse_streams(event_loop&, quic_connection& connection) -> task<bool>
+{
+    std::array<std::byte, 8> buffer {};
+    // Higher IDs implicitly open the lower IDs. Accept the higher ID first,
+    // then wait for the missing lower streams, across two rounds of slot reuse.
+    for (std::uint64_t round = 0; round < 2; ++round) {
+        for (const std::uint64_t ordinal : {3u, 1u, 2u}) {
+            const auto id = flatten_result(co_await connection.async_accept_stream());
+            if (!id || *id != (round * 3 + ordinal) * 4) co_return false;
+            const auto count = flatten_result(co_await connection.async_read(*id, buffer));
+            if (!count || *count != reply.size() ||
+                !std::equal(reply.begin(), reply.end(), buffer.begin())) co_return false;
+            const auto eof = flatten_result(co_await connection.async_read(*id, buffer));
+            if (!eof || *eof != 0) co_return false;
+            const auto sent = flatten_result(co_await connection.async_write(*id, reply, true));
+            if (!sent || *sent != reply.size()) co_return false;
+        }
+    }
+    co_return true;
+}
+
+auto send_sparse_streams(event_loop&, quic_connection& connection) -> task<bool>
+{
+    std::array<std::byte, 8> buffer {};
+    for (unsigned round = 0; round < 2; ++round) {
+        std::array<std::uint64_t, 3> streams {};
+        for (auto& id : streams) {
+            const auto opened = flatten_result(co_await connection.async_open_stream(
+                quic_stream_direction::bidirectional));
+            if (!opened) co_return false;
+            id = *opened;
+        }
+        for (const std::size_t position : {2u, 0u, 1u}) {
+            const auto id = streams[position];
+            const auto sent = flatten_result(co_await connection.async_write(id, reply, true));
+            if (!sent || *sent != reply.size()) co_return false;
+            const auto count = flatten_result(co_await connection.async_read(id, buffer));
+            if (!count || *count != reply.size() ||
+                !std::equal(reply.begin(), reply.end(), buffer.begin())) co_return false;
+            const auto eof = flatten_result(co_await connection.async_read(id, buffer));
+            if (!eof || *eof != 0) co_return false;
+        }
+    }
+    co_return true;
+}
+
 auto server_serve(event_loop& loop, quic_endpoint& server, outcome& result) -> task<void>
 {
     auto accepted = flatten_result(co_await server.async_accept());
@@ -141,10 +187,11 @@ auto server_serve(event_loop& loop, quic_endpoint& server, outcome& result) -> t
                    datagram_in.begin());
     if (datagram_ok)
         (void)flatten_result(co_await connection.async_send_datagram(datagram_out));
-    result.server_ok = stream_ok && uni_ok && datagram_ok;
+    const auto sparse_ok = co_await accept_sparse_streams(loop, connection);
+    result.server_ok = stream_ok && uni_ok && datagram_ok && sparse_ok && *sparse_ok;
 }
 
-auto client_run(event_loop&, quic_endpoint& client, ip_endpoint server,
+auto client_run(event_loop& loop, quic_endpoint& client, ip_endpoint server,
                 outcome& result) -> task<void>
 {
     auto connected = flatten_result(co_await client.async_connect(server, "localhost"));
@@ -179,8 +226,9 @@ auto client_run(event_loop&, quic_endpoint& client, ip_endpoint server,
     const bool datagram_ok = received && *received == datagram_out.size() &&
         std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*received),
                    datagram_out.begin());
+    const auto sparse_ok = co_await send_sparse_streams(loop, connection);
     (void)flatten_result(co_await connection.async_write(*stream, {}, true));
-    result.client_ok = stream_ok && uni_ok && datagram_ok;
+    result.client_ok = stream_ok && uni_ok && datagram_ok && sparse_ok && *sparse_ok;
 }
 
 auto watch(event_loop& loop, quic_endpoint& server, quic_endpoint& client,

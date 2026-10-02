@@ -541,8 +541,8 @@ private:
 
     auto build_parameters(slot& entry, bool client) noexcept -> bool
     {
-        std::array<transport_parameter, 12> entries {};
-        std::array<std::array<std::byte, 8>, 10> numbers {};
+        std::array<transport_parameter, 16> entries {};
+        std::array<std::array<std::byte, 8>, 12> numbers {};
         std::size_t count = 0;
         const auto add_number = [&](std::uint64_t id, std::uint64_t value) {
             const auto encoded = encode_varint(value, numbers[count]);
@@ -583,6 +583,9 @@ private:
             !add_number(static_cast<std::uint64_t>(parameter_id::initial_max_streams_uni),
                 std::min<std::uint64_t>(settings.max_streams_uni,
                     bounded_connection::uni_stream_capacity)))
+            return false;
+        if (!add_number(static_cast<std::uint64_t>(parameter_id::max_udp_payload_size),
+                std::clamp<std::uint64_t>(settings.max_udp_payload_size, 1200, 8192)))
             return false;
         if (settings.max_datagram_frame_size > 0 &&
             !add_number(static_cast<std::uint64_t>(parameter_id::max_datagram_frame_size),
@@ -680,6 +683,7 @@ auto read_stream(event_loop&, quic_endpoint::implementation& impl,
             std::copy_n(readable.begin(), count, buffer.begin());
             if (!slot.connection->consume_stream(stream_id, count))
                 co_return std::unexpected(make_error_code(quic_errc::invalid_state));
+            if (slot.driver) slot.driver->notify();
             co_return count;
         }
         if (stream->receive->complete() ||
@@ -716,12 +720,14 @@ auto write_stream(event_loop&, quic_endpoint::implementation& impl,
                 co_return std::unexpected(make_error_code(quic_errc::invalid_state));
             if (fin && !stream->send.close())
                 co_return std::unexpected(make_error_code(quic_errc::invalid_state));
+            if (slot.driver) slot.driver->notify();
             co_return buffer.size();
         }
         if (writable > 0) {
             const auto accepted = std::min(writable, buffer.size());
             if (!stream->send.append(buffer.first(accepted)))
                 co_return std::unexpected(make_error_code(quic_errc::invalid_state));
+            if (slot.driver) slot.driver->notify();
             co_return accepted;
         }
         co_await notify(impl);

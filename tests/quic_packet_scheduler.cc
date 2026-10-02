@@ -56,8 +56,8 @@ static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcep
 static bool on_frame(void* argument, tls_level, const decoded_frame&) noexcept
 { ++*static_cast<int*>(argument); return true; }
 struct buffers {
-    std::array<std::uint8_t, 2048> encoded {}, frame {}, build_scratch {},
-        packet_scratch {}, plaintext {}, auth_scratch {};
+    std::array<std::uint8_t, packet_scheduler::maximum_datagram> encoded {}, frame {},
+        build_scratch {}, packet_scratch {}, plaintext {}, auth_scratch {};
 };
 int main()
 {
@@ -285,5 +285,80 @@ int main()
                 cursor+=frame->encoded_size;
             }
         }
+        // Filling the range reservation ends selection at exactly eight
+        // streams, including FIN-only frames that consume no byte credit.
+        // PTO retransmissions still precede the ninth stream's pending FIN.
+        std::array<std::uint64_t,bounded_connection::frames_per_packet+1> fin_streams {};
+        for (auto& stream_id : fin_streams) {
+            const auto opened=client->open_stream(stream_direction::bidirectional);
+            check(opened.has_value()); stream_id=*opened;
+            check(client->stream(stream_id)->send.close().has_value());
+        }
+        const auto fin_credit=client->flow().sent_total();
+        check(send(*client,*server,outgoing,incoming,tls_level::application,true));
+        check(client->flow().sent_total()==fin_credit);
+        for (const auto stream_id : fin_streams)
+            check(client->stream(stream_id)->send.next_pending(0).fin);
+        auto check_fin_packet=[&] {
+            std::size_t cursor=0, stream_count=0;
+            while (cursor<last_plaintext_size) {
+                const auto frame=decode_frame(std::as_bytes(std::span(buffer.plaintext)
+                    .first(last_plaintext_size)).subspan(cursor));
+                check(frame.has_value()); cursor+=frame->encoded_size;
+                if (frame->type<8 || frame->type>15) continue;
+                check(stream_count<bounded_connection::frames_per_packet);
+                check(frame->stream_id==fin_streams[stream_count++]);
+                check(frame->fin && frame->offset==0 && frame->data.empty());
+            }
+            check(stream_count==bounded_connection::frames_per_packet);
+        };
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        check_fin_packet();
+        check(server->stream(fin_streams.back())==nullptr);
+        check(send(*client,*server,outgoing,incoming,tls_level::application,false,true));
+        check_fin_packet();
+        check(server->stream(fin_streams.back())==nullptr);
+        check(client->flow().sent_total()==fin_credit);
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        const auto* last_fin=server->stream(fin_streams.back());
+        check(last_fin && last_fin->receive && last_fin->receive->final_size()==0);
+        check(client->flow().sent_total()==fin_credit);
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        for (const auto stream_id : fin_streams) check(client->stream(stream_id)->send.complete());
+        // A candidate rejected by the packet-local flow table must leave its
+        // encoded bytes uncommitted and preserve credit for later streams.
+        // Deliberately make the send ring offer bytes past its stream credit.
+        const auto rejected=client->open_stream(stream_direction::bidirectional);
+        check(rejected.has_value());
+        auto* rejected_stream=client->stream(*rejected);
+        check(rejected_stream->send.extend_flow_limit(2048).has_value());
+        check(rejected_stream->send.append(block).has_value());
+        check(rejected_stream->send.mark_sent(0,block.size()).has_value());
+        check(rejected_stream->send.append(std::span(block).first(1)).has_value());
+        std::array<std::uint64_t,2> selected {};
+        const std::array<std::byte,400> selected_bytes {};
+        for (auto& stream_id : selected) {
+            const auto opened=client->open_stream(stream_direction::bidirectional);
+            check(opened.has_value()); stream_id=*opened;
+            check(client->stream(stream_id)->send.append(selected_bytes).has_value());
+            check(client->stream(stream_id)->send.close().has_value());
+        }
+        const auto credit_before=client->flow().sent_total();
+        check(send(*client,*server,outgoing,incoming,tls_level::application,true));
+        check(client->flow().sent_total()==credit_before);
+        for (const auto stream_id : selected)
+            check(client->stream(stream_id)->send.next_pending(1000).data.size()==selected_bytes.size());
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        check(client->flow().sent_total()==credit_before+selected.size()*selected_bytes.size());
+        check(server->stream(*rejected)==nullptr);
+        check(rejected_stream->send.next_pending(1000).offset==block.size());
+        for (const auto stream_id : selected) {
+            const auto* received=server->stream(stream_id);
+            check(received && received->receive && received->receive->final_size()==selected_bytes.size());
+            check(std::ranges::equal(received->receive->readable(),selected_bytes));
+        }
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        for (const auto stream_id : selected) check(client->stream(stream_id)->send.complete());
     }
 }

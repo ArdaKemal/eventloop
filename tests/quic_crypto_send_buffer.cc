@@ -11,6 +11,15 @@ namespace {
 
 using namespace eventloop::quic::detail;
 
+static_assert([] {
+    crypto_send_buffer<17> buffer;
+    std::array<std::byte,17> data {};
+    if (!buffer.append(data) || !buffer.mark_sent(0,16)) return false;
+    if (buffer.acknowledge(0,17) || !buffer.acknowledge(0,16)) return false;
+    const auto pending=buffer.next_pending(17);
+    return buffer.base_offset()==16 && pending.offset==16 && pending.data.size()==1;
+}(), "flag validation remains usable during constant evaluation");
+
 auto check(bool condition, std::string_view message) -> void
 {
     if (condition) return;
@@ -164,6 +173,171 @@ auto delayed_reports_after_ring_reuse() -> void
           "failed overlapping send does not clear pending bytes");
 }
 
+auto pending_selection_after_out_of_order_send() -> void
+{
+    crypto_send_buffer<8> buffer;
+    check(buffer.append(input("abcdefgh")) == 0, "append full ring");
+    check(buffer.preflight_mark_sent(0, 8).has_value() &&
+              equals(buffer.next_pending(8), 0, "abcdefgh"),
+          "send preflight does not advance pending selection");
+    check(buffer.mark_sent(4, 4).has_value() &&
+              equals(buffer.next_pending(8), 0, "abcd"),
+          "sending a later interval preserves the earlier pending interval");
+    check(buffer.mark_sent(0, 2).has_value() &&
+              equals(buffer.next_pending(8), 2, "cd") &&
+              buffer.mark_sent(2, 2).has_value() &&
+              buffer.next_pending(8).data.empty(),
+          "selection skips transmitted suffix when the pending prefix is sent");
+    check(buffer.mark_lost(4, 4).has_value() &&
+              buffer.mark_lost(0, 2).has_value() &&
+              equals(buffer.next_pending(8), 0, "ab"),
+          "earlier loss rewinds selection ahead of later pending data");
+    check(buffer.acknowledge(0, 2).has_value() &&
+              equals(buffer.next_pending(8), 4, "efgh"),
+          "ACK of pending loss skips the transmitted gap");
+    check(buffer.mark_sent(4, 2).has_value() &&
+              buffer.acknowledge(6, 2).has_value() &&
+              buffer.next_pending(8).data.empty(),
+          "ACK of pending suffix leaves no pending bytes");
+    check(buffer.mark_lost(2, 6).has_value() &&
+              equals(buffer.next_pending(8), 2, "cdef"),
+          "overlapping loss restores unacknowledged data only");
+    check(buffer.mark_sent(2, 4).has_value() &&
+              buffer.acknowledge(2, 4).has_value() &&
+              buffer.append(input("ijklmnop")) == 8 &&
+              equals(buffer.next_pending(8), 8, "ijklmnop"),
+          "append after retirement restarts selection at reused storage");
+    buffer.reset();
+    check(buffer.append(input("xy")) == 0 && buffer.mark_sent(0, 2).has_value() &&
+              buffer.retransmit_initial() && equals(buffer.next_pending(8), 0, "xy"),
+          "Retry restores initial pending selection after reset");
+}
+
+auto bulk_flags_prefix_and_wrap() -> void
+{
+    crypto_send_buffer<8> buffer;
+    check(buffer.append(input("abcdefgh")) == 0 &&
+              buffer.mark_sent(0, 8).has_value() &&
+              buffer.acknowledge(4, 4).has_value() &&
+              buffer.mark_lost(0, 8).has_value() &&
+              buffer.mark_sent(0, 4).has_value() &&
+              buffer.acknowledge(0, 2).has_value(),
+          "ACKed suffix waits for retransmitted prefix");
+    check(buffer.append(input("ij")) == 8 && buffer.mark_sent(8, 2).has_value() &&
+              buffer.mark_lost(2, 8).has_value() && buffer.acknowledge(2, 2).has_value(),
+          "prefix retirement traverses earlier ACKed suffix");
+    check(buffer.base_offset() == 8 && equals(buffer.next_pending(8), 8, "ij"),
+          "retiring suffix preserves live data in reused ring slots");
+    check(buffer.append(input("klmnop")) == 10 && buffer.mark_sent(8, 8).has_value() &&
+              buffer.acknowledge(9, 3).has_value() && buffer.acknowledge(8, 4).has_value() &&
+              buffer.base_offset() == 12,
+          "overlapping ACK retires exactly the covered prefix");
+    check(buffer.append(input("qrst")) == 16 && buffer.mark_sent(12, 8).has_value() &&
+              buffer.acknowledge(14, 6).has_value() && buffer.mark_lost(12, 8).has_value(),
+          "sent and ACKed flag ranges cross the physical ring boundary");
+    check(buffer.mark_sent(12, 8).error() == crypto_send_error::invalid_range &&
+              equals(buffer.next_pending(8), 12, "mn"),
+          "failed wrapped send cannot clear its pending prefix");
+    check(buffer.acknowledge(12, 2).has_value() && buffer.base_offset() == 20 &&
+              buffer.buffered_size() == 0 && buffer.next_pending(8).data.empty(),
+          "prefix ACK retires previously ACKed suffix across wrap");
+    check(buffer.acknowledge(8, 12).has_value() && buffer.mark_lost(8, 12).has_value() &&
+              buffer.append(input("uv")) == 20 &&
+              equals(buffer.next_pending(8), 20, "uv"),
+          "late reports do not rewrite newly reused slots");
+}
+
+auto flag_validation_word_boundaries() -> void
+{
+    const std::array<std::byte,31> data {};
+    for (std::size_t unsent=0;unsent<data.size();++unsent) {
+        crypto_send_buffer<31> buffer;
+        check(buffer.append(data)==0 && buffer.mark_sent(0,unsent).has_value() &&
+                  buffer.mark_sent(unsent+1,data.size()-unsent-1).has_value(),
+              "leave one unsent byte at each validation position");
+        check(buffer.acknowledge(0,data.size()).error()==crypto_send_error::unsent_data &&
+                  buffer.mark_lost(0,data.size()).error()==crypto_send_error::unsent_data &&
+                  buffer.base_offset()==0 && buffer.next_pending(31).offset==unsent,
+              "word and remainder checks reject unsent bytes without mutation");
+        check(buffer.mark_sent(unsent,1).has_value() &&
+                  buffer.acknowledge(0,17).has_value() &&
+                  buffer.append(std::span(data).first(17))==31 &&
+                  buffer.mark_sent(31,17).has_value(),
+              "reuse the ring with an unaligned validation start");
+        const auto acked=18+unsent%30;
+        check(buffer.acknowledge(acked,1).has_value() &&
+                  buffer.preflight_mark_sent(17,31).error()==crypto_send_error::invalid_range,
+              "word checks reject ACKed bytes in either wrapped segment");
+        check(buffer.mark_lost(17,31).has_value() &&
+                  buffer.mark_sent(17,31).error()==crypto_send_error::invalid_range,
+              "failed wrapped send retains retransmission state");
+        const auto pending=buffer.next_pending(31);
+        check(pending.offset==17 && pending.data.size()==std::min<std::size_t>(acked-17,14),
+              "validation failure preserves the pending prefix");
+        check(buffer.acknowledge(17,31).has_value() && buffer.base_offset()==48 &&
+                  buffer.next_pending(31).data.empty(),
+              "validated wrapped ACK retires the full live window");
+    }
+}
+
+auto acked_suffix_word_boundaries() -> void
+{
+    const std::array<std::byte,31> data {};
+    for (std::size_t gap=1;gap<31;++gap) {
+        crypto_send_buffer<31> buffer;
+        check(buffer.append(data)==0 && buffer.mark_sent(0,31).has_value() &&
+                  buffer.acknowledge(0,17).has_value() &&
+                  buffer.append(std::span(data).first(17))==31 &&
+                  buffer.mark_sent(31,17).has_value(),
+              "prepare a full wrapped sent window");
+        check(buffer.acknowledge(18,gap-1).has_value() &&
+                  buffer.acknowledge(18+gap,30-gap).has_value() &&
+                  buffer.acknowledge(17,1).has_value() &&
+                  buffer.base_offset()==17+gap && buffer.buffered_size()==31-gap,
+              "ACK suffix scan stops at each unacknowledged byte position");
+        check(buffer.mark_lost(17+gap,1).has_value() &&
+                  buffer.next_pending(31).offset==17+gap &&
+                  buffer.next_pending(31).data.size()==1 &&
+                  buffer.mark_sent(17+gap,1).has_value() &&
+                  buffer.acknowledge(17+gap,1).has_value() &&
+                  buffer.base_offset()==48 && buffer.buffered_size()==0,
+              "filling the gap retires the wrapped ACKed suffix exactly");
+        check(buffer.append(data)==48 && buffer.next_pending(31).offset==48,
+              "retired word segments can be reused");
+    }
+}
+
+auto pending_run_word_boundaries() -> void
+{
+    const std::array<std::byte,31> data {};
+    for (std::size_t stop=1;stop<31;++stop) {
+        crypto_send_buffer<31> buffer;
+        check(buffer.append(data)==0 && buffer.mark_sent(stop,1).has_value(),
+              "place a sent byte at every pending-run position");
+        for (std::size_t maximum=0;maximum<=32;++maximum) {
+            const auto chunk=buffer.next_pending(maximum);
+            check(chunk.offset==0 && chunk.data.size()==std::min(maximum,stop),
+                  "word scan clips at packet limit or first nonpending byte");
+        }
+        check(buffer.mark_sent(0,stop).has_value() &&
+                  (stop==30 || buffer.next_pending(31).offset==stop+1) &&
+                  buffer.next_pending(31).data.size()==30-stop,
+              "pending cursor advances across the sent byte");
+    }
+    crypto_send_buffer<31> buffer;
+    check(buffer.append(data)==0 && buffer.mark_sent(0,31).has_value() &&
+              buffer.acknowledge(0,17).has_value() &&
+              buffer.append(std::span(data).first(17))==31 &&
+              buffer.mark_lost(17,14).has_value(),
+          "prepare pending runs on both physical ring segments");
+    check(buffer.next_pending(31).offset==17 && buffer.next_pending(31).data.size()==14 &&
+              buffer.mark_sent(17,14).has_value() &&
+              buffer.next_pending(31).offset==31 && buffer.next_pending(31).data.size()==17,
+          "word scan stops at physical wrap and resumes in the next segment");
+    check(buffer.mark_sent(31,17).has_value() && buffer.next_pending(31).data.empty(),
+          "fully transmitted wrapped ring returns no pending span");
+}
+
 } // namespace
 
 auto main() -> int
@@ -172,4 +346,9 @@ auto main() -> int
     overlapping_transmissions_and_wrap();
     bounds_and_failure_atomicity();
     delayed_reports_after_ring_reuse();
+    pending_selection_after_out_of_order_send();
+    bulk_flags_prefix_and_wrap();
+    flag_validation_word_boundaries();
+    acked_suffix_word_boundaries();
+    pending_run_word_boundaries();
 }

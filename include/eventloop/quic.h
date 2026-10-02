@@ -67,6 +67,12 @@ struct quic_transport_limits {
     std::uint64_t max_streams_bidi {32};
     std::uint64_t max_streams_uni {8};
     std::uint64_t max_datagram_frame_size {0};
+    // Maximum UDP payload advertised and used for application packets, clamped
+    // to 1200..8192 and negotiated down to the peer's advertised limit. The
+    // default is the standard Ethernet payload (1500 MTU) because path MTU
+    // discovery is not implemented; constrained paths may lower it. Handshake
+    // packets remain bounded at 1200 so anti-amplification is unaffected.
+    std::uint64_t max_udp_payload_size {1472};
 };
 
 struct quic_server_options {
