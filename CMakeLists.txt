@@ -969,6 +969,14 @@ if(BUILD_TESTING)
     target_compile_options(http2_hpack_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http2_hpack COMMAND http2_hpack_test)
 
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(http2_file_send_test tests/http2_file_send.cc)
+        target_include_directories(http2_file_send_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(http2_file_send_test PRIVATE eventloop::eventloop)
+        target_compile_options(http2_file_send_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+        add_test(NAME http2_file_send COMMAND http2_file_send_test)
+    endif()
+
     add_executable(quic_varint_test tests/quic_varint.cc)
     target_include_directories(quic_varint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(quic_varint_test PRIVATE eventloop::eventloop)
@@ -1522,6 +1530,15 @@ if(BUILD_TESTING)
                      ${CURL_EXECUTABLE}
     )
     set_tests_properties(http2_server PROPERTIES TIMEOUT 30)
+
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME http2_file_transfer
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http2_file_transfer.py"
+                $<TARGET_FILE:http_server> ${OPENSSL_EXECUTABLE})
+        set_tests_properties(http2_file_transfer PROPERTIES TIMEOUT 20)
+    endif()
 
     add_test(
         NAME http3_server

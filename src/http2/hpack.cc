@@ -466,7 +466,10 @@ struct huffman_tree {
 auto write_string(std::string_view value, std::vector<std::byte>& output) -> void
 {
     write_integer(static_cast<std::uint32_t>(value.size()), 7, 0, output);
-    for (const unsigned char octet : value) output.push_back(std::byte {octet});
+    if (!value.empty()) {
+        const auto octets = std::as_bytes(std::span {value.data(), value.size()});
+        output.insert(output.end(), octets.begin(), octets.end());
+    }
 }
 
 } // namespace

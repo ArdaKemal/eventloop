@@ -218,7 +218,9 @@ separately; Wayfarer and the WebSocket client do so on a bounded worker.
   bounded buffers and a component-by-component path walk that blocks symlink
   escapes. Stonegate supports conditional requests, single byte ranges, and
   bounded directory listings. Linux plain HTTP uses `sendfile` for larger
-  files.
+  files. HTTPS HTTP/1.1 and HTTP/2 use OpenSSL kTLS `sendfile` for file
+  responses when transmit kTLS is active for the connection, with bounded
+  buffered paths otherwise.
 - The outbound HTTP/2 client performs one HTTPS request per connection using
   ALPN `h2`. It supports general methods, bounded owned request bodies,
   streamed uploads, and streamed response bodies and headers. See

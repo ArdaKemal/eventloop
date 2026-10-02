@@ -62,6 +62,10 @@ tcp_stream::~tcp_stream()
 {
     if (connector_ != nullptr || reader_ != nullptr || writer_ != nullptr ||
         file_writer_ != nullptr ||
+#ifdef __linux__
+        read_waiter_ != nullptr || second_read_waiter_ != nullptr ||
+        write_waiter_ != nullptr || second_write_waiter_ != nullptr ||
+#endif
         detail::socket_operations::stream_has_pending(*this)
     ) {
         std::terminate();
@@ -97,6 +101,12 @@ auto tcp_stream::close() -> void
 
 auto tcp_stream::on_read() -> void
 {
+#ifdef __linux__
+    if (read_waiter_ != nullptr && !closed_) {
+        complete_ready<true>({});
+        return;
+    }
+#endif
     if (reader_ == nullptr || closed_) return;
     auto result = detail::socket_operations::start_read(
         descriptor_.get(), reader_->data_, reader_->size_, reader_->operation_);
@@ -122,6 +132,12 @@ auto tcp_stream::on_write() -> void
         complete_file(error);
         return;
     }
+#ifdef __linux__
+    if (write_waiter_ != nullptr && !closed_) {
+        complete_ready<false>({});
+        return;
+    }
+#endif
     if (writer_ == nullptr || closed_) return;
     auto result = detail::socket_operations::start_write(
         descriptor_.get(), writer_->data_, writer_->size_, writer_->operation_);
@@ -153,6 +169,10 @@ auto tcp_stream::fail_and_close(std::error_code error) -> void
             *this, writer_->operation_)) complete_write(0, error);
     if (file_writer_ == nullptr || !detail::socket_operations::stream_cancel(
             *this, file_writer_->operation_)) complete_file(error);
+#ifdef __linux__
+    complete_ready<true>(error);
+    complete_ready<false>(error);
+#endif
     detail::socket_operations::stream_close(*this);
 }
 
@@ -170,9 +190,17 @@ auto tcp_stream::update_async_interest() noexcept -> void
 {
     if (!closed_) {
         try {
-            set_async_interest(reader_ != nullptr,
+            set_async_interest(reader_ != nullptr
+#ifdef __linux__
+                || read_waiter_ != nullptr || second_read_waiter_ != nullptr
+#endif
+                ,
                 connector_ != nullptr || writer_ != nullptr ||
-                    file_writer_ != nullptr);
+                    file_writer_ != nullptr
+#ifdef __linux__
+                    || write_waiter_ != nullptr || second_write_waiter_ != nullptr
+#endif
+                );
         } catch (...) {
             std::terminate();
         }
@@ -371,12 +399,20 @@ auto tcp_stream::io_awaiter<Read>::suspend(
         return false;
     }
     if constexpr (Read) {
-        if (owner_.reader_ != nullptr) {
+        if (owner_.reader_ != nullptr
+#ifdef __linux__
+            || owner_.read_waiter_ != nullptr || owner_.second_read_waiter_ != nullptr
+#endif
+            ) {
             error_ = code(EBUSY);
             return false;
         }
     } else {
-        if (owner_.writer_ != nullptr || owner_.file_writer_ != nullptr) {
+        if (owner_.writer_ != nullptr || owner_.file_writer_ != nullptr
+#ifdef __linux__
+            || owner_.write_waiter_ != nullptr || owner_.second_write_waiter_ != nullptr
+#endif
+            ) {
             error_ = code(EBUSY);
             return false;
         }
@@ -511,7 +547,11 @@ auto tcp_stream::file_awaiter::suspend(
         error_ = code(EBADF);
         return false;
     }
-    if (owner_.writer_ != nullptr || owner_.file_writer_ != nullptr) {
+    if (owner_.writer_ != nullptr || owner_.file_writer_ != nullptr
+#ifdef __linux__
+        || owner_.write_waiter_ != nullptr || owner_.second_write_waiter_ != nullptr
+#endif
+        ) {
         error_ = code(EBUSY);
         return false;
     }
@@ -591,5 +631,115 @@ auto tcp_stream::async_send_file(std::span<const std::byte> header,
 {
     return send_file_task(loop_, *this, header, std::move(file), size);
 }
+
+#ifdef __linux__
+template<bool Read>
+tcp_stream::readiness_awaiter<Read>::~readiness_awaiter()
+{
+    if constexpr (Read) {
+        if (owner_.read_waiter_ == this || owner_.second_read_waiter_ == this)
+            std::terminate();
+    } else {
+        if (owner_.write_waiter_ == this || owner_.second_write_waiter_ == this)
+            std::terminate();
+    }
+}
+
+template<bool Read>
+auto tcp_stream::readiness_awaiter<Read>::suspend(
+    std::coroutine_handle<> handle,
+    detail::coroutine_cancellation_state& state) -> bool
+{
+    if (auto activated = owner_.activate_async_transport(); !activated) {
+        error_ = activated.error();
+        return false;
+    }
+    if (owner_.closed_) { error_ = code(ECANCELED); return false; }
+    if constexpr (Read) {
+        if (owner_.reader_ || (owner_.read_waiter_ && owner_.second_read_waiter_)) {
+            error_ = code(EBUSY); return false;
+        }
+    } else {
+        if (owner_.writer_ || owner_.file_writer_ ||
+            (owner_.write_waiter_ && owner_.second_write_waiter_)) {
+            error_ = code(EBUSY); return false;
+        }
+    }
+    if (state.requested || !detail::coroutine_frame_access::attach_cancellation(
+            state, cancellation_)) {
+        error_ = code(ECANCELED);
+        return false;
+    }
+    continuation_ = handle;
+    if constexpr (Read) {
+        if (owner_.read_waiter_) owner_.second_read_waiter_ = this;
+        else owner_.read_waiter_ = this;
+    } else {
+        if (owner_.write_waiter_) owner_.second_write_waiter_ = this;
+        else owner_.write_waiter_ = this;
+    }
+    try {
+        owner_.set_async_interest(owner_.reader_ || owner_.read_waiter_ ||
+            owner_.second_read_waiter_,
+            owner_.connector_ || owner_.writer_ || owner_.file_writer_ ||
+            owner_.write_waiter_ || owner_.second_write_waiter_);
+    } catch (const std::system_error& error) {
+        if constexpr (Read) {
+            if (owner_.read_waiter_ == this) owner_.read_waiter_ = nullptr;
+            else owner_.second_read_waiter_ = nullptr;
+        } else {
+            if (owner_.write_waiter_ == this) owner_.write_waiter_ = nullptr;
+            else owner_.second_write_waiter_ = nullptr;
+        }
+        detail::coroutine_frame_access::detach_cancellation(cancellation_);
+        error_ = error.code();
+        return false;
+    }
+    return true;
+}
+
+template<bool Read>
+auto tcp_stream::readiness_awaiter<Read>::cancel(
+    detail::coroutine_cancellation_node& node) noexcept -> void
+{
+    auto& self = *static_cast<readiness_awaiter*>(node.operation);
+    auto& owner = self.owner_;
+    if constexpr (Read) {
+        if (owner.read_waiter_ == &self) owner.read_waiter_ = nullptr;
+        else owner.second_read_waiter_ = nullptr;
+    } else {
+        if (owner.write_waiter_ == &self) owner.write_waiter_ = nullptr;
+        else owner.second_write_waiter_ = nullptr;
+    }
+    detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
+    owner.update_async_interest();
+    self.finish(code(ECANCELED));
+}
+
+template<bool Read>
+auto tcp_stream::complete_ready(std::error_code error) noexcept -> void
+{
+    event_loop::handler_call_scope scope(loop_);
+    readiness_awaiter<Read>* first;
+    readiness_awaiter<Read>* second;
+    if constexpr (Read) {
+        first = std::exchange(read_waiter_, nullptr);
+        second = std::exchange(second_read_waiter_, nullptr);
+    } else {
+        first = std::exchange(write_waiter_, nullptr);
+        second = std::exchange(second_write_waiter_, nullptr);
+    }
+    if (first) detail::coroutine_frame_access::detach_cancellation(first->cancellation_);
+    if (second) detail::coroutine_frame_access::detach_cancellation(second->cancellation_);
+    update_async_interest();
+    if (first) first->finish(error);
+    if (second) second->finish(error);
+}
+
+template class tcp_stream::readiness_awaiter<true>;
+template class tcp_stream::readiness_awaiter<false>;
+template auto tcp_stream::complete_ready<true>(std::error_code) noexcept -> void;
+template auto tcp_stream::complete_ready<false>(std::error_code) noexcept -> void;
+#endif
 
 } // namespace eventloop

@@ -30,7 +30,21 @@ struct request {
 
 class session final {
 public:
-    session();
+    explicit session(bool file_sendfile = false);
+
+    struct file_send {
+        unique_fd file;
+        std::uint64_t offset = 0;
+        std::size_t size = 0;
+        std::span<const std::byte> prefix {};
+    };
+    // Normally available after all preceding bytes drain. With include_prefix,
+    // a contiguous preceding queue span can be borrowed for the combined send;
+    // consume that prefix only after transport completion, before returning file.
+    [[nodiscard]] auto take_file_send(bool include_prefix = false) noexcept
+        -> std::optional<file_send>;
+    // Return the descriptor after the borrowed transport send has completed.
+    auto complete_file_send(unique_fd file) -> void;
 
     session(const session&) = delete;
     auto operator=(const session&) -> session& = delete;
@@ -94,11 +108,20 @@ private:
     auto send_window_update(std::uint32_t id, std::uint32_t increment) -> void;
     auto append_frame(std::uint8_t type, std::uint8_t flags,
                       std::uint32_t stream_id,
-                      std::span<const std::byte> payload = {}) -> bool;
+                      std::span<const std::byte> payload = {},
+                      std::size_t file_payload_size = 0) -> bool;
     auto append_response_headers(stream& value, unsigned status,
                                  std::span<const field> headers) -> bool;
     auto pump_responses() -> void;
 
+    // One external payload is an ordering barrier in the bounded byte queue.
+    file_send file_send_;
+    std::size_t file_send_prefix_ = 0;
+    std::uint32_t file_send_stream_ = 0;
+    std::size_t file_send_index_ = 0;
+    std::size_t response_cursor_ = 0;
+    bool file_send_active_ = false;
+    bool file_sendfile_ = false;
     std::array<std::byte, 4096> read_buffer_ {};
     std::array<std::byte, 9> frame_header_ {};
     std::array<std::byte, max_frame_payload> frame_payload_ {};
@@ -107,6 +130,7 @@ private:
     std::size_t expected_payload_size_ = 0;
     std::size_t preface_size_ = 0;
     std::size_t output_offset_ = 0;
+    std::size_t output_size_ = 0;
     std::uint32_t frame_stream_id_ = 0;
     std::uint32_t continuation_stream_id_ = 0;
     std::uint32_t header_stream_id_ = 0;

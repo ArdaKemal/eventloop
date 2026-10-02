@@ -154,6 +154,25 @@ back to an unbounded allocation.
   and `application_protocols` configures ALPN. A handshake on an unconnected
   socket returns `ENOTCONN`. Raw TCP `async_send_file()` is hidden from
   `tls_stream` because it would bypass TLS framing.
+  Construction preallocates OpenSSL's read and write record buffers and throws
+  `std::bad_alloc` if that allocation fails. The stream retains drained record
+  buffers; OpenSSL may still allocate for other TLS processing.
+- On Linux, `tls_stream::kernel_sendfile_available()` reports whether the
+  completed handshake enabled OpenSSL transmit kTLS for this connection.
+  When true, `tls_stream::async_send_file(file, offset, size)` owns the file
+  descriptor through completion and sends that range as encrypted TLS data
+  using `SSL_sendfile()`. It shares the one-write limit and returns `EBUSY`
+  for a concurrent write, `EOVERFLOW` for an unrepresentable file range, and
+  `EOPNOTSUPP` when transmit kTLS is unavailable. Cancellation and transport
+  errors close the stream once sending has begun. On other platforms this
+  operation returns `EOPNOTSUPP`. The overload taking a native descriptor
+  borrows the file without duplicating or closing it; callers must keep it open
+  until completion, including after requesting cancellation. It has the same
+  error, cancellation, and one-write rules as the owning overload. Its optional
+  prefix span is sent before the file range under the same write operation;
+  callers must keep the prefix storage valid and unchanged until completion.
+  HTTPS HTTP/1.1 file responses use this path
+  when available and otherwise use a bounded 4 KiB read/write buffer.
 
 ## UDP and WebSocket
 
@@ -199,8 +218,10 @@ back to an unbounded allocation.
   streams per connection, decodes bounded HPACK header blocks, and observes
   connection and stream DATA flow control. Request bodies are discarded and
   limited to 1 MiB. File responses stream from their owned descriptors; inline
-  response bodies are bounded to 4 MiB per connection. Directory-root traversal
-  shares HTTP/1.1's component-by-component `O_NOFOLLOW` checks. Cleartext
+  response bodies are bounded to 4 MiB per connection. On Linux, file response
+  DATA uses OpenSSL `SSL_sendfile()` when transmit kTLS is active, and otherwise
+  uses the bounded buffered path. Directory-root traversal shares HTTP/1.1's
+  component-by-component `O_NOFOLLOW` checks. Cleartext
   prior-knowledge HTTP/2, h2c upgrade, CONNECT tunnels, and extended CONNECT are
   not supported. Plain `http::server` continues to serve HTTP/1.1.
 - Built-in static-file GET and HEAD responses over HTTP/1.1, HTTP/2, and

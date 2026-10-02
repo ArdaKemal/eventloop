@@ -5,6 +5,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -22,14 +23,23 @@ namespace {
 {
     return {value, std::generic_category()};
 }
+#ifndef __linux__
 [[nodiscard]] auto task_code(task_result result) noexcept -> std::error_code
 {
     return system_code(result == task_result::frame_allocation_failure ? ENOMEM : ECANCELED);
 }
+#endif
 struct active_operation_guard {
     bool& active;
     ~active_operation_guard() { active = false; }
 };
+// SSL_get_error() requires an empty queue before its matching I/O call.
+// Clearing an already empty queue still scans all OpenSSL error slots; the
+// normal established-I/O path only needs to check whether there is an error.
+auto clear_io_errors() noexcept -> void
+{
+    if (ERR_peek_error() != 0) ERR_clear_error();
+}
 enum class context_role { client, server };
 struct tls_callbacks {
     std::vector<std::string> server_protocols_;
@@ -136,10 +146,13 @@ public:
         if (!context) throw std::bad_alloc();
         require_ssl(SSL_CTX_set_min_proto_version(context.get(), TLS1_2_VERSION), "TLS minimum version");
         SSL_CTX_set_options(context.get(), SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_COMPRESSION);
+#ifdef __linux__
+        SSL_CTX_set_options(context.get(), SSL_OP_ENABLE_KTLS);
+#endif
         // Keep record buffers for the connection, avoiding release/reallocate on each read.
         SSL_CTX_clear_mode(context.get(), SSL_MODE_RELEASE_BUFFERS);
         SSL_CTX_set_mode(context.get(), SSL_MODE_AUTO_RETRY);
-        require_ssl(SSL_CTX_set_max_send_fragment(context.get(), 4096), "TLS send fragment limit");
+        require_ssl(SSL_CTX_set_max_send_fragment(context.get(), 16 * 1024), "TLS send fragment limit");
         SSL_CTX_set_session_cache_mode(context.get(), SSL_SESS_CACHE_OFF);
         SSL_CTX_set_num_tickets(context.get(), 0);
         if (role == context_role::client)
@@ -247,7 +260,6 @@ public:
         }
         if (size != 0 && SSL_set_alpn_protos(ssl_.get(), protocols, static_cast<unsigned int>(size)) != 0)
             throw std::bad_alloc();
-        SSL_set_connect_state(ssl_.get());
     }
     implementation(std::shared_ptr<tls_context> context, tls_server_options options)
         : tls_callbacks {std::move(options.application_protocols), {}}, context_(std::move(context)), ssl_(nullptr, SSL_free)
@@ -255,7 +267,6 @@ public:
         initialize(context_role::server);
         for (const auto& protocol : server_protocols_)
             if (protocol.empty() || protocol.size() > 255) throw std::invalid_argument("invalid TLS ALPN protocol");
-        SSL_set_accept_state(ssl_.get());
     }
     auto initialize(context_role role) -> void
     {
@@ -275,6 +286,13 @@ public:
                 state->fatal_error_ = {value & 255, tls_error_category()};
             }
         });
+        if (role == context_role::client) SSL_set_connect_state(ssl_.get());
+        else SSL_set_accept_state(ssl_.get());
+        // Setting the connection role resets the record layer; preallocate after it.
+        if (SSL_alloc_buffers(ssl_.get()) != 1) {
+            ERR_clear_error();
+            throw std::bad_alloc();
+        }
     }
     static auto bio_method() -> const BIO_METHOD*
     {
@@ -317,13 +335,24 @@ public:
         return methods.get();
     }
     auto active() const noexcept -> bool { return SSL_is_init_finished(ssl_.get()) == 1; }
-    auto error(int result) noexcept -> int { return SSL_get_error(ssl_.get(), result); }
+    auto error(int result) noexcept -> int
+    {
+        const int value = SSL_get_error(ssl_.get(), result);
+#ifdef __linux__
+        if (value == SSL_ERROR_SYSCALL && errno != 0)
+            fatal_error_ = system_code(errno);
+#endif
+        return value;
+    }
     auto failure() noexcept -> std::error_code
     {
         const auto code = ERR_peek_last_error();
         const bool exhausted = code && ERR_GET_REASON(code) == ERR_R_MALLOC_FAILURE;
+        const bool truncated = code && ERR_GET_LIB(code) == ERR_LIB_SSL &&
+            ERR_GET_REASON(code) == SSL_R_UNEXPECTED_EOF_WHILE_READING;
         ERR_clear_error();
         if (exhausted) return system_code(ENOMEM);
+        if (truncated) return make_error_code(tls_errc::truncated);
         if (fatal_error_) return fatal_error_;
         return make_error_code(active() ? tls_errc::protocol_error : tls_errc::handshake_failed);
     }
@@ -406,6 +435,32 @@ auto tls_stream::async_write_some(std::span<const std::byte> buffer)
     return write_task(owner_loop(), *this, buffer);
 }
 
+auto tls_stream::kernel_sendfile_available() const noexcept -> bool
+{
+#ifdef __linux__
+    return async_tls_mode_ && implementation_->active() && !transport_closed() &&
+        !(SSL_get_shutdown(implementation_->ssl_.get()) & SSL_SENT_SHUTDOWN) &&
+        BIO_get_ktls_send(SSL_get_wbio(implementation_->ssl_.get())) != 0;
+#else
+    return false;
+#endif
+}
+
+auto tls_stream::async_send_file(unique_fd file, std::uint64_t offset,
+                                 std::size_t size)
+    -> task<std::expected<void, std::error_code>>
+{
+    const auto descriptor = file.get();
+    return send_file_task(owner_loop(), *this, std::move(file), descriptor, offset, size, {});
+}
+
+auto tls_stream::async_send_file(native_socket file, std::uint64_t offset,
+                                 std::size_t size, std::span<const std::byte> prefix)
+    -> task<std::expected<void, std::error_code>>
+{
+    return send_file_task(owner_loop(), *this, {}, file, offset, size, prefix);
+}
+
 auto tls_stream::async_close()
     -> task<std::expected<void, std::error_code>>
 {
@@ -419,6 +474,12 @@ auto tls_stream::activate_async_tls() noexcept
     if (closing_) return std::unexpected(system_code(ECANCELED));
     auto result = activate_async_transport();
     if (!result) return result;
+#ifdef __linux__
+    if (SSL_set_fd(implementation_->ssl_.get(), descriptor()) != 1) {
+        ERR_clear_error();
+        return std::unexpected(system_code(ENOMEM));
+    }
+#endif
     async_tls_mode_ = true;
     return {};
 }
@@ -520,6 +581,10 @@ auto tls_stream::flush_task(event_loop& loop, tls_stream& self)
     -> task<std::expected<void, std::error_code>>
 {
     (void)loop;
+#ifdef __linux__
+    (void)self;
+    co_return std::expected<void, std::error_code> {};
+#else
     auto acquired = co_await flush_waiter {self};
     if (!acquired) co_return std::unexpected(acquired.error());
     struct flush_guard {
@@ -538,11 +603,15 @@ auto tls_stream::flush_task(event_loop& loop, tls_stream& self)
                      state.encrypted_size_);
     }
     co_return std::expected<void, std::error_code> {};
+#endif
 }
 
 auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
     -> task<std::expected<void, std::error_code>>
 {
+#ifdef __linux__
+    (void)loop;
+#endif
     if (self.exclusive_operation_active_ || self.read_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
     self.exclusive_operation_active_ = true;
@@ -556,10 +625,21 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
     auto& state = *self.implementation_;
     for (;;) {
         ERR_clear_error();
+#ifdef __linux__
+        errno = 0;
+#endif
         const int result = SSL_do_handshake(state.ssl_.get());
         const int error = result == 1 ? SSL_ERROR_NONE : state.error(result);
         if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
             co_return std::unexpected(state.failure());
+#ifdef __linux__
+        if (result == 1) { completed = true; co_return std::expected<void, std::error_code> {}; }
+        auto ready = error == SSL_ERROR_WANT_READ
+            ? co_await self.await_readable() : co_await self.await_writable();
+        if (!ready) co_return std::unexpected(ready.error());
+        if (self.transport_closed()) co_return std::unexpected(system_code(ECANCELED));
+        if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+#else
         auto flushed = co_await flush_task(loop, self);
         if (!flushed) co_return std::unexpected(task_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
@@ -570,12 +650,16 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
         if (*received == 0) co_return std::unexpected(make_error_code(tls_errc::truncated));
         if (auto input_error = self.receive_encrypted(std::span(state.input_).first(*received)); input_error)
             co_return std::unexpected(input_error);
+#endif
     }
 }
 
 auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::byte> buffer)
     -> task<std::expected<std::size_t, std::error_code>>
 {
+#ifdef __linux__
+    (void)loop;
+#endif
     if (self.exclusive_operation_active_ || self.read_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
     self.read_operation_active_ = true;
@@ -590,7 +674,10 @@ auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::by
     struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
     for (;;) {
         std::size_t size = 0;
-        ERR_clear_error();
+        clear_io_errors();
+#ifdef __linux__
+        errno = 0;
+#endif
         const int result = SSL_read_ex(state.ssl_.get(), buffer.data(), buffer.size(), &size);
         const int error = result == 1 ? SSL_ERROR_NONE : state.error(result);
         if (error == SSL_ERROR_ZERO_RETURN) {
@@ -600,6 +687,14 @@ auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::by
         }
         if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
             co_return std::unexpected(state.failure());
+#ifdef __linux__
+        if (result == 1) { completed = true; co_return size; }
+        auto ready = error == SSL_ERROR_WANT_READ
+            ? co_await self.await_readable() : co_await self.await_writable();
+        if (!ready) co_return std::unexpected(ready.error());
+        if (self.transport_closed()) co_return std::unexpected(system_code(ECANCELED));
+        if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+#else
         auto flushed = co_await flush_task(loop, self);
         if (!flushed) co_return std::unexpected(task_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
@@ -610,12 +705,16 @@ auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::by
         if (*received == 0) co_return std::unexpected(make_error_code(tls_errc::truncated));
         if (auto input_error = self.receive_encrypted(std::span(state.input_).first(*received)); input_error)
             co_return std::unexpected(input_error);
+#endif
     }
 }
 
 auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const std::byte> buffer)
     -> task<std::expected<std::size_t, std::error_code>>
 {
+#ifdef __linux__
+    (void)loop;
+#endif
     if (self.exclusive_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
     self.write_operation_active_ = true;
@@ -629,29 +728,50 @@ auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const 
     bool completed = false;
     struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
     const auto size = std::min<std::size_t>(buffer.size(), 4096);
+#ifndef __linux__
     // Flush before writing, so this record always has bounded output space.
     auto flushed = co_await flush_task(loop, self);
     if (!flushed) co_return std::unexpected(task_code(flushed.error()));
     if (!*flushed) co_return std::unexpected(flushed->error());
+#endif
     for (;;) {
         std::size_t written = 0;
-        ERR_clear_error();
+        clear_io_errors();
+#ifdef __linux__
+        errno = 0;
+#endif
         const int result = SSL_write_ex(state.ssl_.get(), buffer.data(), size, &written);
         const int error = result == 1 ? SSL_ERROR_NONE : state.error(result);
         // Renegotiation is disabled; established writes do not need a second
         // transport reader. Preserve the caller's buffer across output retries.
-        if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_WRITE)
+        if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_WRITE
+#ifdef __linux__
+            && error != SSL_ERROR_WANT_READ
+#endif
+            )
             co_return std::unexpected(state.failure());
+#ifdef __linux__
+        if (result == 1) { completed = true; co_return written; }
+        auto ready = error == SSL_ERROR_WANT_READ
+            ? co_await self.await_readable() : co_await self.await_writable();
+        if (!ready) co_return std::unexpected(ready.error());
+        if (self.transport_closed()) co_return std::unexpected(system_code(ECANCELED));
+        if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+#else
         auto sent = co_await flush_task(loop, self);
         if (!sent) co_return std::unexpected(task_code(sent.error()));
         if (!*sent) co_return std::unexpected(sent->error());
         if (result == 1) { completed = true; co_return written; }
+#endif
     }
 }
 
 auto tls_stream::close_task(event_loop& loop, tls_stream& self)
     -> task<std::expected<void, std::error_code>>
 {
+#ifdef __linux__
+    (void)loop;
+#endif
     if (self.exclusive_operation_active_ || self.read_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
     self.exclusive_operation_active_ = true;
@@ -663,10 +783,26 @@ auto tls_stream::close_task(event_loop& loop, tls_stream& self)
     auto& state = *self.implementation_;
     for (;;) {
         ERR_clear_error();
+#ifdef __linux__
+        errno = 0;
+#endif
         const int result = SSL_shutdown(state.ssl_.get());
         const int error = result < 0 ? state.error(result) : SSL_ERROR_NONE;
         if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_WRITE && error != SSL_ERROR_WANT_READ)
             co_return std::unexpected(state.failure());
+#ifdef __linux__
+        if (SSL_get_shutdown(state.ssl_.get()) & SSL_SENT_SHUTDOWN) {
+            completed = true;
+            co_return std::expected<void, std::error_code> {};
+        }
+        if (error != SSL_ERROR_WANT_WRITE && error != SSL_ERROR_WANT_READ)
+            co_return std::unexpected(state.failure());
+        auto ready = error == SSL_ERROR_WANT_READ
+            ? co_await self.await_readable() : co_await self.await_writable();
+        if (!ready) co_return std::unexpected(ready.error());
+        if (self.transport_closed()) co_return std::unexpected(system_code(ECANCELED));
+        if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+#else
         auto flushed = co_await flush_task(loop, self);
         if (!flushed) co_return std::unexpected(task_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
@@ -676,6 +812,89 @@ auto tls_stream::close_task(event_loop& loop, tls_stream& self)
             co_return std::expected<void, std::error_code> {};
         }
         if (error != SSL_ERROR_WANT_WRITE) co_return std::unexpected(state.failure());
+#endif
     }
+}
+
+auto tls_stream::send_file_task(event_loop& loop, tls_stream& self,
+    unique_fd owned_file, native_socket file, std::uint64_t offset, std::size_t size,
+    std::span<const std::byte> prefix)
+    -> task<std::expected<void, std::error_code>>
+{
+    (void)loop;
+    (void)owned_file; // Retained in this frame for the owning overload.
+#ifdef __linux__
+    if (self.exclusive_operation_active_ || self.write_operation_active_)
+        co_return std::unexpected(system_code(EBUSY));
+    self.write_operation_active_ = true;
+    active_operation_guard guard {self.write_operation_active_};
+    if (co_await cancellation_requested())
+        co_return std::unexpected(system_code(ECANCELED));
+    if (file == static_cast<native_socket>(-1)) co_return std::unexpected(system_code(EBADF));
+    if (!self.kernel_sendfile_available())
+        co_return std::unexpected(system_code(EOPNOTSUPP));
+    if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+        size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) - offset)
+        co_return std::unexpected(system_code(EOVERFLOW));
+    bool completed = false;
+    struct failure_guard {
+        tls_stream& stream;
+        bool& completed;
+        ~failure_guard() { if (!completed) stream.close(); }
+    } failure {self, completed};
+    auto& state = *self.implementation_;
+    // Keep the H2 DATA header and file payload under one write guard and task.
+    // The prefix is borrowed from the caller's bounded queue; it is never copied
+    // into frame storage, and SSL retries keep the same pointer and length.
+    while (!prefix.empty()) {
+        const auto amount = std::min<std::size_t>(prefix.size(), 16 * 1024);
+        std::size_t written = 0;
+        clear_io_errors();
+        errno = 0;
+        const int result = SSL_write_ex(state.ssl_.get(), prefix.data(), amount, &written);
+        if (result == 1) {
+            if (written == 0) co_return std::unexpected(system_code(EIO));
+            prefix = prefix.subspan(written);
+            continue;
+        }
+        const int error = state.error(result);
+        if (error != SSL_ERROR_WANT_WRITE && error != SSL_ERROR_WANT_READ)
+            co_return std::unexpected(state.failure());
+        auto ready = error == SSL_ERROR_WANT_READ
+            ? co_await self.await_readable() : co_await self.await_writable();
+        if (!ready) co_return std::unexpected(ready.error());
+        if (self.transport_closed()) co_return std::unexpected(system_code(ECANCELED));
+        if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+    }
+    while (size != 0) {
+        const auto amount = std::min(size,
+            static_cast<std::size_t>(std::numeric_limits<ossl_ssize_t>::max()));
+        clear_io_errors();
+        errno = 0;
+        const auto result = SSL_sendfile(state.ssl_.get(), file,
+            static_cast<off_t>(offset), amount, 0);
+        if (result > 0) {
+            offset += static_cast<std::uint64_t>(result);
+            size -= static_cast<std::size_t>(result);
+            continue;
+        }
+        const auto error = state.error(static_cast<int>(result));
+        if (error != SSL_ERROR_WANT_WRITE && error != SSL_ERROR_WANT_READ) {
+            if (error == SSL_ERROR_SYSCALL && errno != 0)
+                co_return std::unexpected(system_code(errno));
+            co_return std::unexpected(state.failure());
+        }
+        auto ready = error == SSL_ERROR_WANT_READ
+            ? co_await self.await_readable() : co_await self.await_writable();
+        if (!ready) co_return std::unexpected(ready.error());
+        if (self.transport_closed()) co_return std::unexpected(system_code(ECANCELED));
+        if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+    }
+    completed = true;
+    co_return std::expected<void, std::error_code> {};
+#else
+    (void)self; (void)file; (void)offset; (void)size; (void)prefix;
+    co_return std::unexpected(system_code(EOPNOTSUPP));
+#endif
 }
 } // namespace eventloop

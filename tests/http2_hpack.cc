@@ -1,10 +1,17 @@
 #include "http2/hpack.h"
+#include "http2/session.h"
+
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <deque>
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -111,9 +118,148 @@ auto encoder_round_trip() -> void
               decoded[0].name == source[0].name &&
               decoded[1].value == source[1].value,
           "encoder round trip");
+    // Raw literals preserve empty strings and every octet across the
+    // one-byte and multi-byte length-prefix boundary.
+    std::string octets;
+    for (unsigned value = 0; value < 256; ++value) {
+        octets.push_back(static_cast<char>(value));
+    }
+    for (const auto length : {std::size_t {0}, std::size_t {126},
+                              std::size_t {127}, std::size_t {128},
+                              octets.size()}) {
+        const std::vector<field> raw {{"x-raw", octets.substr(0, length)}};
+        check(hpack_encode(raw, encoded) == hpack_error::none,
+              "encode raw literal");
+        check(decoder.decode(encoded, decoded) == hpack_error::none &&
+                  decoded.size() == 1 && decoded[0].name == raw[0].name &&
+                  decoded[0].value == raw[0].value,
+              "raw literal octets or length changed");
+    }
     std::vector<field> too_many(hpack_max_fields + 1, field {"x", "y"});
     check(hpack_encode(too_many, encoded) == hpack_error::limit_exceeded,
           "encoder field count limit");
+}
+
+// Exercise the session output queue through its transport-facing interface.
+// Keep nearly 256 KiB pending while draining fragments and appending PINGs,
+// so both frame headers and payloads repeatedly cross the buffer boundary.
+auto session_output_wraparound() -> void
+{
+    eventloop::http2::detail::session state;
+    auto feed = [&state](std::span<const std::byte> input) {
+        while (!input.empty()) {
+            const auto count = std::min(input.size(), state.read_buffer().size());
+            std::memcpy(state.read_buffer().data(), input.data(), count);
+            state.commit_read(count);
+            input = input.subspan(count);
+        }
+    };
+    constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    feed(std::as_bytes(std::span(preface)));
+    const std::array<std::byte, 9> settings {std::byte {0}, std::byte {0},
+        std::byte {0}, std::byte {4}};
+    feed(settings);
+    while (!state.output().empty()) state.consume_output(state.output().size());
+
+    std::deque<std::byte> expected;
+    auto ping = [&](std::size_t sequence) {
+        std::array<std::byte, 17> frame {};
+        frame[2] = std::byte {8};
+        frame[3] = std::byte {6};
+        for (std::size_t index = 9; index < frame.size(); ++index) {
+            frame[index] = static_cast<std::byte>((sequence + index * 31) & 255);
+        }
+        feed(frame);
+        frame[4] = std::byte {1};
+        expected.insert(expected.end(), frame.begin(), frame.end());
+        check(!state.closed(), "session closed while recycling output capacity");
+    };
+    auto drain = [&](std::size_t count) {
+        while (count != 0) {
+            const auto bytes = state.output();
+            check(!bytes.empty(), "session lost queued bytes");
+            const auto consumed = std::min(count, bytes.size());
+            for (const auto byte : bytes.first(consumed)) {
+                check(!expected.empty() && byte == expected.front(),
+                    "session changed frame bytes or order across wraparound");
+                expected.pop_front();
+            }
+            state.consume_output(consumed);
+            count -= consumed;
+        }
+    };
+    // Force a size increase after unread bytes have already wrapped around
+    // the initial 4 KiB storage, then verify the queue survives reuse.
+    for (std::size_t sequence = 0; sequence < 200; ++sequence) ping(sequence);
+    drain(1000);
+    for (std::size_t sequence = 200; sequence < 300; ++sequence) ping(sequence);
+    drain(expected.size());
+    for (std::size_t sequence = 0; sequence < 15000; ++sequence) ping(sequence);
+    for (std::size_t sequence = 15000; sequence < 55000; ++sequence) {
+        drain(sequence % 3 == 0 ? 1 : sequence % 3 == 1 ? 16 : 34);
+        ping(sequence);
+    }
+    drain(expected.size());
+    check(state.output().empty(), "session retained fully consumed output");
+
+    // A response larger than the queue must resume after partial transport
+    // drains. Widen both HTTP/2 windows to make queue capacity the limiter.
+    const std::array<std::byte, 15> large_window {std::byte {0}, std::byte {0},
+        std::byte {6}, std::byte {4}, std::byte {0}, std::byte {0}, std::byte {0},
+        std::byte {0}, std::byte {0}, std::byte {0}, std::byte {4}, std::byte {0},
+        std::byte {64}, std::byte {0}, std::byte {0}};
+    feed(large_window);
+    const std::array<std::byte, 13> connection_window {std::byte {0}, std::byte {0},
+        std::byte {4}, std::byte {8}, std::byte {0}, std::byte {0}, std::byte {0},
+        std::byte {0}, std::byte {0}, std::byte {0}, std::byte {64},
+        std::byte {0}, std::byte {0}};
+    feed(connection_window);
+    std::vector<std::byte> block;
+    const std::array<field, 4> fields {{{":method", "GET"}, {":scheme", "https"},
+        {":path", "/"}, {":authority", "localhost"}}};
+    check(hpack_encode(fields, block) == hpack_error::none, "encode session request");
+    std::array<std::byte, 9> headers {};
+    headers[2] = static_cast<std::byte>(block.size());
+    headers[3] = std::byte {1};
+    headers[4] = std::byte {5};
+    headers[8] = std::byte {1};
+    feed(headers);
+    feed(block);
+    eventloop::http2::detail::request request;
+    check(state.pop_request(request), "session did not deliver request");
+    std::vector<std::byte> body(1024 * 1024);
+    for (std::size_t index = 0; index < body.size(); ++index) {
+        body[index] = static_cast<std::byte>((index * 31 + index / 16384) & 255);
+    }
+    check(state.respond(1, 200, {}, body), "session rejected bounded body");
+    std::vector<std::byte> wire;
+    while (!state.output().empty()) {
+        const auto bytes = state.output().first(std::min<std::size_t>(997, state.output().size()));
+        wire.insert(wire.end(), bytes.begin(), bytes.end());
+        state.consume_output(bytes.size());
+    }
+    std::size_t body_offset = 0;
+    bool ended = false;
+    for (std::size_t offset = 0; offset < wire.size();) {
+        check(wire.size() - offset >= 9, "session truncated frame header");
+        const auto length = (std::to_integer<std::size_t>(wire[offset]) << 16) |
+            (std::to_integer<std::size_t>(wire[offset + 1]) << 8) |
+            std::to_integer<std::size_t>(wire[offset + 2]);
+        check(length <= wire.size() - offset - 9, "session truncated frame payload");
+        if (wire[offset + 3] == std::byte {0}) {
+            check(!ended && length <= body.size() - body_offset,
+                "session emitted excess or late DATA");
+            check(std::equal(wire.begin() + static_cast<std::ptrdiff_t>(offset + 9),
+                wire.begin() + static_cast<std::ptrdiff_t>(offset + 9 + length),
+                body.begin() + static_cast<std::ptrdiff_t>(body_offset)),
+                "session corrupted DATA while resuming full queue");
+            body_offset += length;
+            ended = (wire[offset + 4] & std::byte {1}) != std::byte {0};
+        }
+        offset += 9 + length;
+    }
+    check(body_offset == body.size() && ended && !state.closed(),
+        "session did not finish response after full queue retries");
 }
 
 } // namespace
@@ -123,4 +269,5 @@ int main()
     rfc_request_vectors();
     malformed_and_limits();
     encoder_round_trip();
+    session_output_wraparound();
 }

@@ -176,11 +176,12 @@ auto write_u32(std::byte* output, std::uint32_t value) noexcept -> void
 
 } // namespace
 
-session::session()
+session::session(bool file_sendfile)
+    : file_sendfile_(file_sendfile)
 {
     requests_.reserve(8);
     header_block_.reserve(4096);
-    output_.reserve(4096);
+    output_.resize(4096);
     decoded_fields_.reserve(16);
 
     std::array<std::byte, 24> settings {};
@@ -214,21 +215,51 @@ auto session::commit_read(std::size_t size) -> void
 
 auto session::output() const noexcept -> std::span<const std::byte>
 {
-    if (output_offset_ >= output_.size()) return {};
-    return std::span {output_}.subspan(output_offset_);
+    return std::span {output_}.subspan(output_offset_,
+        std::min({output_size_, output_.size() - output_offset_,
+            file_send_active_ ? file_send_prefix_ : output_size_}));
 }
 
 auto session::consume_output(std::size_t size) -> void
 {
-    if (size > output_.size() - output_offset_) {
+    if (size > output().size()) {
         connection_error(internal_error);
         return;
     }
-    output_offset_ += size;
-    if (output_offset_ == output_.size()) {
-        output_.clear();
-        output_offset_ = 0;
+    output_offset_ = (output_offset_ + size) % output_.size();
+    output_size_ -= size;
+    if (file_send_active_) file_send_prefix_ -= size;
+    if (output_size_ == 0) output_offset_ = 0;
+    pump_responses();
+}
+
+auto session::take_file_send(bool include_prefix) noexcept -> std::optional<file_send>
+{
+    if (!file_send_active_ || !file_send_.file) return std::nullopt;
+    if (file_send_prefix_ != 0) {
+        // A wrapped queue is drained normally until its remaining prefix is
+        // contiguous. Never expose bytes after the file ordering barrier.
+        if (!include_prefix || output().size() != file_send_prefix_)
+            return std::nullopt;
+        file_send_.prefix = output();
     }
+    return std::move(file_send_);
+}
+
+auto session::complete_file_send(unique_fd file) -> void
+{
+    if (!file_send_active_ || file_send_prefix_ != 0 || file_send_.file || !file) {
+        connection_error(internal_error);
+        return;
+    }
+    // A nonfinal frame returns its owner to the active response. A final
+    // frame (or a reset stream) closes it here, after transport completion.
+    auto& value = streams_[file_send_index_];
+    if (value.active && value.id == file_send_stream_)
+        value.response_file = std::move(file);
+    file_send_active_ = false;
+    file_send_ = {};
+    file_send_stream_ = 0;
     pump_responses();
 }
 
@@ -281,7 +312,7 @@ auto session::respond_file(std::uint32_t stream_id, unsigned status,
 
 auto session::closed() const noexcept -> bool
 {
-    if (!output().empty()) return false;
+    if (output_size_ != 0 || file_send_active_) return false;
     if (fatal_) return true;
     if (!peer_goaway_) return false;
     return std::none_of(streams_.begin(), streams_.end(),
@@ -961,33 +992,49 @@ auto session::send_window_update(std::uint32_t id,
 
 auto session::append_frame(std::uint8_t type, std::uint8_t flags,
                            std::uint32_t stream_id,
-                           std::span<const std::byte> payload) -> bool
+                           std::span<const std::byte> payload,
+                           std::size_t file_payload_size) -> bool
 {
-    if (payload.size() > max_frame_payload || payload.size() > 0x00ffffffu) {
+    if (file_payload_size > max_frame_payload ||
+        payload.size() > max_frame_payload - file_payload_size) return false;
+    const auto needed = payload.size() + 9;
+    const auto reserved = file_send_active_ ? file_send_.size : 0;
+    if (needed + file_payload_size > max_output_size - output_size_ - reserved)
         return false;
-    }
-    const auto pending = output_.size() - output_offset_;
-    if (payload.size() + 9 > max_output_size - std::min(pending, max_output_size)) {
-        return false;
-    }
-    if (output_offset_ != 0 &&
-        (output_offset_ > output_.size() / 2 || output_.size() + payload.size() + 9 >
-                                               max_output_size)) {
-        std::move(output_.begin() + static_cast<std::ptrdiff_t>(output_offset_),
-                  output_.end(), output_.begin());
-        output_.resize(pending);
+    if (needed > output_.size() - output_size_) {
+        // Grow only when needed, up to the queue bound. Once grown, partial
+        // transport writes recycle space without moving any pending bytes.
+        const auto capacity = std::min(max_output_size,
+            std::max(output_.size() * 2, output_size_ + needed));
+        std::vector<std::byte> grown(capacity);
+        const auto first = std::min(output_size_, output_.size() - output_offset_);
+        std::memcpy(grown.data(), output_.data() + output_offset_, first);
+        if (first != output_size_) {
+            std::memcpy(grown.data() + first, output_.data(), output_size_ - first);
+        }
+        output_ = std::move(grown);
         output_offset_ = 0;
     }
-    const auto old_size = output_.size();
-    output_.resize(old_size + 9 + payload.size());
-    auto* header = output_.data() + old_size;
-    header[0] = static_cast<std::byte>((payload.size() >> 16) & 0xff);
-    header[1] = static_cast<std::byte>((payload.size() >> 8) & 0xff);
-    header[2] = static_cast<std::byte>(payload.size() & 0xff);
+    std::array<std::byte, 9> header {};
+    const auto wire_size = payload.size() + file_payload_size;
+    header[0] = static_cast<std::byte>((wire_size >> 16) & 0xff);
+    header[1] = static_cast<std::byte>((wire_size >> 8) & 0xff);
+    header[2] = static_cast<std::byte>(wire_size & 0xff);
     header[3] = static_cast<std::byte>(type);
     header[4] = static_cast<std::byte>(flags);
-    write_u32(header + 5, stream_id & 0x7fffffffu);
-    if (!payload.empty()) std::memcpy(header + 9, payload.data(), payload.size());
+    write_u32(header.data() + 5, stream_id & 0x7fffffffu);
+    auto append = [this](std::span<const std::byte> bytes) {
+        if (bytes.empty()) return;
+        const auto tail = (output_offset_ + output_size_) % output_.size();
+        const auto first = std::min(bytes.size(), output_.size() - tail);
+        std::memcpy(output_.data() + tail, bytes.data(), first);
+        if (first != bytes.size()) {
+            std::memcpy(output_.data(), bytes.data() + first, bytes.size() - first);
+        }
+        output_size_ += bytes.size();
+    };
+    append(header);
+    append(payload);
     return true;
 }
 
@@ -1008,7 +1055,8 @@ auto session::append_response_headers(stream& value, unsigned status,
     if (encoded != hpack_error::none) return false;
     const auto frames = (block.size() + max_frame_payload - 1) / max_frame_payload;
     const auto needed = block.size() + 9 * std::max<std::size_t>(frames, 1);
-    if (needed > max_output_size - (output_.size() - output_offset_)) return false;
+    const auto reserved = file_send_active_ ? file_send_.size : 0;
+    if (needed > max_output_size - output_size_ - reserved) return false;
 
     std::size_t offset = 0;
     bool first = true;
@@ -1030,11 +1078,14 @@ auto session::append_response_headers(stream& value, unsigned status,
 
 auto session::pump_responses() -> void
 {
-    if (fatal_) return;
+    if (fatal_ || file_send_active_) return;
     bool progressed = true;
     while (progressed) {
         progressed = false;
-        for (auto& value : streams_) {
+        const auto start = response_cursor_;
+        for (std::size_t step = 0; step < streams_.size(); ++step) {
+            const auto index = (start + step) % streams_.size();
+            auto& value = streams_[index];
             if (!value.active) continue;
             if (value.request_ready && !value.response_started) continue;
             if (!value.response_started) continue;
@@ -1054,7 +1105,34 @@ auto session::pump_responses() -> void
             });
             if (available == 0) continue;
             const auto count = static_cast<std::size_t>(available);
+            if (count + 9 > max_output_size - output_size_) {
+                // Do not read a file range that cannot be queued yet.
+                // consume_output() retries after the transport drains output.
+                return;
+            }
             std::span<const std::byte> body;
+            if (value.response_file && file_sendfile_) {
+#if defined(__linux__)
+                // Move the response owner into the frame instead of duplicating
+                // it. The transport borrows it and completion returns ownership
+                // to this response, or closes it for the final/reset stream.
+                const bool last = value.response_offset + count == value.response_size;
+                if (!append_frame(data_frame, last ? flag_end_stream : 0,
+                                  value.id, {}, count)) return;
+                file_send_ = {std::move(value.response_file),
+                    value.response_file_start + value.response_offset, count};
+                file_send_stream_ = value.id;
+                file_send_index_ = index;
+                file_send_prefix_ = output_size_;
+                file_send_active_ = true;
+                value.response_offset += count;
+                connection_send_window_ -= static_cast<std::int64_t>(count);
+                value.send_window -= static_cast<std::int64_t>(count);
+                response_cursor_ = (index + 1) % streams_.size();
+                if (last) reset_stream(value);
+                return;
+#endif
+            }
             if (value.response_file) {
                 if (!http::detail::read_file_at(value.response_file.get(),
                         value.response_file_start + value.response_offset,
@@ -1075,6 +1153,7 @@ auto session::pump_responses() -> void
                 // pumping after the transport drains it.
                 return;
             }
+            response_cursor_ = (index + 1) % streams_.size();
             value.response_offset += count;
             connection_send_window_ -= static_cast<std::int64_t>(count);
             value.send_window -= static_cast<std::int64_t>(count);

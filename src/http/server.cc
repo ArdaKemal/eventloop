@@ -164,6 +164,18 @@ template<typename Stream>
                         continue;
                     }
                 }
+                if constexpr (std::is_same_v<Stream, tls_stream>) {
+                    if (peer->kernel_sendfile_available()) {
+                        auto sent = co_await peer->async_send_file(
+                            std::move(file), file_offset, file_size);
+                        if (!operation_succeeded(sent)) {
+                            peer->close();
+                            co_return;
+                        }
+                        state->finish_response();
+                        continue;
+                    }
+                }
                 if (!tls_file_buffer) {
                     tls_file_buffer.reset(
                         new (std::nothrow) std::byte[4096]);

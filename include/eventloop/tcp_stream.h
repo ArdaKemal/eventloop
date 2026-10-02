@@ -172,6 +172,43 @@ protected:
     [[nodiscard]] auto activate_async_transport() noexcept
         -> std::expected<void, std::error_code>;
     [[nodiscard]] auto transport_closed() const noexcept -> bool { return closed_; }
+#ifdef __linux__
+    template<bool Read>
+    class readiness_awaiter {
+    public:
+        explicit readiness_awaiter(tcp_stream& owner) noexcept : owner_(owner)
+        { cancellation_.operation = this; cancellation_.cancel = &cancel; }
+        ~readiness_awaiter();
+        readiness_awaiter(const readiness_awaiter&) = delete;
+        auto operator=(const readiness_awaiter&) -> readiness_awaiter& = delete;
+        readiness_awaiter(readiness_awaiter&&) = delete;
+        [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+        template<typename Promise>
+        auto await_suspend(std::coroutine_handle<Promise> handle) -> bool
+        {
+            if (handle.promise().owner_loop() != &owner_.loop_) std::terminate();
+            return suspend(handle, *handle.promise().cancellation_state());
+        }
+        [[nodiscard]] auto await_resume() const noexcept
+            -> std::expected<void, std::error_code>
+        { if (error_) return std::unexpected(error_); return {}; }
+    private:
+        friend class tcp_stream;
+        static auto cancel(detail::coroutine_cancellation_node& node) noexcept -> void;
+        auto suspend(std::coroutine_handle<> handle,
+                     detail::coroutine_cancellation_state& state) -> bool;
+        auto finish(std::error_code error) noexcept -> void
+        { error_ = error; continuation_.resume(); }
+        tcp_stream& owner_;
+        detail::coroutine_cancellation_node cancellation_ {};
+        std::coroutine_handle<> continuation_ {};
+        std::error_code error_ {};
+    };
+    [[nodiscard]] auto await_readable() noexcept -> readiness_awaiter<true>
+    { return readiness_awaiter<true>(*this); }
+    [[nodiscard]] auto await_writable() noexcept -> readiness_awaiter<false>
+    { return readiness_awaiter<false>(*this); }
+#endif
 
 private:
     friend class event_loop;
@@ -192,6 +229,9 @@ private:
     auto complete_read(std::size_t size, std::error_code error) noexcept -> void;
     auto complete_write(std::size_t size, std::error_code error) noexcept -> void;
     auto complete_file(std::error_code error) noexcept -> void;
+#ifdef __linux__
+    template<bool Read> auto complete_ready(std::error_code error) noexcept -> void;
+#endif
     auto fail_and_close(std::error_code error) -> void;
 
     event_loop& loop_;
@@ -204,6 +244,12 @@ private:
     io_awaiter<true>* reader_ {nullptr};
     io_awaiter<false>* writer_ {nullptr};
     file_awaiter* file_writer_ {nullptr};
+#ifdef __linux__
+    readiness_awaiter<true>* read_waiter_ {nullptr};
+    readiness_awaiter<true>* second_read_waiter_ {nullptr};
+    readiness_awaiter<false>* write_waiter_ {nullptr};
+    readiness_awaiter<false>* second_write_waiter_ {nullptr};
+#endif
     bool connected_ {true};
     bool connect_started_ {false};
     bool transport_activated_ {false};

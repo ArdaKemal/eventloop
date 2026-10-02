@@ -5,6 +5,7 @@
 #include "eventloop/tls_context.h"
 
 #include <expected>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -60,6 +61,21 @@ public:
         -> task<std::expected<std::size_t, std::error_code>>;
     [[nodiscard]] auto async_write_some(std::span<const std::byte> buffer)
         -> task<std::expected<std::size_t, std::error_code>>;
+    // Available after handshake when OpenSSL enabled Linux transmit kTLS.
+    // The file remains owned through completion or cancellation.
+    [[nodiscard]] auto kernel_sendfile_available() const noexcept -> bool;
+    [[nodiscard]] auto async_send_file(unique_fd file, std::uint64_t offset,
+                                       std::size_t size)
+        -> task<std::expected<void, std::error_code>>;
+    // Borrows a descriptor; the caller must keep it open until completion,
+    // including after cancellation is requested. Otherwise identical to the
+    // ownership-taking overload, without duplicating or closing the file.
+    // An optional prefix is sent before the file range in the same write
+    // operation; its storage must remain valid and unchanged until completion.
+    [[nodiscard]] auto async_send_file(native_socket file, std::uint64_t offset,
+                                       std::size_t size,
+                                       std::span<const std::byte> prefix = {})
+        -> task<std::expected<void, std::error_code>>;
     // Flushes close_notify. Close the transport after this task completes.
     [[nodiscard]] auto async_close()
         -> task<std::expected<void, std::error_code>>;
@@ -80,6 +96,10 @@ private:
     [[nodiscard]] static auto flush_task(event_loop& loop, tls_stream& self)
         -> task<std::expected<void, std::error_code>>;
     [[nodiscard]] static auto close_task(event_loop& loop, tls_stream& self)
+        -> task<std::expected<void, std::error_code>>;
+    [[nodiscard]] static auto send_file_task(event_loop& loop, tls_stream& self,
+        unique_fd owned_file, native_socket file, std::uint64_t offset, std::size_t size,
+        std::span<const std::byte> prefix)
         -> task<std::expected<void, std::error_code>>;
     [[nodiscard]] auto activate_async_tls() noexcept
         -> std::expected<void, std::error_code>;

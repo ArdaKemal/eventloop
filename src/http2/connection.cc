@@ -197,7 +197,7 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
            bool directory_listing) -> task<bool>
 {
     try {
-        auto state = std::make_unique<session>();
+        auto state = std::make_unique<session>(peer.kernel_sendfile_available());
         for (;;) {
             request incoming;
             while (state->pop_request(incoming)) {
@@ -205,7 +205,16 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
                               directory_listing);
             }
 
-            while (!state->output().empty()) {
+            for (;;) {
+                if (auto file = state->take_file_send(true)) {
+                    auto sent = operation_result(co_await peer.async_send_file(
+                        file->file.get(), file->offset, file->size, file->prefix));
+                    if (!sent) co_return false;
+                    state->consume_output(file->prefix.size());
+                    state->complete_file_send(std::move(file->file));
+                    continue;
+                }
+                if (state->output().empty()) break;
                 auto written = operation_result(
                     co_await peer.async_write_some(state->output()));
                 if (!written || *written == 0) co_return false;
