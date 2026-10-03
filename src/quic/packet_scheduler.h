@@ -120,9 +120,10 @@ public:
         }
         if (level == tls_level::application) {
             // ACK/control-only packets need no packet-local flow snapshot.
-            // Copy the bounded table only after a STREAM candidate fits.
-            std::optional<flow_control<bounded_connection::stream_capacity>> flow;
-            auto credit = connection_.flow().send_max_data() - connection_.flow().sent_total();
+            // A read-only transaction stages only the streams this packet
+            // touches, so no full flow table is copied per packet.
+            auto flow = connection_.flow().stage_send<bounded_connection::frames_per_packet>();
+            auto credit = flow.send_max_data() - flow.sent_total();
             // Across all streams, transmitted data precedes new data in a PTO
             // packet. Selection does not declare the original packet lost.
             for (unsigned pass = 0; pass < (probe ? 2u : 1u) && range_count_ < ranges_.size(); ++pass) {
@@ -154,9 +155,8 @@ public:
                 // avoids copying the whole flow table for each STREAM frame.
                 const auto size = encode_frame(frame,std::span(payload_).subspan(used_,payload_limit_-used_));
                 if (!size) continue;
-                if (!flow) flow.emplace(connection_.flow());
-                if (!flow->send_stream_range(stream.id, chunk.offset, chunk.data.size(), chunk.fin)) continue;
-                credit = flow->send_max_data() - flow->sent_total();
+                if (!flow.send_stream_range(stream.id, chunk.offset, chunk.data.size(), chunk.fin)) continue;
+                credit = flow.send_max_data() - flow.sent_total();
                 used_ += *size;
                 range_slots_[range_count_] = &stream;
                 ranges_[range_count_++] = {false,stream.id,chunk.offset,chunk.data.size(),chunk.fin}; eliciting = true;

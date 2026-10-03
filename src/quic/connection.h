@@ -407,7 +407,8 @@ public:
                     return std::unexpected(connection_error::invalid_state);
             } else {
                 auto* s = range_streams[range_index];
-                (void)s->send.mark_sent(range.offset, range.size, range.fin);
+                // preflight_mark_sent validated this range in the first pass.
+                s->send.mark_sent_trusted(range.offset, range.size, range.fin);
                 (void)s->state.send_stream(range.offset, range.size, range.fin);
                 s->sent_highest = (std::max)(s->sent_highest, range.offset + range.size);
             }

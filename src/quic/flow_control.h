@@ -71,6 +71,13 @@ public:
             return {};
         }
 
+        // Running connection-level credit after the ranges staged so far. Lets a
+        // caller track a packet's remaining credit without copying the table.
+        [[nodiscard]] constexpr auto send_max_data() const noexcept -> std::uint64_t
+        { return owner_.send_max_data(); }
+        [[nodiscard]] constexpr auto sent_total() const noexcept -> std::uint64_t
+        { return total_; }
+
         constexpr auto commit() noexcept -> void requires (!ReadOnly)
         {
             for (std::size_t i = 0; i < size_; ++i) {

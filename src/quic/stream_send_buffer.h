@@ -184,6 +184,18 @@ public:
         return {};
     }
 
+    // Commit a range already validated by preflight_mark_sent within the same
+    // serialized packet operation; skips the redundant validation rescan.
+    constexpr auto mark_sent_trusted(std::uint64_t offset, std::size_t length,
+                                     bool fin = false) noexcept -> void
+    {
+        bytes_.mark_sent_trusted(offset, length);
+        if (fin) {
+            fin_sent_ = true;
+            fin_pending_ = false;
+        }
+    }
+
     // Reports may cover part of a transmitted STREAM frame. Retired prefixes
     // and duplicate reports are harmless. Both byte and FIN updates are atomic.
     [[nodiscard]] constexpr auto acknowledge(std::uint64_t offset,

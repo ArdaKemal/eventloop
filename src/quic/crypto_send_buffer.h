@@ -148,11 +148,19 @@ public:
         if (const auto result = preflight_mark_sent(offset, length); !result) return result;
         // Preflight excluded ACKed bytes; every remaining byte becomes sent
         // and non-pending, including overlapping probes and retransmissions.
+        mark_sent_trusted(offset, length);
+        return {};
+    }
+
+    // Commit a range the caller already validated with preflight_mark_sent in
+    // the same serialized operation. Skips the redundant flag rescan.
+    constexpr auto mark_sent_trusted(std::uint64_t offset,
+                                     std::size_t length) noexcept -> void
+    {
         fill_flags(offset, length, sent_flag);
         if (pending_begin_ >= offset && pending_begin_ < offset + length)
             pending_begin_ = offset + length;
         advance_pending();
-        return {};
     }
 
     // ACK and loss reports may cover subranges of a transmitted CRYPTO frame.
