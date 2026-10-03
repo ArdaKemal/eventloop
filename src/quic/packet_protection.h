@@ -63,8 +63,14 @@ private:
     void* seal_ {};
     void* open_ {};
     void* hp_ {};
+    std::array<std::uint8_t, 16> seal_key_ {};
+    std::array<std::uint8_t, 16> open_key_ {};
+    std::array<std::uint8_t, 16> hp_key_ {};
     std::thread::id owner_;
     bool initialized_ {};
+    bool seal_key_set_ {false};
+    bool open_key_set_ {false};
+    bool hp_key_set_ {false};
 };
 
 [[nodiscard]] auto seal_payload(packet_protection_context& context,

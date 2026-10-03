@@ -263,9 +263,16 @@ auto packet_protection_context::seal(const aes_128_gcm_keys& keys, std::uint64_t
     const auto nonce = nonce_for(keys, packet_number);
     int written = 0;
     int final_written = 0;
-    if (!ready() || EVP_EncryptInit_ex(ctx, nullptr, nullptr,
-                                   keys.key.data(), nonce.data()) <= 0 ||
-        EVP_EncryptUpdate(ctx, nullptr, &written, header.data(),
+    if (!ready())
+        return std::unexpected(protection_error::provider_failure);
+    // Re-key only on a key change; the nonce alone selects the packet.
+    const auto reuse_key = seal_key_set_ && seal_key_ == keys.key;
+    if (EVP_EncryptInit_ex(ctx, nullptr, nullptr,
+                           reuse_key ? nullptr : keys.key.data(), nonce.data()) <= 0)
+        return std::unexpected(protection_error::provider_failure);
+    seal_key_ = keys.key;
+    seal_key_set_ = true;
+    if (EVP_EncryptUpdate(ctx, nullptr, &written, header.data(),
                           static_cast<int>(header.size())) <= 0 ||
         EVP_EncryptUpdate(ctx, output.data(), &written, plaintext.data(),
                           static_cast<int>(plaintext.size())) <= 0 ||
@@ -310,8 +317,12 @@ auto packet_protection_context::open(const aes_128_gcm_keys& keys, std::uint64_t
     } clear {scratch};
     int written = 0;
     int final_written = 0;
-    if (!ready() || EVP_DecryptInit_ex(ctx, nullptr, nullptr,
-                                   keys.key.data(), nonce.data()) <= 0 ||
+    if (!ready())
+        return std::unexpected(protection_error::provider_failure);
+    // Re-key only on a key change; the nonce alone selects the packet.
+    const auto reuse_key = open_key_set_ && open_key_ == keys.key;
+    if (EVP_DecryptInit_ex(ctx, nullptr, nullptr,
+                           reuse_key ? nullptr : keys.key.data(), nonce.data()) <= 0 ||
         EVP_DecryptUpdate(ctx, nullptr, &written, header.data(),
                           static_cast<int>(header.size())) <= 0 ||
         EVP_DecryptUpdate(ctx, destination, &written,
@@ -320,6 +331,8 @@ auto packet_protection_context::open(const aes_128_gcm_keys& keys, std::uint64_t
                             const_cast<std::uint8_t*>(ciphertext_and_tag.data() + length)) <= 0) {
         return std::unexpected(protection_error::provider_failure);
     }
+    open_key_ = keys.key;
+    open_key_set_ = true;
     if (EVP_DecryptFinal_ex(ctx, destination + written,
                             &final_written) <= 0) {
         return std::unexpected(protection_error::authentication_failed);
@@ -341,10 +354,22 @@ auto packet_protection_context::protect_header(
     std::array<std::uint8_t, 16> mask {};
     int written = 0;
     int final_written = 0;
-    if (!ready() || EVP_EncryptInit_ex(ctx, nullptr, nullptr,
-                                   keys.hp.data(), nullptr) <= 0 ||
-        EVP_CIPHER_CTX_set_padding(ctx, 0) <= 0 ||
-        EVP_EncryptUpdate(ctx, mask.data(), &written,
+    if (!ready())
+        return std::unexpected(protection_error::provider_failure);
+    const auto reuse_key = hp_key_set_ && hp_key_ == keys.hp;
+    if (reuse_key) {
+        // Reset the block context per packet without re-keying or touching the
+        // already-disabled padding.
+        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, nullptr) <= 0)
+            return std::unexpected(protection_error::provider_failure);
+    } else if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, keys.hp.data(), nullptr) <= 0 ||
+               EVP_CIPHER_CTX_set_padding(ctx, 0) <= 0) {
+        return std::unexpected(protection_error::provider_failure);
+    } else {
+        hp_key_ = keys.hp;
+        hp_key_set_ = true;
+    }
+    if (EVP_EncryptUpdate(ctx, mask.data(), &written,
                           packet.data() + packet_number_offset + 4, 16) <= 0 ||
         EVP_EncryptFinal_ex(ctx, mask.data() + written,
                             &final_written) <= 0 ||
