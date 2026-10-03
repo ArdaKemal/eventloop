@@ -1,13 +1,18 @@
 #include "eventloop/task.h"
+#include "eventloop/udp_socket.h"
+#include "publication_pause.h"
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <csignal>
 #include <memory>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <utility>
 
 #ifndef _WIN32
 #if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
@@ -109,6 +114,192 @@ auto post_tests() -> bool
         }
     }
     return true;
+}
+
+struct publication_progress {
+    event_loop& loop;
+    test_publication::pause gate {};
+    std::array<int, 2> order {};
+    int posted_count {0};
+    bool timer_ok {false};
+    bool send_ok {false};
+    bool receive_ok {false};
+    bool blocking_ok {false};
+    bool sender_done {false};
+    bool receiver_done {false};
+    std::atomic<bool> progressed {false};
+
+    auto finish() -> void
+    {
+        if (sender_done && receiver_done) {
+            progressed.store(true, std::memory_order_release);
+            if (posted_count == 2) loop.stop();
+        }
+    }
+};
+
+auto receive_during_publication(event_loop& loop, udp_socket& receiver,
+                                publication_progress& progress) -> task<void>
+{
+    (void)loop;
+    std::array<std::byte, 1> buffer {};
+    const auto result = co_await receiver.async_receive_from(buffer);
+    progress.receive_ok = result && result->size == 1 &&
+        buffer[0] == std::byte {42} && !progress.gate.released.load();
+    progress.receiver_done = true;
+    progress.finish();
+}
+
+auto work_during_publication(event_loop& loop, udp_socket& sender,
+                             ip_endpoint destination,
+                             publication_progress& progress) -> task<void>
+{
+    progress.timer_ok = co_await sleep_for(loop, 5ms) == timer_wait_result::expired &&
+                        !progress.gate.released.load();
+    const std::array<std::byte, 1> payload {std::byte {42}};
+    const auto sent = co_await sender.async_send_to(payload, destination);
+    progress.send_ok = sent && *sent == 1 && !progress.gate.released.load();
+    const auto result = co_await run_blocking(loop, []() noexcept { return 7; });
+    progress.blocking_ok = result && *result == 7 && !progress.gate.released.load();
+    progress.sender_done = true;
+    progress.finish();
+}
+
+auto pending_post_progress_test(bool local_second) -> bool
+{
+    event_loop loop(event_loop_options {.worker_count = 1, .post_capacity = 2});
+    publication_progress progress {loop};
+    auto receiver = std::make_unique<udp_socket>(loop, ip_endpoint::loopback_v4());
+    auto sender = std::make_unique<udp_socket>(loop, ip_endpoint::loopback_v4());
+    auto* receiver_ptr = receiver.get();
+    auto* sender_ptr = sender.get();
+    const auto destination = receiver->local_endpoint();
+    loop.add(std::move(receiver));
+    loop.add(std::move(sender));
+    auto first = test_publication::make_task(progress.gate, [&]() noexcept {
+        progress.order[static_cast<std::size_t>(progress.posted_count++)] = 1;
+    });
+    progress.gate.armed.store(true, std::memory_order_release);
+    bool first_accepted = false;
+    std::thread producer([&] { first_accepted = loop.post(std::move(first)); });
+    if (!test_publication::wait_until([&] {
+            return progress.gate.entered.load(std::memory_order_acquire);
+        })) {
+        progress.gate.open();
+        producer.join();
+        return false;
+    }
+
+    bool second_accepted = false;
+    execution_task second([&]() noexcept {
+        progress.order[static_cast<std::size_t>(progress.posted_count++)] = 2;
+        progress.finish();
+    });
+    if (local_second) {
+        second_accepted = loop.post(std::move(second));
+    } else {
+        std::thread later([&] { second_accepted = loop.post(std::move(second)); });
+        later.join();
+    }
+    if (!second_accepted ||
+        loop.spawn(receive_during_publication(loop, *receiver_ptr, progress)) !=
+            task_spawn_result::accepted ||
+        loop.spawn(work_during_publication(loop, *sender_ptr, destination, progress)) !=
+            task_spawn_result::accepted) {
+        progress.gate.open();
+        producer.join();
+        loop.shutdown(event_loop::clock::duration::zero());
+        (void)loop.run();
+        return false;
+    }
+
+    // Keep publication paused until the loop services a timer, pending UDP
+    // receive, and independent worker completion. The deadline lets a broken
+    // drain finish so the test reports failure instead of hanging.
+    bool before_release = false;
+    std::thread watchdog([&] {
+        before_release = test_publication::wait_until([&] {
+            return progress.progressed.load(std::memory_order_acquire);
+        });
+        progress.gate.open();
+    });
+    const auto result = loop.run();
+    watchdog.join();
+    producer.join();
+    return result == event_loop_result::stopped && before_release && first_accepted &&
+        progress.timer_ok && progress.send_ok && progress.receive_ok &&
+        progress.blocking_ok && progress.posted_count == 2 &&
+        progress.order == std::array<int, 2> {1, 2} &&
+        loop.coroutine_statistics().live == 0;
+}
+
+auto completion_pause_timer(event_loop& loop, test_publication::pause& gate,
+                            std::atomic<bool>& expired) -> task<void>
+{
+    const auto result = co_await sleep_for(loop, 5ms);
+    expired.store(result == timer_wait_result::expired && !gate.released.load(),
+                  std::memory_order_release);
+}
+
+auto pending_completion_progress_test() -> bool
+{
+    event_loop loop;
+    test_publication::pause gate;
+    std::array<int, 2> order {};
+    int count = 0;
+    std::atomic<bool> expired {false};
+    std::atomic<bool> posted {false};
+    // Internal completion producers have fixed callback types. Reserve and
+    // publish through their existing detail entry points to pause this queue
+    // independently of the public post/timer/UDP caller tested above.
+    for (int index = 0; index < 2; ++index) {
+        if (detail::coroutine_frame_access::reserve_completion(loop) !=
+            detail::completion_reservation_result::accepted) return false;
+    }
+    auto first = test_publication::make_task(gate, [&]() noexcept {
+        order[static_cast<std::size_t>(count++)] = 1;
+    });
+    gate.armed.store(true, std::memory_order_release);
+    std::thread producer([&] {
+        detail::coroutine_frame_access::post_completion(loop, std::move(first));
+    });
+    if (!test_publication::wait_until([&] {
+            return gate.entered.load(std::memory_order_acquire);
+        })) {
+        gate.open();
+        producer.join();
+        return false;
+    }
+    detail::coroutine_frame_access::post_completion(loop, execution_task([&]() noexcept {
+        order[static_cast<std::size_t>(count++)] = 2;
+        loop.stop();
+    }));
+    if (!loop.post(execution_task([&]() noexcept {
+            posted.store(!gate.released.load(), std::memory_order_release);
+        })) ||
+        loop.spawn(completion_pause_timer(loop, gate, expired)) !=
+            task_spawn_result::accepted) {
+        gate.open();
+        producer.join();
+        return false;
+    }
+    bool before_release = false;
+    std::thread watchdog([&] {
+        before_release = test_publication::wait_until([&] {
+            return expired.load(std::memory_order_acquire) &&
+                   posted.load(std::memory_order_acquire);
+        });
+        gate.open();
+    });
+    const auto result = loop.run();
+    watchdog.join();
+    producer.join();
+    if (loop.coroutine_statistics().live != 0) {
+        loop.shutdown(event_loop::clock::duration::zero());
+        (void)loop.run();
+    }
+    return result == event_loop_result::stopped && before_release && count == 2 &&
+        order == std::array<int, 2> {1, 2} && loop.coroutine_statistics().live == 0;
 }
 
 auto executor_integration_test() -> bool
@@ -273,6 +464,9 @@ auto main() -> int
     if (!nested_signal_mask_test()) return 1;
 #endif
     if (!post_tests()) return 1;
+    if (!pending_post_progress_test(true) ||
+        !pending_post_progress_test(false)) return 1;
+    if (!pending_completion_progress_test()) return 1;
     if (!executor_integration_test()) return 1;
     if (!timer_tests()) return 1;
     if (!timer_arm_failure_test()) return 1;

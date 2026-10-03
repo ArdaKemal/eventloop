@@ -18,7 +18,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <limits>
@@ -457,10 +456,13 @@ public:
 
     [[nodiscard]] auto drain_posted() -> bool
     {
+        // An unpublished head ends this pass without requesting an immediate
+        // retry. Its producer wakes the poller after publishing the slot.
         execution_task task;
         std::size_t count = 0;
         while (count < max_posted_tasks_per_iteration &&
-               posted_tasks.try_pop(task)) {
+               posted_tasks.try_pop_ready(task) ==
+                   bounded_task_queue::pop_result::popped) {
             task();
             ++count;
         }
@@ -469,13 +471,14 @@ public:
 
     [[nodiscard]] auto drain_coroutine_completions() -> bool
     {
+        if (std::this_thread::get_id() != owner_thread) std::terminate();
         execution_task task;
         std::size_t count = 0;
         while (count < max_posted_tasks_per_iteration &&
-               coroutine_completions.try_pop(task)) {
-            const auto previous = reserved_coroutine_completions.fetch_sub(
-                1, std::memory_order_acq_rel);
-            if (previous == 0) std::terminate();
+               coroutine_completions.try_pop_ready(task) ==
+                   bounded_task_queue::pop_result::popped) {
+            if (reserved_coroutine_completions == 0) std::terminate();
+            --reserved_coroutine_completions;
             task();
             ++count;
         }
@@ -485,26 +488,22 @@ public:
     [[nodiscard]] auto reserve_coroutine_completion() noexcept
         -> detail::completion_reservation_result
     {
+        if (std::this_thread::get_id() != owner_thread) std::terminate();
         if (shutting_down) {
             return detail::completion_reservation_result::shutting_down;
         }
-        auto reserved = reserved_coroutine_completions.load(
-            std::memory_order_relaxed);
-        while (reserved < coroutine_completion_capacity) {
-            if (reserved_coroutine_completions.compare_exchange_weak(
-                    reserved, reserved + 1, std::memory_order_acq_rel,
-                    std::memory_order_relaxed)) {
-                return detail::completion_reservation_result::accepted;
-            }
+        if (reserved_coroutine_completions < coroutine_completion_capacity) {
+            ++reserved_coroutine_completions;
+            return detail::completion_reservation_result::accepted;
         }
         return detail::completion_reservation_result::capacity_exhausted;
     }
 
     auto release_coroutine_completion() noexcept -> void
     {
-        const auto previous = reserved_coroutine_completions.fetch_sub(
-            1, std::memory_order_acq_rel);
-        if (previous == 0) std::terminate();
+        if (std::this_thread::get_id() != owner_thread ||
+            reserved_coroutine_completions == 0) std::terminate();
+        --reserved_coroutine_completions;
     }
 
     auto post_coroutine_completion(execution_task&& completion) noexcept -> void
@@ -633,7 +632,9 @@ public:
         if (timer.next != nullptr) timer.next->previous = &timer;
         *position = &timer;
         try {
-            arm_next_timer();
+            // Only a new head can change the next deadline. Due-timer
+            // dispatch rearms after its bounded batch of resumptions.
+            if (timer.previous == nullptr) arm_next_timer();
         } catch (...) {
             unlink_coroutine_timer(timer);
             throw;
@@ -644,11 +645,12 @@ public:
         detail::coroutine_timer_node& timer) noexcept -> void
     {
         if (timer.owner != owner) std::terminate();
+        const bool was_head = timer.previous == nullptr;
         unlink_coroutine_timer(timer);
         detail::coroutine_frame_access::detach_cancellation(
             timer.cancellation);
         try {
-            arm_next_timer();
+            if (was_head) arm_next_timer();
         } catch (...) {
             std::terminate();
         }
@@ -770,7 +772,9 @@ public:
     bool local_post_pending {false};
     bounded_task_queue coroutine_completions;
     const std::size_t coroutine_completion_capacity;
-    std::atomic<std::size_t> reserved_coroutine_completions {0};
+    // Owner-loop accounting only; workers publish through the atomic queue.
+    // Includes running work and queued completions until they are dequeued.
+    std::size_t reserved_coroutine_completions {0};
     const bool blocking_executor_available;
     std::unique_ptr<executor> task_executor;
     const std::size_t file_io_depth;

@@ -258,3 +258,5 @@ separately; Wayfarer and the WebSocket client do so on a bounded worker.
 
 Benchmark programs and harnesses live in `benchmark/`. They exercise local
 workloads and are not throughput guarantees for other machines or networks.
+The [single-thread performance report](docs/single-thread-performance.md)
+records executor, post, timer, and UDP measurements with reproducible commands.

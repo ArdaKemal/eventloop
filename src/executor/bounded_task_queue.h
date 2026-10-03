@@ -17,6 +17,8 @@ namespace eventloop {
 
 class bounded_task_queue {
 public:
+    enum class pop_result { popped, empty, publication_pending };
+
     explicit bounded_task_queue(std::size_t capacity)
         : capacity_(checked_capacity(capacity)),
           mask_(capacity_ - 1),
@@ -58,8 +60,22 @@ public:
         }
     }
 
-    // Moves a published task into `output`. Never blocks and never allocates.
+    // Worker consumers retain their acquired permit while an earlier producer
+    // publishes. This may wait indefinitely for that producer; never allocates.
     auto try_pop(execution_task& output) noexcept -> bool
+    {
+        for (;;) {
+            const auto result = try_pop_ready(output);
+            if (result == pop_result::popped) return true;
+            if (result == pop_result::empty) return false;
+            std::this_thread::yield();
+        }
+    }
+
+    // Moves a published task into `output`, or leaves it intact when the head
+    // is empty or not yet published. Does not wait for publication or allocate;
+    // may retry consumer contention. The sole owner-loop consumer has none.
+    auto try_pop_ready(execution_task& output) noexcept -> pop_result
     {
         std::size_t position = dequeue_position_.load(std::memory_order_relaxed);
         for (;;) {
@@ -75,18 +91,17 @@ public:
                     output = std::move(current.task);
                     current.sequence.store(position + capacity_,
                                            std::memory_order_release);
-                    return true;
+                    return pop_result::popped;
                 }
             } else if (difference < 0) {
-                // A producer advances the enqueue position before publishing
-                // the slot. When the head slot has been claimed, a task is on
-                // its way and the consumer must not report an empty queue.
+                // A claimed head is distinct from an empty queue. Workers
+                // must retain their permit; the owner loop can return to I/O
+                // because each producer wakes it after publishing its slot.
                 if (difference == -1 &&
                     enqueue_position_.load(std::memory_order_acquire) > position) {
-                    std::this_thread::yield();
-                    continue;
+                    return pop_result::publication_pending;
                 }
-                return false;
+                return pop_result::empty;
             } else {
                 position = dequeue_position_.load(std::memory_order_relaxed);
             }

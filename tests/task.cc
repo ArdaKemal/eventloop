@@ -663,14 +663,67 @@ auto run_blocking_cancellation_test() -> bool
 
 auto run_blocking_requires_worker_test() -> bool
 {
-    event_loop loop;
+    event_loop_options options;
+    options.coroutine_completion_capacity = 2;
+    event_loop loop(options);
     bool ran = false;
-    blocking_error error = blocking_error::cancelled;
-    auto root = rejected_blocking_root(loop, ran, error);
-    if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
+    // Rejection must roll back its reservation every time.
+    for (int index = 0; index < 4; ++index) {
+        blocking_error error = blocking_error::cancelled;
+        auto root = rejected_blocking_root(loop, ran, error);
+        if (loop.spawn(std::move(root)) != task_spawn_result::accepted ||
+            error != blocking_error::no_worker_threads) return false;
+    }
     const auto statistics = loop.coroutine_statistics();
-    return !ran && error == blocking_error::no_worker_threads &&
-           statistics.active_roots == 0 && statistics.live == 0;
+    return !ran && statistics.active_roots == 0 && statistics.live == 0;
+}
+
+auto reuse_completion_capacity(event_loop& loop, std::atomic<bool>& release,
+                               bool& passed, int& completed) -> task<void>
+{
+    passed = true;
+    // The parked operation holds the other slot throughout, so every
+    // resubmission reuses one released slot. External work behind the parked
+    // worker must still be taken by the idle peer.
+    for (int index = 0; index < 16; ++index) {
+        const auto result = co_await run_blocking(loop, [index]() noexcept { return index; });
+        if (!result || *result != index) {
+            passed = false;
+            break;
+        }
+    }
+    release.store(true, std::memory_order_release);
+    if (++completed == 2) loop.stop();
+}
+
+auto parked_completion(event_loop& loop, std::atomic<bool>& release,
+                       bool& passed, int& completed) -> task<void>
+{
+    const auto result = co_await run_blocking(loop, [&release]() noexcept {
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+    passed = result.has_value();
+    if (++completed == 2) loop.stop();
+}
+
+auto run_blocking_completion_reuse_test() -> bool
+{
+    event_loop_options options;
+    options.worker_count = 2;
+    options.coroutine_completion_capacity = 2;
+    event_loop loop(options);
+    std::atomic<bool> release {false};
+    bool reused = false;
+    bool parked = false;
+    int completed = 0;
+    if (loop.spawn(parked_completion(loop, release, parked, completed)) !=
+            task_spawn_result::accepted ||
+        loop.spawn(reuse_completion_capacity(loop, release, reused, completed)) !=
+            task_spawn_result::accepted) return false;
+    return loop.run() == event_loop_result::stopped && reused && parked &&
+           loop.coroutine_statistics().live == 0;
 }
 
 auto run_blocking_completion_capacity_test() -> bool
@@ -856,6 +909,10 @@ auto main(int argc, char** argv) -> int
     }
     if (!run_blocking_completion_capacity_test()) {
         std::cerr << "run-blocking completion-capacity test failed\n";
+        return 1;
+    }
+    if (!run_blocking_completion_reuse_test()) {
+        std::cerr << "run-blocking completion-capacity reuse test failed\n";
         return 1;
     }
     if (!spawn_failure_test()) {

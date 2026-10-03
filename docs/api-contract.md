@@ -86,6 +86,12 @@ back to an unbounded allocation.
 - `task_executor()` runs independent work away from the loop. Worker code must
   not access loop-owned objects; use `post()` or the coroutine blocking/file
   operations to return work to the loop safely.
+- Draining posted commands and worker completions does not wait for a producer
+  to finish publishing a claimed queue slot. The loop continues servicing I/O
+  and timers and retries after the producer publishes and wakes it. Later
+  entries in that queue remain behind the unpublished head. These loop command
+  and completion queues do not promise lock-free progress. Worker scheduling
+  uses separate unordered queues, described in [executor-scheduling.md](executor-scheduling.md).
 
 ## Results and errors
 
