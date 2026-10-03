@@ -183,32 +183,20 @@ public:
                                          retirement_reason) noexcept;
     auto set_retirement_observer(void* argument, retirement_callback callback) noexcept -> void
     { check_owner(); retirement_argument_ = argument; retirement_callback_ = callback; }
-    // Preview on the owner thread before UDP submission. Until completion the
-    // owner must serialize sends and retain the selected stream/CRYPTO ranges.
+    // Capacity-only preview on the owner thread before UDP submission. Stream,
+    // flow-credit, and state validation happens once in record_sent after the
+    // send is staged; the scheduler serializes prepare/complete, so no
+    // connection state changes between the preview and the commit.
     [[nodiscard]] auto preflight_sent(tls_level level, sent_packet packet,
-        std::span<const transmitted_range> ranges, bool probe = false) const
-        -> std::expected<void, connection_error>
+        bool probe = false) const -> std::expected<void, connection_error>
     {
         check_owner();
-        if (static_cast<std::size_t>(level) >= 3 || ranges.size() > frames_per_packet)
+        if (static_cast<std::size_t>(level) >= 3)
             return std::unexpected(connection_error::invalid_configuration);
         if (std::ranges::none_of(sent_, [](const auto& r) { return !r.occupied; }))
             return std::unexpected(connection_error::capacity_exceeded);
         if (!recovery_.preflight_record(static_cast<packet_number_space>(level), packet, probe))
             return std::unexpected(connection_error::capacity_exceeded);
-        auto flow = flow_.stage_send<frames_per_packet>();
-        for (const auto& range : ranges) {
-            if (range.crypto) continue;
-            const stream_slot* slot = nullptr;
-            for (const auto& s : slots_)
-                if (s.occupied && s.id == range.stream_id) { slot = &s; break; }
-            if (!slot || !flow.send_stream_range(range.stream_id, range.offset, range.size, range.fin))
-                return std::unexpected(connection_error::protocol_violation);
-            auto state = slot->state;
-            if (!slot->send.preflight_mark_sent(range.offset, range.size, range.fin) ||
-                !state.send_stream(range.offset, range.size, range.fin))
-                return std::unexpected(connection_error::invalid_state);
-        }
         return {};
     }
     [[nodiscard]] auto consume_stream(std::uint64_t id, std::size_t size)
@@ -229,6 +217,7 @@ public:
             return std::unexpected(connection_error::invalid_state);
         data_credit_pending_ |= *data_limit > flow_.receive_max_data();
         s->credit_pending |= *stream_limit > s->receive_limit;
+        if (s->credit_pending) stream_control_pending_ = true;
         s->receive_limit = *stream_limit;
         s->consumed += size;
         flow_ = next_flow;
@@ -272,6 +261,10 @@ public:
     [[nodiscard]] auto pending_control() noexcept -> std::optional<decoded_frame>
     {
         check_owner();
+        // Fast path: most application packets carry no pending control frame.
+        if (!stream_control_pending_ && !data_credit_pending_ &&
+            !stream_credit_pending_[0] && !stream_credit_pending_[1])
+            return {};
         decoded_frame frame;
         for (auto& s : slots_) if (s.occupied && s.reset_pending) {
             frame.type = 4; frame.stream_id = s.id;
@@ -282,6 +275,7 @@ public:
         for (auto& s : slots_) if (s.occupied && s.credit_pending) {
             frame.type = 0x11; frame.stream_id = s.id; frame.limit = s.receive_limit; return frame;
         }
+        stream_control_pending_ = false;
         for (std::size_t i = 0; i < stream_credit_pending_.size(); ++i)
             if (stream_credit_pending_[i]) {
                 frame.type = i == 0 ? 0x12 : 0x13;
@@ -368,8 +362,11 @@ public:
     // Called after successful UDP transmission. A bookkeeping failure requires
     // retiring the connection; the endpoint must reserve capacity before send.
     // Each packet's retransmittable byte ranges are retained until ACK or loss.
+    // The optional `range_slots` are the stream slots that produced `ranges`,
+    // in order, so callers that already selected them avoid a stream lookup.
     [[nodiscard]] auto record_sent(tls_level level, sent_packet packet,
         std::span<const transmitted_range> ranges, bool probe = false,
+        std::span<stream_slot* const> range_slots = {},
         std::optional<std::uint64_t> carried_ack_largest = {},
         std::optional<std::uint64_t> acknowledged_peer_packet = {})
         -> std::expected<void, connection_error>
@@ -386,7 +383,8 @@ public:
         std::size_t range_index = 0;
         for (const auto& range : ranges) {
             if (range.crypto) { ++range_index; continue; }
-            auto* s = stream(range.stream_id);
+            auto* s = range_index < range_slots.size() ? range_slots[range_index]
+                                                       : stream(range.stream_id);
             if (!s || !next_flow.send_stream_range(range.stream_id, range.offset, range.size, range.fin))
                 return std::unexpected(connection_error::protocol_violation);
             auto state = s->state;
@@ -635,6 +633,7 @@ private:
             const auto final = s->state.send_final_size().value_or(s->sent_highest);
             if (!flow_.set_send_final_size(s->id, final) || !s->state.send_reset(final)) return false;
             s->reset_pending = true;
+            stream_control_pending_ = true;
             return true;
         }
         case 0x10: return flow_.update_send_max_data(frame.limit).has_value();
@@ -668,6 +667,7 @@ private:
     endpoint_role role_;
     connection_callbacks callbacks_;
     bool data_credit_pending_ {false};
+    bool stream_control_pending_ {false};
     std::array<bool, 2> stream_credit_pending_ {};
     void* retirement_argument_ {};
     retirement_callback retirement_callback_ {};

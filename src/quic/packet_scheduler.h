@@ -112,7 +112,11 @@ public:
         if (crypto.data.empty()) crypto = connection_.core().next_crypto(level, remaining());
         if (!crypto.data.empty()) {
             decoded_frame frame; frame.type = 6; frame.offset = crypto.offset; frame.data = crypto.data;
-            if (append(frame)) { ranges_[range_count_++] = {true,0,crypto.offset,crypto.data.size(),false}; eliciting = true; }
+            if (append(frame)) {
+                range_slots_[range_count_] = nullptr;
+                ranges_[range_count_++] = {true,0,crypto.offset,crypto.data.size(),false};
+                eliciting = true;
+            }
         }
         if (level == tls_level::application) {
             // ACK/control-only packets need no packet-local flow snapshot.
@@ -122,7 +126,7 @@ public:
             // Across all streams, transmitted data precedes new data in a PTO
             // packet. Selection does not declare the original packet lost.
             for (unsigned pass = 0; pass < (probe ? 2u : 1u) && range_count_ < ranges_.size(); ++pass) {
-            for (const auto& stream : connection_.stream_slots()) {
+            for (auto& stream : connection_.stream_slots()) {
                 if (range_count_ == ranges_.size()) break;
                 if (!stream.occupied ||
                     stream.state.sending() == stream_send_state::reset_sent ||
@@ -154,6 +158,7 @@ public:
                 if (!flow->send_stream_range(stream.id, chunk.offset, chunk.data.size(), chunk.fin)) continue;
                 credit = flow->send_max_data() - flow->sent_total();
                 used_ += *size;
+                range_slots_[range_count_] = &stream;
                 ranges_[range_count_++] = {false,stream.id,chunk.offset,chunk.data.size(),chunk.fin}; eliciting = true;
             }
             }
@@ -179,7 +184,7 @@ public:
             {reinterpret_cast<const std::uint8_t*>(payload_.data()),used_}, output.first(level_max), scratch);
         if (!size) return std::unexpected(size.error());
         packet_ = {*number,now,eliciting,eliciting || level == tls_level::initial,*size};
-        const auto preview = connection_.preflight_sent(level, packet_, {ranges_.data(),range_count_},probe);
+        const auto preview = connection_.preflight_sent(level, packet_, probe);
         if (!preview) return std::unexpected(preview.error());
         pending_ = true; level_ = level; probe_ = probe;
         return *size;
@@ -192,6 +197,7 @@ public:
         if (!sent) return {};
         packet_.sent_time = now;
         const auto result = connection_.record_sent(level_,packet_,{ranges_.data(),range_count_},probe_,
+            {range_slots_.data(),range_count_},
             ack_ ? std::optional<std::uint64_t>(ack_largest_) : std::nullopt,
             acknowledged_peer_update_);
         if (!result) return result;
@@ -240,6 +246,7 @@ private:
     std::array<std::byte,maximum_datagram> payload_{};
     std::array<std::byte,1024> ack_storage_{};
     std::array<bounded_connection::transmitted_range,bounded_connection::frames_per_packet> ranges_{};
+    std::array<bounded_connection::stream_slot*,bounded_connection::frames_per_packet> range_slots_{};
     std::array<control_slot,16> controls_{};
     std::array<std::size_t,16> control_indices_{};
     std::array<std::uint64_t,3> ack_pending_{};
