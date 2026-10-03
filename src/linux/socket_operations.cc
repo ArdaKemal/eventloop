@@ -4,6 +4,7 @@
 #include "eventloop/udp_socket.h"
 #include "ip_endpoint_native.h"
 
+#include <array>
 #include <cerrno>
 #include <fcntl.h>
 #include <limits>
@@ -13,6 +14,10 @@
 #include <sys/un.h>
 #include <cstring>
 #include <unistd.h>
+
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
 
 namespace eventloop::detail {
 namespace {
@@ -295,6 +300,44 @@ auto socket_operations::start_send_to(native_socket socket,
     for (;;) {
         const auto sent = ::sendto(socket, buffer, size, MSG_NOSIGNAL,
                                    address.address(), address.length);
+        if (sent >= 0) return {.transferred = static_cast<std::size_t>(sent)};
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return {.pending = true};
+        return {.error = code(errno)};
+    }
+}
+
+auto socket_operations::start_send_segments(native_socket socket,
+                                            const void* buffer, std::size_t size,
+                                            std::size_t segment,
+                                            ip_endpoint destination,
+                                            socket_operation& operation) noexcept
+    -> socket_result
+{
+    if (segment == 0 || segment > 0xffffU) return {.error = code(EINVAL)};
+    if (segment >= size) return start_send_to(socket, buffer, size, destination, operation);
+    const bool ipv6 = destination.address_family == ip_endpoint::family::ipv6;
+    if (size > (ipv6 ? 65535U : 65507U)) return {.error = code(EMSGSIZE)};
+    const auto address = native_endpoint(destination);
+    std::array<char, CMSG_SPACE(sizeof(std::uint16_t))> control {};
+    iovec vector {};
+    vector.iov_base = const_cast<void*>(buffer);
+    vector.iov_len = size;
+    msghdr message {};
+    message.msg_name = const_cast<sockaddr*>(address.address());
+    message.msg_namelen = address.length;
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    auto* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = IPPROTO_UDP;
+    header->cmsg_type = UDP_SEGMENT;
+    header->cmsg_len = CMSG_LEN(sizeof(std::uint16_t));
+    const auto value = static_cast<std::uint16_t>(segment);
+    std::memcpy(CMSG_DATA(header), &value, sizeof(value));
+    for (;;) {
+        const auto sent = ::sendmsg(socket, &message, MSG_NOSIGNAL);
         if (sent >= 0) return {.transferred = static_cast<std::size_t>(sent)};
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return {.pending = true};

@@ -53,6 +53,64 @@ auto udp_endpoint::async_send_candidate(endpoint_connection handle, std::span<co
     -> task<std::expected<std::size_t, std::error_code>>
 { check_owner(); return send(loop_, *this, handle, bytes, true); }
 
+auto udp_endpoint::stage_send(endpoint_connection handle, std::span<const std::byte> bytes,
+    bool candidate) -> std::error_code
+{
+    check_owner();
+    if (socket_ == nullptr) return std::error_code(ECANCELED, std::generic_category());
+    if (bytes.empty() || bytes.size() > maximum_datagram_size ||
+        bytes.size() > send_segment_capacity)
+        return std::error_code(EMSGSIZE, std::generic_category());
+    std::error_code flush_error {};
+    const bool needs_new_batch = send_batch_active_ &&
+        (send_batch_segment_ != bytes.size() || send_batch_handle_ != handle ||
+         send_batch_candidate_ != candidate || send_batch_count_ == send_batch_capacity);
+    if (needs_new_batch) flush_error = flush_send();
+    if (!send_batch_active_) {
+        send_batch_segment_ = bytes.size();
+        send_batch_handle_ = handle;
+        send_batch_candidate_ = candidate;
+        send_batch_active_ = true;
+        send_batch_count_ = 0;
+    }
+    std::memcpy(send_batch_bytes_.data() + send_batch_count_ * send_batch_segment_,
+                bytes.data(), bytes.size());
+    ++send_batch_count_;
+    return flush_error;
+}
+
+auto udp_endpoint::flush_send() -> std::error_code
+{
+    check_owner();
+    const auto count = send_batch_count_;
+    const auto segment = send_batch_segment_;
+    const auto handle = send_batch_handle_;
+    const auto candidate = send_batch_candidate_;
+    send_batch_active_ = false;
+    send_batch_count_ = 0;
+    send_batch_segment_ = 0;
+    if (count == 0) return {};
+    if (socket_ == nullptr) return std::error_code(ECANCELED, std::generic_category());
+    const auto total = count * segment;
+    const auto peer = router_.begin_send_to(handle, total, candidate);
+    if (!peer)
+        return std::error_code(
+            peer.error() == endpoint_error::amplification_limited ? EAGAIN : EINVAL,
+            std::generic_category());
+    const auto sent = socket_->send_batch(
+        std::span<const std::byte>(send_batch_bytes_).first(total), segment, *peer);
+    const bool success = sent && *sent == total;
+    router_.finish_send(handle, total, success);
+    if (!sent) {
+        const auto value = sent.error().value();
+        if (value == EAGAIN || value == EWOULDBLOCK || value == EBUSY)
+            return std::error_code(EAGAIN, std::generic_category());
+        return sent.error();
+    }
+    if (*sent != total) return std::error_code(EIO, std::generic_category());
+    return {};
+}
+
 auto udp_endpoint::receive_loop(event_loop&, udp_endpoint& endpoint) -> task<std::error_code>
 {
     endpoint.check_owner();

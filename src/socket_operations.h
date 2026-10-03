@@ -144,6 +144,16 @@ public:
                                             ip_endpoint destination,
                                             socket_operation& operation) noexcept
         -> socket_result;
+    // UDP segmentation offload: submit `size` bytes as `segment`-sized
+    // datagrams (the final segment may be shorter). Platforms without offload
+    // report EINVAL/EOPNOTSUPP so the caller can fall back to per-segment sends.
+    [[nodiscard]] static auto start_send_segments(native_socket socket,
+                                                  const void* buffer,
+                                                  std::size_t size,
+                                                  std::size_t segment,
+                                                  ip_endpoint destination,
+                                                  socket_operation& operation) noexcept
+        -> socket_result;
     static auto cancel(native_socket socket, socket_operation& operation) noexcept
         -> void;
 };

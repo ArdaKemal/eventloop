@@ -401,7 +401,9 @@ private:
             // the receive queue capacity and yield before sending more.
             constexpr std::size_t burst_capacity=queue_capacity/2;
             std::size_t transmitted=0;
+            bool stop_sending=false;
             for (const auto level : {tls_level::initial,tls_level::handshake,tls_level::application}) {
+                if (stop_sending) break;
                 if (!self.connection_.core().keys_available(level,tls_direction::write)) continue;
                 while (transmitted<burst_capacity) {
                     const bool probe=self.probes_ && self.probe_level_==level;
@@ -410,16 +412,28 @@ private:
                         if (prepared.error()==connection_error::invalid_state || prepared.error()==connection_error::capacity_exceeded) break;
                         co_return std::unexpected(prepared.error());
                     }
-                    const auto sent=co_await self.endpoint_.async_send(self.route_,std::as_bytes(std::span(self.output_).first(*prepared)));
-                    const bool success=sent && *sent && **sent==*prepared;
-                    const auto completed=self.scheduler_.complete(success,lifecycle_time_point::clock::now());
+                    // Queue equal-sized datagrams into one offloaded batch and
+                    // record them as sent; a later loss recovers any datagram
+                    // the provider drops.
+                    const auto queued=self.endpoint_.stage_send(self.route_,
+                        std::as_bytes(std::span(self.output_).first(*prepared)),false);
+                    const auto completed=self.scheduler_.complete(true,lifecycle_time_point::clock::now());
                     if (!completed) co_return std::unexpected(completed.error());
-                    if (success && probe) --self.probes_;
-                    if (!success && (!sent || (sent && !*sent && sent->error().value()!=EAGAIN)))
-                        co_return std::unexpected(connection_error::provider_failure);
-                    if (!success) break;
+                    if (probe) --self.probes_;
                     ++transmitted;
+                    if (queued) {
+                        const auto value=queued.value();
+                        if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY)
+                            co_return std::unexpected(connection_error::provider_failure);
+                        stop_sending=true;
+                        break;
+                    }
                 }
+            }
+            if (const auto flushed=self.endpoint_.flush_send(); flushed) {
+                const auto value=flushed.value();
+                if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY)
+                    co_return std::unexpected(connection_error::provider_failure);
             }
             if (self.progress_) self.progress_(self.progress_argument_);
             // A progress callback can make more application data ready, and

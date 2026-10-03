@@ -127,6 +127,17 @@ public:
                                      ip_endpoint destination) noexcept
         -> send_awaiter;
 
+    // Best-effort batch send of one or more equal-sized datagrams packed in
+    // `buffer` at `segment_size` boundaries (the final segment may be shorter).
+    // Uses UDP segmentation offload where the platform supports it and falls
+    // back to one send per segment otherwise. Non-blocking: returns the number
+    // of bytes accepted, or a readiness/error code. `buffer` is caller-owned
+    // and remains valid until this call returns.
+    [[nodiscard]] auto send_batch(std::span<const std::byte> buffer,
+                                  std::size_t segment_size,
+                                  ip_endpoint destination) noexcept
+        -> std::expected<std::size_t, std::error_code>;
+
 private:
     friend class event_loop;
     friend class receive_awaiter;
@@ -156,6 +167,7 @@ private:
     receive_awaiter* receive_ {nullptr};
     send_awaiter* send_ {nullptr};
     bool closing_ {false};
+    bool gso_disabled_ {false};
     void* lifetime_observer_context_ {nullptr};
     void (*lifetime_observer_)(void*) noexcept {nullptr};
     [[no_unique_address]] detail::socket_datagram_state backend_state_ {};

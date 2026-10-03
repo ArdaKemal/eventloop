@@ -1,6 +1,7 @@
 #include "eventloop/udp_socket.h"
 #include "socket_operations.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -87,6 +88,49 @@ auto udp_socket::async_send_to(std::span<const std::byte> buffer,
                                ip_endpoint destination) noexcept -> send_awaiter
 {
     return {*this, buffer, destination};
+}
+
+auto udp_socket::send_batch(std::span<const std::byte> buffer,
+                            std::size_t segment_size,
+                            ip_endpoint destination) noexcept
+    -> std::expected<std::size_t, std::error_code>
+{
+    if (closing_)
+        return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+    if (buffer.empty() || segment_size == 0 || segment_size > buffer.size())
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+    if (send_ != nullptr)
+        return std::unexpected(std::make_error_code(std::errc::device_or_resource_busy));
+#if defined(__linux__)
+    if (!gso_disabled_) {
+        detail::socket_operation operation {};
+        const auto result = detail::socket_operations::start_send_segments(
+            descriptor_.get(), buffer.data(), buffer.size(), segment_size,
+            destination, operation);
+        if (!result.pending && !result.error)
+            return static_cast<std::size_t>(result.transferred);
+        if (result.pending)
+            return std::unexpected(
+                std::make_error_code(std::errc::resource_unavailable_try_again));
+        const auto value = result.error.value();
+        if (value != EINVAL && value != ENOPROTOOPT && value != EOPNOTSUPP)
+            return std::unexpected(result.error);
+        gso_disabled_ = true;
+    }
+#endif
+    std::size_t total = 0;
+    for (std::size_t offset = 0; offset < buffer.size(); offset += segment_size) {
+        const auto length = std::min(segment_size, buffer.size() - offset);
+        detail::socket_operation operation {};
+        const auto result = detail::socket_operations::start_send_to(
+            descriptor_.get(), buffer.data() + offset, length, destination, operation);
+        if (result.error) return std::unexpected(result.error);
+        if (result.pending)
+            return std::unexpected(
+                std::make_error_code(std::errc::resource_unavailable_try_again));
+        total += result.transferred;
+    }
+    return total;
 }
 
 udp_socket::receive_awaiter::receive_awaiter(

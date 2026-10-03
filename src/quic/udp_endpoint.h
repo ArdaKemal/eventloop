@@ -3,6 +3,9 @@
 #include "eventloop/udp_socket.h"
 #include "quic/endpoint_router.h"
 
+#include <array>
+#include <cstddef>
+
 namespace eventloop::quic::detail {
 
 struct endpoint_accept_callback {
@@ -41,7 +44,19 @@ public:
     [[nodiscard]] auto async_send_candidate(endpoint_connection, std::span<const std::byte>)
         -> task<std::expected<std::size_t, std::error_code>>;
 
+    // Queue one datagram for a batched send. The bytes are copied, so the
+    // caller may reuse its buffer immediately. A datagram with a different
+    // route, candidate flag, or size flushes the current batch first. Returns
+    // the error from flushing a previous batch, if one occurred.
+    [[nodiscard]] auto stage_send(endpoint_connection, std::span<const std::byte>, bool candidate)
+        -> std::error_code;
+    // Flush queued datagrams with one offload/syscall batch. Always clears the
+    // pending batch, even on failure.
+    [[nodiscard]] auto flush_send() -> std::error_code;
+
 private:
+    static constexpr std::size_t send_batch_capacity = 8;
+    static constexpr std::size_t send_segment_capacity = 8448;
     static auto receive_loop(event_loop&, udp_endpoint&) -> task<std::error_code>;
     static auto send(event_loop&, udp_endpoint&, endpoint_connection,
                      std::span<const std::byte>, bool candidate)
@@ -56,6 +71,12 @@ private:
     endpoint_accept_callback accept_;
     std::array<std::byte, maximum_datagram_size> receive_buffer_ {};
     std::array<std::byte, 600> version_buffer_ {};
+    std::array<std::byte, send_batch_capacity * send_segment_capacity> send_batch_bytes_ {};
+    std::size_t send_batch_count_ {};
+    std::size_t send_batch_segment_ {};
+    endpoint_connection send_batch_handle_ {};
+    bool send_batch_candidate_ {};
+    bool send_batch_active_ {};
     bool receiving_ {};
     bool sending_ {};
 };
