@@ -115,10 +115,22 @@ You need a C++23 compiler, CMake 3.20 or newer, OpenSSL 3.5 or newer, and
 thread support.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build -j2
-ctest --test-dir build --output-on-failure
 ```
+
+Tests are enabled by default, but their executables and HTTP fixtures are
+excluded from normal builds. Run final verification explicitly:
+
+```sh
+cmake --build build --target check -j2
+```
+
+The `check` target builds the test executables and then runs CTest. It does not
+require Python, aioquic, h2, websockets, curl, or an external QUIC stack.
+On Unix, the TLS loopback check uses Bash and the OpenSSL command line tool. Subsequent
+runs reuse the existing build. `-DBUILD_TESTING=OFF` omits tests and the `check`
+target entirely.
 
 Start the echo server on loopback port 7000:
 
@@ -239,9 +251,8 @@ separately; Wayfarer and the WebSocket client do so on a bounded worker.
   covers its outbound echo example.
 - The public QUIC API supports v1/v2 connections, streams, and DATAGRAMs.
   Wayfarer and Stonegate exercise the client and server sides of HTTP/3.
-  QUIC transport release qualification is still active; see the
-  [milestone and remaining gates](docs/quic-milestone.md). The root test suite
-  retains a separate [HTTP/3 fixture guide](docs/http3-outbound-tests.md).
+  QUIC transport release qualification is still active. Optional independent
+  HTTP/3 checks are described in the Wayfarer and Stonegate guides.
 - The HTTP server cancels active connection tasks on shutdown; its grace
   timeout does not drain unfinished responses.
 

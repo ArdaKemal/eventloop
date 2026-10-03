@@ -85,11 +85,8 @@ ownership, and error visibility.
   HTTP/3 support bounded GET, HEAD, and OPTIONS operations.
 - QUIC v1/v2 public endpoints, streams, and DATAGRAMs are implemented. The
   Wayfarer and Stonegate examples exercise HTTP/1.1, HTTP/2, and HTTP/3 through
-  public APIs. Root HTTP/3 test fixtures and optional aioquic v1/v2 tests are
-  documented in [docs/http3-outbound-tests.md](docs/http3-outbound-tests.md).
-  Transport release gates and remaining endpoint work are in
-  [docs/quic-milestone.md](docs/quic-milestone.md). Keep public claims scoped to
-  verified behavior.
+  public APIs. Keep public claims scoped to verified behavior.
+
 
 ## Working in this repository
 
@@ -100,8 +97,13 @@ ownership, and error visibility.
 - Review new features through a public-header caller. For an installed-library
   change, check the exported `eventloop::eventloop` CMake target as well as
   in-tree examples. Keep private-header tests for protocol internals.
+- Tests are enabled by default and excluded from normal builds. Run
+  `cmake --build build --target check -j2` for final verification; it builds
+  test executables before running CTest. `BUILD_TESTING=OFF` omits this target.
 - Build dependencies: a C++23 compiler, CMake 3.20+, OpenSSL 3.5+, and
-  threads. Optional HTTP/3 interop tests require Python and aioquic 1.3.0.
+  threads. Unix TLS loopback checks also use Bash and the OpenSSL CLI.
+  Python and independent protocol peers belong only to manual interoperability
+  probes; do not add them to CMake configuration or the core `check` target.
 - Use Git-ignored or external build directories. Inspect `git status` before
   staging, and stage only intended files.
 - After changing code, check warnings, `git diff --check`, and the relevant

@@ -98,31 +98,19 @@ public QUIC as a real HTTP/3 caller, but it is not a complete HTTP/3 client.
 The root test suite keeps a broader HTTP/3 client fixture that uses private
 codec headers. Wayfarer itself uses only public eventloop headers.
 
-## Automated checks
+## Manual interoperability probes
 
-`tests/run_w3_aioquic.py` drives a controlled aioquic 1.3.0 peer for the HTTP/3
-response client, and `tests/run_w4.py` adds HTTP/1.1 and TLS HTTP/2 peers plus
-the `-I`/`-O` CLI behavior. Wayfarer is a standalone example project, so the
-root eventloop test suite does not build it; enable the checks in the Wayfarer
-build instead. The W4 HTTP/2 checks need the `h2` package in the same
-interpreter as aioquic:
+The scripts in `tests/` use independent peers to check HTTP/1.1, HTTP/2,
+HTTP/3 and CLI behavior. They are separate from CMake and the library's
+`check` target. Running them requires Python with aioquic 1.3.0; the HTTP/2
+checks also require `h2`. These packages are not library build dependencies.
 
-```sh
-python3 -m venv /tmp/wayfarer-aioquic
-/tmp/wayfarer-aioquic/bin/python -m pip install 'aioquic==1.3.0' h2
-cmake -S examples/wayfarer -B /tmp/wayfarer-build -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_TESTING=OFF -DWAYFARER_HTTP3_TESTS=ON \
-  -DPython3_EXECUTABLE=/tmp/wayfarer-aioquic/bin/python
-cmake --build /tmp/wayfarer-build --target wayfarer
-ctest --test-dir /tmp/wayfarer-build --output-on-failure
-```
-
-The runners also work standalone:
+With those packages already available in your interpreter:
 
 ```sh
-/tmp/wayfarer-aioquic/bin/python examples/wayfarer/tests/run_w3_aioquic.py \
+python3 examples/wayfarer/tests/run_w3_aioquic.py \
   --wayfarer /tmp/wayfarer-build/wayfarer --version both
-/tmp/wayfarer-aioquic/bin/python examples/wayfarer/tests/run_w4.py \
+python3 examples/wayfarer/tests/run_w4.py \
   --wayfarer /tmp/wayfarer-build/wayfarer --version all
 ```
 

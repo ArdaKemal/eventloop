@@ -5,29 +5,33 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-option(EVENTLOOP_HTTP3_INTEROP_TESTS
-    "Enable optional outbound HTTP/3 v1/v2 tests using aioquic 1.3.0" OFF)
-function(eventloop_register_http3_interop_tests)
-    if(BUILD_TESTING AND EVENTLOOP_HTTP3_INTEROP_TESTS)
-        find_package(Python3 REQUIRED COMPONENTS Interpreter)
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}" -c
-                "import aioquic; assert aioquic.__version__ == '1.3.0', 'aioquic 1.3.0 required'"
-            RESULT_VARIABLE aioquic_import_result
-            ERROR_VARIABLE aioquic_import_error)
-        if(NOT aioquic_import_result EQUAL 0)
-            message(FATAL_ERROR
-                "HTTP/3 interop tests require aioquic==1.3.0 in Python3_EXECUTABLE: ${aioquic_import_error}")
-        endif()
-        foreach(version v1 v2)
-            add_test(NAME http3_outbound_${version}
-                COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http3_outbound.py"
-                    --client $<TARGET_FILE:http3_client> --version ${version})
-            set_tests_properties(http3_outbound_${version} PROPERTIES
-                TIMEOUT 60 LABELS "http3;interop")
-        endforeach()
+# Register tests by default, but build them only through explicit targets.
+option(BUILD_TESTING "Enable eventloop tests and integration fixtures" ON)
+
+# Build and run the registered core tests.
+function(eventloop_add_check_target)
+    if(NOT BUILD_TESTING)
+        return()
     endif()
+    get_property(directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    set(check_dependencies)
+    foreach(target IN LISTS directory_targets)
+        if(target MATCHES "_test$" OR
+           target MATCHES "^(http_server|http3_client|http3_file_server)$")
+            set_target_properties(${target} PROPERTIES
+                EXCLUDE_FROM_ALL TRUE
+                EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+            if(target MATCHES "_test$")
+                list(APPEND check_dependencies ${target})
+            endif()
+        endif()
+    endforeach()
+    add_custom_target(check
+        COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --build-config "$<CONFIG>" --output-on-failure
+        DEPENDS ${check_dependencies}
+        USES_TERMINAL
+        VERBATIM)
 endfunction()
 
 if(WIN32)
@@ -624,8 +628,10 @@ if(WIN32)
     target_link_libraries(file_io_benchmark PRIVATE eventloop::eventloop)
 
     if(EVENTLOOP_WINDOWS_TLS)
-        add_executable(http_server tests/fixtures/http_server.cc)
-        target_link_libraries(http_server PRIVATE eventloop::eventloop)
+        if(BUILD_TESTING)
+            add_executable(http_server tests/fixtures/http_server.cc)
+            target_link_libraries(http_server PRIVATE eventloop::eventloop)
+        endif()
 
         add_executable(tls_echo examples/tls_echo.cc)
         target_link_libraries(tls_echo PRIVATE eventloop::eventloop)
@@ -639,18 +645,20 @@ if(WIN32)
         target_link_libraries(websocket_client PRIVATE eventloop::eventloop OpenSSL::Crypto)
     endif()
 
-    add_executable(http3_client
-        tests/fixtures/http3_client.cc
-        tests/fixtures/http3_client_session.cc
-        examples/common/http_client_url.cc
-        examples/common/http_client_resolve.cc
-        src/http3/qpack.cc)
-    target_include_directories(http3_client PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
-    target_link_libraries(http3_client PRIVATE eventloop::eventloop)
-    add_executable(http3_file_server tests/fixtures/http3_file_server.cc)
-    target_link_libraries(http3_file_server PRIVATE eventloop::eventloop)
+    if(BUILD_TESTING)
+        add_executable(http3_client
+            tests/fixtures/http3_client.cc
+            tests/fixtures/http3_client_session.cc
+            examples/common/http_client_url.cc
+            examples/common/http_client_resolve.cc
+            src/http3/qpack.cc)
+        target_include_directories(http3_client PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+        target_link_libraries(http3_client PRIVATE eventloop::eventloop)
+        add_executable(http3_file_server tests/fixtures/http3_file_server.cc)
+        target_link_libraries(http3_file_server PRIVATE eventloop::eventloop)
+    endif()
 
     add_executable(executor_benchmark benchmark/executor_benchmark.cc)
     target_link_libraries(executor_benchmark PRIVATE eventloop::eventloop)
@@ -704,7 +712,7 @@ if(WIN32)
         "${CMAKE_CURRENT_BINARY_DIR}/eventloopConfigVersion.cmake"
         DESTINATION "${eventloop_package_dir}"
     )
-    eventloop_register_http3_interop_tests()
+    eventloop_add_check_target()
     return()
 endif()
 
@@ -859,9 +867,11 @@ add_executable(tls_echo examples/tls_echo.cc)
 target_link_libraries(tls_echo PRIVATE eventloop::eventloop)
 target_compile_options(tls_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
-add_executable(http_server tests/fixtures/http_server.cc)
-target_link_libraries(http_server PRIVATE eventloop::eventloop)
-target_compile_options(http_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+if(BUILD_TESTING)
+    add_executable(http_server tests/fixtures/http_server.cc)
+    target_link_libraries(http_server PRIVATE eventloop::eventloop)
+    target_compile_options(http_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+endif()
 
 add_executable(websocket_client
     examples/websocket_client.cc
@@ -873,20 +883,22 @@ target_include_directories(websocket_client PRIVATE
 target_link_libraries(websocket_client PRIVATE eventloop::eventloop OpenSSL::Crypto)
 target_compile_options(websocket_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
-add_executable(http3_client
-    tests/fixtures/http3_client.cc
-    tests/fixtures/http3_client_session.cc
-    examples/common/http_client_url.cc
-    examples/common/http_client_resolve.cc
-    src/http3/qpack.cc)
-target_include_directories(http3_client PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
-target_link_libraries(http3_client PRIVATE eventloop::eventloop)
-target_compile_options(http3_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-add_executable(http3_file_server tests/fixtures/http3_file_server.cc)
-target_link_libraries(http3_file_server PRIVATE eventloop::eventloop)
-target_compile_options(http3_file_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+if(BUILD_TESTING)
+    add_executable(http3_client
+        tests/fixtures/http3_client.cc
+        tests/fixtures/http3_client_session.cc
+        examples/common/http_client_url.cc
+        examples/common/http_client_resolve.cc
+        src/http3/qpack.cc)
+    target_include_directories(http3_client PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+    target_link_libraries(http3_client PRIVATE eventloop::eventloop)
+    target_compile_options(http3_client PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_executable(http3_file_server tests/fixtures/http3_file_server.cc)
+    target_link_libraries(http3_file_server PRIVATE eventloop::eventloop)
+    target_compile_options(http3_file_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+endif()
 
 add_executable(http_benchmark_server benchmark/http_benchmark_server.cc)
 target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
@@ -934,7 +946,6 @@ if(BUILD_TESTING)
     set_tests_properties(socket_api PROPERTIES TIMEOUT 10)
 
     find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
-    find_program(CURL_EXECUTABLE curl REQUIRED)
     add_executable(tls_openssl_test tests/tls_openssl.cc)
     target_link_libraries(tls_openssl_test PRIVATE eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
     target_compile_options(tls_openssl_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
@@ -1501,57 +1512,8 @@ if(BUILD_TESTING)
     add_test(NAME coroutine_udp COMMAND coroutine_udp_test)
     set_tests_properties(coroutine_udp PROPERTIES TIMEOUT 10)
 
-    add_test(
-        NAME http_server
-        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http_server.sh
-                     $<TARGET_FILE:http_server>
-                     ${OPENSSL_EXECUTABLE}
-                     ${CURL_EXECUTABLE}
-    )
-    set_tests_properties(http_server PROPERTIES TIMEOUT 15)
-    option(EVENTLOOP_WEBSOCKET_INTEROP_TESTS
-        "Enable Python websockets interoperability test" OFF)
-    if(EVENTLOOP_WEBSOCKET_INTEROP_TESTS)
-        find_package(Python3 REQUIRED COMPONENTS Interpreter)
-        execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import websockets"
-            RESULT_VARIABLE websocket_python_result)
-        if(NOT websocket_python_result EQUAL 0)
-            message(FATAL_ERROR "WebSocket interop test requires Python websockets")
-        endif()
-        add_test(NAME websocket_server_interop
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_websocket_server.py"
-                $<TARGET_FILE:websocket_echo_server>)
-        set_tests_properties(websocket_server_interop PROPERTIES TIMEOUT 20)
-    endif()
-
-    add_test(
-        NAME http2_server
-        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http2_server.sh
-                     $<TARGET_FILE:http_server>
-                     ${OPENSSL_EXECUTABLE}
-                     ${CURL_EXECUTABLE}
-    )
-    set_tests_properties(http2_server PROPERTIES TIMEOUT 30)
-
-    find_package(Python3 QUIET COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME http2_file_transfer
-            COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http2_file_transfer.py"
-                $<TARGET_FILE:http_server> ${OPENSSL_EXECUTABLE})
-        set_tests_properties(http2_file_transfer PROPERTIES TIMEOUT 20)
-    endif()
-
-    add_test(
-        NAME http3_server
-        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http3_server.sh
-                     $<TARGET_FILE:http3_file_server>
-                     ${OPENSSL_EXECUTABLE}
-                     ${CURL_EXECUTABLE}
-                     $<TARGET_FILE:http3_client>
-    )
-    set_tests_properties(http3_server PROPERTIES TIMEOUT 30)
+    # External interoperability runners are invoked manually; they are not
+    # dependencies of configuration, the normal build, or check.
 endif()
 
-eventloop_register_http3_interop_tests()
+eventloop_add_check_target()
