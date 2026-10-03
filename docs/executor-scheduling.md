@@ -64,6 +64,20 @@ observe its task in their second check.
 The second check covers publication immediately before sleeper registration.
 Shutdown signals every worker.
 
+Signalling an idle peer removes its registration with an atomic exchange, and
+the remover also removes it from the sleeper count. Wakeup takes tens of
+microseconds, so without this every push of a burst would select the same
+sleeper until it ran, and the other sleepers would wake one after another
+through the hand-off above. Successive pushes now wake distinct sleepers in
+parallel: at most one wake per sleeper, so at most W - 1 for a burst from one
+worker, and none once every sleeper has been woken. Only the worker sets its
+registration; the worker or its waker clears it, and exactly one of them
+decrements the count. A woken worker that finds no task registers again and
+repeats its queue check before waiting or claiming a watch. A registration
+removed after the worker looked at it leaves a pending signal, so the worker
+cannot wait while unregistered. An owner woken this way no longer counts as
+idle to producers that later target its queue; they signal another sleeper.
+
 ## Lone task behind a stalled owner
 
 The stealing threshold keeps a lone nested task with the worker that submitted

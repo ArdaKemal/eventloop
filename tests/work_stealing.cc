@@ -605,6 +605,47 @@ auto idle_peers_take_shareable_work_test() -> bool
     return true;
 }
 
+// A stalled worker's bursts of every size reach distinct idle peers. A woken
+// peer leaves the idle set, so one that finds nothing must register again to
+// be woken later; reusing the executor carries that state across bursts.
+auto burst_reaches_idle_peers_test() -> bool
+{
+    constexpr int peers = 3;
+    auto target = make_multi_thread_executor({.worker_count = peers + 1,
+                                              .queue_capacity = 16});
+    for (int cycle = 0; cycle < 120; ++cycle) {
+        const int children = 1 + cycle % 6;
+        const int together = children < peers ? children : peers;
+        std::atomic<int> started {0};
+        std::atomic<int> completed {0};
+        std::atomic<bool> failed {false};
+        std::atomic<bool> parent_done {false};
+        if (!target->execute(execution_task([&]() noexcept {
+                for (int child = 0; child < children; ++child) {
+                    if (!target->execute(execution_task([&]() noexcept {
+                            started.fetch_add(1);
+                            if (!wait_until([&] { return started.load() >= together; })) {
+                                failed.store(true);
+                            }
+                            completed.fetch_add(1);
+                        }))) failed.store(true);
+                }
+                // Block without starting another task, as a stalled owner.
+                if (!wait_until([&] { return completed.load() == children; })) {
+                    failed.store(true);
+                }
+                parent_done.store(true);
+            }))) return check(false, "burst parent accepted");
+        // The parent's last access to this cycle's state is its store.
+        if (!check(wait_until([&] { return parent_done.load(); }) && !failed.load() &&
+                       completed.load() == children,
+                   "a stalled worker's burst runs on distinct idle peers")) {
+            std::_Exit(1);
+        }
+    }
+    return true;
+}
+
 // Every worker must be running one external task at the same time.
 auto external_rendezvous_test() -> bool
 {
@@ -671,6 +712,7 @@ auto main(int argc, char** argv) -> int
         !sparse_external_submission_test() ||
         !executor_runtime_allocation_test() || !nested_ownership_test() ||
         !idle_worker_wakeup_test() || !idle_peers_take_shareable_work_test() ||
+        !burst_reaches_idle_peers_test() ||
         !external_rendezvous_test() || !shutdown_signal_test()) return 1;
     return 0;
 }

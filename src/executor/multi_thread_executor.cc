@@ -61,9 +61,18 @@ public:
     }
 
     // Registered after the sleeper count and before the second queue check.
-    auto set_idle(bool idle) noexcept -> void
+    // Only the worker sets the flag. The worker or a waker clears it, and
+    // whichever clears it also removes the worker from the sleeper count.
+    auto set_idle() noexcept -> void
     {
-        idle_.store(idle, std::memory_order_seq_cst);
+        idle_.store(true, std::memory_order_seq_cst);
+    }
+
+    // True for the one caller that removed the registration.
+    auto claim_idle() noexcept -> bool
+    {
+        return idle_.load(std::memory_order_seq_cst) &&
+               idle_.exchange(false, std::memory_order_seq_cst);
     }
 
     [[nodiscard]] auto idle() const noexcept -> bool
@@ -175,8 +184,9 @@ private:
             return false;
         }
         wake_[worker].release();
-        // An idle target observes its own signal. Otherwise one idle peer is
-        // enough: a woken worker that leaves shareable work wakes the next.
+        // A target still registered idle observes its own signal. Otherwise
+        // wake one idle peer; the next push reaches another (see
+        // wake_idle_peer), and a woken worker leaving shareable work wakes one.
         // A lone local task is not shareable yet, but a busy owner may never
         // return to it. Wake one peer to watch it unless one already does.
         // The watch lasts at least stall_detection_delay, so an owner's lone
@@ -195,12 +205,17 @@ private:
 
     // Publication precedes these SC idle loads. A worker that registers later
     // repeats its queue check after registration and observes the work.
+    // Waking a peer removes its registration, so a burst's next push wakes
+    // another sleeper instead of coalescing on one that has not run yet. A
+    // sleep is woken at most once this way, and sleepers_ counts only peers
+    // nobody has woken: the woken one checks every queue once it runs.
     auto wake_idle_peer(std::size_t busy) noexcept -> void
     {
         for (std::size_t offset = 1; offset < worker_count_; ++offset) {
             auto peer = busy + offset;
             if (peer >= worker_count_) peer -= worker_count_;
-            if (wake_[peer].idle()) {
+            if (wake_[peer].claim_idle()) {
+                sleepers_.fetch_sub(1, std::memory_order_seq_cst);
                 wake_[peer].release();
                 return;
             }
@@ -312,8 +327,9 @@ private:
                std::size_t& victim, std::size_t& cursor,
                execution_task& task) noexcept -> bool
     {
-        // A producer that signalled this worker while it was registered idle
-        // published before the idle clear; take that work instead of waiting.
+        // A producer that woke this worker while it was registered idle
+        // published before the registration was cleared; take that work
+        // instead of waiting.
         bool found = take_work(index, victim, cursor, task);
         if (!found) {
             const auto wait = stall_wait(owner, started);
@@ -358,7 +374,7 @@ private:
                 return;
             }
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
-            if (shared) wake_[index].set_idle(true);
+            if (shared) wake_[index].set_idle();
             // Either publication observes this registration and signals us,
             // or this second SC queue check observes the published work.
             bool found = take_work(index, victim, dequeue_cursor, task);
@@ -370,19 +386,30 @@ private:
                 if (shared && (owner = claim_watch(index, started)) != worker_count_) break;
                 wake_[index].acquire();
                 found = take_work(index, victim, dequeue_cursor, task);
+                // The peer that woke this worker removed its registration.
+                // Register again and repeat the check before waiting. A
+                // registration cleared after this load leaves a signal, so
+                // the next acquire() returns and this check runs again.
+                if (!found && shared && !wake_[index].idle()) {
+                    sleepers_.fetch_add(1, std::memory_order_seq_cst);
+                    wake_[index].set_idle();
+                    found = take_work(index, victim, dequeue_cursor, task);
+                }
             }
-            if (shared) wake_[index].set_idle(false);
-            sleepers_.fetch_sub(1, std::memory_order_seq_cst);
+            if (!shared || wake_[index].claim_idle()) {
+                sleepers_.fetch_sub(1, std::memory_order_seq_cst);
+            }
             if (owner != worker_count_) {
                 found = watch(index, owner, started, victim, dequeue_cursor, task);
                 watched = !found;
             }
             if (!found) continue;
             if (shared) note_owners(index);
-            // Producers that observed this worker idle signalled only this
-            // worker. Their publications precede the idle clear above, so
-            // this check sees any of their work this worker leaves behind.
-            // That includes a lone local task whose wake this worker took.
+            // A producer that removed this worker's registration woke only
+            // this worker, after publishing. The claim_idle() above follows
+            // that removal, so this check sees any of its work this worker
+            // leaves behind. That includes a lone local task whose wake this
+            // worker took.
             if (shared && sleepers_.load(std::memory_order_seq_cst) != 0 &&
                 (queue_.has_shareable_work() || has_unwatched_local_work(index))) {
                 wake_idle_peer(index);
