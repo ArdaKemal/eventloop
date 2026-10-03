@@ -96,7 +96,19 @@ struct alignas(64) owner_progress {
     // this repeats its SC queue check; a lone pusher publishes before its SC
     // load of this flag, so one of them observes the task.
     std::atomic<bool> watched {false};
+    // Written by thieves, never by the owner: the progress value they last
+    // saw and when they first saw it. Later thieves skip their own wait
+    // once an unchanged value is at least the detection delay old. Hints
+    // only: a stale value moves a task to another worker, which is allowed.
+    std::atomic<std::uint64_t> seen_started {~std::uint64_t {0}};
+    std::atomic<std::int64_t> seen_at {0};
 };
+
+[[nodiscard]] inline auto steady_ns() noexcept -> std::int64_t
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 struct worker_context {
     const executor* owner {nullptr};
@@ -261,6 +273,39 @@ private:
         return false;
     }
 
+    // Records, for every peer with queued local work, the progress value a
+    // thief sees now. Called once per wake with work, not per task.
+    auto note_owners(std::size_t index) noexcept -> void
+    {
+        std::int64_t now = 0;
+        for (std::size_t peer = 0; peer < worker_count_; ++peer) {
+            if (peer == index || !queue_.has_local_work(peer)) continue;
+            auto& owner = progress_[peer];
+            const auto started = owner.started.load(std::memory_order_relaxed);
+            if (owner.seen_started.load(std::memory_order_relaxed) == started) continue;
+            if (now == 0) now = steady_ns();
+            owner.seen_at.store(now, std::memory_order_relaxed);
+            owner.seen_started.store(started, std::memory_order_relaxed);
+        }
+    }
+
+    // Time left before an unchanged progress value counts as stalled.
+    auto stall_wait(std::size_t owner, std::uint64_t started) noexcept
+        -> std::chrono::nanoseconds
+    {
+        auto& progress = progress_[owner];
+        const auto now = steady_ns();
+        if (progress.seen_started.load(std::memory_order_relaxed) != started) {
+            progress.seen_at.store(now, std::memory_order_relaxed);
+            progress.seen_started.store(started, std::memory_order_relaxed);
+            return stall_detection_delay;
+        }
+        const auto age = std::chrono::nanoseconds {
+            now - progress.seen_at.load(std::memory_order_relaxed)};
+        return age >= stall_detection_delay ? std::chrono::nanoseconds {0}
+                                            : stall_detection_delay - age;
+    }
+
     // Runs outside the idle state, like a task: producers wake other idle
     // peers meanwhile, and this worker checks every queue when it ends.
     auto watch(std::size_t index, std::size_t owner, std::uint64_t started,
@@ -271,7 +316,8 @@ private:
         // published before the idle clear; take that work instead of waiting.
         bool found = take_work(index, victim, cursor, task);
         if (!found) {
-            std::this_thread::sleep_for(stall_detection_delay);
+            const auto wait = stall_wait(owner, started);
+            if (wait.count() > 0) std::this_thread::sleep_for(wait);
             // An owner that started no task in the delay is stalled in one.
             found = progress_[owner].started.load(std::memory_order_relaxed) == started &&
                     queue_.try_pop(owner, task, cursor);
@@ -332,6 +378,7 @@ private:
                 watched = !found;
             }
             if (!found) continue;
+            if (shared) note_owners(index);
             // Producers that observed this worker idle signalled only this
             // worker. Their publications precede the idle clear above, so
             // this check sees any of their work this worker leaves behind.

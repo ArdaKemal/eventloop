@@ -80,6 +80,14 @@ signalled it while idle), sleeps for the delay, and takes the owner's task only
 if the count is unchanged. It clears the flag and checks the queues again
 before registering idle or running a task. At most one peer watches an owner.
 
+The delay is measured from when any thief first saw the owner's current count,
+not from when this watcher started. A worker that wakes and finds work records,
+beside the flag, the count it sees and the time; thieves write these fields
+and the owner never does. A later watcher that finds the same count at least
+one delay old takes the task without sleeping, so the tail of a burst waits
+one delay after the first sighting instead of one delay per idle peer. The
+fields are hints: a stale value only moves a task to another worker.
+
 The watch is not an idle wait: producers wake other registered idle peers
 meanwhile, and parked workers still wait without a timeout. No timer thread
 or timed wake primitive is added; a watcher sleeps for the delay as a running
