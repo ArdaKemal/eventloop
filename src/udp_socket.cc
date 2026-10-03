@@ -10,6 +10,14 @@
 #include <stdexcept>
 #include <utility>
 
+#if defined(__linux__)
+#include <netinet/in.h>
+#include <sys/socket.h>
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
+#endif
+
 
 namespace eventloop {
 
@@ -59,6 +67,17 @@ auto udp_socket::descriptor() const noexcept -> native_socket
 auto udp_socket::local_endpoint() const -> ip_endpoint
 {
     return detail::socket_operations::local_endpoint(descriptor_.get());
+}
+
+auto udp_socket::enable_receive_coalescing() noexcept -> void
+{
+#if defined(__linux__)
+    // Opt-in UDP_GRO for the QUIC endpoint only; the public API keeps one
+    // datagram per receive. Best-effort: failure keeps single-datagram reads.
+    const int enabled = 1;
+    (void)::setsockopt(descriptor_.get(), IPPROTO_UDP, UDP_GRO,
+                       &enabled, sizeof(enabled));
+#endif
 }
 
 auto udp_socket::close() -> void
@@ -167,6 +186,7 @@ auto udp_socket::receive_awaiter::start(
         detail::coroutine_frame_access::detach_cancellation(cancellation_);
         result_ = detail::socket_operations::datagram_result(result);
         source_ = result.source;
+        socket_.receive_segment_ = result.segment_size;
         return false;
     }
     detail::socket_operations::datagram_submitted(socket_, operation_);
@@ -277,7 +297,8 @@ auto udp_socket::update_interest() -> void
                           send_ != nullptr);
 }
 
-auto udp_socket::complete_receive(int result, ip_endpoint source) noexcept
+auto udp_socket::complete_receive(int result, ip_endpoint source,
+                                  std::size_t segment) noexcept
     -> void
 {
     event_loop::handler_call_scope scope(loop_);
@@ -288,6 +309,7 @@ auto udp_socket::complete_receive(int result, ip_endpoint source) noexcept
         operation->cancellation_);
     operation->result_ = result;
     operation->source_ = source;
+    receive_segment_ = segment;
     try {
         update_interest();
     } catch (...) {
@@ -349,7 +371,8 @@ auto udp_socket::on_read() -> void
     if (receive_ == nullptr) return;
     const auto result = detail::socket_operations::datagram_receive(*this, *receive_);
     if (!result.pending) complete_receive(
-        detail::socket_operations::datagram_result(result), result.source);
+        detail::socket_operations::datagram_result(result), result.source,
+        result.segment_size);
 }
 
 auto udp_socket::on_write() -> void

@@ -396,8 +396,10 @@ public:
             if (!duration) continue;
             bool ack_eliciting_in_flight = false;
             for (const auto& packet : histories_[index].remaining()) {
-                if (packet.in_flight && packet.ack_eliciting)
+                if (packet.in_flight && packet.ack_eliciting) {
                     ack_eliciting_in_flight = true;
+                    break;
+                }
             }
             if (!ack_eliciting_in_flight || !last_ack_eliciting_sent_[index]) continue;
             const auto deadline = saturated_deadline(

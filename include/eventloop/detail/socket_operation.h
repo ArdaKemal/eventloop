@@ -74,6 +74,9 @@ struct socket_result {
     native_socket accepted {static_cast<native_socket>(-1)};
     ip_endpoint source {};
     std::error_code error {};
+    // UDP_GRO: when nonzero, `transferred` bytes hold whole datagrams of this
+    // size (the final datagram may be shorter). Zero means one datagram.
+    std::size_t segment_size {0};
 };
 
 } // namespace eventloop::detail

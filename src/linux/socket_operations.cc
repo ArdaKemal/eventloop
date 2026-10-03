@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <limits>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
@@ -17,6 +18,9 @@
 
 #ifndef UDP_SEGMENT
 #define UDP_SEGMENT 103
+#endif
+#ifndef UDP_GRO
+#define UDP_GRO 104
 #endif
 
 namespace eventloop::detail {
@@ -266,20 +270,37 @@ auto socket_operations::start_receive_from(native_socket socket, void* buffer,
         return {.error = code(EINVAL)};
     sockaddr_storage address {};
     iovec iov {.iov_base = buffer, .iov_len = size};
+    std::array<std::byte, 64> control {};
     msghdr message {};
     message.msg_name = &address;
     message.msg_namelen = sizeof(address);
     message.msg_iov = &iov;
     message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
     for (;;) {
         const auto received = ::recvmsg(socket, &message, MSG_TRUNC);
         if (received >= 0) {
             if ((message.msg_flags & MSG_TRUNC) != 0 ||
                 static_cast<std::size_t>(received) > size)
                 return {.error = code(EMSGSIZE)};
+            std::size_t segment = 0;
+            if ((message.msg_flags & MSG_CTRUNC) == 0) {
+                for (auto* cmsg = CMSG_FIRSTHDR(&message); cmsg != nullptr;
+                     cmsg = CMSG_NXTHDR(&message, cmsg)) {
+                    if (cmsg->cmsg_level == IPPROTO_UDP &&
+                        cmsg->cmsg_type == UDP_GRO) {
+                        std::uint16_t value = 0;
+                        std::memcpy(&value, CMSG_DATA(cmsg), sizeof(value));
+                        segment = value;
+                        break;
+                    }
+                }
+            }
             try {
                 return {.transferred = static_cast<std::size_t>(received),
-                        .source = public_endpoint(address)};
+                        .source = public_endpoint(address),
+                        .segment_size = segment};
             } catch (...) { return {.error = code(EIO)}; }
         }
         if (errno == EINTR) continue;

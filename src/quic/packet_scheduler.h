@@ -127,8 +127,9 @@ public:
             // Across all streams, transmitted data precedes new data in a PTO
             // packet. Selection does not declare the original packet lost.
             for (unsigned pass = 0; pass < (probe ? 2u : 1u) && range_count_ < ranges_.size(); ++pass) {
-            for (auto& stream : connection_.stream_slots()) {
+            for (auto* active : connection_.active_slots()) {
                 if (range_count_ == ranges_.size()) break;
+                auto& stream = *active;
                 if (!stream.occupied ||
                     stream.state.sending() == stream_send_state::reset_sent ||
                     stream.state.sending() == stream_send_state::reset_received) continue;

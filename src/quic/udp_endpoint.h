@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <span>
 
 namespace eventloop::quic::detail {
 
@@ -44,18 +46,22 @@ public:
     [[nodiscard]] auto async_send_candidate(endpoint_connection, std::span<const std::byte>)
         -> task<std::expected<std::size_t, std::error_code>>;
 
-    // Queue one datagram for a batched send. The bytes are copied, so the
-    // caller may reuse its buffer immediately. A datagram with a different
-    // route, candidate flag, or size flushes the current batch first. Returns
-    // the error from flushing a previous batch, if one occurred.
-    [[nodiscard]] auto stage_send(endpoint_connection, std::span<const std::byte>, bool candidate)
+    // Batching built packets directly into the offload buffer avoids a copy.
+    // reserve_send() prepares the next datagram slot (flushing a completed
+    // batch first) and returns any error from that flush; the caller builds
+    // into reserved() and then commit_send()s the built length. A length that
+    // differs from the batch's segment size flushes the uniform prefix and
+    // starts a new batch, so every batch stays uniformly segmented.
+    [[nodiscard]] auto reserve_send(endpoint_connection, std::size_t, bool candidate)
         -> std::error_code;
+    [[nodiscard]] auto reserved() noexcept -> std::span<std::uint8_t>;
+    [[nodiscard]] auto commit_send(std::size_t size) noexcept -> std::error_code;
     // Flush queued datagrams with one offload/syscall batch. Always clears the
     // pending batch, even on failure.
     [[nodiscard]] auto flush_send() -> std::error_code;
 
 private:
-    static constexpr std::size_t send_batch_capacity = 8;
+    static constexpr std::size_t send_batch_capacity = 32;
     static constexpr std::size_t send_segment_capacity = 8448;
     static auto receive_loop(event_loop&, udp_endpoint&) -> task<std::error_code>;
     static auto send(event_loop&, udp_endpoint&, endpoint_connection,
@@ -74,6 +80,8 @@ private:
     std::array<std::byte, send_batch_capacity * send_segment_capacity> send_batch_bytes_ {};
     std::size_t send_batch_count_ {};
     std::size_t send_batch_segment_ {};
+    std::size_t send_batch_write_ {};
+    std::size_t send_batch_reserved_ {};
     endpoint_connection send_batch_handle_ {};
     bool send_batch_candidate_ {};
     bool send_batch_active_ {};

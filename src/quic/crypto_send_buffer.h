@@ -2,14 +2,12 @@
 
 #include "quic/varint.h"
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <expected>
 #include <span>
-#include <type_traits>
 
 namespace eventloop::quic::detail {
 
@@ -29,9 +27,138 @@ struct crypto_send_chunk {
 // window; append copies provider output so its source may be released. No
 // storage or allocation is supplied by the caller. Returned spans are valid
 // until the next append, acknowledge, or reset.
+//
+// Byte state is tracked as intervals instead of a per-byte flag array. `base_`
+// is the acknowledged prefix (SND.UNA) and `acked_` holds out-of-order ACKs
+// (SACK); `sent_` is every transmitted interval and unsent bytes are its
+// complement in [base_, end_); `lost_` is transmitted-but-unacknowledged bytes
+// queued for retransmission. Selection and validation are O(intervals) rather
+// than O(bytes), matching msquic's SparseAckRanges and mvfst's IntervalSet.
 template<std::size_t Capacity>
 class crypto_send_buffer {
     static_assert(Capacity > 0);
+    static constexpr std::size_t max_ranges = Capacity < 64 ? Capacity : 64;
+
+    struct offset_range {
+        std::uint64_t begin {0};
+        std::uint64_t end {0};
+    };
+
+    // Sorted, non-overlapping, non-adjacent half-open intervals [begin, end).
+    // Capacity is bounded by the tracked window; more than `max_ranges` holes
+    // is reported as crypto_send_error::capacity_exceeded rather than corrupting.
+    struct range_set {
+        std::array<offset_range, max_ranges> ranges_ {};
+        std::size_t size_ {0};
+
+        constexpr auto clear() noexcept -> void { size_ = 0; }
+        [[nodiscard]] constexpr auto empty() const noexcept -> bool { return size_ == 0; }
+        [[nodiscard]] constexpr auto front() const noexcept -> std::uint64_t
+        { return ranges_[0].begin; }
+
+        [[nodiscard]] constexpr auto contains(std::uint64_t value) const noexcept -> bool
+        {
+            for (std::size_t i = 0; i < size_; ++i)
+                if (ranges_[i].begin <= value && value < ranges_[i].end) return true;
+            return false;
+        }
+        [[nodiscard]] constexpr auto covers(std::uint64_t begin, std::uint64_t end) const noexcept -> bool
+        {
+            if (begin >= end) return true;
+            for (std::size_t i = 0; i < size_; ++i)
+                if (ranges_[i].begin <= begin && end <= ranges_[i].end) return true;
+            return false;
+        }
+        [[nodiscard]] constexpr auto intersects(std::uint64_t begin, std::uint64_t end) const noexcept -> bool
+        {
+            for (std::size_t i = 0; i < size_; ++i)
+                if (ranges_[i].begin < end && begin < ranges_[i].end) return true;
+            return false;
+        }
+        [[nodiscard]] constexpr auto interval_end(std::uint64_t value) const noexcept -> std::uint64_t
+        {
+            for (std::size_t i = 0; i < size_; ++i)
+                if (ranges_[i].begin <= value && value < ranges_[i].end) return ranges_[i].end;
+            return value;
+        }
+        // First offset in [from, limit) present in the set, or limit.
+        [[nodiscard]] constexpr auto first_present(std::uint64_t from, std::uint64_t limit) const noexcept -> std::uint64_t
+        {
+            if (from >= limit) return limit;
+            for (std::size_t i = 0; i < size_; ++i) {
+                if (ranges_[i].end <= from) continue;
+                if (ranges_[i].begin >= limit) break;
+                return std::max(ranges_[i].begin, from);
+            }
+            return limit;
+        }
+        // First offset in [from, limit) absent from the set, or limit.
+        [[nodiscard]] constexpr auto first_missing(std::uint64_t from, std::uint64_t limit) const noexcept -> std::uint64_t
+        {
+            if (from >= limit) return limit;
+            for (std::size_t i = 0; i < size_; ++i) {
+                if (ranges_[i].end <= from) continue;
+                if (ranges_[i].begin > from) return from;
+                return std::min(ranges_[i].end, limit);
+            }
+            return from;
+        }
+
+        [[nodiscard]] constexpr auto add(std::uint64_t begin, std::uint64_t end) noexcept -> bool
+        {
+            if (begin >= end) return true;
+            std::size_t i = 0;
+            while (i < size_ && ranges_[i].end < begin) ++i;
+            auto merged_begin = begin;
+            auto merged_end = end;
+            std::size_t j = i;
+            while (j < size_ && ranges_[j].begin <= merged_end) {
+                merged_begin = std::min(merged_begin, ranges_[j].begin);
+                merged_end = std::max(merged_end, ranges_[j].end);
+                ++j;
+            }
+            const auto removed = j - i;
+            if (removed == 0) {
+                if (size_ == max_ranges) return false;
+                for (std::size_t k = size_; k > i; --k) ranges_[k] = ranges_[k - 1];
+                ++size_;
+            } else {
+                std::size_t write = i + 1;
+                for (std::size_t read = j; read < size_; ++read) ranges_[write++] = ranges_[read];
+                size_ = write;
+            }
+            ranges_[i] = {merged_begin, merged_end};
+            return true;
+        }
+
+        constexpr auto remove(std::uint64_t begin, std::uint64_t end) noexcept -> void
+        {
+            if (begin >= end) return;
+            std::size_t write = 0;
+            for (std::size_t i = 0; i < size_; ++i) {
+                const auto r = ranges_[i];
+                if (r.end <= begin || r.begin >= end) {
+                    ranges_[write++] = r;
+                    continue;
+                }
+                if (r.begin < begin && write < max_ranges) ranges_[write++] = {r.begin, begin};
+                if (r.end > end && write < max_ranges) ranges_[write++] = {end, r.end};
+            }
+            size_ = write;
+        }
+
+        constexpr auto drop_below(std::uint64_t value) noexcept -> void
+        {
+            std::size_t write = 0;
+            for (std::size_t i = 0; i < size_; ++i) {
+                auto r = ranges_[i];
+                if (r.end <= value) continue;
+                if (r.begin < value) r.begin = value;
+                ranges_[write++] = r;
+            }
+            size_ = write;
+        }
+    };
 
 public:
     [[nodiscard]] constexpr auto base_offset() const noexcept -> std::uint64_t
@@ -53,20 +180,18 @@ public:
     {
         base_ = 0;
         end_ = 0;
-        pending_begin_ = 0;
-        flags_.fill(0);
+        sent_.clear();
+        acked_.clear();
+        lost_.clear();
     }
 
     // Retry occurs before any authenticated response can acknowledge CRYPTO.
     // Preserve the exact TLS bytes while making the whole first flight pending.
     [[nodiscard]] constexpr auto retransmit_initial() noexcept -> bool
     {
-        if (base_ != 0) return false;
-        for (auto offset = base_; offset < end_; ++offset)
-            if (flags_[offset % Capacity] & acked_flag) return false;
-        for (auto offset = base_; offset < end_; ++offset)
-            flags_[offset % Capacity] = pending_flag;
-        pending_begin_ = base_;
+        if (base_ != 0 || !acked_.empty()) return false;
+        sent_.clear();
+        lost_.clear();
         return true;
     }
 
@@ -84,9 +209,7 @@ public:
         const auto slot = static_cast<std::size_t>(end_ % Capacity);
         const auto first = std::min(data.size(), Capacity - slot);
         std::copy_n(data.begin(), first, bytes_.begin() + slot);
-        std::fill_n(flags_.begin() + slot, first, pending_flag);
         std::copy(data.begin() + first, data.end(), bytes_.begin());
-        std::fill_n(flags_.begin(), data.size() - first, pending_flag);
         end_ += data.size();
         return offset;
     }
@@ -97,13 +220,28 @@ public:
     [[nodiscard]] constexpr auto next_pending(std::size_t max_size) const noexcept
         -> crypto_send_chunk
     {
-        if (max_size == 0 || pending_begin_ == end_) return {};
-        const auto slot = static_cast<std::size_t>(pending_begin_ % Capacity);
-        const auto limit = std::min({max_size, Capacity - slot,
-                                     static_cast<std::size_t>(end_ - pending_begin_)});
-        const auto length = matching_flags_prefix(
-            std::span(flags_).subspan(slot, limit), pending_flag, pending_flag);
-        return {pending_begin_, std::span<const std::byte>(bytes_).subspan(slot, length)};
+        if (max_size == 0 || base_ == end_) return {};
+        auto start = sent_.first_missing(base_, end_);
+        if (!lost_.empty() && lost_.front() < start) start = lost_.front();
+        if (start >= end_) return {};
+        auto run_end = start;
+        for (;;) {
+            if (run_end >= end_) break;
+            if (!sent_.contains(run_end)) {
+                run_end = sent_.first_present(run_end, end_);
+                continue;
+            }
+            if (lost_.contains(run_end)) {
+                run_end = lost_.interval_end(run_end);
+                continue;
+            }
+            break;
+        }
+        const auto slot = static_cast<std::size_t>(start % Capacity);
+        const auto length = std::min({max_size,
+            static_cast<std::size_t>(run_end - start),
+            Capacity - slot});
+        return {start, std::span<const std::byte>(bytes_).subspan(slot, length)};
     }
 
     // PTO selects transmitted bytes without marking the original packet lost
@@ -111,16 +249,21 @@ public:
     [[nodiscard]] constexpr auto next_unacknowledged(std::size_t max_size) const noexcept
         -> crypto_send_chunk
     {
-        if (max_size == 0) return {};
-        for (auto offset = base_; offset < end_; ++offset) {
-            const auto slot = static_cast<std::size_t>(offset % Capacity);
-            if ((flags_[slot] & (sent_flag | acked_flag)) != sent_flag) continue;
-            const auto limit = std::min({max_size, Capacity - slot,
-                                         static_cast<std::size_t>(end_ - offset)});
-            std::size_t length = 0;
-            while (length < limit &&
-                   (flags_[slot + length] & (sent_flag | acked_flag)) == sent_flag) ++length;
-            return {offset, std::span<const std::byte>(bytes_).subspan(slot, length)};
+        if (max_size == 0 || base_ == end_) return {};
+        for (std::size_t i = 0; i < sent_.size_; ++i) {
+            const auto begin = std::max(sent_.ranges_[i].begin, base_);
+            const auto end = std::min(sent_.ranges_[i].end, end_);
+            auto cur = begin;
+            while (cur < end) {
+                const auto ack_end = acked_.interval_end(cur);
+                if (ack_end > cur) { cur = ack_end; continue; }
+                const auto block_end = std::min(end, acked_.first_present(cur, end));
+                const auto slot = static_cast<std::size_t>(cur % Capacity);
+                const auto length = std::min({max_size,
+                    static_cast<std::size_t>(block_end - cur),
+                    Capacity - slot});
+                return {cur, std::span<const std::byte>(bytes_).subspan(slot, length)};
+            }
         }
         return {};
     }
@@ -134,7 +277,7 @@ public:
             return std::unexpected(crypto_send_error::invalid_range);
         if (offset < base_)
             return std::unexpected(crypto_send_error::invalid_range);
-        if (!range_has_flags(offset, length, acked_flag, 0))
+        if (acked_.intersects(offset, offset + length))
             return std::unexpected(crypto_send_error::invalid_range);
         return {};
     }
@@ -146,21 +289,17 @@ public:
         -> std::expected<void, crypto_send_error>
     {
         if (const auto result = preflight_mark_sent(offset, length); !result) return result;
-        // Preflight excluded ACKed bytes; every remaining byte becomes sent
-        // and non-pending, including overlapping probes and retransmissions.
-        mark_sent_trusted(offset, length);
+        if (!commit_mark_sent(offset, length))
+            return std::unexpected(crypto_send_error::capacity_exceeded);
         return {};
     }
 
     // Commit a range the caller already validated with preflight_mark_sent in
-    // the same serialized operation. Skips the redundant flag rescan.
+    // the same serialized operation. Skips the redundant rescan.
     constexpr auto mark_sent_trusted(std::uint64_t offset,
                                      std::size_t length) noexcept -> void
     {
-        fill_flags(offset, length, sent_flag);
-        if (pending_begin_ >= offset && pending_begin_ < offset + length)
-            pending_begin_ = offset + length;
-        advance_pending();
+        (void)commit_mark_sent(offset, length);
     }
 
     // ACK and loss reports may cover subranges of a transmitted CRYPTO frame.
@@ -174,29 +313,14 @@ public:
             return std::unexpected(crypto_send_error::invalid_range);
         const auto start = std::max(offset, base_);
         const auto finish = offset + length;
-        if (start < finish && !range_has_flags(start, static_cast<std::size_t>(finish - start), sent_flag, sent_flag))
+        if (start < finish && !sent_.covers(start, finish))
             return std::unexpected(crypto_send_error::unsent_data);
         if (start < finish) {
-            if (start == base_) {
-                // Validation proved this entire prefix sent. Retire it in
-                // bulk, then inspect any suffix ACKed by an earlier report.
-                fill_flags(start, static_cast<std::size_t>(finish - start), 0);
-                base_ = finish;
-            } else {
-                fill_flags(start, static_cast<std::size_t>(finish - start), acked_flag | sent_flag);
-            }
+            lost_.remove(start, finish);
+            if (!acked_.add(start, finish))
+                return std::unexpected(crypto_send_error::capacity_exceeded);
         }
-        while (base_ < end_) {
-            const auto slot = static_cast<std::size_t>(base_ % Capacity);
-            const auto limit = std::min(Capacity - slot, static_cast<std::size_t>(end_ - base_));
-            const auto length = matching_flags_prefix(
-                std::span(flags_).subspan(slot, limit), acked_flag, acked_flag);
-            std::fill_n(flags_.begin() + slot, length, 0);
-            base_ += length;
-            if (length != limit) break;
-        }
-        pending_begin_ = std::max(pending_begin_, base_);
-        advance_pending();
+        advance_base();
         return {};
     }
 
@@ -208,69 +332,42 @@ public:
             return std::unexpected(crypto_send_error::invalid_range);
         const auto start = std::max(offset, base_);
         const auto finish = offset + length;
-        if (start < finish && !range_has_flags(start, static_cast<std::size_t>(finish - start), sent_flag, sent_flag))
+        if (start < finish && !sent_.covers(start, finish))
             return std::unexpected(crypto_send_error::unsent_data);
-        for (auto pos = start; pos < finish; ++pos) {
-            auto& flag = flags_[pos % Capacity];
-            if ((flag & acked_flag) == 0) {
-                flag |= pending_flag;
-                pending_begin_ = std::min(pending_begin_, pos);
-            }
+        auto cur = start;
+        while (cur < finish) {
+            const auto ack_end = acked_.interval_end(cur);
+            if (ack_end > cur) { cur = ack_end; continue; }
+            const auto block_end = std::min(finish, acked_.first_present(cur, finish));
+            if (!lost_.add(cur, block_end))
+                return std::unexpected(crypto_send_error::capacity_exceeded);
+            cur = block_end;
         }
         return {};
     }
 
 private:
-    [[nodiscard]] static constexpr auto has_flags(std::span<const std::uint8_t> flags,
-        std::uint8_t mask, std::uint8_t expected) noexcept -> bool
+    [[nodiscard]] constexpr auto commit_mark_sent(std::uint64_t offset,
+                                                  std::size_t length) noexcept -> bool
     {
-        return matching_flags_prefix(flags, mask, expected) == flags.size();
+        lost_.remove(offset, offset + length);
+        return sent_.add(offset, offset + length);
     }
-    [[nodiscard]] static constexpr auto matching_flags_prefix(std::span<const std::uint8_t> flags,
-        std::uint8_t mask, std::uint8_t expected) noexcept -> std::size_t
+
+    // Advance the acknowledged prefix (SND.UNA) over contiguous ACKed bytes and
+    // drop state below it.
+    constexpr auto advance_base() noexcept -> void
     {
-        std::size_t i = 0;
-        if (!std::is_constant_evaluated()) {
-            // Uniform byte masks work in either endian order. memcpy permits
-            // unaligned loads without aliasing or reading beyond the segment.
-            constexpr std::uint64_t repeat = 0x0101010101010101;
-            const auto word_mask = repeat * mask;
-            const auto word_expected = repeat * expected;
-            for (; flags.size() - i >= sizeof(std::uint64_t); i += sizeof(std::uint64_t)) {
-                std::uint64_t word;
-                std::memcpy(&word, flags.data() + i, sizeof(word));
-                if ((word & word_mask) != word_expected) break;
-            }
+        for (;;) {
+            const auto next = acked_.interval_end(base_);
+            if (next <= base_) break;
+            base_ = next;
         }
-        for (; i < flags.size(); ++i)
-            if ((flags[i] & mask) != expected) break;
-        return i;
+        sent_.drop_below(base_);
+        acked_.drop_below(base_);
+        lost_.drop_below(base_);
     }
-    [[nodiscard]] constexpr auto range_has_flags(std::uint64_t offset,
-        std::size_t length, std::uint8_t mask, std::uint8_t expected) const noexcept -> bool
-    {
-        const auto slot = static_cast<std::size_t>(offset % Capacity);
-        const auto first = std::min(length, Capacity - slot);
-        return has_flags(std::span(flags_).subspan(slot, first), mask, expected) &&
-            has_flags(std::span(flags_).first(length - first), mask, expected);
-    }
-    constexpr auto fill_flags(std::uint64_t offset, std::size_t length,
-        std::uint8_t value) noexcept -> void
-    {
-        const auto slot = static_cast<std::size_t>(offset % Capacity);
-        const auto first = std::min(length, Capacity - slot);
-        std::fill_n(flags_.begin() + slot, first, value);
-        std::fill_n(flags_.begin(), length - first, value);
-    }
-    // Lowest pending byte, or end_ when all buffered bytes are in flight.
-    // Retain it across packet selection so an ACK-blocked stream does not
-    // rescan its whole ring for every packet sent on another stream.
-    constexpr auto advance_pending() noexcept -> void
-    {
-        while (pending_begin_ < end_ &&
-               (flags_[pending_begin_ % Capacity] & pending_flag) == 0)
-            ++pending_begin_;
-    }
+
     [[nodiscard]] constexpr auto valid_range(std::uint64_t offset,
                                               std::size_t length) const noexcept
         -> bool
@@ -278,14 +375,12 @@ private:
         return offset <= end_ && length <= end_ - offset;
     }
 
-    static constexpr std::uint8_t pending_flag = 1;
-    static constexpr std::uint8_t sent_flag = 2;
-    static constexpr std::uint8_t acked_flag = 4;
     std::array<std::byte, Capacity> bytes_ {};
-    std::array<std::uint8_t, Capacity> flags_ {};
+    range_set sent_ {};
+    range_set acked_ {};
+    range_set lost_ {};
     std::uint64_t base_ {0};
     std::uint64_t end_ {0};
-    std::uint64_t pending_begin_ {0};
 };
 
 } // namespace eventloop::quic::detail

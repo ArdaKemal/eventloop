@@ -15,6 +15,7 @@ udp_endpoint::udp_endpoint(event_loop& loop, ip_endpoint local, path_endpoint_ro
     auto socket = std::make_unique<udp_socket>(loop, local);
     local_ = socket->local_endpoint();
     socket_ = socket.get();
+    socket->enable_receive_coalescing();
     socket->set_lifetime_observer(this, socket_destroyed);
     loop.add(std::move(socket));
 }
@@ -53,45 +54,82 @@ auto udp_endpoint::async_send_candidate(endpoint_connection handle, std::span<co
     -> task<std::expected<std::size_t, std::error_code>>
 { check_owner(); return send(loop_, *this, handle, bytes, true); }
 
-auto udp_endpoint::stage_send(endpoint_connection handle, std::span<const std::byte> bytes,
+auto udp_endpoint::reserve_send(endpoint_connection handle, std::size_t size,
     bool candidate) -> std::error_code
 {
     check_owner();
     if (socket_ == nullptr) return std::error_code(ECANCELED, std::generic_category());
-    if (bytes.empty() || bytes.size() > maximum_datagram_size ||
-        bytes.size() > send_segment_capacity)
+    if (size == 0 || size > send_segment_capacity)
         return std::error_code(EMSGSIZE, std::generic_category());
     std::error_code flush_error {};
     const bool needs_new_batch = send_batch_active_ &&
-        (send_batch_segment_ != bytes.size() || send_batch_handle_ != handle ||
-         send_batch_candidate_ != candidate || send_batch_count_ == send_batch_capacity);
+        (send_batch_handle_ != handle || send_batch_candidate_ != candidate ||
+         send_batch_count_ == send_batch_capacity ||
+         send_batch_write_ + size > send_batch_bytes_.size());
     if (needs_new_batch) flush_error = flush_send();
     if (!send_batch_active_) {
-        send_batch_segment_ = bytes.size();
         send_batch_handle_ = handle;
         send_batch_candidate_ = candidate;
         send_batch_active_ = true;
         send_batch_count_ = 0;
+        send_batch_segment_ = 0;
+        send_batch_write_ = 0;
     }
-    std::memcpy(send_batch_bytes_.data() + send_batch_count_ * send_batch_segment_,
-                bytes.data(), bytes.size());
-    ++send_batch_count_;
+    send_batch_reserved_ = size;
+    return flush_error;
+}
+
+auto udp_endpoint::reserved() noexcept -> std::span<std::uint8_t>
+{
+    return {reinterpret_cast<std::uint8_t*>(send_batch_bytes_.data()) + send_batch_write_,
+            send_batch_reserved_};
+}
+
+auto udp_endpoint::commit_send(std::size_t size) noexcept -> std::error_code
+{
+    if (!send_batch_active_ || size > send_batch_reserved_) return {};
+    if (send_batch_count_ == 0) {
+        send_batch_segment_ = size;
+        send_batch_write_ = size;
+        send_batch_count_ = 1;
+        return {};
+    }
+    if (size == send_batch_segment_) {
+        send_batch_write_ += size;
+        ++send_batch_count_;
+        return {};
+    }
+    // A different length cannot join the uniform GSO batch. Flush the prefix,
+    // then keep this datagram as the first of the next batch.
+    const auto offset = send_batch_write_;
+    const auto handle = send_batch_handle_;
+    const auto candidate = send_batch_candidate_;
+    const auto flush_error = flush_send();
+    if (offset != 0)
+        std::memmove(send_batch_bytes_.data(), send_batch_bytes_.data() + offset, size);
+    send_batch_handle_ = handle;
+    send_batch_candidate_ = candidate;
+    send_batch_active_ = true;
+    send_batch_segment_ = size;
+    send_batch_write_ = size;
+    send_batch_count_ = 1;
     return flush_error;
 }
 
 auto udp_endpoint::flush_send() -> std::error_code
 {
     check_owner();
-    const auto count = send_batch_count_;
+    const auto total = send_batch_write_;
     const auto segment = send_batch_segment_;
     const auto handle = send_batch_handle_;
     const auto candidate = send_batch_candidate_;
     send_batch_active_ = false;
     send_batch_count_ = 0;
     send_batch_segment_ = 0;
-    if (count == 0) return {};
+    send_batch_write_ = 0;
+    send_batch_reserved_ = 0;
+    if (total == 0) return {};
     if (socket_ == nullptr) return std::error_code(ECANCELED, std::generic_category());
-    const auto total = count * segment;
     const auto peer = router_.begin_send_to(handle, total, candidate);
     if (!peer)
         return std::error_code(
@@ -125,36 +163,56 @@ auto udp_endpoint::receive_loop(event_loop&, udp_endpoint& endpoint) -> task<std
             endpoint.close();
             co_return received.error();
         }
-        const auto datagram = std::span<const std::byte>(endpoint.receive_buffer_)
-                                  .first(received->size);
-        if (endpoint.router_.role() == path_endpoint_role::server) {
-            // VN packets use random unused bits and are always smaller than the
-            // triggering 1200-byte datagram, so stateless amplification is bounded.
-            const auto vn = endpoint_version_response(datagram, 0, endpoint.version_buffer_);
-            if (vn) {
-                std::uint8_t unused = 0;
-                if (RAND_bytes(&unused, 1) != 1) continue;
-                endpoint.version_buffer_[0] = static_cast<std::byte>(0x80U | (unused & 0x7fU));
-                if (!endpoint.sending_) {
-                    endpoint.sending_ = true;
-                    const auto sent = co_await endpoint.socket_->async_send_to(
-                        std::span<const std::byte>(endpoint.version_buffer_).first(vn), received->source);
-                    endpoint.sending_ = false;
-                    if (!sent && sent.error().value() == ECANCELED) {
-                        endpoint.close();
-                        co_return sent.error();
+        const auto* const base = endpoint.receive_buffer_.data();
+        const auto total = received->size;
+        const auto segment = endpoint.socket_->receive_segment_;
+        // UDP_GRO may coalesce consecutive equal-sized datagrams into one
+        // receive; the final datagram may be shorter than `segment`. Without
+        // coalescing the loop below runs exactly once for the whole datagram.
+        const bool coalesced = segment != 0 && total > segment;
+        std::size_t offset = 0;
+        do {
+            const auto size = coalesced ? std::min(segment, total - offset) : total;
+            const auto datagram = std::span<const std::byte>(base + offset, size);
+            bool handled = false;
+            if (endpoint.router_.role() == path_endpoint_role::server) {
+                // VN packets use random unused bits and are always smaller than
+                // the triggering 1200-byte datagram, so stateless amplification
+                // is bounded.
+                const auto vn = endpoint_version_response(datagram, 0, endpoint.version_buffer_);
+                if (vn) {
+                    std::uint8_t unused = 0;
+                    if (RAND_bytes(&unused, 1) == 1) {
+                        endpoint.version_buffer_[0] =
+                            static_cast<std::byte>(0x80U | (unused & 0x7fU));
+                        if (!endpoint.sending_) {
+                            endpoint.sending_ = true;
+                            const auto sent = co_await endpoint.socket_->async_send_to(
+                                std::span<const std::byte>(endpoint.version_buffer_).first(vn),
+                                received->source);
+                            endpoint.sending_ = false;
+                            if (!sent && sent.error().value() == ECANCELED) {
+                                endpoint.close();
+                                co_return sent.error();
+                            }
+                        }
+                    }
+                    handled = true;
+                } else {
+                    const auto header = parse_packet_header(
+                        datagram, 0, endpoint.router_.short_cid_length());
+                    if (header && header->kind == packet_kind::initial &&
+                        datagram.size() >= 1200 &&
+                        !endpoint.router_.lookup(header->destination_cid) &&
+                        endpoint.accept_.initial) {
+                        handled = !endpoint.accept_.initial(endpoint.accept_.argument,
+                            endpoint.router_, *header, received->source);
                     }
                 }
-                continue;
             }
-            const auto header = parse_packet_header(datagram, 0, endpoint.router_.short_cid_length());
-            if (header && header->kind == packet_kind::initial && datagram.size() >= 1200 &&
-                !endpoint.router_.lookup(header->destination_cid) && endpoint.accept_.initial) {
-                if (!endpoint.accept_.initial(endpoint.accept_.argument, endpoint.router_,
-                                               *header, received->source)) continue;
-            }
-        }
-        (void)endpoint.router_.dispatch(datagram, received->source);
+            if (!handled) (void)endpoint.router_.dispatch(datagram, received->source);
+            offset += size;
+        } while (offset < total);
     }
     co_return std::error_code(ECANCELED, std::generic_category());
 }

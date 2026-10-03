@@ -147,6 +147,9 @@ private:
 
     auto set_lifetime_observer(void* context,
         void (*observer)(void*) noexcept) noexcept -> void;
+    // Enable kernel receive coalescing (UDP_GRO). Internal: only the QUIC
+    // endpoint opts in, so the public receive API stays datagram-atomic.
+    auto enable_receive_coalescing() noexcept -> void;
 
     [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
     {
@@ -158,7 +161,8 @@ private:
     auto on_error() -> void override;
     auto on_shutdown() -> void override;
     auto update_interest() -> void;
-    auto complete_receive(int result, ip_endpoint source = {}) noexcept -> void;
+    auto complete_receive(int result, ip_endpoint source = {},
+                          std::size_t segment = 0) noexcept -> void;
     auto complete_send(int result) noexcept -> void;
     auto complete_pending(int result) noexcept -> void;
 
@@ -166,6 +170,7 @@ private:
     unique_fd descriptor_;
     receive_awaiter* receive_ {nullptr};
     send_awaiter* send_ {nullptr};
+    std::size_t receive_segment_ {0};
     bool closing_ {false};
     bool gso_disabled_ {false};
     void* lifetime_observer_context_ {nullptr};

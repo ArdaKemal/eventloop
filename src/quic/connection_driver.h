@@ -160,7 +160,7 @@ private:
 #else
     __attribute__((noinline))
 #endif
-    auto tick() -> std::expected<void,connection_error>
+    auto tick(lifecycle_time_point now) -> std::expected<void,connection_error>
     {            while (count_) {
                 const auto& packet=queue_[head_];
                 const auto source=packet.peer;
@@ -177,7 +177,7 @@ private:
                 }
                 const auto received=connection_.receive(std::span(packet.bytes).first(packet.size),0,
                     local_size_,packet_scratch_,plaintext_,auth_scratch_,
-                    lifecycle_time_point::clock::now(),std::chrono::seconds(1));
+                    now,std::chrono::seconds(1));
                 head_=(head_+1)%queue_capacity; --count_;
                 if (!received) {
                     if (received.error()==connection_error::authentication_failed ||
@@ -236,7 +236,6 @@ private:
                 if (eliciting) scheduler_.request_ack(level);
                 if (received->kind==packet_kind::handshake) (void)endpoint_.router().validate_peer(route_);
             }
-            const auto now=lifecycle_time_point::clock::now();
             if (!connection_.core().poll(now,std::chrono::seconds(1))) return std::unexpected(connection_error::invalid_state);
             const auto timeout=connection_.on_timeout(now);
             if (!timeout) return std::unexpected(timeout.error());
@@ -256,13 +255,15 @@ private:
 #else
     __attribute__((noinline))
 #endif
-    auto prepare(tls_level level, bool probe) -> std::expected<std::size_t,connection_error>
+    auto prepare(tls_level level, bool probe, std::span<std::uint8_t> output,
+                 lifecycle_time_point now)
+        -> std::expected<std::size_t,connection_error>
     {
         protected_packet_fields fields;
         fields.destination_cid={peer_.data(),peer_size_};
         if (level==tls_level::initial) fields.token=initial_token_;
         if (level != tls_level::application) fields.source_cid={local_.data(),local_size_};
-        return scheduler_.prepare(level,fields,lifecycle_time_point::clock::now(),output_,build_scratch_,probe);
+        return scheduler_.prepare(level,fields,now,output,build_scratch_,probe);
     }
     [[nodiscard]] static auto same_peer(const ip_endpoint& a,const ip_endpoint& b) noexcept -> bool
     {
@@ -388,12 +389,13 @@ private:
         if (const auto synchronized=self.connection_.synchronize_discarded_spaces(); !synchronized)
             co_return std::unexpected(synchronized.error());
         while (!self.stopped_) {
+            const auto now=lifecycle_time_point::clock::now();
             self.work_pending_=false;
-            if (const auto result=self.tick(); !result) co_return std::unexpected(result.error());
+            if (const auto result=self.tick(now); !result) co_return std::unexpected(result.error());
             if (self.stopped_) break;
             if (const auto result=unwrap_task(co_await send_pending_path_responses(loop,self)); !result)
                 co_return std::unexpected(result.error());
-            if (const auto result=unwrap_task(co_await send_candidate_probe(loop,self,lifecycle_time_point::clock::now())); !result)
+            if (const auto result=unwrap_task(co_await send_candidate_probe(loop,self,now)); !result)
                 co_return std::unexpected(result.error());
             // Drain a bounded burst rather than charging every packet a
             // timer tick. Per-packet preflight still enforces congestion,
@@ -407,22 +409,28 @@ private:
                 if (!self.connection_.core().keys_available(level,tls_direction::write)) continue;
                 while (transmitted<burst_capacity) {
                     const bool probe=self.probes_ && self.probe_level_==level;
-                    const auto prepared=self.prepare(level,probe);
+                    // Build the packet directly into the offload batch; a
+                    // later loss recovers any datagram the provider drops.
+                    const auto reserved_error=self.endpoint_.reserve_send(
+                        self.route_,bounded_connection::datagram_buffer_size,false);
+                    if (reserved_error &&
+                        reserved_error.value()!=EAGAIN &&
+                        reserved_error.value()!=EWOULDBLOCK &&
+                        reserved_error.value()!=EBUSY)
+                        co_return std::unexpected(connection_error::provider_failure);
+                    const auto prepared=self.prepare(level,probe,self.endpoint_.reserved(),now);
                     if (!prepared) {
                         if (prepared.error()==connection_error::invalid_state || prepared.error()==connection_error::capacity_exceeded) break;
                         co_return std::unexpected(prepared.error());
                     }
-                    // Queue equal-sized datagrams into one offloaded batch and
-                    // record them as sent; a later loss recovers any datagram
-                    // the provider drops.
-                    const auto queued=self.endpoint_.stage_send(self.route_,
-                        std::as_bytes(std::span(self.output_).first(*prepared)),false);
-                    const auto completed=self.scheduler_.complete(true,lifecycle_time_point::clock::now());
+                    const auto committed_error=self.endpoint_.commit_send(*prepared);
+                    const auto completed=self.scheduler_.complete(true,now);
                     if (!completed) co_return std::unexpected(completed.error());
                     if (probe) --self.probes_;
                     ++transmitted;
-                    if (queued) {
-                        const auto value=queued.value();
+                    const auto error=reserved_error?reserved_error:committed_error;
+                    if (error) {
+                        const auto value=error.value();
                         if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY)
                             co_return std::unexpected(connection_error::provider_failure);
                         stop_sending=true;

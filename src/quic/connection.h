@@ -179,6 +179,10 @@ public:
     { check_owner(); return slots_; }
     [[nodiscard]] auto stream_slots() const noexcept -> std::span<const stream_slot>
     { check_owner(); return slots_; }
+    // Occupied slots in ascending slot order, so iterating matches a scan of
+    // stream_slots() that skips empty slots, but touches only active entries.
+    [[nodiscard]] auto active_slots() noexcept -> std::span<stream_slot*>
+    { check_owner(); return {active_slots_.data(), active_count_}; }
     using retirement_callback = void (*)(void*, tls_level, std::uint64_t,
                                          retirement_reason) noexcept;
     auto set_retirement_observer(void* argument, retirement_callback callback) noexcept -> void
@@ -379,7 +383,7 @@ public:
         for (auto& candidate : sent_) if (!candidate.occupied) { record = &candidate; break; }
         if (!record) return std::unexpected(connection_error::capacity_exceeded);
         auto next_flow = flow_.stage_send<frames_per_packet>();
-        std::array<stream_slot*, frames_per_packet> range_streams;
+        std::array<stream_slot*, frames_per_packet> range_streams {};
         std::size_t range_index = 0;
         for (const auto& range : ranges) {
             if (range.crypto) { ++range_index; continue; }
@@ -400,6 +404,7 @@ public:
         record->carried_ack_largest = carried_ack_largest;
         record->count = ranges.size();
         std::copy(ranges.begin(), ranges.end(), record->ranges.begin());
+        record->stream_slots = range_streams;
         range_index = 0;
         for (const auto& range : ranges) {
             if (range.crypto) {
@@ -444,6 +449,10 @@ private:
         packet_number_space space {};
         std::uint64_t number {};
         std::array<transmitted_range, frames_per_packet> ranges {};
+        // Stream slot that produced each non-crypto range, parallel to `ranges`.
+        // The slot cannot be reused while this record is occupied, so the
+        // pointer stays valid until retirement (see retire_closed_streams).
+        std::array<stream_slot*, frames_per_packet> stream_slots {};
         std::size_t count {};
         std::optional<std::uint64_t> carried_ack_largest;
         bool occupied {false};
@@ -504,6 +513,12 @@ private:
             s.receive_window = s.receive_limit = receive_limit;
             s.receive.emplace(s.bytes, s.coverage, receive_limit);
             (void)s.send.extend_flow_limit(send_limit);
+            const auto position = std::lower_bound(active_slots_.begin(),
+                active_slots_.begin() + active_count_, &s);
+            std::move_backward(position, active_slots_.begin() + active_count_,
+                active_slots_.begin() + active_count_ + 1);
+            *position = &s;
+            ++active_count_;
             return &s;
         }
         return nullptr;
@@ -511,8 +526,10 @@ private:
     auto retire_closed_streams() noexcept -> void
     {
         const auto local_role = role_ == endpoint_role::client ? stream_role::client : stream_role::server;
-        for (auto& slot : slots_) {
-            if (!slot.occupied || !slot.state.closed()) continue;
+        std::size_t active = 0;
+        while (active < active_count_) {
+            auto& slot = *active_slots_[active];
+            if (!slot.occupied || !slot.state.closed()) { ++active; continue; }
             bool outstanding = false;
             for (const auto& packet : sent_) {
                 if (!packet.occupied) continue;
@@ -524,7 +541,7 @@ private:
                 }
                 if (outstanding) break;
             }
-            if (outstanding || !registry_.close(slot.id)) continue;
+            if (outstanding || !registry_.close(slot.id)) { ++active; continue; }
             const auto peer = stream_initiator(slot.id) != local_role;
             const auto direction = stream_type(slot.id);
             (void)flow_.remove_stream(slot.id);
@@ -535,6 +552,10 @@ private:
             slot.receive_limit = slot.consumed = 0;
             slot.credit_pending = slot.reset_pending = false;
             slot.accepted = slot.occupied = false;
+            std::move(active_slots_.begin() + active + 1,
+                active_slots_.begin() + active_count_,
+                active_slots_.begin() + active);
+            --active_count_;
             if (peer && registry_.local_limit(direction) < max_stream_count) {
                 (void)registry_.set_local_limit(direction,
                     registry_.local_limit(direction) + 1);
@@ -572,11 +593,12 @@ private:
                         if (!(ack ? core_.acknowledge_crypto(level, range.offset, range.size) :
                                     core_.lose_crypto(level, range.offset, range.size))) return false;
                     } else {
-                        auto* s = stream(range.stream_id);
-                        if (s && (s->state.sending() == stream_send_state::reset_sent ||
-                                  s->state.sending() == stream_send_state::reset_received)) continue;
-                        if (!s || !(ack ? s->send.acknowledge(range.offset, range.size, range.fin) :
-                                         s->send.mark_lost(range.offset, range.size, range.fin))) return false;
+                        auto* s = record.stream_slots[j];
+                        if (s == nullptr) return false;
+                        if (s->state.sending() == stream_send_state::reset_sent ||
+                            s->state.sending() == stream_send_state::reset_received) continue;
+                        if (!(ack ? s->send.acknowledge(range.offset, range.size, range.fin) :
+                                    s->send.mark_lost(range.offset, range.size, range.fin))) return false;
                         if (s->send.complete() && !s->state.all_data_acked()) return false;
                     }
                 }
@@ -677,6 +699,8 @@ private:
     stream_registry<stream_capacity> registry_;
     flow_control<stream_capacity> flow_;
     std::array<stream_slot, stream_capacity> slots_;
+    std::array<stream_slot*, stream_capacity> active_slots_ {};
+    std::size_t active_count_ {0};
     recovery_orchestration<packet_capacity> recovery_;
     path_recovery_state<4> path_recovery_ {};
     std::array<packet_record, packet_capacity * 3> sent_ {};
