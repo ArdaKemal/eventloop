@@ -120,7 +120,8 @@ private:
 // the single-thread executor has already run it; the multi-thread executor
 // has queued it for a worker. Worker submissions prefer their own queue;
 // idle workers take external work and steal local jobs from queues observed
-// to have more than one task.
+// to have more than one task. A lone local job is taken once its owner has
+// started no task for a short stall-detection delay.
 // Execution order and worker affinity are unspecified. A false result means
 // the task is empty, the multi-thread queue is full, or the executor is shutting
 // down; a named task

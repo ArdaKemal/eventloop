@@ -90,7 +90,10 @@ back to an unbounded allocation.
   allow any idle worker to take them, including a lone task behind a busy
   worker. Nested submissions prefer the submitting worker's local queue.
   Idle workers steal local jobs from queues observed to contain more than one
-  task. Execution order
+  task. A lone local job is taken by an idle worker once its owner has started
+  no task for a short stall-detection delay (about 100 µs; longer where the
+  platform's sleep granularity is coarser). While another worker is idle, it
+  waits a bounded, nonzero time behind a blocked owner. Execution order
   and worker affinity are unspecified. Victim size is a concurrent hint;
   competing consumers can claim the remaining tasks after that observation.
   `queue_capacity` bounds one shared

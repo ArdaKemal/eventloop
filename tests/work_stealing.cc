@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -294,38 +295,148 @@ auto concurrent_reuse_test(std::size_t capacity) -> bool
 auto busy_owner_stealing_test() -> bool
 {
     auto target = make_multi_thread_executor({.worker_count = 2, .queue_capacity = 8});
-    test_publication::pause add_second;
     test_publication::pause release_owner;
-    std::atomic<bool> one_queued {false};
     std::atomic<int> completed {0};
-    std::atomic<bool> accepted {true};
-    std::atomic<bool> stolen {false};
+    std::atomic<int> accepted {0};
+    std::atomic<int> stolen {0};
     const bool parent = target->execute(execution_task([&]() noexcept {
         const auto owner = std::this_thread::get_id();
-        const auto submit_child = [&]() noexcept {
-            return target->execute(execution_task([&, owner]() noexcept {
-                if (std::this_thread::get_id() != owner) stolen.store(true);
-                completed.fetch_add(1);
-            }));
-        };
-        accepted.store(submit_child());
-        one_queued.store(true);
-        while (!add_second.released.load()) add_second.released.wait(false);
-        if (!submit_child()) accepted.store(false);
+        for (int child = 0; child < 2; ++child) {
+            if (target->execute(execution_task([&, owner]() noexcept {
+                    if (std::this_thread::get_id() != owner) stolen.fetch_add(1);
+                    completed.fetch_add(1);
+                }))) accepted.fetch_add(1);
+        }
         while (!release_owner.released.load()) release_owner.released.wait(false);
     }));
-    bool ok = check(parent && wait_until([&] { return one_queued.load(); }),
-                    "busy worker submits local child");
-    std::this_thread::sleep_for(std::chrono::milliseconds {20});
-    ok &= check(completed.load() == 0, "idle worker leaves victim's sole task");
-    add_second.open();
-    ok &= check(wait_until([&] { return completed.load() != 0; }),
-                "idle worker steals while owner remains busy");
-    ok &= check(stolen.load() && completed.load() == 1 && accepted.load(),
-                "stealing runs on another worker and leaves one queued task");
+    bool ok = check(parent && wait_until([&] { return completed.load() == 2; }),
+                    "idle worker takes backlog and lone task while owner remains busy");
+    ok &= check(stolen.load() == 2 && accepted.load() == 2,
+                "both children run on another worker exactly once");
     release_owner.open();
     target.reset();
-    return ok && check(completed.load() == 2, "destruction drains remaining local work");
+    return ok && check(completed.load() == 2, "destruction leaves no extra work");
+}
+
+// A lone local task is left to its owner briefly, then taken by an idle peer
+// once the owner starts no task. The executor's private delay is 100 us; the
+// lower bound below only checks that the wait is not zero.
+auto stalled_owner_lone_task_test() -> bool
+{
+    constexpr auto minimum_wait = std::chrono::microseconds {50};
+    constexpr auto maximum_wait = std::chrono::milliseconds {500};
+    for (const std::size_t workers : {std::size_t {2}, std::size_t {4}}) {
+        auto target = make_multi_thread_executor({.worker_count = workers,
+                                                  .queue_capacity = 8});
+        for (int cycle = 0; cycle < 50; ++cycle) {
+            std::atomic<bool> done {false};
+            std::atomic<bool> accepted {false};
+            std::atomic<bool> stolen {false};
+            std::atomic<bool> timed_out {false};
+            std::atomic<std::int64_t> waited_ns {-1};
+            std::atomic<bool> parent_done {false};
+            const bool parent = target->execute(execution_task([&]() noexcept {
+                const auto owner = std::this_thread::get_id();
+                const auto submitted = std::chrono::steady_clock::now();
+                accepted.store(target->execute(execution_task([&, owner, submitted]() noexcept {
+                    waited_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - submitted).count());
+                    stolen.store(std::this_thread::get_id() != owner);
+                    done.store(true);
+                })));
+                // Block without starting another task, as a stalled owner.
+                if (!wait_until([&] { return done.load(); })) timed_out.store(true);
+                parent_done.store(true);
+            }));
+            const bool ran = parent && wait_until([&] { return done.load(); });
+            if (!check(ran, "lone task behind a stalled owner runs")) std::_Exit(1);
+            // The parent's last access to this cycle's state is its store.
+            if (!check(wait_until([&] { return parent_done.load(); }),
+                       "stalled parent returns")) std::_Exit(1);
+            if (!check(accepted.load() && stolen.load() && !timed_out.load(),
+                       "a peer takes the stalled owner's lone task")) std::_Exit(1);
+            const auto waited = std::chrono::nanoseconds {waited_ns.load()};
+            if (!check(waited >= minimum_wait && waited < maximum_wait,
+                       "lone task waits a bounded nonzero stall delay")) {
+                std::cerr << "  waited " << waited.count() << " ns\n";
+                std::_Exit(1);
+            }
+        }
+    }
+    return true;
+}
+
+// Fewer idle peers than stalled owners: one peer handles each lone task in
+// turn.
+auto stalled_owners_share_one_peer_test() -> bool
+{
+    for (int cycle = 0; cycle < 20; ++cycle) {
+        auto target = make_multi_thread_executor({.worker_count = 3, .queue_capacity = 8});
+        test_publication::pause release;
+        std::atomic<int> parents {0};
+        std::atomic<int> children {0};
+        for (int parent = 0; parent < 2; ++parent) {
+            if (!target->execute(execution_task([&]() noexcept {
+                    parents.fetch_add(1);
+                    // Wait for both parents, so neither runs the other's child.
+                    while (parents.load() != 2) std::this_thread::yield();
+                    if (!target->execute(execution_task([&]() noexcept {
+                            children.fetch_add(1);
+                        }))) children.fetch_add(100);
+                    while (!release.released.load()) release.released.wait(false);
+                }))) return check(false, "stalled parent accepted");
+        }
+        const bool ran = check(wait_until([&] { return children.load() == 2; }),
+                               "one idle peer runs both stalled owners' lone tasks");
+        release.open();
+        target.reset();
+        if (!ran || !check(children.load() == 2, "lone tasks run exactly once")) return false;
+    }
+    return true;
+}
+
+// Owners that keep making progress through long single-task chains. Lone
+// tasks may move to watching peers, but none may be lost or duplicated.
+constexpr std::size_t chain_links = 20000;
+
+struct chain_link {
+    executor* target;
+    std::atomic<int>* seen;
+    std::atomic<std::size_t>* finished;
+    std::size_t chain;
+    std::size_t index;
+
+    auto operator()() noexcept -> void
+    {
+        seen[chain * chain_links + index].fetch_add(1);
+        if (index + 1 == chain_links) {
+            finished->fetch_add(1);
+            return;
+        }
+        execution_task next(chain_link {target, seen, finished, chain, index + 1});
+        if (!target->execute(std::move(next))) next();
+    }
+};
+
+auto progressing_owner_chain_test() -> bool
+{
+    constexpr std::size_t chains = 3;
+    auto target = make_multi_thread_executor({.worker_count = 4, .queue_capacity = 16});
+    auto seen = std::make_unique<std::atomic<int>[]>(chains * chain_links);
+    std::atomic<std::size_t> finished {0};
+    for (std::size_t chain = 0; chain < chains; ++chain) {
+        if (!target->execute(execution_task(chain_link {target.get(), seen.get(),
+                                                        &finished, chain, 0}))) {
+            return false;
+        }
+    }
+    const bool done = wait_until([&] { return finished.load() == chains; });
+    target.reset();
+    bool ok = check(done, "progressing chains finish");
+    for (std::size_t id = 0; id < chains * chain_links; ++id) {
+        if (!check(seen[id].load() == 1, "chain links run exactly once")) return false;
+    }
+    return ok;
 }
 
 auto executor_global_capacity_test() -> bool
@@ -554,7 +665,9 @@ auto main(int argc, char** argv) -> int
     }
     if (!incomplete_full_check_test() ||
         !paused_move_test(false) || !paused_move_test(true) ||
-        !busy_owner_stealing_test() || !executor_global_capacity_test() ||
+        !busy_owner_stealing_test() || !stalled_owner_lone_task_test() ||
+        !stalled_owners_share_one_peer_test() || !progressing_owner_chain_test() ||
+        !executor_global_capacity_test() ||
         !sparse_external_submission_test() ||
         !executor_runtime_allocation_test() || !nested_ownership_test() ||
         !idle_worker_wakeup_test() || !idle_peers_take_shareable_work_test() ||

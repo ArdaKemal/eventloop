@@ -159,6 +159,13 @@ public:
         return stealing_ && queues_[worker].queued.load(std::memory_order_seq_cst) > 1;
     }
 
+    // Any task in a worker's local queue, including a lone one that
+    // try_steal() leaves for its owner. A concurrent hint like has_backlog().
+    [[nodiscard]] auto has_local_work(std::size_t worker) const noexcept -> bool
+    {
+        return stealing_ && queues_[worker].queued.load(std::memory_order_seq_cst) != 0;
+    }
+
     // Only a cursor that previously failed consults the full cache. A
     // successful claim clears this bit along with advancing the cursor.
     [[nodiscard]] auto known_full(std::size_t cursor) const noexcept -> bool

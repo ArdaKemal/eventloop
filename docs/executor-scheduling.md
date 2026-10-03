@@ -6,9 +6,15 @@ External submitters distribute tasks across worker-associated injection queues;
 any worker can take these tasks, including a single task behind a busy worker.
 A worker submitting to its own executor prefers its local queue.
 An idle worker checks other queues
-and steals from a victim observed to have more than one queued task. Execution
-order and worker affinity are unspecified; callers must not wait inside a
-worker for child tasks to complete.
+and steals from a victim observed to have more than one queued task. A lone
+local task is left to its owner for a short stall-detection delay (about
+100 µs, a private constant): an idle peer takes it once the owner has started
+no task during that delay. While a peer is idle, the wait is bounded but not
+zero; sleep granularity can lengthen it, notably to milliseconds on Windows.
+If every other worker is busy, the task waits for one to become idle, as any
+other queued task does. Execution order and
+worker affinity are unspecified; callers must not wait inside a worker for
+child tasks to complete.
 Victim size is a concurrent hint, not a guarantee that racing consumers always
 leave a task for the owner.
 
@@ -58,6 +64,45 @@ observe its task in their second check.
 The second check covers publication immediately before sleeper registration.
 Shutdown signals every worker.
 
+## Lone task behind a stalled owner
+
+The stealing threshold keeps a lone nested task with the worker that submitted
+it, which usually reaches it next. If that owner is blocked in a long task,
+an idle peer takes the task after the stall-detection delay instead of
+leaving it for the whole stall.
+
+Each worker publishes a count of tasks it has started, written only by that
+worker with a relaxed store, on a cache line of its own beside a per-owner
+`watched` flag. An idle peer that finds a local queue holding work after its
+registered queue check claims that owner's flag, records the count, and leaves
+the idle state. It then checks every queue once more (covering producers that
+signalled it while idle), sleeps for the delay, and takes the owner's task only
+if the count is unchanged. It clears the flag and checks the queues again
+before registering idle or running a task. At most one peer watches an owner.
+
+The watch is not an idle wait: producers wake other registered idle peers
+meanwhile, and parked workers still wait without a timeout. No timer thread
+or timed wake primitive is added; a watcher sleeps for the delay as a running
+task would occupy its worker.
+
+A lone local push wakes one registered idle peer when its owner is unwatched.
+This is the only new wake. Because a watch lasts at least the delay and blocks
+further lone wakes for that owner, an owner causes at most one such wake per
+delay rather than one per task. The pusher publishes before its SC load of
+the flag; a watcher clears the flag before its SC queue check, so either the
+pusher wakes a peer or the watcher observes the task. A worker leaving the
+idle state with a task also wakes one idle peer if an unwatched local queue
+holds work, like the shareable-work chain above, so a peer woken for a lone
+task that finds other work passes the wakeup on.
+
+A stale count can only move a task to another worker, which scheduling
+already permits. The cost falls on owners that keep their local queue at one
+task while peers are idle, such as long single-child chains: one peer sleeps
+and wakes about once per delay per such owner, and each watch can cost the
+owner one wake. Measured on one host, a single chain of fine tasks ran 4-10%
+slower with about 11,000 extra voluntary context switches per second; fan-out
+and handoff benchmarks stayed within run-to-run variation.
+
 Loop command and completion queues remain FIFO and retain their existing
 nonwaiting owner-loop drain. This change concerns worker scheduling only.
 
@@ -93,9 +138,9 @@ fanout, and successful handoff with the saved pre-optimization scheduler.
 Retain the optimization only if these measurements justify its added work.
 
 Validation must cover paused producers and consumers, stealing while the
-owner is busy, the victim threshold, global capacity, rejection ownership,
-exactly-once execution, nested submission, zero runtime allocations, idle
-wakeup, destruction with stolen work, coroutine completion and cancellation,
-and installed public-header callers. Compare the same optimized benchmark
+owner is busy, the victim threshold, lone tasks behind stalled owners, global
+capacity, rejection ownership, exactly-once execution, nested submission, zero
+runtime allocations, idle wakeup, destruction with stolen work, coroutine
+completion and cancellation, and installed public-header callers. Compare the same optimized benchmark
 against the previous shared queue, including fine tasks and worker-generated
 fan-out. Report regressions as well as improvements.
