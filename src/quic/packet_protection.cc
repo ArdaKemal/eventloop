@@ -353,27 +353,23 @@ auto packet_protection_context::protect_header(
     auto* ctx = static_cast<EVP_CIPHER_CTX*>(hp_);
     std::array<std::uint8_t, 16> mask {};
     int written = 0;
-    int final_written = 0;
     if (!ready())
         return std::unexpected(protection_error::provider_failure);
     const auto reuse_key = hp_key_set_ && hp_key_ == keys.hp;
-    if (reuse_key) {
-        // Reset the block context per packet without re-keying or touching the
-        // already-disabled padding.
-        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, nullptr) <= 0)
+    if (!reuse_key) {
+        hp_key_set_ = false;
+        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, keys.hp.data(), nullptr) <= 0 ||
+            EVP_CIPHER_CTX_set_padding(ctx, 0) <= 0)
             return std::unexpected(protection_error::provider_failure);
-    } else if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, keys.hp.data(), nullptr) <= 0 ||
-               EVP_CIPHER_CTX_set_padding(ctx, 0) <= 0) {
-        return std::unexpected(protection_error::provider_failure);
-    } else {
         hp_key_ = keys.hp;
         hp_key_set_ = true;
     }
+    // ECB has no chaining state. Each complete sample leaves no buffered bytes
+    // with padding disabled, so consecutive samples need no reset or final call.
     if (EVP_EncryptUpdate(ctx, mask.data(), &written,
                           packet.data() + packet_number_offset + 4, 16) <= 0 ||
-        EVP_EncryptFinal_ex(ctx, mask.data() + written,
-                            &final_written) <= 0 ||
-        written != 16 || final_written != 0) {
+        written != 16) {
+        hp_key_set_ = false;
         return std::unexpected(protection_error::provider_failure);
     }
     const auto first_mask = (packet[0] & 0x80) != 0 ? 0x0f : 0x1f;

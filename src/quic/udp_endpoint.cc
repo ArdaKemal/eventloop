@@ -99,8 +99,15 @@ auto udp_endpoint::commit_send(std::size_t size) noexcept -> std::error_code
         ++send_batch_count_;
         return {};
     }
-    // A different length cannot join the uniform GSO batch. Flush the prefix,
-    // then keep this datagram as the first of the next batch.
+    // GSO permits a shorter final datagram. Flush it with the uniform prefix
+    // now so no later datagram can change the segment boundaries.
+    if (size != 0 && size < send_batch_segment_) {
+        send_batch_write_ += size;
+        ++send_batch_count_;
+        return flush_send();
+    }
+    // A larger datagram cannot join this GSO batch. Flush the prefix, then
+    // keep this datagram as the first of the next batch.
     const auto offset = send_batch_write_;
     const auto handle = send_batch_handle_;
     const auto candidate = send_batch_candidate_;

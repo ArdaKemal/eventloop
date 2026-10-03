@@ -42,8 +42,8 @@ public:
     // retry. Resumption remains a timer-loop action, outside router dispatch.
     auto notify() noexcept -> void
     { check_owner(); work_pending_=true; if (idle_) idle_->wake(); }
-    // Progress notifications run on the owning loop after each pump iteration;
-    // the endpoint uses them to resume ready public-API waiters.
+    // Progress notifications run on the owning loop after receive, send, or
+    // recovery state changes; the endpoint resumes public-API waiters.
     auto set_progress(void* argument, void (*callback)(void*) noexcept) noexcept
     { check_owner(); progress_argument_=argument; progress_=callback; }
     // The hook runs from the pump, outside router dispatch, in receive order.
@@ -65,8 +65,8 @@ public:
     }
     [[nodiscard]] auto run() -> task<std::expected<void,connection_error>> { return pump(loop_,*this); }
     [[nodiscard]] auto dropped_packets() const noexcept -> std::size_t { return dropped_; }
-    // Internal frame-local wait; the deadline remains bounded polling for
-    // idle/recovery work, but notify() can advance it without inline resume.
+    // Internal frame-local wait; bounded polling covers idle/recovery work,
+    // while notify() can advance it without inline resume.
     class idle_wait {
     public:
         explicit idle_wait(connection_driver& driver,
@@ -290,7 +290,8 @@ private:
         return std::move(*result);
     }
     static auto send_path_frame(event_loop& loop,connection_driver& self,
-                                std::uint64_t type,path_challenge token,bool candidate)
+                                std::uint64_t type,path_challenge token,bool candidate,
+                                lifecycle_time_point now)
         -> task<std::expected<bool,connection_error>>
     {
         if (&loop!=&self.loop_) co_return std::unexpected(connection_error::invalid_state);
@@ -316,7 +317,6 @@ private:
             co_return std::unexpected(connection_error::provider_failure);
         }
         if (**sent!=*built) co_return std::unexpected(connection_error::provider_failure);
-        const auto now=lifecycle_time_point::clock::now();
         const sent_packet packet{*number,now,true,true,*built};
         if (!self.connection_.record_sent(tls_level::application,packet,{}))
             co_return std::unexpected(connection_error::invalid_state);
@@ -334,7 +334,8 @@ private:
         candidate_attempts_=0; candidate_probe_due_=now;
         return true;
     }
-    static auto send_pending_path_responses(event_loop& loop,connection_driver& self)
+    static auto send_pending_path_responses(event_loop& loop,connection_driver& self,
+                                           lifecycle_time_point now)
         -> task<std::expected<void,connection_error>>
     {
         if (&loop!=&self.loop_) co_return std::unexpected(connection_error::invalid_state);
@@ -345,7 +346,7 @@ private:
             const auto current_address=self.endpoint_.router().peer(self.route_);
             if (candidate_address&&same_peer(job.peer,*candidate_address)) candidate=true;
             else if (!current_address||!same_peer(job.peer,*current_address)) { job.occupied=false; continue; }
-            const auto sent=unwrap_task(co_await send_path_frame(loop,self,0x1b,job.token,candidate));
+            const auto sent=unwrap_task(co_await send_path_frame(loop,self,0x1b,job.token,candidate,now));
             if (!sent) co_return std::unexpected(sent.error());
             if (*sent) job.occupied=false;
             else break;
@@ -370,7 +371,7 @@ private:
             self.candidate_challenge_active_=false; self.candidate_attempts_=0;
             co_return std::expected<void,connection_error>{};
         }
-        const auto sent=unwrap_task(co_await send_path_frame(loop,self,0x1a,self.candidate_challenge_,true));
+        const auto sent=unwrap_task(co_await send_path_frame(loop,self,0x1a,self.candidate_challenge_,true,now));
         if (!sent) co_return std::unexpected(sent.error());
         const auto retry=self.connection_.application_pto().value_or(std::chrono::seconds(1));
         self.candidate_probe_due_=now+(*sent?retry:std::chrono::milliseconds(25));
@@ -393,15 +394,15 @@ private:
             self.work_pending_=false;
             if (const auto result=self.tick(now); !result) co_return std::unexpected(result.error());
             if (self.stopped_) break;
-            if (const auto result=unwrap_task(co_await send_pending_path_responses(loop,self)); !result)
+            if (const auto result=unwrap_task(co_await send_pending_path_responses(loop,self,now)); !result)
                 co_return std::unexpected(result.error());
             if (const auto result=unwrap_task(co_await send_candidate_probe(loop,self,now)); !result)
                 co_return std::unexpected(result.error());
             // Drain a bounded burst rather than charging every packet a
             // timer tick. Per-packet preflight still enforces congestion,
-            // flow credit and sent-record capacity. Keep the total below
-            // the receive queue capacity and yield before sending more.
-            constexpr std::size_t burst_capacity=queue_capacity/2;
+            // flow credit and sent-record capacity. Leave two slots of
+            // receive-queue headroom and yield before sending more.
+            constexpr std::size_t burst_capacity=queue_capacity-2;
             std::size_t transmitted=0;
             bool stop_sending=false;
             for (const auto level : {tls_level::initial,tls_level::handshake,tls_level::application}) {

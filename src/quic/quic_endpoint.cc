@@ -107,42 +107,102 @@ auto make_error_code(quic_errc value) noexcept -> std::error_code
 class quic_endpoint::implementation {
 public:
     struct waiter_state {
-        explicit waiter_state(std::size_t capacity) : handles(capacity) {}
+        static constexpr auto no_index = static_cast<std::size_t>(-1);
 
-        auto register_waiter(std::coroutine_handle<> handle) noexcept -> bool
+        struct group {
+            std::size_t head {no_index};
+            std::size_t tail {no_index};
+            std::size_t count {0};
+            bool pending {false};
+        };
+
+        explicit waiter_state(std::size_t slots)
+            : handles(slots * 256), next(handles.size()), groups(slots + 1),
+              pending(groups.size())
         {
-            if (count == handles.size()) return false;
-            handles[(head + count) % handles.size()] = handle;
-            ++count;
+            for (std::size_t i = 0; i < next.size(); ++i)
+                next[i] = i + 1 == next.size() ? no_index : i + 1;
+            if (!handles.empty()) free_head = 0;
+        }
+
+        // Group zero is endpoint acceptance; each slot has its own group.
+        // All groups share the same pool, retaining the aggregate capacity.
+        auto register_waiter(std::size_t index,
+                             std::coroutine_handle<> handle) noexcept -> bool
+        {
+            if (free_head == no_index) return false;
+            const auto node = free_head;
+            free_head = next[node];
+            next[node] = no_index;
+            handles[node] = handle;
+            auto& queue = groups[index];
+            if (queue.tail == no_index) queue.head = node;
+            else next[queue.tail] = node;
+            queue.tail = node;
+            ++queue.count;
             return true;
+        }
+
+        auto request_wake(std::size_t index) noexcept -> void
+        {
+            auto& queue = groups[index];
+            if (queue.pending || queue.count == 0) return;
+            queue.pending = true;
+            pending[(pending_head + pending_count) % pending.size()] = index;
+            ++pending_count;
+        }
+
+        auto drain() noexcept -> void
+        {
+            if (waking) return;
+            waking = true;
+            while (pending_count != 0) {
+                const auto index = pending[pending_head];
+                pending_head = (pending_head + 1) % pending.size();
+                --pending_count;
+                auto& queue = groups[index];
+                queue.pending = false;
+                const auto initial = queue.count;
+                for (std::size_t i = 0; i < initial; ++i) {
+                    const auto node = queue.head;
+                    auto handle = handles[node];
+                    queue.head = next[node];
+                    if (queue.head == no_index) queue.tail = no_index;
+                    --queue.count;
+                    handles[node] = {};
+                    next[node] = free_head;
+                    free_head = node;
+                    if (handle && !handle.done()) handle.resume();
+                }
+            }
+            waking = false;
+        }
+
+        auto wake_connection(std::size_t slot_index) noexcept -> void
+        {
+            request_wake(slot_index + 1);
+            request_wake(0);
+            drain();
         }
 
         auto wake_all() noexcept -> void
         {
-            if (waking) { wake_again = true; return; }
-            waking = true;
-            do {
-                wake_again = false;
-                const auto initial = count;
-                for (std::size_t i = 0; i < initial; ++i) {
-                    auto handle = handles[head];
-                    handles[head] = {};
-                    head = (head + 1) % handles.size();
-                    --count;
-                    if (handle && !handle.done()) handle.resume();
-                }
-            } while (wake_again);
-            waking = false;
+            for (std::size_t i = 0; i < groups.size(); ++i) request_wake(i);
+            drain();
         }
 
         std::vector<std::coroutine_handle<>> handles;
-        std::size_t head {0};
-        std::size_t count {0};
+        std::vector<std::size_t> next;
+        std::vector<group> groups;
+        std::vector<std::size_t> pending;
+        std::size_t free_head {no_index};
+        std::size_t pending_head {0};
+        std::size_t pending_count {0};
         bool waking {false};
-        bool wake_again {false};
     };
 
     struct slot {
+        implementation* owner {nullptr};
         bool occupied {false};
         bool accepted {false};
         bool closing {false};
@@ -193,7 +253,7 @@ public:
                     options.connection_capacity),
           server_options_(std::move(options)),
           slots_(server_options_.connection_capacity),
-          waiters_(std::make_shared<waiter_state>(server_options_.connection_capacity * 256))
+          waiters_(std::make_shared<waiter_state>(server_options_.connection_capacity))
     {
         common_init();
     }
@@ -204,7 +264,7 @@ public:
                     endpoint_accept_callback {}, true, 8),
           client_options_(std::move(options)),
           slots_(8), client_mode_(true),
-          waiters_(std::make_shared<waiter_state>(8 * 256))
+          waiters_(std::make_shared<waiter_state>(8))
     {
         common_init();
     }
@@ -228,8 +288,15 @@ public:
     // Progress-hook waiters: each public operation registers its coroutine
     // handle once and is resumed by the connection-driver progress callback, so
     // stream/DATAGRAM operations do not poll on a timer.
-    auto register_waiter(std::coroutine_handle<> handle) noexcept -> bool
-    { return waiters_->register_waiter(handle); }
+    auto register_waiter(std::size_t group,
+                         std::coroutine_handle<> handle) noexcept -> bool
+    { return waiters_->register_waiter(group, handle); }
+
+    auto wake_connection(std::size_t slot_index) noexcept -> void
+    {
+        auto state = waiters_; // A resumed waiter may destroy this endpoint.
+        state->wake_connection(slot_index);
+    }
 
     auto wake_all() noexcept -> void
     {
@@ -304,7 +371,7 @@ public:
             entry.clear();
             return false;
         }
-        entry.driver->set_progress(this, &implementation::on_progress);
+        entry.driver->set_progress(&entry, &implementation::on_progress);
         return true;
     }
 
@@ -363,12 +430,13 @@ private:
         entry.route = endpoint_.router().lookup(entry.local_cid);
         entry.driver->set_retry_handler(&entry, accept_retry);
         entry.driver->set_initial_token(std::span(entry.retry_token).first(entry.retry_token_size));
-        entry.driver->set_progress(this, &implementation::on_progress);
+        entry.driver->set_progress(&entry, &implementation::on_progress);
         return entry.route != 0;
     }
 
     auto common_init() noexcept -> void
     {
+        for (auto& entry : slots_) entry.owner = this;
         const auto alpn = client_mode_ ? client_options_.alpn : server_options_.alpn;
         if (alpn.empty() || alpn.size() > alpn_.size()) return;
         std::copy(alpn.begin(), alpn.end(), alpn_.begin());
@@ -438,8 +506,9 @@ private:
         entry.closing = true;
         // run() has retired before resuming this wrapper. Reap before waking:
         // resumed operations may close and destroy the endpoint inline.
+        const auto index = self.slot_of(entry);
         self.reap();
-        self.wake_all();
+        self.wake_connection(index);
     }
 
     static auto accept_initial(void* argument, endpoint_router& router,
@@ -507,15 +576,18 @@ private:
             entry->clear();
             return false;
         }
-        entry->driver->set_progress(&self, &implementation::on_progress);
+        entry->driver->set_progress(entry, &implementation::on_progress);
         return true;
     }
 
     static auto on_progress(void* argument) noexcept -> void
     {
-        auto& self = *static_cast<implementation*>(argument);
-        self.wake_all();
-        self.reap();
+        auto& entry = *static_cast<slot*>(argument);
+        auto& self = *entry.owner;
+        const auto index = self.slot_of(entry);
+        // The pumping driver is still running. Retired slots are reaped by
+        // drive(), connection acceptance, and endpoint close instead.
+        self.wake_connection(index);
     }
 
     static auto validate_peer(void* argument, std::span<const std::uint8_t> bytes) noexcept -> bool
@@ -615,19 +687,22 @@ namespace {
 // stop_all() wakes every waiter so shutdown cannot deadlock.
 class notify_awaiter {
 public:
-    explicit notify_awaiter(quic_endpoint::implementation& impl) noexcept
-        : impl_(&impl) {}
+    explicit notify_awaiter(quic_endpoint::implementation& impl,
+                            std::size_t group = 0) noexcept
+        : impl_(&impl), group_(group) {}
     [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
     template<typename Promise>
     auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
-    { return impl_->register_waiter(handle); }
+    { return impl_->register_waiter(group_, handle); }
     auto await_resume() const noexcept -> void {}
 private:
     quic_endpoint::implementation* impl_;
+    std::size_t group_;
 };
 
-auto notify(quic_endpoint::implementation& impl) noexcept -> notify_awaiter
-{ return notify_awaiter(impl); }
+auto notify(quic_endpoint::implementation& impl,
+            std::size_t group = 0) noexcept -> notify_awaiter
+{ return notify_awaiter(impl, group); }
 
 auto failure_task(event_loop&) -> task<std::expected<quic_connection, std::error_code>>
 { co_return std::unexpected(make_error_code(quic_errc::tls_failure)); }
@@ -691,7 +766,7 @@ auto read_stream(event_loop&, quic_endpoint::implementation& impl,
             (void)slot.connection->finish_read(stream_id);
             co_return std::size_t {0};
         }
-        co_await notify(impl);
+        co_await notify(impl, slot_index + 1);
     }
 }
 
@@ -730,7 +805,7 @@ auto write_stream(event_loop&, quic_endpoint::implementation& impl,
             if (slot.driver) slot.driver->notify();
             co_return accepted;
         }
-        co_await notify(impl);
+        co_await notify(impl, slot_index + 1);
     }
 }
 
@@ -759,7 +834,7 @@ auto accept_stream(event_loop&, quic_endpoint::implementation& impl,
             co_return candidate.id;
         }
         if (slot.closing) co_return std::unexpected(make_error_code(quic_errc::peer_closed));
-        co_await notify(impl);
+        co_await notify(impl, slot_index + 1);
     }
 }
 
@@ -781,7 +856,7 @@ auto send_datagram_task(event_loop&, quic_endpoint::implementation& impl,
         if (result.has_value()) co_return std::expected<void, std::error_code> {};
         if (result.error() == datagram_queue_error::frame_too_large)
             co_return std::unexpected(make_error_code(quic_errc::invalid_argument));
-        co_await notify(impl);
+        co_await notify(impl, slot_index + 1);
     }
 }
 
@@ -801,7 +876,7 @@ auto receive_datagram_task(event_loop&, quic_endpoint::implementation& impl,
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         const auto received = slot.connection->receive_datagram(buffer);
         if (received.has_value()) co_return *received;
-        co_await notify(impl);
+        co_await notify(impl, slot_index + 1);
     }
 }
 
@@ -815,8 +890,12 @@ auto accept_connection(event_loop&, quic_endpoint::implementation& impl)
         for (std::size_t i = 0; i < impl.slots_.size(); ++i) {
             auto& slot = impl.slots_[i];
             if (slot.occupied && !slot.accepted && slot.terminal_error) {
+                const auto error = slot.terminal_error;
                 slot.accepted = true;
-                co_return std::unexpected(slot.terminal_error);
+                // Error delivery releases an otherwise retained failed slot;
+                // it must not depend on another driver's progress callback.
+                impl.reap();
+                co_return std::unexpected(error);
             }
             if (slot.occupied && !slot.accepted && slot.connection &&
                 slot.connection->core().state() == connection_state::active) {
@@ -856,7 +935,7 @@ auto connect_task(event_loop&, quic_endpoint::implementation& impl,
             co_return quic_connection {impl.owner_, index, generation};
         if (slot.closing || impl.closing_)
             co_return std::unexpected(make_error_code(quic_errc::peer_closed));
-        co_await notify(impl);
+        co_await notify(impl, index + 1);
     }
 }
 

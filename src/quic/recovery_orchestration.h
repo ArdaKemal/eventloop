@@ -534,22 +534,23 @@ private:
         const std::array<sent_packet_history<Capacity, SentRangeCapacity>, 3>&
             histories) noexcept -> void
     {
+        // Every candidate barrier asks the same question about the remaining
+        // histories. One minimum replaces a packet scan for each ACK event.
+        std::optional<recovery_time_point> oldest_outstanding;
+        for (const auto& history : histories) {
+            for (const auto& packet : history.remaining()) {
+                if (!oldest_outstanding || packet.sent_time < *oldest_outstanding)
+                    oldest_outstanding = packet.sent_time;
+            }
+        }
         std::optional<recovery_time_point> safe_barrier;
         for (std::size_t index = 0; index < count; ++index) {
             const auto& event = events[index];
-            if (!event.acknowledged) continue;
-            bool prior_outstanding = false;
-            for (const auto& history : histories) {
-                for (const auto& packet : history.remaining()) {
-                    if (packet.sent_time <= event.packet.sent_time) {
-                        prior_outstanding = true;
-                        break;
-                    }
-                }
-                if (prior_outstanding) break;
-            }
-            if (!prior_outstanding &&
-                (!safe_barrier || event.packet.sent_time > *safe_barrier))
+            if (!event.acknowledged ||
+                (oldest_outstanding &&
+                 *oldest_outstanding <= event.packet.sent_time))
+                continue;
+            if (!safe_barrier || event.packet.sent_time > *safe_barrier)
                 safe_barrier = event.packet.sent_time;
         }
         if (!safe_barrier) return;

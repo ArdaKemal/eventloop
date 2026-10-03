@@ -315,6 +315,14 @@ public:
         const auto finish = offset + length;
         if (start < finish && !sent_.covers(start, finish))
             return std::unexpected(crypto_send_error::unsent_data);
+        // Ordered ACKs retire the prefix without creating a temporary SACK
+        // interval only to find and erase it again in advance_base().
+        if (start < finish && start == base_ && acked_.empty()) {
+            base_ = finish;
+            sent_.drop_below(base_);
+            lost_.drop_below(base_);
+            return {};
+        }
         if (start < finish) {
             lost_.remove(start, finish);
             if (!acked_.add(start, finish))

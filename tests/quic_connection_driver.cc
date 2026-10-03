@@ -144,6 +144,89 @@ static auto queue_peer_close(bounded_connection& server,udp_endpoint& client_end
         check(dispatched && *dispatched==1);
     }
 }
+static auto receive_summary_scenario(event_loop& loop,bounded_connection& client,
+    bounded_connection& server,udp_endpoint& client_endpoint,ip_endpoint server_peer) -> task<void>
+{
+    // Use established connections and actual encrypted packets. Recording each
+    // injected transmission keeps the driver's eventual ACKs valid for recovery.
+    auto storage=std::make_unique<buffers>();
+    auto& buffer=*storage;
+    protected_packet_fields fields; fields.kind=packet_kind::short_header;
+    fields.destination_cid=dcid;
+    std::size_t packet_size=0;
+    auto queue=[&] {
+        const auto dispatched=client_endpoint.router().dispatch(
+            std::as_bytes(std::span(buffer.encoded).first(packet_size)),server_peer);
+        check(dispatched && *dispatched==1);
+    };
+    auto inject=[&](std::size_t payload_size,bool eliciting) {
+        const auto number=*server.core().next_packet_number(tls_level::application);
+        const auto built=server.core().build(fields,std::span(buffer.frame).first(payload_size),
+            buffer.encoded,buffer.build_scratch);
+        check(built.has_value()); packet_size=*built;
+        check(server.record_sent(tls_level::application,
+            {number,lifecycle_time_point::clock::now(),eliciting,eliciting,*built},{}).has_value());
+        queue(); return number;
+    };
+    std::array<std::byte,256> ack_storage {};
+    // Let the transfer's existing ACKs settle before observing packet numbers.
+    check(co_await sleep_for(loop,10ms)==timer_wait_result::expired);
+    const auto ack=server.core().make_ack(tls_level::application,0,ack_storage);
+    check(ack.has_value());
+    buffer.frame[0]=0; // Leading PADDING must not make an ACK packet eliciting.
+    const auto encoded=encode_frame(*ack,std::as_writable_bytes(std::span(buffer.frame).subspan(1)));
+    check(encoded.has_value());
+    const auto before_ack=client.core().next_packet_number(tls_level::application);
+    const auto ack_number=inject(1+*encoded,false);
+    bool ack_received=false;
+    for (int attempt=0;attempt<1000 && !ack_received;++attempt) {
+        const auto received=client.core().make_ack(tls_level::application,0,ack_storage);
+        ack_received=received && received->largest_acknowledged>=ack_number;
+        if (!ack_received) check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
+    }
+    check(ack_received && client.core().next_packet_number(tls_level::application)==before_ack);
+    queue(); // A duplicate ACK-only packet also needs no response.
+    check(co_await sleep_for(loop,5ms)==timer_wait_result::expired);
+    check(client.core().next_packet_number(tls_level::application)==before_ack);
+    buffer.frame[0]=1;
+    const auto before_ping=*client.core().next_packet_number(tls_level::application);
+    (void)inject(1,true);
+    for (int attempt=0;attempt<1000 &&
+        *client.core().next_packet_number(tls_level::application)==before_ping;++attempt)
+        check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
+    check(*client.core().next_packet_number(tls_level::application)>before_ping);
+    const auto before_duplicate=*client.core().next_packet_number(tls_level::application);
+    queue(); // The core suppresses redispatch, but the driver still sends an ACK.
+    for (int attempt=0;attempt<1000 &&
+        *client.core().next_packet_number(tls_level::application)==before_duplicate;++attempt)
+        check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
+    check(*client.core().next_packet_number(tls_level::application)>before_duplicate);
+    // Two challenges and their duplicate occupy all four response jobs. Both
+    // new and duplicate packets must receive path responses followed by an ACK.
+    const path_challenge first {std::byte{1}},second {std::byte{2}};
+    check(server.paths().add(100).has_value());
+    check(server.paths().add(101).has_value());
+    check(server.paths().issue_challenge(100,first).has_value());
+    check(server.paths().issue_challenge(101,second).has_value());
+    decoded_frame challenge; challenge.type=0x1a; challenge.data=first;
+    const auto first_size=encode_frame(challenge,std::as_writable_bytes(std::span(buffer.frame)));
+    check(first_size.has_value()); challenge.data=second;
+    const auto second_size=encode_frame(challenge,
+        std::as_writable_bytes(std::span(buffer.frame).subspan(*first_size)));
+    check(second_size.has_value());
+    const auto before_paths=*client.core().next_packet_number(tls_level::application);
+    const auto& path_history=*client.recovery().history(packet_number_space::application_data);
+    (void)inject(*first_size+*second_size,true);
+    queue();
+    // Wait for all four responses and their ACK to commit; a built packet's
+    // number alone does not establish that its asynchronous send has retired.
+    for (int attempt=0;attempt<1000 &&
+        (!*server.paths().is_validated(100) || !*server.paths().is_validated(101) ||
+         !path_history.highest_sent() || *path_history.highest_sent()<before_paths+4);++attempt)
+        check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
+    check(*server.paths().is_validated(100) && *server.paths().is_validated(101));
+    check(path_history.highest_sent() && *path_history.highest_sent()>=before_paths+4);
+}
 static auto observe(event_loop& loop,bounded_connection& client,bounded_connection& server,
     connection_driver& client_driver,connection_driver& server_driver,
     udp_endpoint& client_endpoint,ip_endpoint server_peer,bool& delivered,
@@ -168,7 +251,11 @@ static auto observe(event_loop& loop,bounded_connection& client,bounded_connecti
         }
         if (co_await sleep_for(loop,1ms)!=timer_wait_result::expired) co_return;
     }
-    if (delivered) queue_peer_close(server,client_endpoint,server_peer);
+    if (delivered) {
+        const auto tested=co_await receive_summary_scenario(loop,client,server,client_endpoint,server_peer);
+        check(tested==task_result::success);
+        queue_peer_close(server,client_endpoint,server_peer);
+    }
     else client_driver.stop();
     server_driver.stop();
     // Drivers must retire their pending sends before endpoint shutdown.

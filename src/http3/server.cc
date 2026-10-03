@@ -332,16 +332,22 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     }
     std::uint64_t sent = 0;
     while (sent < size) {
-        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(s.io.size(), size - sent));
-        if (!http::detail::read_file_at(file.get(), offset + sent, std::span(s.io).first(count))) {
+        // Request headers and conditional fields have already been consumed.
+        // Reuse their bounded scratch area for a contiguous DATA frame: larger
+        // reads and one stream write per chunk need no additional request memory.
+        constexpr std::size_t frame_header_limit = 16;
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+            s.headers.size() - frame_header_limit, size - sent));
+        const auto header_size = h3::encode_frame_header(h3::data_frame, count,
+            std::span(s.headers).first(frame_header_limit));
+        if (!header_size) co_return;
+        if (!http::detail::read_file_at(file.get(), offset + sent,
+                std::span(s.headers).subspan(*header_size, count))) {
             connection.close(std::make_error_code(std::errc::io_error)); co_return;
         }
-        std::array<std::byte, 16> frame_header {};
-        const auto header_size = h3::encode_frame_header(h3::data_frame, count, frame_header);
-        if (!header_size || !(co_await write_all(loop, connection, id,
-                std::span(frame_header).first(*header_size), false)).value_or(false) ||
-            !(co_await write_all(loop, connection, id, std::span(s.io).first(count), false)).value_or(false))
-            co_return;
+        if (!(co_await write_all(loop, connection, id,
+                std::span<const std::byte>(s.headers).first(*header_size + count), false))
+                .value_or(false)) co_return;
         sent += count;
     }
     (void)co_await write_all(loop, connection, id, {}, true);
