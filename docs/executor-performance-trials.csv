@@ -1,0 +1,99 @@
+trial,variant,benchmark,value,unit
+1,before,single-thread invoke,281723000.0,operations/s
+1,before,single-producer handoff,22085100.0,operations/s
+1,before,multi-producer handoff,5532100.0,operations/s
+1,before,queue-full rejection,281220000.0,operations/s
+1,before,fine-task worker fanout,20525800.0,operations/s
+1,before,mixed-work worker fanout,7911090.0,operations/s
+1,before,stalled-publisher later-task latency,100143.0,us
+1,after,single-thread invoke,284548000.0,operations/s
+1,after,single-producer handoff,30794500.0,operations/s
+1,after,multi-producer handoff,2583800.0,operations/s
+1,after,queue-full rejection,240162000.0,operations/s
+1,after,fine-task worker fanout,22638000.0,operations/s
+1,after,mixed-work worker fanout,7122690.0,operations/s
+1,after,stalled-publisher later-task latency,29.045,us
+2,after,single-thread invoke,283791000.0,operations/s
+2,after,single-producer handoff,28983300.0,operations/s
+2,after,multi-producer handoff,11266700.0,operations/s
+2,after,queue-full rejection,259968000.0,operations/s
+2,after,fine-task worker fanout,23396100.0,operations/s
+2,after,mixed-work worker fanout,7088910.0,operations/s
+2,after,stalled-publisher later-task latency,32.465,us
+2,before,single-thread invoke,285070000.0,operations/s
+2,before,single-producer handoff,22264900.0,operations/s
+2,before,multi-producer handoff,5829220.0,operations/s
+2,before,queue-full rejection,300876000.0,operations/s
+2,before,fine-task worker fanout,21267000.0,operations/s
+2,before,mixed-work worker fanout,7944610.0,operations/s
+2,before,stalled-publisher later-task latency,100157.0,us
+3,before,single-thread invoke,282749000.0,operations/s
+3,before,single-producer handoff,22059000.0,operations/s
+3,before,multi-producer handoff,1789970.0,operations/s
+3,before,queue-full rejection,288073000.0,operations/s
+3,before,fine-task worker fanout,21889800.0,operations/s
+3,before,mixed-work worker fanout,8075390.0,operations/s
+3,before,stalled-publisher later-task latency,100142.0,us
+3,after,single-thread invoke,284422000.0,operations/s
+3,after,single-producer handoff,31092800.0,operations/s
+3,after,multi-producer handoff,1526320.0,operations/s
+3,after,queue-full rejection,257724000.0,operations/s
+3,after,fine-task worker fanout,44548000.0,operations/s
+3,after,mixed-work worker fanout,7381790.0,operations/s
+3,after,stalled-publisher later-task latency,32.716,us
+4,after,single-thread invoke,285198000.0,operations/s
+4,after,single-producer handoff,31741700.0,operations/s
+4,after,multi-producer handoff,2611300.0,operations/s
+4,after,queue-full rejection,261234000.0,operations/s
+4,after,fine-task worker fanout,23631000.0,operations/s
+4,after,mixed-work worker fanout,7151540.0,operations/s
+4,after,stalled-publisher later-task latency,31.097,us
+4,before,single-thread invoke,284823000.0,operations/s
+4,before,single-producer handoff,22577800.0,operations/s
+4,before,multi-producer handoff,6063840.0,operations/s
+4,before,queue-full rejection,301661000.0,operations/s
+4,before,fine-task worker fanout,20948400.0,operations/s
+4,before,mixed-work worker fanout,7919490.0,operations/s
+4,before,stalled-publisher later-task latency,100146.0,us
+5,before,single-thread invoke,284426000.0,operations/s
+5,before,single-producer handoff,22543400.0,operations/s
+5,before,multi-producer handoff,6121200.0,operations/s
+5,before,queue-full rejection,281751000.0,operations/s
+5,before,fine-task worker fanout,20906500.0,operations/s
+5,before,mixed-work worker fanout,7912600.0,operations/s
+5,before,stalled-publisher later-task latency,100148.0,us
+5,after,single-thread invoke,283992000.0,operations/s
+5,after,single-producer handoff,30829800.0,operations/s
+5,after,multi-producer handoff,3211600.0,operations/s
+5,after,queue-full rejection,247598000.0,operations/s
+5,after,fine-task worker fanout,49312700.0,operations/s
+5,after,mixed-work worker fanout,7416720.0,operations/s
+5,after,stalled-publisher later-task latency,32.272,us
+6,after,single-thread invoke,282025000.0,operations/s
+6,after,single-producer handoff,32252200.0,operations/s
+6,after,multi-producer handoff,6941720.0,operations/s
+6,after,queue-full rejection,242805000.0,operations/s
+6,after,fine-task worker fanout,24211400.0,operations/s
+6,after,mixed-work worker fanout,7185730.0,operations/s
+6,after,stalled-publisher later-task latency,33.428,us
+6,before,single-thread invoke,282359000.0,operations/s
+6,before,single-producer handoff,22026700.0,operations/s
+6,before,multi-producer handoff,4487160.0,operations/s
+6,before,queue-full rejection,303476000.0,operations/s
+6,before,fine-task worker fanout,22648600.0,operations/s
+6,before,mixed-work worker fanout,8051380.0,operations/s
+6,before,stalled-publisher later-task latency,100147.0,us
+7,before,single-thread invoke,281855000.0,operations/s
+7,before,single-producer handoff,22257700.0,operations/s
+7,before,multi-producer handoff,2374160.0,operations/s
+7,before,queue-full rejection,304924000.0,operations/s
+7,before,fine-task worker fanout,20911800.0,operations/s
+7,before,mixed-work worker fanout,7929400.0,operations/s
+7,before,stalled-publisher later-task latency,100145.0,us
+7,after,single-thread invoke,283593000.0,operations/s
+7,after,single-producer handoff,30082800.0,operations/s
+7,after,multi-producer handoff,2319730.0,operations/s
+7,after,queue-full rejection,257842000.0,operations/s
+7,after,fine-task worker fanout,47464100.0,operations/s
+7,after,mixed-work worker fanout,7411640.0,operations/s
+7,after,stalled-publisher later-task latency,26.925,us

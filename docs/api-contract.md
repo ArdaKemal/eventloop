@@ -86,6 +86,18 @@ back to an unbounded allocation.
 - `task_executor()` runs independent work away from the loop. Worker code must
   not access loop-owned objects; use `post()` or the coroutine blocking/file
   operations to return work to the loop safely.
+- Multi-thread executors distribute external submissions across workers and
+  allow any idle worker to take them, including a lone task behind a busy
+  worker. Nested submissions prefer the submitting worker's local queue.
+  Idle workers steal local jobs from queues observed to contain more than one
+  task. Execution order
+  and worker affinity are unspecified. Victim size is a concurrent hint;
+  competing consumers can claim the remaining tasks after that observation.
+  `queue_capacity` bounds one shared
+  payload pool across all workers, including tasks being moved into or out of
+  storage; running tasks do not occupy a queue slot. Rejection leaves a named
+  input task intact. Submission, dequeue, and stealing use preallocated storage.
+  A paused callable move does not prevent other published tasks from running.
 - Draining posted commands and worker completions does not wait for a producer
   to finish publishing a claimed queue slot. The loop continues servicing I/O
   and timers and retries after the producer publishes and wakes it. Later

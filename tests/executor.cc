@@ -1,6 +1,7 @@
 #include "eventloop/executor.h"
 
 #include "executor/bounded_task_queue.h"
+#include "publication_pause.h"
 
 #include <array>
 #include <atomic>
@@ -506,11 +507,99 @@ auto multi_thread_tests() -> bool
     return ok;
 }
 
+auto pending_publication_test() -> bool
+{
+    bounded_task_queue queue(2);
+    test_publication::pause gate;
+    std::array<int, 2> order {};
+    int count = 0;
+    auto first = test_publication::make_task(gate, [&]() noexcept {
+        order[static_cast<std::size_t>(count++)] = 1;
+    });
+    gate.armed.store(true, std::memory_order_release);
+    bool accepted = false;
+    std::thread producer([&] { accepted = queue.try_push(std::move(first)); });
+    const bool entered = test_publication::wait_until([&] {
+        return gate.entered.load(std::memory_order_acquire);
+    });
+    bool ok = check(entered, "producer paused before publication");
+    ok &= check(queue.try_push(execution_task([&]() noexcept {
+                    order[static_cast<std::size_t>(count++)] = 2;
+                })), "later task publishes behind paused head");
+    int fallback = 0;
+    execution_task output([&]() noexcept { ++fallback; });
+    ok &= check(queue.try_pop_ready(output) ==
+                    bounded_task_queue::pop_result::publication_pending,
+                "ready pop reports pending publication without waiting");
+    output();
+    ok &= check(fallback == 1, "pending pop preserves output ownership");
+    execution_task rejected([]() noexcept {});
+    ok &= check(!queue.try_push(std::move(rejected)) && rejected,
+                "claimed slots count toward capacity and preserve rejection");
+    gate.open();
+    producer.join();
+    ok &= check(accepted, "paused producer publishes successfully");
+    for (int index = 0; index < 2; ++index) {
+        if (queue.try_pop_ready(output) != bounded_task_queue::pop_result::popped) {
+            return check(false, "published task can be popped");
+        }
+        output();
+    }
+    ok &= check(count == 2 && order == std::array<int, 2> {1, 2},
+                "pending publication preserves FIFO and exactly-once execution");
+    ok &= check(queue.try_pop_ready(output) == bounded_task_queue::pop_result::empty,
+                "ready pop distinguishes empty from pending");
+    return ok;
+}
+
+auto pending_executor_permit_test() -> bool
+{
+    auto executor = make_multi_thread_executor({.worker_count = 1, .queue_capacity = 2});
+    test_publication::pause gate;
+    std::atomic<int> completed {0};
+    std::array<int, 2> order {};
+    auto first = test_publication::make_task(gate, [&]() noexcept {
+        order[static_cast<std::size_t>(completed.load(std::memory_order_relaxed))] = 1;
+        completed.fetch_add(1, std::memory_order_release);
+    });
+    gate.armed.store(true, std::memory_order_release);
+    bool accepted = false;
+    std::thread producer([&] { accepted = executor->execute(std::move(first)); });
+    const bool entered = test_publication::wait_until([&] {
+        return gate.entered.load(std::memory_order_acquire);
+    });
+    bool ok = check(entered, "executor producer paused before publication");
+    ok &= check(executor->execute(execution_task([&]() noexcept {
+                    order[static_cast<std::size_t>(
+                        completed.load(std::memory_order_relaxed))] = 2;
+                    completed.fetch_add(1, std::memory_order_release);
+                })), "later executor task publishes and releases a permit");
+    ok &= check(test_publication::wait_until([&] {
+                    return completed.load(std::memory_order_acquire) == 1;
+                }), "worker runs published task while earlier producer is paused");
+    gate.open();
+    producer.join();
+    ok &= check(accepted, "paused executor producer accepted");
+    const bool finished = test_publication::wait_until([&] {
+        return completed.load(std::memory_order_acquire) == 2;
+    });
+    if (!check(finished, "both tasks execute without another permit or shutdown")) {
+        // A lost permit can deadlock destruction as well: its shutdown permit
+        // executes stranded work, leaving none to let the worker exit.
+        std::_Exit(1);
+    }
+    executor.reset();
+    ok &= check(completed.load() == 2 && order == std::array<int, 2> {2, 1},
+                "executor preserves accepted work and exactly-once execution");
+    return ok;
+}
+
 } // namespace
 
 auto main() -> int
 {
     if (!task_tests() || !single_thread_tests() || !queue_tests() ||
+        !pending_publication_test() || !pending_executor_permit_test() ||
         !multi_thread_tests()) {
         std::cerr << "executor tests failed\n";
         return 1;

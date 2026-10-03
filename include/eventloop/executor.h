@@ -118,8 +118,12 @@ private:
 // Executors own a fixed execution strategy. Submitting work never allocates.
 // execute() returns true once ownership of the task has been accepted:
 // the single-thread executor has already run it; the multi-thread executor
-// has queued it for a worker. A false result means the task is empty, the
-// multi-thread queue is full, or the executor is shutting down; a named task
+// has queued it for a worker. Worker submissions prefer their own queue;
+// idle workers take external work and steal local jobs from queues observed
+// to have more than one task.
+// Execution order and worker affinity are unspecified. A false result means
+// the task is empty, the multi-thread queue is full, or the executor is shutting
+// down; a named task
 // remains valid for a fallback path. Calling execute() concurrently is
 // supported; destroying an executor while execute() is running is not.
 class executor {
@@ -144,8 +148,9 @@ struct multi_thread_executor_options {
 auto make_single_thread_executor() -> std::unique_ptr<executor>;
 
 // worker_count must be greater than zero. queue_capacity must be a power of
-// two and at least two, otherwise std::invalid_argument is thrown. Destruction
-// drains accepted work and waits for it to finish.
+// two and at least two, otherwise std::invalid_argument is thrown. Capacity is
+// shared across all workers; preparing or dequeuing tasks occupy slots, running
+// tasks do not. Destruction drains accepted work and waits for it to finish.
 auto make_multi_thread_executor(multi_thread_executor_options options)
     -> std::unique_ptr<executor>;
 

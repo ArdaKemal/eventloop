@@ -221,6 +221,12 @@ on a dedicated bounded worker. Queues and protocol buffers have limits, and
 operations report when a limit is reached. OpenSSL and setup code may allocate,
 so the library does not promise a heap-free process.
 
+Worker executors share a fixed task capacity across workers. Idle workers take
+external submissions and steal local jobs from busy workers with a backlog;
+[worker scheduling](docs/executor-scheduling.md) describes the bounds and ownership.
+The [executor measurements](docs/executor-performance.md) report progress,
+memory cost, throughput gains, and regressions.
+
 Ownership is visible at the API boundary. For example, accepting a TCP
 connection returns an owning `unique_fd`, while a `std::span` passed to an
 asynchronous read remains the caller's buffer until completion. Cancellation
