@@ -368,7 +368,10 @@ struct connection_state {
                 if (exchange.read_waiter && exchange.read_ready()) wake(exchange.read_waiter);
                 if (exchange.write_waiter && exchange.write_ready()) wake(exchange.write_waiter);
             }
-            if (writer_waiter && (broken || state.has_output() || state.closed()))
+            // While the reader dispatches one input batch, responses
+            // accumulate so the writer sends them together.
+            if (writer_waiter && (broken || (!batching && (state.has_output() ||
+                                                           state.closed()))))
                 wake(writer_waiter);
         } while (wake_again);
         waking = false;
@@ -398,6 +401,7 @@ struct connection_state {
     bool broken {false};
     bool waking {false};
     bool wake_again {false};
+    bool batching {false};
 };
 
 auto http2_exchange::loop() noexcept -> event_loop& { return owner->loop; }
@@ -708,12 +712,16 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
     (void)loop;
     auto& state = connection.state;
     for (;;) {
+        // Handlers spawned here usually finish before they suspend; their
+        // responses are written together once the batch is dispatched.
+        connection.batching = true;
         request incoming;
         while (state.pop_request(incoming))
             serve_request(state, std::move(incoming), connection.root,
                           connection.directory_listing, &connection.routes);
         routed_request routed;
         while (state.pop_routed(routed)) dispatch_routed(connection, std::move(routed));
+        connection.batching = false;
         connection.drain();
         if (connection.broken || state.closed()) co_return;
         const auto buffer = state.read_buffer();
