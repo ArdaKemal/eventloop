@@ -934,6 +934,10 @@ add_executable(http_benchmark_server benchmark/http_benchmark_server.cc)
 target_link_libraries(http_benchmark_server PRIVATE eventloop::eventloop)
 target_compile_options(http_benchmark_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
+add_executable(routing_benchmark_server benchmark/routing_benchmark_server.cc)
+target_link_libraries(routing_benchmark_server PRIVATE eventloop::eventloop)
+target_compile_options(routing_benchmark_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
 add_executable(executor_benchmark benchmark/executor_benchmark.cc)
 target_link_libraries(executor_benchmark PRIVATE eventloop::eventloop)
 target_compile_options(executor_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
