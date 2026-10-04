@@ -368,7 +368,11 @@ every running connection has sent its close and retired.
   storage for 40 concurrent stream tasks. Completed task slots are reused.
   The `request_capacity` constructor argument reserves reusable request scratch
   buffers at startup; zero selects four per connection, and explicit values
-  from 1 to 8192 are accepted. Exhaustion closes only the affected connection.
+  from 1 to 8192 are accepted. A request arriving while every buffer is in
+  use, or whose coroutine frame cannot be allocated, is refused with
+  `H3_REQUEST_REJECTED` on its stream; the connection continues. A buffer is
+  held until the request stream ends, the server stops reading it, or it
+  fails.
   The `max_udp_payload_size` constructor argument bounds application datagrams
   to 1200..8192 bytes and is negotiated down to the peer's advertised limit;
   handshake packets remain at 1200 so anti-amplification is unaffected. It
@@ -383,12 +387,57 @@ every running connection has sent its close and retired.
   request concurrency; the shipped HTTP/3 examples scale those frame caps with
   the configured capacity. A frame-allocation
   failure rejects only the affected connection instead of stopping the
-  listener. A request that exceeds the header cap closes its connection. Peer
-  SETTINGS are limited to 1024 payload bytes and 64 entries; malformed or
-  oversized SETTINGS close the connection. Control SETTINGS are validated
-  incrementally using bounded frame storage, which is released after
-  validation. Directory listings are available when the server is constructed
-  with `directory_listing` and follow the shared bounded renderer. Request
-  bodies, HTTP/3 server push, and WebTransport are not supported. The server
-  discards up to 1 MiB of request bytes after headers to retire a completed
-  stream; larger remainders close the connection.
+  listener; one for a peer unidirectional stream closes that connection with
+  `H3_INTERNAL_ERROR`.
+  Each peer unidirectional stream is parsed by type with about 300 bytes of
+  fixed state in its reader frame; nothing is buffered beyond one partial
+  integer. A client push stream, or a second control, QPACK encoder, or QPACK
+  decoder stream, is `H3_STREAM_CREATION_ERROR`; FIN or reset of any of those
+  three is `H3_CLOSED_CRITICAL_STREAM`. The control stream must begin with
+  SETTINGS (`H3_MISSING_SETTINGS`); a second SETTINGS or a DATA, HEADERS,
+  PUSH_PROMISE, or reserved HTTP/2 frame is `H3_FRAME_UNEXPECTED`. SETTINGS
+  accepts at most 32 distinct identifiers (`H3_EXCESSIVE_LOAD` beyond that)
+  and rejects duplicate or HTTP/2-only identifiers, and
+  `ENABLE_CONNECT_PROTOCOL` or `H3_DATAGRAM` values above 1
+  (`H3_SETTINGS_ERROR`).
+  GOAWAY, MAX_PUSH_ID, and CANCEL_PUSH must hold exactly one push ID
+  (`H3_FRAME_ERROR`); an increasing GOAWAY, decreasing MAX_PUSH_ID, or
+  CANCEL_PUSH above the client's MAX_PUSH_ID is `H3_ID_ERROR`. Unknown frames
+  are skipped by length. Because the server advertises a zero-capacity
+  dynamic table, the encoder stream accepts only Set Dynamic Table Capacity 0
+  (`QPACK_ENCODER_STREAM_ERROR`), and the decoder stream accepts only Stream
+  Cancellation (`QPACK_DECODER_STREAM_ERROR`). Unknown stream types are
+  refused with STOP_SENDING `H3_STREAM_CREATION_ERROR`. Each violation closes the connection with that code in
+  CONNECTION_CLOSE, as does a client whose stream limit leaves no room for the
+  server's three unidirectional streams (`H3_GENERAL_PROTOCOL_ERROR`). A
+  connection that ends normally is closed with `H3_NO_ERROR`.
+  Request streams are parsed as HTTP/3 frames: HEADERS, then DATA, then at
+  most one trailing HEADERS, with unknown and reserved extension frames
+  skipped by length anywhere. DATA before the request HEADERS, a frame after
+  trailers, or a control, PUSH_PROMISE, or reserved HTTP/2 frame is
+  `H3_FRAME_UNEXPECTED`; a FIN inside a frame is `H3_FRAME_ERROR`; a QPACK
+  section that uses the dynamic table or does not decode is
+  `QPACK_DECOMPRESSION_FAILED`. Those close the connection. Errors confined to
+  one request reset the response and send STOP_SENDING with the same code,
+  and the connection continues. A malformed request is `H3_MESSAGE_ERROR`:
+  missing, duplicate, unknown, or late pseudo-header fields (including
+  `:protocol`), an empty `:path` or missing authority for `http`/`https`,
+  `:authority` and Host that disagree, uppercase or invalid field names,
+  NUL, CR, LF, or DEL in values, connection-specific fields, TE other than
+  `trailers`, a non-numeric or conflicting Content-Length, DATA whose total
+  differs from Content-Length, or a pseudo-header in trailers. A stream
+  ending before its request HEADERS is `H3_REQUEST_INCOMPLETE`. A field
+  section above the 16 KiB header cap or the decode limits, or If-None-Match
+  values that do not fit request storage, is `H3_EXCESSIVE_LOAD`. A file read
+  failure is `H3_INTERNAL_ERROR`, and a response write that fails because the
+  peer stopped or reset the stream is `H3_REQUEST_CANCELLED`. CONNECT is
+  answered 405 and a `:scheme` other than `https` 400. The response is sent
+  once the request HEADERS are valid. The server then reads the rest of the
+  request: DATA is counted and dropped, and trailers are decoded into the
+  request's own storage. Violations found after the response reset a stream
+  whose response may already be complete. After 1 MiB of request DATA the
+  server stops reading with STOP_SENDING `H3_NO_ERROR` (RFC 9114 4.1), so
+  Content-Length is not checked past that point. Request bodies are not
+  delivered to handlers. Directory listings are available when the server is
+  constructed with `directory_listing` and follow the shared bounded
+  renderer. HTTP/3 server push and WebTransport are not supported.

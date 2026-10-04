@@ -7,6 +7,8 @@
 #include "../http/resource.h"
 #include "../http/file_response.h"
 #include "frames.h"
+#include "peer_streams.h"
+#include "request_stream.h"
 #include "qpack.h"
 
 #include <algorithm>
@@ -23,7 +25,6 @@
 namespace eventloop::http {
 namespace {
 namespace h3 = eventloop::http3::detail;
-namespace wire = eventloop::quic::detail;
 constexpr std::size_t max_streams = 40;
 constexpr std::size_t header_limit = 16 * 1024;
 using stream_handlers = std::array<std::optional<task_handle<void>>, max_streams>;
@@ -71,59 +72,6 @@ auto write_all(event_loop& loop, quic_connection& connection, std::uint64_t id,
     co_return true;
 }
 
-auto read_exact(event_loop& loop, quic_connection& connection, std::uint64_t id,
-                std::span<std::byte> bytes) -> task<bool>
-{
-    (void)loop;
-    while (!bytes.empty()) {
-        auto result = flatten_result(co_await connection.async_read(id, bytes));
-        if (!result || *result == 0 || *result > bytes.size()) co_return false;
-        bytes = bytes.subspan(*result);
-    }
-    co_return true;
-}
-
-auto read_varint(event_loop& loop, quic_connection& connection, std::uint64_t id,
-                 std::size_t* remaining = nullptr)
-    -> task<std::expected<std::uint64_t, std::error_code>>
-{
-    std::array<std::byte, 8> input {};
-    if (remaining && *remaining == 0)
-        co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
-    if (!(co_await read_exact(loop, connection, id, std::span(input).first(1))).value_or(false))
-        co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
-    const auto size = std::size_t{1} << (std::to_integer<unsigned>(input[0]) >> 6);
-    if (remaining && size > *remaining)
-        co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
-    if (size > 1 && !(co_await read_exact(loop, connection, id, std::span(input).subspan(1, size - 1))).value_or(false))
-        co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
-    auto decoded = wire::decode_varint(std::span(input).first(size));
-    if (!decoded) co_return std::unexpected(std::make_error_code(std::errc::protocol_error));
-    if (remaining) *remaining -= size;
-    co_return decoded->value;
-}
-
-auto read_control_settings(event_loop& loop, quic_connection& connection,
-                           std::uint64_t id, std::size_t remaining) -> task<bool>
-{
-    // Keep the 64 identifiers in a short-lived frame. The peer SETTINGS
-    // payload is consumed incrementally, so no 1 KiB receive buffer remains
-    // pinned while the long-lived unidirectional stream waits for input.
-    std::array<std::uint64_t, 64> identifiers {};
-    std::size_t count = 0;
-    while (remaining != 0) {
-        if (count == identifiers.size()) co_return false;
-        const auto identifier = flatten_result(co_await read_varint(loop, connection, id, &remaining));
-        if (!identifier || h3::forbidden_setting(*identifier)) co_return false;
-        const auto value = flatten_result(co_await read_varint(loop, connection, id, &remaining));
-        if (!value || std::find(identifiers.begin(), identifiers.begin() +
-                static_cast<std::ptrdiff_t>(count), *identifier) !=
-                identifiers.begin() + static_cast<std::ptrdiff_t>(count)) co_return false;
-        identifiers[count++] = *identifier;
-    }
-    co_return true;
-}
-
 // Header encoding uses a caller-owned scratch buffer so the 512-byte encode
 // area does not enlarge this coroutine's frame. Keeping the frame within the
 // 1 KiB size class matters because each active request holds one.
@@ -161,21 +109,86 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
     co_return (co_await write_all(loop, connection, id, buffer.first(*framed), fin)).value_or(false);
 }
 
-auto discard_request_remainder(event_loop& loop, quic_connection& connection,
-                               std::uint64_t id, std::span<std::byte> scratch)
-    -> task<void>
+// Stream-scoped HTTP/3 errors reset the response and stop the request body;
+// the transport absorbs the rest so the stream retires. Every other code is a
+// connection error sent in CONNECTION_CLOSE.
+auto fail(quic_connection& connection, std::uint64_t id, h3::h3_error error) noexcept -> void
+{
+    const auto code = static_cast<std::uint64_t>(error);
+    if (!h3::stream_scoped(error)) {
+        connection.close_application(code);
+        return;
+    }
+    (void)connection.stop_sending(id, code);
+    (void)connection.reset_stream(id, code);
+}
+
+// io holds the encoded response HEADERS in its first part and request input
+// in the rest, so bytes read past the request HEADERS survive the response.
+constexpr std::size_t response_header_area = 1024;
+// Request DATA read after a complete response. Beyond it the server stops
+// reading with H3_NO_ERROR, as RFC 9114 4.1 permits for unneeded bodies.
+constexpr std::uint64_t request_body_limit = 1024 * 1024;
+
+enum class read_outcome { block, end, body_limit, failure, transport_failure };
+
+// Reads request frames until a complete HEADERS block, a clean FIN, or an
+// error. pending carries unparsed input in input_area between calls.
+auto read_request_frames(event_loop& loop, quic_connection& connection, std::uint64_t id,
+                         h3::request_frames& frames, std::span<std::byte> input_area,
+                         std::span<const std::byte>& pending, h3::h3_error& error)
+    -> task<read_outcome>
 {
     (void)loop;
-    constexpr std::size_t discard_limit = 1024 * 1024;
-    std::size_t discarded = 0;
-    while (connection.valid()) {
-        const auto got = flatten_result(co_await connection.async_read(id, scratch));
-        if (!got || *got == 0) co_return;
-        if (*got > discard_limit - discarded) {
-            connection.close(std::make_error_code(std::errc::message_size));
-            co_return;
+    for (;;) {
+        if (!pending.empty()) {
+            const auto parsed = frames.receive(pending);
+            if (!parsed) { error = parsed.error(); co_return read_outcome::failure; }
+            if (*parsed == h3::request_frames::event::header_block) co_return read_outcome::block;
+            if (frames.data_received() > request_body_limit) co_return read_outcome::body_limit;
+            continue;
         }
-        discarded += *got;
+        const auto got = flatten_result(co_await connection.async_read(id, input_area));
+        if (!got) co_return read_outcome::transport_failure;
+        if (*got == 0) {
+            if (const auto finished = frames.finish(); !finished) {
+                error = finished.error();
+                co_return read_outcome::failure;
+            }
+            co_return read_outcome::end;
+        }
+        pending = std::span<const std::byte>(input_area).first(*got);
+    }
+}
+
+// After the response: validate the remaining request frames, DATA length
+// against Content-Length, and any trailers, until FIN or the body limit.
+auto finish_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
+                    stream_storage& s, h3::request_frames& frames,
+                    std::span<const std::byte> pending) -> task<void>
+{
+    const auto input_area = std::span(s.io).subspan(response_header_area);
+    h3::h3_error error {};
+    for (;;) {
+        const auto outcome = (co_await read_request_frames(loop, connection, id, frames,
+            input_area, pending, error)).value_or(read_outcome::transport_failure);
+        switch (outcome) {
+        case read_outcome::block: {
+            const auto decoded = h3::qpack_decode(frames.block(), s.fields, s.strings);
+            if (!decoded) { fail(connection, id, h3::qpack_failure(decoded.error())); co_return; }
+            if (const auto valid = h3::validate_trailers(std::span(s.fields).first(*decoded)); !valid) {
+                fail(connection, id, valid.error());
+                co_return;
+            }
+            continue;
+        }
+        case read_outcome::body_limit:
+            (void)connection.stop_sending(id, static_cast<std::uint64_t>(h3::h3_error::no_error));
+            co_return;
+        case read_outcome::failure: fail(connection, id, error); co_return;
+        case read_outcome::end:
+        case read_outcome::transport_failure: co_return;
+        }
     }
 }
 
@@ -189,66 +202,52 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         ~release_storage() { storage->in_use = false; }
     } release {storage};
     auto& s = *storage;
-    const auto type = flatten_result(co_await read_varint(loop, connection, id));
-    const auto length = flatten_result(co_await read_varint(loop, connection, id));
-    if (!type || !length || *type != h3::headers_frame || *length > s.headers.size()) {
-        connection.close(std::make_error_code(std::errc::protocol_error));
-        co_return;
-    }
-    if (!(co_await read_exact(loop, connection, id, std::span(s.headers).first(*length))).value_or(false))
-        co_return;
-    const auto decoded = h3::qpack_decode(std::span(s.headers).first(*length), s.fields, s.strings);
+    // The parser copies HEADERS payloads into s.headers. Once the request
+    // section is decoded (strings live in s.strings), s.headers is reused for
+    // If-None-Match and response DATA, and later for any trailers.
+    h3::request_frames frames(s.headers);
+    std::span<const std::byte> pending;
+    h3::h3_error error {};
+    const auto input_area = std::span(s.io).subspan(response_header_area);
+    const auto outcome = (co_await read_request_frames(loop, connection, id, frames,
+        input_area, pending, error)).value_or(read_outcome::transport_failure);
+    if (outcome == read_outcome::failure) fail(connection, id, error);
+    if (outcome != read_outcome::block) co_return;
+    const auto decoded = h3::qpack_decode(frames.block(), s.fields, s.strings);
     if (!decoded) {
-        connection.close(std::make_error_code(std::errc::protocol_error));
+        fail(connection, id, h3::qpack_failure(decoded.error()));
         co_return;
     }
-    std::string_view method, path, scheme, authority;
+    const auto request_fields = std::span<const h3::field>(s.fields).first(*decoded);
+    const auto head = h3::validate_request(request_fields);
+    if (!head) {
+        fail(connection, id, head.error());
+        co_return;
+    }
+    frames.set_content_length(head->content_length);
+    const auto method = head->method;
+    const auto path = head->path;
     std::size_t match_size = 0;
-    bool match_overflow = false;
     std::string_view if_modified_since, range;
     bool duplicate_range = false;
-    bool regular = false;
-    for (const auto& field : std::span(s.fields).first(*decoded)) {
-        bool invalid = field.name.empty() || field.name == "connection" ||
-            field.name == "transfer-encoding" || field.name == "upgrade";
-        for (unsigned char c : field.name)
-            invalid |= c <= 0x20 || c >= 0x7f || (c >= 'A' && c <= 'Z');
-        for (unsigned char c : field.value)
-            invalid |= c == 0 || c == '\r' || c == '\n' || c == 0x7f;
-        if (invalid) {
-            connection.close(std::make_error_code(std::errc::protocol_error));
-            co_return;
-        }
-        if (field.name.front() == ':') {
-            if (regular) { connection.close(std::make_error_code(std::errc::protocol_error)); co_return; }
-            if (field.name == ":method" && method.empty()) method = field.value;
-            else if (field.name == ":path" && path.empty()) path = field.value;
-            else if (field.name == ":scheme" && scheme.empty()) scheme = field.value;
-            else if (field.name == ":authority" && authority.empty()) authority = field.value;
-            else { connection.close(std::make_error_code(std::errc::protocol_error)); co_return; }
-        } else {
-            regular = true;
-            if (field.name == "if-none-match") {
-                const auto extra = field.value.size() + (match_size != 0 ? 1 : 0);
-                if (extra > s.headers.size() - match_size) match_overflow = true;
-                else {
-                    auto* output = reinterpret_cast<char*>(s.headers.data());
-                    if (match_size != 0) output[match_size++] = ',';
-                    if (!field.value.empty())
-                        std::memcpy(output + match_size, field.value.data(), field.value.size());
-                    match_size += field.value.size();
-                }
+    for (const auto& field : request_fields) {
+        if (field.name == "if-none-match") {
+            const auto extra = field.value.size() + (match_size != 0 ? 1 : 0);
+            if (extra > s.headers.size() - match_size) {
+                fail(connection, id, h3::h3_error::excessive_load);
+                co_return;
             }
-            else if (field.name == "if-modified-since") if_modified_since = field.value;
-            else if (field.name == "range") {
-                if (!range.empty()) duplicate_range = true;
-                else range = field.value;
-            }
+            auto* output = reinterpret_cast<char*>(s.headers.data());
+            if (match_size != 0) output[match_size++] = ',';
+            if (!field.value.empty())
+                std::memcpy(output + match_size, field.value.data(), field.value.size());
+            match_size += field.value.size();
         }
-    }
-    if (match_overflow) {
-        connection.close(std::make_error_code(std::errc::message_size));
-        co_return;
+        else if (field.name == "if-modified-since") if_modified_since = field.value;
+        else if (field.name == "range") {
+            if (!range.empty()) duplicate_range = true;
+            else range = field.value;
+        }
     }
     const std::string_view if_none_match {
         reinterpret_cast<const char*>(s.headers.data()), match_size};
@@ -261,7 +260,8 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     bool have_listing = false;
     std::vector<char> listing;
     std::string_view mime = "text/plain";
-    if (method.empty() || path.empty() || scheme != "https" || authority.empty()) status = 400;
+    // Plain CONNECT has no :scheme and is answered 405 below.
+    if (method != "CONNECT" && head->scheme != "https") status = 400;
     else if (method == "OPTIONS") status = 204;
     else if (method != "GET" && method != "HEAD") status = 405;
     else {
@@ -307,13 +307,13 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     }
     const bool body_expected = have_listing || (have_file && (status == 200 || status == 206));
     const bool finish = !body_expected || method == "HEAD";
+    // A failed write means the peer stopped or reset the stream, or the
+    // connection is ending; abandon only this request.
+    const auto cancelled = h3::h3_error::request_cancelled;
     if (!(co_await send_headers(loop, connection, id, status, size, mime, finish,
-                               s.io, have_file ? &selected : nullptr)).value_or(false)) {
-        connection.close(std::make_error_code(std::errc::io_error));
-        co_return;
-    }
-    if (finish) {
-        (void)co_await discard_request_remainder(loop, connection, id, s.io);
+            std::span(s.io).first(response_header_area),
+            have_file ? &selected : nullptr)).value_or(false)) {
+        fail(connection, id, cancelled);
         co_return;
     }
     if (have_listing) {
@@ -324,61 +324,72 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
                     std::span(frame_header).first(*header_size), false)).value_or(false) ||
             !(co_await write_all(loop, connection, id,
                     std::span(reinterpret_cast<const std::byte*>(listing.data()),
-                              listing.size()), false)).value_or(false))
+                              listing.size()), true)).value_or(false)) {
+            fail(connection, id, cancelled);
             co_return;
-        (void)co_await write_all(loop, connection, id, {}, true);
-        (void)co_await discard_request_remainder(loop, connection, id, s.io);
-        co_return;
-    }
-    std::uint64_t sent = 0;
-    while (sent < size) {
-        // Request headers and conditional fields have already been consumed.
-        // Reuse their bounded scratch area for a contiguous DATA frame: larger
-        // reads and one stream write per chunk need no additional request memory.
-        constexpr std::size_t frame_header_limit = 16;
-        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
-            s.headers.size() - frame_header_limit, size - sent));
-        const auto header_size = h3::encode_frame_header(h3::data_frame, count,
-            std::span(s.headers).first(frame_header_limit));
-        if (!header_size) co_return;
-        if (!http::detail::read_file_at(file.get(), offset + sent,
-                std::span(s.headers).subspan(*header_size, count))) {
-            connection.close(std::make_error_code(std::errc::io_error)); co_return;
         }
-        if (!(co_await write_all(loop, connection, id,
-                std::span<const std::byte>(s.headers).first(*header_size + count), false))
-                .value_or(false)) co_return;
-        sent += count;
+    } else if (!finish) {
+        if (size == 0 && !(co_await write_all(loop, connection, id, {}, true)).value_or(false)) {
+            fail(connection, id, cancelled);
+            co_return;
+        }
+        std::uint64_t sent = 0;
+        while (sent < size) {
+            // Request headers and conditional fields have already been
+            // consumed. Reuse their bounded scratch area for a contiguous DATA
+            // frame: larger reads and one stream write per chunk need no
+            // additional request memory.
+            constexpr std::size_t frame_header_limit = 16;
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                s.headers.size() - frame_header_limit, size - sent));
+            const auto header_size = h3::encode_frame_header(h3::data_frame, count,
+                std::span(s.headers).first(frame_header_limit));
+            if (!header_size ||
+                !http::detail::read_file_at(file.get(), offset + sent,
+                    std::span(s.headers).subspan(*header_size, count))) {
+                fail(connection, id, h3::h3_error::internal_error);
+                co_return;
+            }
+            if (!(co_await write_all(loop, connection, id,
+                    std::span<const std::byte>(s.headers).first(*header_size + count),
+                    sent + count == size)).value_or(false)) {
+                fail(connection, id, cancelled);
+                co_return;
+            }
+            sent += count;
+        }
     }
-    (void)co_await write_all(loop, connection, id, {}, true);
-    (void)co_await discard_request_remainder(loop, connection, id, s.io);
+    (void)co_await finish_request(loop, connection, id, s, frames, pending);
 }
 
-auto drain_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t id,
-                    bool& have_control) -> task<void>
+// Client unidirectional streams: control, QPACK encoder/decoder, rejected
+// push streams, and refused unknown types. Validation state lives in this
+// frame; a reset or FIN of a critical stream closes the connection.
+auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t id,
+                   h3::peer_critical_streams& critical) -> task<void>
 {
-    const auto stream_type = flatten_result(co_await read_varint(loop, connection, id));
-    if (!stream_type) co_return;
-    if (*stream_type == 0) {
-        if (have_control) { connection.close(std::make_error_code(std::errc::protocol_error)); co_return; }
-        have_control = true;
-        const auto frame_type = flatten_result(co_await read_varint(loop, connection, id));
-        const auto length = flatten_result(co_await read_varint(loop, connection, id));
-        if (!frame_type || !length || *frame_type != h3::settings_frame || *length > 1024) {
-            connection.close(std::make_error_code(std::errc::protocol_error)); co_return;
-        }
-        if (!(co_await read_control_settings(loop, connection, id,
-                static_cast<std::size_t>(*length))).value_or(false)) {
-            connection.close(std::make_error_code(std::errc::protocol_error)); co_return;
-        }
-    }
-    std::array<std::byte, 256> discard {};
+    (void)loop;
+    h3::peer_uni_stream stream;
+    std::array<std::byte, 256> input {};
     while (connection.valid()) {
-        auto got = flatten_result(co_await connection.async_read(id, discard));
-        if (!got || *got == 0) break;
+        const auto got = flatten_result(co_await connection.async_read(id, input));
+        if (!got && got.error() != make_error_code(quic_errc::stream_reset)) co_return;
+        const bool ended = !got || *got == 0;
+        const auto checked = ended ? stream.finish()
+                                   : stream.receive(std::span(input).first(*got), critical);
+        if (!checked) {
+            fail(connection, id, checked.error());
+            co_return;
+        }
+        if (ended) co_return;
+        // Unknown and reserved types are refused rather than drained
+        // (RFC 9114 6.2); the transport discards anything still arriving.
+        if (stream.stream_kind() == h3::peer_uni_stream::kind::unknown) {
+            (void)connection.stop_sending(id,
+                static_cast<std::uint64_t>(h3::h3_error::stream_creation_error));
+            co_return;
+        }
     }
-    if (*stream_type == 0 && connection.valid())
-        connection.close(std::make_error_code(std::errc::protocol_error));
 }
 
 auto serve_connection(event_loop& loop, quic_connection connection,
@@ -386,9 +397,11 @@ auto serve_connection(event_loop& loop, quic_connection connection,
                       stream_handlers& handlers, storage_pool& pool,
                       bool directory_listing) -> task<void>
 {
-    bool have_control = false;
+    h3::peer_critical_streams critical;
     auto control = flatten_result(co_await connection.async_open_stream(quic_stream_direction::unidirectional));
-    if (!control) { connection.close(control.error()); co_return; }
+    // RFC 9114 6.2 requires room for the three server critical streams.
+    const auto general = static_cast<std::uint64_t>(h3::h3_error::general_protocol_error);
+    if (!control) { connection.close_application(general); co_return; }
     // Server control stream: stream type 0, SETTINGS with zero QPACK dynamic table.
     const std::array<std::byte, 6> settings {std::byte{0}, std::byte{4}, std::byte{4},
         std::byte{1}, std::byte{0}, std::byte{7}};
@@ -400,7 +413,8 @@ auto serve_connection(event_loop& loop, quic_connection connection,
     // Required QPACK encoder and decoder streams. No dynamic entries are sent.
     for (std::byte type : {std::byte{2}, std::byte{3}}) {
         auto id = flatten_result(co_await connection.async_open_stream(quic_stream_direction::unidirectional));
-        if (!id || !(co_await write_all(loop, connection, *id, std::span(&type, 1), false)).value_or(false)) {
+        if (!id) { connection.close_application(general); co_return; }
+        if (!(co_await write_all(loop, connection, *id, std::span(&type, 1), false)).value_or(false)) {
             connection.close(); co_return;
         }
     }
@@ -408,28 +422,34 @@ auto serve_connection(event_loop& loop, quic_connection connection,
         auto accepted = flatten_result(co_await connection.async_accept_stream());
         if (!accepted) break;
         const auto id = *accepted;
-        task_spawn_result spawned = task_spawn_result::invalid_task;
+        const bool request = (id & 3u) == 0u;
+        // Handler slots cover every stream QUIC admits (32 bidirectional and
+        // 8 unidirectional), so exhaustion here is a capacity bug.
         auto slot = std::find_if(handlers.begin(), handlers.end(),
             [](const auto& handler) { return !handler || handler->done(); });
-        if (slot == handlers.end()) { connection.close(); break; }
-        slot->reset();
-        slot->emplace();
-        if ((id & 3u) == 2u) {
-            spawned = loop.spawn(drain_peer_uni(loop, connection, id, have_control), **slot);
-        } else if ((id & 3u) == 0u) {
-            auto* storage = pool.acquire();
-            if (!storage) { slot->reset(); connection.close(); break; }
-            spawned = loop.spawn(serve_request(loop, connection, id, root->get(),
-                storage, directory_listing), **slot);
-            if (spawned != task_spawn_result::accepted) storage->in_use = false;
-        }
-        if (spawned != task_spawn_result::accepted) {
+        stream_storage* storage = request ? pool.acquire() : nullptr;
+        auto spawned = task_spawn_result::invalid_task;
+        if (slot != handlers.end() && (!request || storage)) {
             slot->reset();
-            connection.close();
+            slot->emplace();
+            spawned = request
+                ? loop.spawn(serve_request(loop, connection, id, root->get(),
+                      storage, directory_listing), **slot)
+                : loop.spawn(read_peer_uni(loop, connection, id, critical), **slot);
+            if (spawned != task_spawn_result::accepted) slot->reset();
+        }
+        if (spawned == task_spawn_result::accepted) continue;
+        if (storage) storage->in_use = false;
+        // Without request storage or a frame, refuse only this request; it
+        // was not processed and may be retried (RFC 9114 8.1). A peer
+        // unidirectional stream may be critical, so the connection ends.
+        if (request) fail(connection, id, h3::h3_error::request_rejected);
+        else {
+            connection.close_application(static_cast<std::uint64_t>(h3::h3_error::internal_error));
             break;
         }
     }
-    connection.close();
+    connection.close_application(static_cast<std::uint64_t>(h3::h3_error::no_error));
     for (auto& handler : handlers) {
         if (!handler) continue;
         (void)handler->cancel();

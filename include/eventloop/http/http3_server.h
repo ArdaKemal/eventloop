@@ -17,7 +17,9 @@ namespace eventloop::http {
 // `directory_listing`, a directory without an index.html renders a bounded
 // directory listing; otherwise it is forbidden. Connection capacity is 1..256.
 // Request capacity is 1..8192, or four per connection when zero. Both pools
-// reserve storage at construction; exhaustion closes the affected connection.
+// reserve storage at construction. A connection beyond capacity is closed; a
+// request without free storage is refused with H3_REQUEST_REJECTED on its
+// stream.
 class http3_server final {
 public:
     // `max_udp_payload_size` is clamped to 1200..8192 and negotiated down to

@@ -2,6 +2,7 @@
 
 #include "quic/varint.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -48,6 +49,33 @@ enum class frame_error {
            type == push_promise_frame || type == goaway_frame ||
            type == max_push_id_frame;
 }
+
+// QUIC variable-length integer split across arbitrary read boundaries, for
+// stream parsers that consume input without buffering whole frames.
+struct varint_accumulator {
+    std::array<std::byte, 8> bytes {};
+    std::uint8_t have {0};
+    std::uint8_t need {0};
+
+    // Consumes octets from input until one integer completes.
+    [[nodiscard]] auto feed(std::span<const std::byte>& input) noexcept
+        -> std::optional<std::uint64_t>
+    {
+        while (!input.empty()) {
+            if (have == 0)
+                need = static_cast<std::uint8_t>(
+                    1u << (std::to_integer<unsigned>(input.front()) >> 6));
+            bytes[have++] = input.front();
+            input = input.subspan(1);
+            if (have == need) {
+                have = 0;
+                return quic::detail::decode_varint(std::span(bytes).first(need))->value;
+            }
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] auto partial() const noexcept -> bool { return have != 0; }
+};
 
 struct frame_header {
     std::uint64_t type;

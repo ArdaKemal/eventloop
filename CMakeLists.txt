@@ -413,6 +413,16 @@ if(WIN32)
         set_tests_properties(quic_public_api PROPERTIES TIMEOUT 20
             ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
 
+        add_executable(http3_server_errors_test tests/http3_server_errors.cc
+            src/http3/qpack.cc)
+        target_include_directories(http3_server_errors_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(http3_server_errors_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME http3_server_errors COMMAND http3_server_errors_test)
+        set_tests_properties(http3_server_errors PROPERTIES TIMEOUT 20
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
         add_executable(quic_packet_protection_test
             tests/quic_packet_protection.cc)
         target_include_directories(quic_packet_protection_test PRIVATE
@@ -506,6 +516,18 @@ if(WIN32)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(http3_qpack_test PRIVATE eventloop::eventloop)
         add_test(NAME http3_qpack COMMAND http3_qpack_test)
+
+        add_executable(http3_peer_streams_test tests/http3_peer_streams.cc src/http3/qpack.cc)
+        target_include_directories(http3_peer_streams_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(http3_peer_streams_test PRIVATE eventloop::eventloop)
+        add_test(NAME http3_peer_streams COMMAND http3_peer_streams_test)
+
+        add_executable(http3_request_stream_test tests/http3_request_stream.cc)
+        target_include_directories(http3_request_stream_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(http3_request_stream_test PRIVATE eventloop::eventloop)
+        add_test(NAME http3_request_stream COMMAND http3_request_stream_test)
 
         add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
         target_include_directories(quic_udp_endpoint_test PRIVATE
@@ -1321,6 +1343,21 @@ if(BUILD_TESTING)
     add_test(NAME quic_public_api COMMAND quic_public_api_test)
     set_tests_properties(quic_public_api PROPERTIES TIMEOUT 20)
 
+    add_executable(http3_server_errors_test tests/http3_server_errors.cc
+        src/http3/qpack.cc)
+    target_include_directories(http3_server_errors_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_server_errors_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(http3_server_errors_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(http3_server_errors_test PRIVATE
+            -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME http3_server_errors COMMAND http3_server_errors_test)
+    set_tests_properties(http3_server_errors PROPERTIES TIMEOUT 20)
+
     add_executable(quic_packet_protection_test
         tests/quic_packet_protection.cc)
     target_include_directories(quic_packet_protection_test PRIVATE
@@ -1417,6 +1454,22 @@ if(BUILD_TESTING)
     target_compile_options(http3_qpack_test PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http3_qpack COMMAND http3_qpack_test)
+
+    add_executable(http3_peer_streams_test tests/http3_peer_streams.cc src/http3/qpack.cc)
+    target_include_directories(http3_peer_streams_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_peer_streams_test PRIVATE eventloop::eventloop)
+    target_compile_options(http3_peer_streams_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http3_peer_streams COMMAND http3_peer_streams_test)
+
+    add_executable(http3_request_stream_test tests/http3_request_stream.cc)
+    target_include_directories(http3_request_stream_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_request_stream_test PRIVATE eventloop::eventloop)
+    target_compile_options(http3_request_stream_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http3_request_stream COMMAND http3_request_stream_test)
 
     add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
     target_include_directories(quic_udp_endpoint_test PRIVATE
