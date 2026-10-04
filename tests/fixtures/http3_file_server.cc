@@ -29,7 +29,10 @@ auto main(int argc, char** argv) -> int
         eventloop::event_loop loop(options);
         eventloop::http::http3_server server(loop,
             eventloop::ip_endpoint::any_v4(static_cast<std::uint16_t>(port)),
-            argv[2], argv[3], argv[4], directory_listing, 16);
+            argv[3], argv[4],
+            eventloop::http::server_options {.document_root = argv[2],
+                                             .directory_listing = directory_listing,
+                                             .connection_capacity = 16});
         if (loop.spawn(server.run()) != eventloop::task_spawn_result::accepted)
             return 1;
         (void)loop.run();

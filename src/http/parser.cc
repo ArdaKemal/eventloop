@@ -1,8 +1,8 @@
-#include "eventloop/http/request.h"
+#include "parser.h"
 
 #include <charconv>
 
-namespace eventloop::http {
+namespace eventloop::http::detail {
 namespace {
 
 [[nodiscard]] constexpr auto ascii_lower(char value) noexcept -> char
@@ -10,7 +10,9 @@ namespace {
     return value >= 'A' && value <= 'Z' ? static_cast<char>(value + ('a' - 'A')) : value;
 }
 
-[[nodiscard]] auto ascii_equal(std::string_view left, std::string_view right) noexcept -> bool
+} // namespace
+
+auto ascii_equal(std::string_view left, std::string_view right) noexcept -> bool
 {
     if (left.size() != right.size()) {
         return false;
@@ -22,6 +24,8 @@ namespace {
     }
     return true;
 }
+
+namespace {
 
 [[nodiscard]] auto contains_token(std::string_view value, std::string_view token) noexcept -> bool
 {
@@ -96,7 +100,7 @@ namespace {
 
 } // namespace
 
-auto request::header_value(std::string_view name) const noexcept
+auto parsed_request::header_value(std::string_view name) const noexcept
     -> std::optional<std::string_view>
 {
     for (std::size_t index = 0; index < header_count; ++index) {
@@ -107,7 +111,7 @@ auto request::header_value(std::string_view name) const noexcept
     return std::nullopt;
 }
 
-auto request::header_occurrences(std::string_view name) const noexcept -> std::size_t
+auto parsed_request::header_occurrences(std::string_view name) const noexcept -> std::size_t
 {
     std::size_t count = 0;
     for (std::size_t index = 0; index < header_count; ++index) {
@@ -116,7 +120,7 @@ auto request::header_occurrences(std::string_view name) const noexcept -> std::s
     return count;
 }
 
-auto request::joined_header_value(std::string_view name, std::string& storage) const
+auto parsed_request::joined_header_value(std::string_view name, std::string& storage) const
     -> std::string_view
 {
     std::string_view single;
@@ -136,7 +140,8 @@ auto request::joined_header_value(std::string_view name, std::string& storage) c
     return storage;
 }
 
-auto parse_request(std::string_view input, request& output) noexcept -> parse_result
+auto parse_request_head(std::string_view input, parsed_request& output) noexcept
+    -> parse_result
 {
     output = {};
     const auto header_end = input.find("\r\n\r\n");
@@ -159,7 +164,8 @@ auto parse_request(std::string_view input, request& output) noexcept -> parse_re
         return {parse_status::bad_request};
     }
 
-    output.method = parse_method(first_line.substr(0, first_space));
+    output.method_name = first_line.substr(0, first_space);
+    output.method = parse_method(output.method_name);
     output.target = first_line.substr(first_space + 1, second_space - first_space - 1);
     if (output.method == method_type::unknown || output.target.empty() ||
         output.target.front() != '/' || !valid_target(output.target)) {
@@ -208,6 +214,7 @@ auto parse_request(std::string_view input, request& output) noexcept -> parse_re
                 return {parse_status::bad_request};
             }
             host_seen = true;
+            output.host = value;
         } else if (ascii_equal(name, "Content-Length")) {
             std::size_t parsed = 0;
             const auto [end, error] = std::from_chars(
@@ -223,6 +230,10 @@ auto parse_request(std::string_view input, request& output) noexcept -> parse_re
             return {parse_status::unsupported_transfer_encoding};
         } else if (ascii_equal(name, "Connection") && contains_token(value, "close")) {
             output.close_after_response = true;
+        } else if (ascii_equal(name, "TE") && contains_token(value, "trailers")) {
+            output.trailers_accepted = true;
+        } else if (ascii_equal(name, "Expect") && ascii_equal(value, "100-continue")) {
+            output.expect_continue = true;
         }
         position = line_end + 2;
     }
@@ -231,16 +242,27 @@ auto parse_request(std::string_view input, request& output) noexcept -> parse_re
         return {parse_status::bad_request};
     }
     const std::size_t body_start = header_end + 4;
-    if (body_start > max_message_size ||
-        content_length > max_message_size - body_start) {
-        return {parse_status::payload_too_large};
+    if (body_start > max_message_size) {
+        return {parse_status::headers_too_large};
     }
-    if (input.size() < body_start + content_length) {
-        return {parse_status::incomplete};
-    }
-    output.body = input.substr(body_start, content_length);
-    return {.status = parse_status::complete,
-            .consumed = body_start + content_length};
+    output.content_length = content_length;
+    output.content_length_seen = content_length_seen;
+    return {.status = parse_status::complete, .consumed = body_start};
 }
 
-} // namespace eventloop::http
+auto parse_request(std::string_view input, parsed_request& output) noexcept -> parse_result
+{
+    const auto head = parse_request_head(input, output);
+    if (head.status != parse_status::complete) return head;
+    if (output.content_length > max_message_size - head.consumed) {
+        return {parse_status::payload_too_large};
+    }
+    if (input.size() < head.consumed + output.content_length) {
+        return {parse_status::incomplete};
+    }
+    output.body = input.substr(head.consumed, output.content_length);
+    return {.status = parse_status::complete,
+            .consumed = head.consumed + output.content_length};
+}
+
+} // namespace eventloop::http::detail

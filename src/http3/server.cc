@@ -473,16 +473,26 @@ public:
         return limits;
     }
 
-    implementation(event_loop& loop, ip_endpoint local, std::string_view root,
-                   std::filesystem::path cert, std::filesystem::path key,
-                   bool directory_listing, std::size_t connection_capacity,
-                   std::size_t request_capacity, std::size_t max_udp_payload_size)
-        : loop_(loop), root_(std::make_shared<unique_fd>(http::detail::open_root(root))),
+    // An empty document root means routes only; static requests answer 404.
+    static auto open_document_root(const server_options& options) -> std::shared_ptr<unique_fd>
+    {
+        if (!options.routes && options.document_root.empty())
+            throw std::invalid_argument("server needs routes or a document root");
+        if (options.document_root.empty()) return std::make_shared<unique_fd>();
+        return std::make_shared<unique_fd>(
+            http::detail::open_root(options.document_root.string()));
+    }
+
+    implementation(event_loop& loop, ip_endpoint local, std::filesystem::path cert,
+                   std::filesystem::path key, const server_options& options)
+        : loop_(loop), root_(open_document_root(options)),
           endpoint_(loop, local, quic_server_options{std::move(cert), std::move(key),
-              std::span(alpn_), make_limits(max_udp_payload_size), connection_capacity}),
-          directory_listing_(directory_listing), connections_(connection_capacity),
-          request_storage_(request_capacity == 0 ? connection_capacity * 4
-                                                 : request_capacity) {}
+              std::span(alpn_), make_limits(options.max_udp_payload_size),
+              options.connection_capacity}),
+          directory_listing_(options.directory_listing),
+          connections_(options.connection_capacity),
+          request_storage_(options.request_capacity == 0 ? options.connection_capacity * 4
+                                                         : options.request_capacity) {}
 
     event_loop& loop_;
     std::shared_ptr<unique_fd> root_;
@@ -493,16 +503,11 @@ public:
     storage_pool request_storage_;
 };
 
-http3_server::http3_server(event_loop& loop, ip_endpoint local, std::string_view root,
+http3_server::http3_server(event_loop& loop, ip_endpoint local,
                            std::filesystem::path certificate_chain,
-                           std::filesystem::path private_key,
-                           bool directory_listing,
-                           std::size_t connection_capacity,
-                           std::size_t request_capacity,
-                           std::size_t max_udp_payload_size)
-    : implementation_(std::make_unique<implementation>(loop, local, root,
-          std::move(certificate_chain), std::move(private_key), directory_listing,
-          connection_capacity, request_capacity, max_udp_payload_size)) {}
+                           std::filesystem::path private_key, server_options options)
+    : implementation_(std::make_unique<implementation>(loop, local,
+          std::move(certificate_chain), std::move(private_key), options)) {}
 http3_server::~http3_server() = default;
 auto http3_server::local_endpoint() const noexcept -> ip_endpoint
 { return implementation_->endpoint_.local_endpoint(); }

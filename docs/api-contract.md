@@ -269,11 +269,81 @@ every running connection has sent its close and retired.
   completion, including after cancellation. Read and write buffers remain
   caller-owned and valid for the same period. Operations run on a dedicated
   bounded worker; a full `file_io_depth` returns an error.
+- `http::server(loop, endpoint, options)`,
+  `http::https_server(loop, endpoint, context, options)`, and
+  `http::http3_server(loop, endpoint, certificate_chain, private_key, options)`
+  take one `http::server_options`, and `http::redirect_server(loop, endpoint,
+  hostname, https_port)` answers every request with 308. Options need `routes`,
+  a `document_root`, or both; neither throws `std::invalid_argument`. Requests
+  that match no route serve static files from `document_root`, or answer 404
+  without one. The parser, the HTTP/1.1 session, and directory-listing
+  rendering are private.
 - HTTP accept loops spawn connection tasks. Each task owns its session and I/O
   buffers while suspended; accepted connections share ownership of the
-  document-root descriptor with the listener. Small file reads and metadata
+  document-root descriptor and the router with the listener. Small file reads and metadata
   calls remain synchronous; large plain HTTP files use `sendfile`. Preserve
   the component-by-component `O_NOFOLLOW` path walk.
+- Include `eventloop/http/router.h` to route requests to handlers. Routing
+  currently runs on HTTP/1.1 (`http::server`, and `https_server` connections
+  that negotiate `http/1.1`). HTTP/2 and HTTP/3 connections still serve only
+  static files and ignore `routes`.
+  - A `http::router` holds up to 64 routes (`max_routes`) and is built before
+    a server takes it as `std::shared_ptr<const router>`.
+    - `add(method, path, handler, context)` matches a path exactly, and
+      `add_prefix` matches any path starting with the prefix. Paths start with
+      `/` and contain no `?` or `#`. Matching uses the raw path before `?`,
+      without percent-decoding.
+    - Among routes matching the path, an exact route beats a prefix, and a
+      longer prefix beats a shorter one.
+    - HEAD without a HEAD route runs a GET route; the response keeps its
+      status and fields, and body writes are discarded.
+    - OPTIONS without an OPTIONS route answers 204 with `Allow`. A path routed
+      only for other methods answers 405 with `Allow`.
+    - Registration returns `file_exists` for a duplicate method and path,
+      `invalid_argument` for a bad path or null handler, and
+      `no_buffer_space` past 64 routes. It copies the path, so it may
+      allocate; matching does not.
+  - A handler is a free coroutine function
+    `task<void>(event_loop&, http::request&, http::response&)`. Coroutine
+    lambdas do not work, because frame allocation needs the loop as the first
+    argument. Its frame comes from the loop's bounded size classes: with the
+    default capacities it should fit the 1024-byte class (10240 slots),
+    because larger classes hold only a few frames. A frame that cannot be
+    allocated answers 503. The route's `context` pointer is returned by
+    `request::route_context()` and must outlive every server using the router.
+  - `http::request` views the method, path, query, authority, fields, and
+    Content-Length until the handler completes; `header_value` compares names
+    case-insensitively. `async_read_body(buffer)` reads up to `buffer.size()`
+    body bytes and returns 0 at the end. One read may be pending; another
+    returns `operation_in_progress`. Connection loss returns
+    `connection_reset`. On HTTP/1.1, a request declaring more than
+    `server_options::max_request_body` (default 1 MiB) answers 413 without
+    running the handler. Chunked request bodies still answer 501. The first
+    body read answers `Expect: 100-continue` with 100 Continue.
+  - `http::response` sends the status and fields with `async_start`, body
+    bytes with `async_write`, and the end with `async_finish(trailers)`.
+    `async_send` does all three with content-length set, and `async_send_file`
+    sends a file range it owns through completion. Spans are borrowed until
+    each operation completes, and one operation may be pending at a time.
+    - Field names must be lowercase tokens, and connection-specific fields and
+      statuses outside 200..599 are `invalid_argument`. The server adds `date`
+      when absent.
+    - A declared content-length is enforced: writing past it is
+      `invalid_argument`, and finishing short is `invalid_argument` and
+      abandons the response. Without content-length, HTTP/1.1 uses chunked
+      transfer coding. Trailers are sent only on chunked responses to
+      requests with `TE: trailers`. Status 204 and 304 carry no body.
+    - A handler that returns before `async_start` gets a 500 response. One that
+      returns after `async_start` but before `async_finish` closes the
+      HTTP/1.1 connection.
+    - An unread request body is discarded before the next request on the
+      connection, except after `Expect: 100-continue` without a read, which
+      closes the connection.
+  - HTTP/1.1 runs one handler at a time per connection. Routing state, a 4 KiB
+    response buffer, and the request view are allocated once per connection
+    when the server has routes. Steady-state routed requests on a kept-alive
+    connection make no general-heap allocation; this is checked by
+    `tests/http_routing_allocations.cc`.
 - `eventloop::http::https_server` advertises `h2` and `http/1.1` with ALPN by
   default. Set `eventloop::http::server_options::enable_http2` to `false` to
   disable HTTP/2. The
@@ -318,8 +388,7 @@ every running connection has sent its close and retired.
   trailing `/`. A directory with a regular `index.html` serves that file
   instead. Listings are bounded to 4096 entries and 1 MiB of generated HTML;
   exceeding either returns 500 with a short plain-text body. HTTP/1.1 and
-  HTTP/2 list when `server_options::directory_listing` is set; HTTP/3 lists
-  when `http3_server` is constructed with `directory_listing`. The
+  HTTP/2 and HTTP/3 list when `server_options::directory_listing` is set. The
   component-by-component `O_NOFOLLOW` document-root walk is unchanged.
 - Include `eventloop/http2/client.h` for one outbound HTTPS HTTP/2 request.
   `http2::async_request(loop, endpoint, context, hostname, request)` owns the
@@ -376,7 +445,8 @@ every running connection has sent its close and retired.
   cancellation closes the owned transport. All I/O and resumption occur on
   `loop`, and the outer task result remains distinct from the operation error.
 - `eventloop::http::http3_server` listens on a QUIC UDP endpoint with ALPN
-  `h3`, a certificate/key pair, and an owned document-root descriptor. Its
+  `h3`, a certificate/key pair, and an owned document-root descriptor when
+  `document_root` is set. Its
   `run()` task accepts connections; `close()` stops acceptance and
   `async_close()` waits for endpoint retirement. Keep the server and its
   observed `run()` task alive until both operations complete. GET, HEAD, and
@@ -385,19 +455,19 @@ every running connection has sent its close and retired.
   QPACK tables are disabled, and QUIC caps each connection at 32 peer
   simultaneously active bidirectional and eight peer unidirectional streams.
   The server has eight
-  concurrent connection slots by default; the constructor accepts a
-  `connection_capacity` from 1 to 256. Endpoint routing, connection state,
+  concurrent connection slots by default; `server_options::connection_capacity`
+  accepts 1 to 256. Endpoint routing, connection state,
   waiters, and HTTP/3 task handles are allocated at construction in proportion
   to that capacity. Connections beyond it are rejected. Each connection has
   storage for 40 concurrent stream tasks. Completed task slots are reused.
-  The `request_capacity` constructor argument reserves reusable request scratch
+  `server_options::request_capacity` reserves reusable request scratch
   buffers at startup; zero selects four per connection, and explicit values
   from 1 to 8192 are accepted. A request arriving while every buffer is in
   use, or whose coroutine frame cannot be allocated, is refused with
   `H3_REQUEST_REJECTED` on its stream; the connection continues. A buffer is
   held until the request stream ends, the server stops reading it, or it
   fails.
-  The `max_udp_payload_size` constructor argument bounds application datagrams
+  `server_options::max_udp_payload_size` bounds application datagrams
   to 1200..8192 bytes and is negotiated down to the peer's advertised limit;
   handshake packets remain at 1200 so anti-amplification is unaffected. It
   defaults to 1472 (the standard Ethernet payload) because path MTU discovery

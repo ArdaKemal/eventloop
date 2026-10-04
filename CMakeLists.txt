@@ -59,7 +59,8 @@ if(WIN32)
         src/udp_socket.cc
         src/util/arg_parser.cc
         src/util/toml.cc
-        src/http/request.cc
+        src/http/parser.cc
+        src/http/routing.cc
         src/http/mime_types.cc
         src/http/resource.cc
         src/http/directory_listing.cc
@@ -636,6 +637,9 @@ if(WIN32)
     add_executable(tcp_echo examples/tcp_echo.cc)
     target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)
 
+    add_executable(routing_server examples/routing_server.cc)
+    target_link_libraries(routing_server PRIVATE eventloop::eventloop)
+
     if(EVENTLOOP_WINDOWS_TLS)
         add_executable(websocket_echo_server examples/websocket_echo_server.cc)
         target_link_libraries(websocket_echo_server PRIVATE eventloop::eventloop OpenSSL::Crypto)
@@ -746,10 +750,12 @@ add_library(eventloop
     include/eventloop/file_io.h
     include/eventloop/http/mime_types.h
     include/eventloop/http/request.h
+    include/eventloop/http/response.h
+    include/eventloop/http/router.h
+    include/eventloop/http/server_options.h
     include/eventloop/http2/client.h
     include/eventloop/http/server.h
     include/eventloop/http/http3_server.h
-    include/eventloop/http/session.h
     include/eventloop/ip_endpoint.h
     include/eventloop/tcp_acceptor.h
     include/eventloop/tcp_stream.h
@@ -781,7 +787,12 @@ add_library(eventloop
     src/executor/multi_thread_executor.cc
     src/http/directory_listing.cc
     src/http/mime_types.cc
-    src/http/request.cc
+    src/http/parser.h
+    src/http/parser.cc
+    src/http/routing.cc
+    src/http/exchange.h
+    src/http/http1_exchange.h
+    src/http/session.h
     src/http/resource.h
     src/http/resource.cc
     src/http/server.cc
@@ -863,6 +874,10 @@ install(FILES
 add_executable(tcp_echo examples/tcp_echo.cc)
 target_link_libraries(tcp_echo PRIVATE eventloop::eventloop)
 target_compile_options(tcp_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(routing_server examples/routing_server.cc)
+target_link_libraries(routing_server PRIVATE eventloop::eventloop)
+target_compile_options(routing_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(unix_echo examples/unix_echo.cc)
 target_link_libraries(unix_echo PRIVATE eventloop::eventloop)
@@ -988,7 +1003,20 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME event_loop COMMAND event_loop_test)
 
+    add_executable(http_routing_test tests/http_routing.cc)
+    target_link_libraries(http_routing_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(http_routing_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http_routing COMMAND http_routing_test)
+    set_tests_properties(http_routing PROPERTIES TIMEOUT 15)
+
+    add_executable(http_routing_allocations_test tests/http_routing_allocations.cc)
+    target_link_libraries(http_routing_allocations_test PRIVATE eventloop::eventloop)
+    target_compile_options(http_routing_allocations_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http_routing_allocations COMMAND http_routing_allocations_test)
+    set_tests_properties(http_routing_allocations PROPERTIES TIMEOUT 15)
+
     add_executable(http_test tests/http_test.cc)
+    target_include_directories(http_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(http_test PRIVATE eventloop::eventloop)
     target_compile_options(http_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http COMMAND http_test)

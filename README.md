@@ -178,7 +178,7 @@ consumer outside CMake's usual package search paths. Public headers are under
 | TCP and TLS services | `tcp_acceptor.h`, `tcp_stream.h`, `tls_stream.h` | `tcp_echo`, `tls_echo` |
 | UDP services | `udp_socket.h`, `ip_endpoint.h` | `coroutine_socket_benchmark` |
 | HTTP client | `http2/client.h`, TCP/TLS and QUIC APIs | [Wayfarer](examples/wayfarer/README.md) |
-| HTTP server | `http/server.h`, `http/http3_server.h` | [Stonegate](examples/stonegate/README.md) |
+| HTTP server and routing | `http/server.h`, `http/http3_server.h`, `http/router.h` | [Stonegate](examples/stonegate/README.md), `routing_server` |
 | WebSocket | `ws/web_socket.h` | `websocket_echo_server`, `websocket_client` |
 | Bounded file operations | `file_io.h` | `file_io_benchmark` |
 | QUIC streams and DATAGRAMs | `quic.h` | `quic_echo_server` |

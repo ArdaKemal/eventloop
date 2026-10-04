@@ -126,6 +126,11 @@ body=$(curl --silent --fail --http1.1 --cacert "$work/cert.pem" \
 [[ "$body" == stonegate-ok ]] || { echo 'HTTP/1.1 body mismatch' >&2; exit 1; }
 echo 'HTTP/1.1 redirect and TLS response: PASS'
 
+health=$(curl --silent --fail --http1.1 --cacert "$work/cert.pem" \
+    --resolve "localhost:$https_port:127.0.0.1" "https://localhost:$https_port/healthz")
+[[ "$health" == ok ]] || { echo "unexpected /healthz body: $health" >&2; exit 1; }
+echo 'HTTP/1.1 /healthz route: PASS'
+
 if curl --version | grep -q HTTP2; then
     version=$(curl --silent --fail --http2 --cacert "$work/cert.pem" \
         --resolve "localhost:$https_port:127.0.0.1" \

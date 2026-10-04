@@ -1,6 +1,6 @@
 #include "connection.h"
 
-#include "eventloop/http/directory_listing.h"
+#include "../http/directory_listing.h"
 #include "eventloop/http/mime_types.h"
 #include "../http/resource.h"
 #include "../http/file_operations.h"

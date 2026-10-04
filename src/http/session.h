@@ -1,6 +1,7 @@
 #pragma once
 
-#include "eventloop/http/request.h"
+#include "exchange.h"
+#include "parser.h"
 #include "eventloop/native_socket.h"
 #include "eventloop/unique_fd.h"
 
@@ -12,13 +13,29 @@
 #include <string_view>
 #include <vector>
 
-namespace eventloop::http {
+namespace eventloop::http::detail {
 
-namespace detail { struct file_info; }
+struct file_info;
 
+// Per-connection routing storage, owned by the connection. The parsed head
+// views the session input until finish_routed().
+struct route_state {
+    const router* routes {nullptr};
+    std::uint64_t max_request_body {0};
+    parsed_request request;
+    route_match match;
+    std::size_t head_size {0};
+    std::size_t buffered_consumed {0};
+    std::array<char, 192> reply {};
+};
+
+// The HTTP/1.1 protocol state for one connection. Static responses are
+// produced synchronously. A request that matches a route handler is held
+// until the connection task calls finish_routed().
 class session {
 public:
-    session(native_socket root_descriptor, bool directory_listing = false) noexcept;
+    session(native_socket root_descriptor, bool directory_listing = false,
+            route_state* routing = nullptr, bool static_files = true) noexcept;
     ~session() = default;
 
     session(const session&) = delete;
@@ -36,11 +53,20 @@ public:
     [[nodiscard]] auto closed() const noexcept -> bool { return closed_; }
     auto finish_response() -> void;
 
+    // A routed request head is parsed and waiting for its handler.
+    [[nodiscard]] auto routed() const noexcept -> bool { return routed_; }
+    // Body bytes of the routed request already in the input buffer.
+    [[nodiscard]] auto buffered_body() noexcept -> std::span<const std::byte>;
+    auto consume_buffered_body(std::size_t size) noexcept -> void;
+    // Releases the routed request. Without keep_alive the session closes.
+    auto finish_routed(bool keep_alive) -> void;
+
 private:
     auto process_requests() -> void;
-    auto handle_request(const request& parsed) -> void;
-    auto serve_resource(const request& parsed, bool headers_only) -> void;
-    auto serve_file(const request& parsed, unique_fd descriptor, const detail::file_info& info,
+    [[nodiscard]] auto dispatch_route(std::size_t head_size) -> bool;
+    auto handle_request(const parsed_request& parsed) -> void;
+    auto serve_resource(const parsed_request& parsed, bool headers_only) -> void;
+    auto serve_file(const parsed_request& parsed, unique_fd descriptor, const file_info& info,
                     bool headers_only, std::string_view mime_path) -> void;
     auto serve_directory(unique_fd descriptor, bool headers_only) -> void;
     auto send_directory_redirect(std::string_view target) -> void;
@@ -55,6 +81,7 @@ private:
     [[nodiscard]] auto allocate_response(std::size_t size) -> std::span<char>;
 
     native_socket root_descriptor_;
+    route_state* routing_ {nullptr};
     std::array<char, 256> input_ {};
     std::unique_ptr<char[]> expanded_input_;
     std::vector<char> output_;
@@ -67,9 +94,11 @@ private:
     std::size_t input_size_ {0};
     std::size_t request_size_ {0};
     bool directory_listing_ {false};
+    bool static_files_ {true};
+    bool routed_ {false};
     bool responding_ {false};
     bool close_after_response_ {false};
     bool closed_ {false};
 };
 
-} // namespace eventloop::http
+} // namespace eventloop::http::detail

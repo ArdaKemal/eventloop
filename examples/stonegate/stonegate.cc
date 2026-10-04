@@ -1,8 +1,10 @@
 #include "eventloop/event_loop.h"
 #include "eventloop/http/http3_server.h"
+#include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
 #include "eventloop/tls_context.h"
 
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <algorithm>
@@ -13,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -235,6 +238,26 @@ auto parse(int argc, char** argv) -> config
     return settings;
 }
 
+// GET /healthz answers 200 "ok" on every protocol; HEAD is implied.
+auto healthz(eventloop::event_loop& loop, eventloop::http::request& request,
+             eventloop::http::response& response) -> eventloop::task<void>
+{
+    (void)loop;
+    (void)request;
+    constexpr std::string_view body = "ok\n";
+    const std::array<eventloop::http::header, 2> fields {{
+        {"content-type", "text/plain; charset=utf-8"}, {"cache-control", "no-store"}}};
+    (void)co_await response.async_send(200, fields, std::as_bytes(std::span(body)));
+}
+
+[[nodiscard]] auto make_routes() -> std::shared_ptr<const eventloop::http::router>
+{
+    auto routes = std::make_shared<eventloop::http::router>();
+    if (!routes->add(eventloop::http::method_type::get, "/healthz", healthz))
+        throw std::runtime_error("register /healthz");
+    return routes;
+}
+
 template<typename Listener>
 auto serve(eventloop::event_loop& loop, Listener& listener) -> eventloop::task<void>
 {
@@ -300,9 +323,14 @@ auto main(int argc, char** argv) -> int
     try {
         const auto settings = parse(argc, argv);
         const eventloop::http::server_options options {
+            .routes = make_routes(),
+            .document_root = settings.root,
             .directory_listing = settings.directory_listing,
             .reuse_port = settings.reuse_port,
             .enable_http2 = settings.http2,
+            .connection_capacity = settings.http3_connections,
+            .request_capacity = settings.http3_requests,
+            .max_udp_payload_size = settings.http3_max_datagram,
         };
         // Reserve bounded coroutine slots for aggregate HTTP/3 connection
         // activity. Growth slabs are allocated only when those slots are used.
@@ -317,8 +345,8 @@ auto main(int argc, char** argv) -> int
         std::unique_ptr<eventloop::http::http3_server> http3;
         eventloop::task_handle<void> http3_run;
         if (settings.mode == config::http_mode::serve) {
-            start<eventloop::http::server>(loop, settings.http_port, settings.root,
-                                           settings.bind, options);
+            start<eventloop::http::server>(loop,
+                eventloop::ip_endpoint::parse(settings.bind, settings.http_port), options);
             std::cout << "Serving HTTP/1.1 on " << settings.bind << ':' << settings.http_port << '\n';
         }
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
@@ -326,12 +354,14 @@ auto main(int argc, char** argv) -> int
             auto context = eventloop::tls_context::make_server(
                 settings.certificate, settings.private_key, settings.key_password);
             if (settings.mode == config::http_mode::redirect) {
-                start<eventloop::http::redirect_server>(loop, settings.http_port,
-                    settings.redirect_host, settings.https_port, settings.bind);
+                start<eventloop::http::redirect_server>(loop,
+                    eventloop::ip_endpoint::parse(settings.bind, settings.http_port),
+                    settings.redirect_host, settings.https_port);
                 std::cout << "Redirecting HTTP on " << settings.bind << ':' << settings.http_port << '\n';
             }
-            start<eventloop::http::https_server>(loop, settings.https_port,
-                std::move(context), settings.root, settings.bind, options);
+            start<eventloop::http::https_server>(loop,
+                eventloop::ip_endpoint::parse(settings.bind, settings.https_port),
+                std::move(context), options);
             std::cout << "Serving HTTPS (HTTP/1.1" << (settings.http2 ? ", HTTP/2" : "")
                       << ") on " << settings.bind << ':' << settings.https_port << '\n';
         }
@@ -342,9 +372,7 @@ auto main(int argc, char** argv) -> int
         if (settings.http3_port != 0) {
             http3 = std::make_unique<eventloop::http::http3_server>(
                 loop, eventloop::ip_endpoint::parse(settings.bind, settings.http3_port),
-                settings.root, settings.certificate, settings.private_key,
-                settings.directory_listing, settings.http3_connections,
-                settings.http3_requests, settings.http3_max_datagram);
+                settings.certificate, settings.private_key, options);
             if (loop.spawn(http3->run(), http3_run) !=
                 eventloop::task_spawn_result::accepted)
                 throw std::runtime_error("HTTP/3 listener task capacity exhausted");

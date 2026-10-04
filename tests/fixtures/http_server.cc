@@ -111,10 +111,11 @@ auto main(int argc, char* argv[]) -> int
         event_loop loop;
 
         const auto server_options =
-            http::server_options {.directory_listing = directory_listing};
+            http::server_options {.document_root = root,
+                                  .directory_listing = directory_listing};
         if (http_only) {
             start_listener(loop, std::make_unique<http::server>(
-                loop, http_port, root, address, server_options));
+                loop, ip_endpoint::parse(address, http_port), server_options));
             std::cout << "HTTP server listening on http://" << address << ':'
                       << http_port << '\n';
             run_server(loop, shutdown_timeout);
@@ -131,9 +132,10 @@ auto main(int argc, char* argv[]) -> int
         auto context = tls_context::make_server(
             certificate, private_key, key_password);
         start_listener(loop, std::make_unique<http::redirect_server>(
-            loop, http_port, hostname, https_port, address));
+            loop, ip_endpoint::parse(address, http_port), hostname, https_port));
         start_listener(loop, std::make_unique<http::https_server>(
-            loop, https_port, std::move(context), root, address, server_options));
+            loop, ip_endpoint::parse(address, https_port), std::move(context),
+            server_options));
         std::cout << "HTTP redirect listening on http://" << address << ':'
                   << http_port << '\n'
                   << "HTTPS server listening on https://" << address << ':'

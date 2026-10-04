@@ -1,9 +1,9 @@
 #include "posix_socket_helpers.h"
 
 #include "eventloop/http/mime_types.h"
-#include "eventloop/http/request.h"
+#include "http/parser.h"
 #include "eventloop/http/server.h"
-#include "eventloop/http/session.h"
+#include "http/session.h"
 #include "eventloop/unique_fd.h"
 
 #include <algorithm>
@@ -79,7 +79,7 @@ struct capture {
            std::string_view::npos;
 }
 
-auto collect(http::session& session, capture& stream) -> void
+auto collect(http::detail::session& session, capture& stream) -> void
 {
     while (session.has_response()) {
         const auto response = session.response();
@@ -125,45 +125,45 @@ auto parser_and_mime_tests() -> bool
     constexpr std::string_view raw =
         "GET /assets/site.CSS?version=1 HTTP/1.1\r\n"
         "host: localhost\r\nConnection: keep-alive\r\n\r\n";
-    http::request request;
+    http::detail::parsed_request request;
     const auto before = allocations;
-    const auto result = http::parse_request(raw, request);
+    const auto result = http::detail::parse_request(raw, request);
     const auto mime = http::mime_type_from_path(request.target);
     const auto after = allocations;
 
-    if (result.status != http::parse_status::complete || request.target != "/assets/site.CSS?version=1" ||
+    if (result.status != http::detail::parse_status::complete || request.target != "/assets/site.CSS?version=1" ||
         mime != "text/css; charset=utf-8" || before != after) return false;
     if (http::mime_type_from_path("/image.png") != "image/png") return false;
     if (http::mime_type_from_path("/archive.bin") != "application/octet-stream") return false;
 
-    http::request incomplete;
-    if (http::parse_request("GET / HTTP/1.1\r\nHost: local", incomplete).status !=
-        http::parse_status::incomplete) return false;
-    http::request missing_host;
-    if (http::parse_request("GET / HTTP/1.1\r\n\r\n", missing_host).status !=
-        http::parse_status::bad_request) return false;
-    http::request chunked;
-    if (http::parse_request(
+    http::detail::parsed_request incomplete;
+    if (http::detail::parse_request("GET / HTTP/1.1\r\nHost: local", incomplete).status !=
+        http::detail::parse_status::incomplete) return false;
+    http::detail::parsed_request missing_host;
+    if (http::detail::parse_request("GET / HTTP/1.1\r\n\r\n", missing_host).status !=
+        http::detail::parse_status::bad_request) return false;
+    http::detail::parsed_request chunked;
+    if (http::detail::parse_request(
             "POST / HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n",
-            chunked).status != http::parse_status::unsupported_transfer_encoding) return false;
-    http::request control;
-    if (http::parse_request(
+            chunked).status != http::detail::parse_status::unsupported_transfer_encoding) return false;
+    http::detail::parsed_request control;
+    if (http::detail::parse_request(
             "GET /listing?\nInjected:yes HTTP/1.1\r\nHost: local\r\n\r\n",
-            control).status != http::parse_status::bad_request ||
-        http::parse_request(
+            control).status != http::detail::parse_status::bad_request ||
+        http::detail::parse_request(
             "GET / HTTP/1.1\r\nHost: local\nInjected:yes\r\n\r\n",
-            control).status != http::parse_status::bad_request) return false;
+            control).status != http::detail::parse_status::bad_request) return false;
     return true;
 }
 
 auto session_input_growth_tests() -> bool
 {
-    if (sizeof(http::session) > 512) return false;
+    if (sizeof(http::detail::session) > 512) return false;
 
     const std::string long_request =
         "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nX-Pad: " +
         std::string(500, 'x') + "\r\n\r\n";
-    http::session session(-1);
+    http::detail::session session(-1);
     std::size_t offset = 0;
     const auto before = allocations;
     while (offset < long_request.size()) {
@@ -189,7 +189,7 @@ auto session_input_growth_tests() -> bool
     if (!response.open || allocations != idle_allocations ||
         session.read_space().size() != 256) return false;
 
-    http::session direct(-1);
+    http::detail::session direct(-1);
     const std::string pipelined = long_request + std::string(short_request);
     direct.receive(std::as_bytes(std::span {pipelined}));
     if (!direct.has_response()) return false;
@@ -198,8 +198,8 @@ auto session_input_growth_tests() -> bool
     direct.finish_response();
     if (direct.closed() || direct.read_space().size() != 256) return false;
 
-    http::session oversized(-1);
-    std::array<char, http::max_message_size> unterminated_headers {};
+    http::detail::session oversized(-1);
+    std::array<char, http::detail::max_message_size> unterminated_headers {};
     unterminated_headers.fill('x');
     oversized.receive(std::as_bytes(std::span {unterminated_headers}));
     return oversized.has_response() &&
@@ -233,7 +233,7 @@ auto session_tests() -> bool
     ::close(listing);
 
     capture stream;
-    http::session session(directory);
+    http::detail::session session(directory);
     constexpr std::string_view requests =
         "GET /site.css HTTP/1.1\r\nHost: localhost\r\n\r\n"
         "HEAD /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -256,28 +256,28 @@ auto session_tests() -> bool
         !stream.open;
 
     capture forbidden_stream;
-    http::session forbidden_session(directory);
+    http::detail::session forbidden_session(directory);
     constexpr std::string_view forbidden_request =
         "GET /listing/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     forbidden_session.receive(std::as_bytes(std::span {forbidden_request}));
     collect(forbidden_session, forbidden_stream);
 
     capture redirect_stream;
-    http::session redirect_session(directory, true);
+    http::detail::session redirect_session(directory, true);
     constexpr std::string_view redirect_request =
         "GET /listing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     redirect_session.receive(std::as_bytes(std::span {redirect_request}));
     collect(redirect_session, redirect_stream);
 
     capture injected_redirect_stream;
-    http::session injected_redirect(directory, true);
+    http::detail::session injected_redirect(directory, true);
     constexpr std::string_view injected_redirect_request =
         "GET /listing?\nInjected:yes HTTP/1.1\r\nHost: localhost\r\n\r\n";
     injected_redirect.receive(std::as_bytes(std::span {injected_redirect_request}));
     collect(injected_redirect, injected_redirect_stream);
 
     capture listing_stream;
-    http::session listing_session(directory, true);
+    http::detail::session listing_session(directory, true);
     constexpr std::string_view listing_request =
         "GET /listing/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     listing_session.receive(std::as_bytes(std::span {listing_request}));
@@ -286,7 +286,7 @@ auto session_tests() -> bool
     }
 
     capture escape_stream;
-    http::session escape_session(directory);
+    http::detail::session escape_session(directory);
     constexpr std::string_view escape_request =
         "GET /escape/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     escape_session.receive(std::as_bytes(std::span {escape_request}));
@@ -304,7 +304,7 @@ auto session_tests() -> bool
     const bool root_confined = contains(escape_stream, "404 Not Found");
 
     capture large_stream;
-    http::session large_session(directory);
+    http::detail::session large_session(directory);
     constexpr std::string_view large_request =
         "GET /large.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     large_session.receive(std::as_bytes(std::span {large_request}));
@@ -316,7 +316,7 @@ auto session_tests() -> bool
         large_stream.size > large_contents.size() && !large_stream.open;
 
     capture draining_stream;
-    http::session draining_session(directory);
+    http::detail::session draining_session(directory);
     constexpr std::string_view draining_request =
         "GET /site.css HTTP/1.1\r\nHost: localhost\r\n\r\n";
     draining_session.receive(std::as_bytes(std::span {draining_request}));
@@ -325,7 +325,7 @@ auto session_tests() -> bool
     collect(draining_session, draining_stream);
 
     capture idle_stream;
-    http::session idle_session(directory);
+    http::detail::session idle_session(directory);
     idle_session.shutdown();
     idle_stream.open = !idle_session.closed();
     const bool graceful_shutdown_valid = response_was_allowed_to_drain &&
@@ -399,7 +399,8 @@ auto listener_removal_test() -> bool
 
     event_loop loop;
     const bool valid = request_after_listener_removal(
-        loop, std::make_unique<http::server>(loop, 0, directory_name),
+        loop, std::make_unique<http::server>(loop, ip_endpoint::loopback_v4(0),
+            http::server_options {.document_root = directory_name}),
         "GET /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         "root survives");
     unlinkat(directory.get(), "index.html", 0);
@@ -412,7 +413,8 @@ auto redirect_listener_removal_test() -> bool
 {
     event_loop loop;
     return request_after_listener_removal(
-        loop, std::make_unique<http::redirect_server>(loop, 0, "localhost", 443),
+        loop, std::make_unique<http::redirect_server>(loop, ip_endpoint::loopback_v4(0),
+                                                     "localhost", 443),
         "GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         "Location: https://localhost/next");
 }
@@ -431,7 +433,8 @@ auto pipelined_sendfile_test() -> bool
     }
 
     event_loop loop;
-    auto listener = std::make_unique<http::server>(loop, 0, directory_name);
+    auto listener = std::make_unique<http::server>(loop, ip_endpoint::loopback_v4(0),
+        http::server_options {.document_root = directory_name});
     auto* active = listener.get();
     sockaddr_in endpoint {};
     socklen_t endpoint_size = sizeof(endpoint);
@@ -527,7 +530,8 @@ auto concurrent_connection_capacity_test() -> bool
     }
 
     event_loop loop;
-    auto listener = std::make_unique<http::server>(loop, 0, directory_name);
+    auto listener = std::make_unique<http::server>(loop, ip_endpoint::loopback_v4(0),
+        http::server_options {.document_root = directory_name});
     auto* active = listener.get();
     sockaddr_in endpoint {};
     socklen_t endpoint_size = sizeof(endpoint);
@@ -594,18 +598,26 @@ auto invalid_configuration_test() -> bool
                               '\0', 'x'};
     bool root_rejected = false;
     bool address_rejected = false;
+    bool empty_rejected = false;
     try {
-        http::server server(loop, 0, std::string_view {root, sizeof(root)});
+        http::server server(loop, ip_endpoint::loopback_v4(0), http::server_options {
+            .document_root = std::string(std::string_view {root, sizeof(root)})});
     } catch (const std::invalid_argument&) {
         root_rejected = true;
     }
     try {
-        http::server server(loop, 0, ".",
-                            std::string_view {address, sizeof(address)});
+        http::server server(loop,
+            ip_endpoint::parse(std::string_view {address, sizeof(address)}, 0),
+            http::server_options {.document_root = "."});
     } catch (const std::invalid_argument&) {
         address_rejected = true;
     }
-    return root_rejected && address_rejected;
+    try {
+        http::server server(loop, ip_endpoint::loopback_v4(0), http::server_options {});
+    } catch (const std::invalid_argument&) {
+        empty_rejected = true;
+    }
+    return root_rejected && address_rejected && empty_rejected;
 }
 
 } // namespace
