@@ -60,8 +60,11 @@ using response_header_sink =
 // 64 KiB and 128 fields per header block, 16 KiB frame, 4 MiB owned request
 // and buffered response bodies. A source or sink streams up to 1 TiB; a sink
 // leaves response.body empty. Callbacks run synchronously on the loop thread.
-// Resource limits report message_size; malformed protocol reports
-// protocol_error. Cancellation closes the connection and pending I/O.
+// A request Content-Length must match the body or source total, otherwise
+// invalid_argument. Resource limits report message_size; malformed protocol,
+// including a response Content-Length mismatch or content on a HEAD, 204, or
+// 304 response, reports protocol_error. Cancellation closes the connection
+// and pending I/O.
 [[nodiscard]] auto async_request(event_loop& loop, ip_endpoint endpoint,
                                  std::shared_ptr<tls_context> context,
                                  std::string hostname, client_request request,

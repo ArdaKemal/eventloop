@@ -326,7 +326,11 @@ every running connection has sent its close and retired.
   it returns 0 for EOF, a byte count within the span, or an operation error.
   Resources captured by the source must remain valid through completion,
   including cancellation. `Content-Length` is optional and can be supplied as
-  a request header when known. DATA transmission observes the peer's connection
+  a request header when known; it must be decimal and equal the owned body
+  size or the source's total. A mismatch reports `invalid_argument`, before
+  connecting for an owned body, or when a source exceeds the value or ends
+  short of it. Connection-specific request fields and TE other than
+  `trailers` are also `invalid_argument`. DATA transmission observes the peer's connection
   and stream flow-control windows. Responses own status and headers. The
   five-argument operation owns the response body, capped at 4 MiB. Passing a
   sixth `response_sink` argument
@@ -348,6 +352,11 @@ every running connection has sent its close and retired.
   a limit returns `message_size`; malformed HTTP/2 returns `protocol_error`.
   Each request allocates its own bounded frame, header, and response storage;
   TLS and OpenSSL may allocate separately.
+  Responses are malformed, reporting `protocol_error`, when they carry
+  connection-specific fields or TE other than `trailers`, a non-numeric or
+  conflicting Content-Length, DATA whose total differs from Content-Length,
+  or any DATA content after a HEAD request or with status 204 or 304.
+  Content-Length on those bodyless responses is not compared.
   A TLS connect, handshake, read, or write error is returned directly; task
   cancellation closes the owned transport. All I/O and resumption occur on
   `loop`, and the outer task result remains distinct from the operation error.

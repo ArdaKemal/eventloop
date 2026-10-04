@@ -1002,6 +1002,12 @@ if(BUILD_TESTING)
         add_test(NAME http2_file_send COMMAND http2_file_send_test)
     endif()
 
+    add_executable(http2_client_validation_test tests/http2_client_validation.cc)
+    target_link_libraries(http2_client_validation_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(http2_client_validation_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http2_client_validation COMMAND http2_client_validation_test)
+    set_tests_properties(http2_client_validation PROPERTIES TIMEOUT 30)
+
     add_executable(quic_varint_test tests/quic_varint.cc)
     target_include_directories(quic_varint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(quic_varint_test PRIVATE eventloop::eventloop)

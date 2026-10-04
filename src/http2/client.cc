@@ -7,6 +7,7 @@
 #include <array>
 #include <charconv>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -147,6 +148,33 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
     return true;
 }
 
+// RFC 9113 section 8.2.2.
+[[nodiscard]] auto connection_specific(const std::string_view name,
+                                       const std::string_view value) -> bool
+{
+    return name == "connection" || name == "upgrade" || name == "keep-alive" ||
+           name == "proxy-connection" || name == "transfer-encoding" ||
+           (name == "te" && value != "trailers");
+}
+
+// Every content-length field must hold the same decimal value. Absent returns
+// an empty optional; a malformed or conflicting value returns an error.
+[[nodiscard]] auto content_length(std::span<const header> headers)
+    -> std::expected<std::optional<std::uint64_t>, std::error_code>
+{
+    std::optional<std::uint64_t> length;
+    for (const auto& item : headers) {
+        if (item.name != "content-length") continue;
+        std::uint64_t value = 0;
+        const auto* end = item.value.data() + item.value.size();
+        const auto parsed = std::from_chars(item.value.data(), end, value);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || (length && *length != value))
+            return std::unexpected(failure(std::errc::protocol_error));
+        length = value;
+    }
+    return length;
+}
+
 [[nodiscard]] auto parse_headers(std::span<const std::byte> block,
                                  detail::hpack_decoder& decoder,
                                  client_response& response, bool initial)
@@ -175,7 +203,8 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
             status_seen = true;
         } else if (!field.name.empty() && field.name.front() == ':') {
             return failure(std::errc::protocol_error);
-        } else if (!valid_name(field.name) || !valid_value(field.value)) {
+        } else if (!valid_name(field.name) || !valid_value(field.value) ||
+                   connection_specific(field.name, field.value)) {
             return failure(std::errc::protocol_error);
         } else {
             regular_seen = true;
@@ -210,12 +239,16 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     fields.push_back({":path", request.target});
     for (auto& item : request.headers) {
         if (!valid_name(item.name) || !valid_value(item.value) ||
-            item.name == "connection" || item.name == "upgrade" ||
-            item.name == "keep-alive" || item.name == "proxy-connection" ||
-            item.name == "transfer-encoding")
+            connection_specific(item.name, item.value))
             co_return std::unexpected(failure(std::errc::invalid_argument));
-        fields.push_back({std::move(item.name), std::move(item.value)});
     }
+    // A declared request length must match the owned body, or the source total.
+    const auto request_length = content_length(request.headers);
+    if (!request_length ||
+        (*request_length && !request.body_source && **request_length != request.body.size()))
+        co_return std::unexpected(failure(std::errc::invalid_argument));
+    for (auto& item : request.headers)
+        fields.push_back({std::move(item.name), std::move(item.value)});
     std::vector<std::byte> block;
     const auto encoded = detail::hpack_encode(fields, block);
     if (encoded != detail::hpack_error::none)
@@ -285,6 +318,9 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     std::size_t header_start = 0;
     bool finished = false;
     std::uint64_t response_bytes = 0;
+    // Set from the final response headers. HEAD, 204, and 304 carry no content.
+    std::optional<std::uint64_t> response_length;
+    bool bodyless = false;
     std::size_t body_offset = 0;
     std::uint64_t sourced_bytes = 0;
     bool upload_finished = request.body.empty() && !request.body_source;
@@ -321,6 +357,10 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 }
                 if (count > max_streamed_body - sourced_bytes) {
                     error = failure(std::errc::message_size); break;
+                }
+                if (*request_length && (count > **request_length - sourced_bytes ||
+                                        (count == 0 && sourced_bytes != **request_length))) {
+                    error = failure(std::errc::invalid_argument); break;
                 }
                 sourced_bytes += count;
                 last = count == 0;
@@ -424,6 +464,13 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 error = parse_headers(header_block, decoder, response, !initial_headers);
                 header_block.clear();
                 if (error) break;
+                if (!initial_headers && response.status >= 200) {
+                    bodyless = request.method == "HEAD" || response.status == 204 ||
+                               response.status == 304;
+                    const auto length = content_length(response.headers);
+                    if (!length) { error = length.error(); break; }
+                    if (!bodyless) response_length = *length;
+                }
                 if (header_sink) {
                     try {
                         error = header_sink(initial_headers ? 0 : response.status,
@@ -457,6 +504,10 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 if (padding > length) { error = failure(std::errc::protocol_error); break; }
             }
             const auto size = length - padding;
+            if ((bodyless && size != 0) ||
+                (response_length && size > *response_length - response_bytes)) {
+                error = failure(std::errc::protocol_error); break;
+            }
             const auto limit = sink ? max_streamed_body : max_body;
             if (size > limit - response_bytes) {
                 error = failure(std::errc::message_size); break;
@@ -514,7 +565,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
         }
     }
     if (!error && (!initial_headers || continuation || response.status == 0 ||
-                   (request.method == "HEAD" && response_bytes != 0)))
+                   (response_length && response_bytes != *response_length)))
         error = failure(std::errc::protocol_error);
     detail::client_access::remove(loop, socket_id);
     if (error) co_return std::unexpected(error);
