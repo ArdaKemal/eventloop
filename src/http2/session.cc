@@ -24,6 +24,7 @@ constexpr std::uint8_t ping_frame = 6;
 constexpr std::uint8_t goaway_frame = 7;
 constexpr std::uint8_t window_update_frame = 8;
 constexpr std::uint8_t continuation_frame = 9;
+constexpr std::uint8_t priority_update_frame = 0x10;
 constexpr std::uint8_t flag_end_stream = 0x1;
 constexpr std::uint8_t flag_ack = 0x1;
 constexpr std::uint8_t flag_end_headers = 0x4;
@@ -126,6 +127,102 @@ auto write_u32(std::byte* output, std::uint32_t value) noexcept -> void
     return true;
 }
 
+// Reads the u and i members of an RFC 9218 Priority field, a Structured
+// Fields Dictionary (RFC 8941). Other members and parameters are skipped.
+// Returns false on a syntax error; the caller then keeps its current priority.
+// Out-of-range or wrongly typed u and i values are ignored.
+[[nodiscard]] auto parse_priority(std::string_view text, std::uint8_t& urgency,
+                                  bool& incremental) noexcept -> bool
+{
+    std::size_t at = 0;
+    const auto space = [&] {
+        while (at < text.size() && (text[at] == ' ' || text[at] == '\t')) ++at;
+    };
+    const auto key = [&]() -> std::string_view {
+        const auto start = at;
+        if (at == text.size() || !((text[at] >= 'a' && text[at] <= 'z') || text[at] == '*'))
+            return {};
+        while (at < text.size() &&
+               ((text[at] >= 'a' && text[at] <= 'z') || (text[at] >= '0' && text[at] <= '9') ||
+                std::string_view("_-.*").find(text[at]) != std::string_view::npos)) ++at;
+        return text.substr(start, at - start);
+    };
+    // Skips one bare item or inner list and returns its text.
+    const auto item = [&]() -> std::optional<std::string_view> {
+        const auto start = at;
+        if (at < text.size() && text[at] == '"') {
+            for (++at; at < text.size(); ++at) {
+                if (text[at] == '\\') ++at;
+                else if (text[at] == '"') return text.substr(start, ++at - start);
+            }
+            return std::nullopt;
+        }
+        if (at < text.size() && text[at] == '(') {
+            bool quoted = false;
+            for (++at; at < text.size(); ++at) {
+                if (quoted && text[at] == '\\') ++at;
+                else if (text[at] == '"') quoted = !quoted;
+                else if (!quoted && text[at] == ')') return text.substr(start, ++at - start);
+            }
+            return std::nullopt;
+        }
+        while (at < text.size() && text[at] != ',' && text[at] != ';' && text[at] != ' ' &&
+               text[at] != '\t') ++at;
+        if (at == start) return std::nullopt;
+        return text.substr(start, at - start);
+    };
+    // An sf-integer from 0 to 7.
+    const auto urgency_value = [](std::string_view value) -> std::optional<std::uint8_t> {
+        if (value.empty() || value.size() > 15) return std::nullopt;
+        unsigned parsed = 0;
+        for (const char digit : value) {
+            if (digit < '0' || digit > '9') return std::nullopt;
+            parsed = std::min(parsed * 10 + static_cast<unsigned>(digit - '0'), 8u);
+        }
+        if (parsed > 7) return std::nullopt;
+        return static_cast<std::uint8_t>(parsed);
+    };
+
+    std::optional<std::uint8_t> parsed_urgency;
+    std::optional<bool> parsed_incremental;
+    space();
+    while (at < text.size()) {
+        const auto name = key();
+        if (name.empty()) return false;
+        std::optional<std::string_view> value;
+        if (at < text.size() && text[at] == '=') {
+            ++at;
+            value = item();
+            if (!value) return false;
+        }
+        while (at < text.size() && text[at] == ';') {
+            ++at;
+            space();
+            if (key().empty()) return false;
+            if (at < text.size() && text[at] == '=') {
+                ++at;
+                if (!item()) return false;
+            }
+        }
+        if (name == "u") {
+            parsed_urgency = value ? urgency_value(*value) : std::nullopt;
+        } else if (name == "i") {
+            if (!value || *value == "?1") parsed_incremental = true;
+            else if (*value == "?0") parsed_incremental = false;
+            else parsed_incremental.reset();
+        }
+        space();
+        if (at == text.size()) break;
+        if (text[at] != ',') return false;
+        ++at;
+        space();
+        if (at == text.size()) return false;
+    }
+    if (parsed_urgency) urgency = *parsed_urgency;
+    if (parsed_incremental) incremental = *parsed_incremental;
+    return true;
+}
+
 [[nodiscard]] auto ascii_equal(std::string_view left,
                                std::string_view right) noexcept -> bool
 {
@@ -184,7 +281,7 @@ session::session(bool file_sendfile)
     output_.resize(4096);
     decoded_fields_.reserve(16);
 
-    std::array<std::byte, 24> settings {};
+    std::array<std::byte, 30> settings {};
     auto setting = [&](std::size_t offset, std::uint16_t id,
                        std::uint32_t value) {
         settings[offset] = static_cast<std::byte>(id >> 8);
@@ -195,6 +292,7 @@ session::session(bool file_sendfile)
     setting(6, 2, 0); // This server does not implement push.
     setting(12, 3, static_cast<std::uint32_t>(max_concurrent_streams));
     setting(18, 6, static_cast<std::uint32_t>(hpack_max_field_list_size));
+    setting(24, 9, 1); // SETTINGS_NO_RFC7540_PRIORITIES: RFC 9218 signals only.
     if (!append_frame(settings_frame, 0, 0, settings)) fatal_ = true;
 }
 
@@ -452,6 +550,7 @@ auto session::dispatch_frame() -> void
         }
         break;
     case window_update_frame: dispatch_window_update(); break;
+    case priority_update_frame: dispatch_priority_update(); break;
     case continuation_frame:
         if (continuation_stream_id_ == 0 ||
             frame_stream_id_ != continuation_stream_id_) {
@@ -660,7 +759,7 @@ auto session::dispatch_settings() -> void
             (byte_value(frame_payload_[offset]) << 8) |
              byte_value(frame_payload_[offset + 1]));
         const auto value = read_u32(frame_payload_.data() + offset + 2);
-        if (id == 2 && value > 1) {
+        if ((id == 2 || id == 9) && value > 1) {
             connection_error(protocol_error);
             return;
         }
@@ -688,6 +787,35 @@ auto session::dispatch_settings() -> void
     if (!append_frame(settings_frame, flag_ack, 0)) {
         connection_error(internal_error);
     }
+}
+
+// RFC 9218 section 7.1. An update replaces the stream's priority; omitted
+// parameters take their defaults. Updates for streams that are not open,
+// including streams the client has not opened yet, are ignored.
+auto session::dispatch_priority_update() -> void
+{
+    if (frame_stream_id_ != 0) {
+        connection_error(protocol_error);
+        return;
+    }
+    if (frame_payload_size_ < 4) {
+        connection_error(frame_size_error);
+        return;
+    }
+    const auto id = read_u32(frame_payload_.data()) & 0x7fffffffu;
+    if (id == 0) {
+        connection_error(protocol_error);
+        return;
+    }
+    auto* value = find_stream(id);
+    if (value == nullptr) return;
+    std::uint8_t urgency = 3;
+    bool incremental = false;
+    const std::string_view text(reinterpret_cast<const char*>(frame_payload_.data()) + 4,
+                                frame_payload_size_ - 4);
+    if (!parse_priority(text, urgency, incremental)) return;
+    value->urgency = urgency;
+    value->incremental = incremental;
 }
 
 auto session::dispatch_window_update() -> void
@@ -801,6 +929,9 @@ auto session::validate_initial_headers(stream& value,
     bool target_seen = false;
     bool authority_seen = false;
     bool host_seen = false;
+    std::uint8_t urgency = 3;
+    bool incremental = false;
+    bool priority_valid = true;
 
     for (const auto& entry : fields) {
         if (!valid_header_name(entry.name) || !valid_header_value(entry.value)) {
@@ -847,6 +978,10 @@ auto session::validate_initial_headers(stream& value,
                 (content_length && *content_length != parsed)) return false;
             content_length = parsed;
         }
+        // Repeated Priority lines form one dictionary; a syntax error in any
+        // of them leaves the defaults in place.
+        if (entry.name == "priority" && priority_valid)
+            priority_valid = parse_priority(entry.value, urgency, incremental);
         if (entry.name == "if-none-match") {
             if (!value.if_none_match.empty()) value.if_none_match += ',';
             value.if_none_match += entry.value;
@@ -894,6 +1029,10 @@ auto session::validate_initial_headers(stream& value,
     value.method.assign(method);
     value.target.assign(target);
     value.content_length = content_length;
+    if (priority_valid) {
+        value.urgency = urgency;
+        value.incremental = incremental;
+    }
     return true;
 }
 
@@ -941,6 +1080,8 @@ auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
     found->remote_closed = false;
     found->request_ready = false;
     found->response_started = false;
+    found->urgency = 3;
+    found->incremental = false;
     return &*found;
 }
 
@@ -1076,90 +1217,110 @@ auto session::append_response_headers(stream& value, unsigned status,
     return true;
 }
 
+// Picks the next stream with sendable response work under RFC 9218: the
+// lowest urgency first; within it, non-incremental responses one at a time in
+// stream order, then incremental responses round-robin from the cursor.
+// Streams blocked by flow control are skipped so they do not stall others.
+auto session::next_response() const noexcept -> std::optional<std::size_t>
+{
+    const auto sendable = [this](const stream& value) {
+        if (!value.active || !value.response_started) return false;
+        if (value.response_size == 0) return true;
+        return value.response_offset < value.response_size &&
+               connection_send_window_ > 0 && value.send_window > 0;
+    };
+    std::optional<std::size_t> sequential;
+    std::optional<std::size_t> incremental;
+    std::uint8_t urgency = 8;
+    for (std::size_t step = 0; step < streams_.size(); ++step) {
+        const auto index = (response_cursor_ + step) % streams_.size();
+        const auto& value = streams_[index];
+        if (!sendable(value) || value.urgency > urgency) continue;
+        if (value.urgency < urgency) {
+            urgency = value.urgency;
+            sequential.reset();
+            incremental.reset();
+        }
+        if (value.incremental) {
+            if (!incremental) incremental = index;
+        } else if (!sequential || value.id < streams_[*sequential].id) {
+            sequential = index;
+        }
+    }
+    return sequential ? sequential : incremental;
+}
+
 auto session::pump_responses() -> void
 {
     if (fatal_ || file_send_active_) return;
-    bool progressed = true;
-    while (progressed) {
-        progressed = false;
-        const auto start = response_cursor_;
-        for (std::size_t step = 0; step < streams_.size(); ++step) {
-            const auto index = (start + step) % streams_.size();
-            auto& value = streams_[index];
-            if (!value.active) continue;
-            if (value.request_ready && !value.response_started) continue;
-            if (!value.response_started) continue;
-            if (value.response_size == 0) {
-                reset_stream(value);
-                progressed = true;
-                continue;
-            }
-            if (value.response_offset >= value.response_size ||
-                connection_send_window_ <= 0 || value.send_window <= 0) continue;
+    while (const auto next = next_response()) {
+        const auto index = *next;
+        auto& value = streams_[index];
+        if (value.response_size == 0) {
+            reset_stream(value);
+            continue;
+        }
 
-            const auto available = std::min<std::uint64_t>({
-                value.response_size - value.response_offset,
-                static_cast<std::uint64_t>(max_frame_payload),
-                static_cast<std::uint64_t>(connection_send_window_),
-                static_cast<std::uint64_t>(value.send_window),
-            });
-            if (available == 0) continue;
-            const auto count = static_cast<std::size_t>(available);
-            if (count + 9 > max_output_size - output_size_) {
-                // Do not read a file range that cannot be queued yet.
-                // consume_output() retries after the transport drains output.
-                return;
-            }
-            std::span<const std::byte> body;
-            if (value.response_file && file_sendfile_) {
+        const auto available = std::min<std::uint64_t>({
+            value.response_size - value.response_offset,
+            static_cast<std::uint64_t>(max_frame_payload),
+            static_cast<std::uint64_t>(connection_send_window_),
+            static_cast<std::uint64_t>(value.send_window),
+        });
+        const auto count = static_cast<std::size_t>(available);
+        if (count + 9 > max_output_size - output_size_) {
+            // Do not read a file range that cannot be queued yet.
+            // consume_output() retries after the transport drains output.
+            return;
+        }
+        std::span<const std::byte> body;
+        if (value.response_file && file_sendfile_) {
 #if defined(__linux__)
-                // Move the response owner into the frame instead of duplicating
-                // it. The transport borrows it and completion returns ownership
-                // to this response, or closes it for the final/reset stream.
-                const bool last = value.response_offset + count == value.response_size;
-                if (!append_frame(data_frame, last ? flag_end_stream : 0,
-                                  value.id, {}, count)) return;
-                file_send_ = {std::move(value.response_file),
-                    value.response_file_start + value.response_offset, count};
-                file_send_stream_ = value.id;
-                file_send_index_ = index;
-                file_send_prefix_ = output_size_;
-                file_send_active_ = true;
-                value.response_offset += count;
-                connection_send_window_ -= static_cast<std::int64_t>(count);
-                value.send_window -= static_cast<std::int64_t>(count);
-                response_cursor_ = (index + 1) % streams_.size();
-                if (last) reset_stream(value);
-                return;
-#endif
-            }
-            if (value.response_file) {
-                if (!http::detail::read_file_at(value.response_file.get(),
-                        value.response_file_start + value.response_offset,
-                        std::span {frame_payload_}.first(count))) {
-                    stream_error(value.id, internal_error);
-                    progressed = true;
-                    continue;
-                }
-                body = std::span {frame_payload_}.first(count);
-            } else {
-                body = std::span {value.response_body}.subspan(
-                    static_cast<std::size_t>(value.response_offset), count);
-            }
+            // Move the response owner into the frame instead of duplicating
+            // it. The transport borrows it and completion returns ownership
+            // to this response, or closes it for the final/reset stream.
             const bool last = value.response_offset + count == value.response_size;
             if (!append_frame(data_frame, last ? flag_end_stream : 0,
-                              value.id, body)) {
-                // The bounded output queue is full. consume_output() resumes
-                // pumping after the transport drains it.
-                return;
-            }
-            response_cursor_ = (index + 1) % streams_.size();
+                              value.id, {}, count)) return;
+            file_send_ = {std::move(value.response_file),
+                value.response_file_start + value.response_offset, count};
+            file_send_stream_ = value.id;
+            file_send_index_ = index;
+            file_send_prefix_ = output_size_;
+            file_send_active_ = true;
             value.response_offset += count;
             connection_send_window_ -= static_cast<std::int64_t>(count);
             value.send_window -= static_cast<std::int64_t>(count);
-            progressed = true;
+            response_cursor_ = (index + 1) % streams_.size();
             if (last) reset_stream(value);
+            return;
+#endif
         }
+        if (value.response_file) {
+            if (!http::detail::read_file_at(value.response_file.get(),
+                    value.response_file_start + value.response_offset,
+                    std::span {frame_payload_}.first(count))) {
+                stream_error(value.id, internal_error);
+                if (fatal_) return;
+                continue;
+            }
+            body = std::span {frame_payload_}.first(count);
+        } else {
+            body = std::span {value.response_body}.subspan(
+                static_cast<std::size_t>(value.response_offset), count);
+        }
+        const bool last = value.response_offset + count == value.response_size;
+        if (!append_frame(data_frame, last ? flag_end_stream : 0,
+                          value.id, body)) {
+            // The bounded output queue is full. consume_output() resumes
+            // pumping after the transport drains it.
+            return;
+        }
+        response_cursor_ = (index + 1) % streams_.size();
+        value.response_offset += count;
+        connection_send_window_ -= static_cast<std::int64_t>(count);
+        value.send_window -= static_cast<std::int64_t>(count);
+        if (last) reset_stream(value);
     }
 }
 

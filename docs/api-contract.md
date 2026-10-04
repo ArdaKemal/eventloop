@@ -281,7 +281,16 @@ every running connection has sent its close and retired.
   streams per connection, decodes bounded HPACK header blocks, and observes
   connection and stream DATA flow control. Request bodies are discarded and
   limited to 1 MiB. File responses stream from their owned descriptors; inline
-  response bodies are bounded to 4 MiB per connection. On Linux, file response
+  response bodies are bounded to 4 MiB per connection. Responses are scheduled
+  by RFC 9218 priority, taken from the request `priority` field and replaced
+  by PRIORITY_UPDATE frames. Lower urgency goes first. Within one urgency,
+  non-incremental responses are sent one at a time in stream order, then
+  incremental responses share DATA frames round-robin. A stream blocked by flow
+  control does not hold back others. Requests without a signal use urgency 3,
+  non-incremental. A malformed Priority value keeps the defaults, and an update
+  for a stream that is not open is ignored. The server advertises
+  SETTINGS_NO_RFC7540_PRIORITIES and ignores RFC 7540 PRIORITY frames apart
+  from their validity checks. On Linux, file response
   DATA uses OpenSSL `SSL_sendfile()` when transmit kTLS is active, and otherwise
   uses the bounded buffered path. Directory-root traversal shares HTTP/1.1's
   component-by-component `O_NOFOLLOW` checks. Cleartext
@@ -343,6 +352,11 @@ every running connection has sent its close and retired.
   status for final headers, and zero for trailers. The fields span is borrowed
   only during the call; a nonzero callback error aborts the request. Final
   response headers and trailers remain owned in the returned response.
+  Responses are malformed, reporting `protocol_error`, when they carry
+  connection-specific fields or TE other than `trailers`, a non-numeric or
+  conflicting Content-Length, DATA whose total differs from Content-Length,
+  or any DATA content after a HEAD request or with status 204 or 304.
+  Content-Length on those bodyless responses is not compared.
   Streamed response bodies are limited to 1 TiB while buffering remains one
   16 KiB frame. The operation uses one
   stream per connection. Connection reuse and server push are outside its scope.
@@ -352,11 +366,6 @@ every running connection has sent its close and retired.
   a limit returns `message_size`; malformed HTTP/2 returns `protocol_error`.
   Each request allocates its own bounded frame, header, and response storage;
   TLS and OpenSSL may allocate separately.
-  Responses are malformed, reporting `protocol_error`, when they carry
-  connection-specific fields or TE other than `trailers`, a non-numeric or
-  conflicting Content-Length, DATA whose total differs from Content-Length,
-  or any DATA content after a HEAD request or with status 204 or 304.
-  Content-Length on those bodyless responses is not compared.
   A TLS connect, handshake, read, or write error is returned directly; task
   cancellation closes the owned transport. All I/O and resumption occur on
   `loop`, and the outer task result remains distinct from the operation error.

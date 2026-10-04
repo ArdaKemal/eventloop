@@ -87,6 +87,9 @@ private:
         bool remote_closed = false;
         bool request_ready = false;
         bool response_started = false;
+        // RFC 9218 priority; the defaults apply when the client sends none.
+        std::uint8_t urgency = 3;
+        bool incremental = false;
     };
 
     auto consume_input(std::span<const std::byte> input) -> void;
@@ -95,6 +98,7 @@ private:
     auto dispatch_data() -> void;
     auto dispatch_settings() -> void;
     auto dispatch_window_update() -> void;
+    auto dispatch_priority_update() -> void;
     auto finish_header_block() -> void;
     auto finish_request(stream& value) -> void;
     [[nodiscard]] auto validate_initial_headers(stream& value,
@@ -113,6 +117,7 @@ private:
     auto append_response_headers(stream& value, unsigned status,
                                  std::span<const field> headers) -> bool;
     auto pump_responses() -> void;
+    [[nodiscard]] auto next_response() const noexcept -> std::optional<std::size_t>;
 
     // One external payload is an ordering barrier in the bounded byte queue.
     file_send file_send_;

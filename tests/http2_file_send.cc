@@ -59,11 +59,13 @@ auto drain(session& state) -> std::vector<std::byte>
     return bytes;
 }
 
-auto request_file(session& state, unsigned stream) -> void
+auto request_file(session& state, unsigned stream, std::string_view priority = "u=3")
+    -> void
 {
     std::vector<std::byte> block;
-    const std::array<field, 4> fields {{{":method", "GET"}, {":scheme", "https"},
-        {":path", "/file"}, {":authority", "localhost"}}};
+    const std::array<field, 5> fields {{{":method", "GET"}, {":scheme", "https"},
+        {":path", "/file"}, {":authority", "localhost"},
+        {"priority", std::string(priority)}}};
     check(hpack_encode(fields, block) == hpack_error::none, "request encoding");
     frame(state, 1, 5, stream, block);
     request incoming;
@@ -107,7 +109,8 @@ auto file_barrier() -> void
 
     // Queue a PING response behind the file DATA header. It must not be visible
     // until all seven bytes of this DATA payload have been transferred.
-    request_file(state, 3);
+    // Stream 3 is more urgent, so it precedes the rest of the file (RFC 9218).
+    request_file(state, 3, "u=2");
     const std::vector<std::byte> inline_body(5, std::byte {'x'});
     check(state.respond(3, 200, {}, inline_body), "inline response behind barrier");
     frame(state, 6, 0, 0, ping);
@@ -167,7 +170,7 @@ auto file_barrier() -> void
         }
         offset += size + 9;
     }
-    check(inline_seen, "inline response was starved by file scheduling");
+    check(inline_seen, "more urgent inline response waited behind the file");
     const auto last_header = std::span(final_header).last(9);
     check(last_header[2] == std::byte {4} && last_header[4] == std::byte {1},
           "final DATA header after window update");
