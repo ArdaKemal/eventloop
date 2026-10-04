@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 #include <optional>
 #include <ctime>
@@ -25,26 +26,26 @@
 namespace eventloop::http2::detail {
 namespace {
 
-[[nodiscard]] auto status_fields(std::uint64_t length,
-                                 std::string_view content_type = {})
-    -> std::array<field, 2>
-{
-    auto length_text = std::to_string(length);
-    auto type_text = std::string(content_type);
-    return {field {"content-length", std::move(length_text)},
-            field {"content-type", std::move(type_text)}};
-}
+// Decimal text for content-length; the fields borrow digits.
+struct length_text {
+    explicit length_text(std::uint64_t value) noexcept
+        : size(static_cast<std::size_t>(
+              std::to_chars(digits.data(), digits.data() + digits.size(), value).ptr -
+              digits.data())) {}
+    [[nodiscard]] auto view() const noexcept -> std::string_view { return {digits.data(), size}; }
+    std::array<char, 24> digits {};
+    std::size_t size;
+};
 
 auto respond_empty(session& state, std::uint32_t stream_id,
                    unsigned status) -> void
 {
     if (status == 405) {
-        const std::array<field, 2> headers {
-            field {"content-length", "0"},
-            field {"allow", "GET, HEAD, OPTIONS"}};
+        const std::array<http::header, 2> headers {{
+            {"content-length", "0"}, {"allow", "GET, HEAD, OPTIONS"}}};
         (void)state.respond(stream_id, status, headers, {});
     } else {
-        const std::array<field, 1> headers {field {"content-length", "0"}};
+        const std::array<http::header, 1> headers {{{"content-length", "0"}}};
         (void)state.respond(stream_id, status, headers, {});
     }
 }
@@ -54,14 +55,15 @@ auto respond_static_file(session& state, const request& incoming, unique_fd desc
 {
     const auto selected = http::detail::choose_file_response(info, {
         incoming.if_none_match, incoming.if_modified_since, incoming.range});
-    std::array<field, 6> headers {
-        field {"content-length", std::to_string(selected.length)},
-        field {"content-type", std::string(http::mime_type_from_path(path))},
-        field {"etag", std::string(selected.etag.data(), selected.etag_size)},
-        field {"last-modified", std::string(selected.modified.data(), selected.modified_size)},
-        field {"accept-ranges", "bytes"},
-        field {"content-range", std::string(selected.content_range.data(), selected.content_range_size)},
-    };
+    const length_text length(selected.length);
+    const std::array<http::header, 6> headers {{
+        {"content-length", length.view()},
+        {"content-type", http::mime_type_from_path(path)},
+        {"etag", {selected.etag.data(), selected.etag_size}},
+        {"last-modified", {selected.modified.data(), selected.modified_size}},
+        {"accept-ranges", "bytes"},
+        {"content-range", {selected.content_range.data(), selected.content_range_size}},
+    }};
     const auto count = selected.content_range_size == 0 ? 5 : 6;
     (void)state.respond_file(incoming.stream_id, selected.status,
         std::span(headers).first(count), std::move(descriptor), selected.length,
@@ -98,9 +100,8 @@ auto serve_request(session& state, request incoming, native_socket root,
         if (match.allowed != 0) {
             std::array<char, 96> allow {};
             const auto size = http::detail::format_allow(match.allowed, allow);
-            const std::array<field, 2> headers {
-                field {"content-length", "0"},
-                field {"allow", std::string(allow.data(), size)}};
+            const std::array<http::header, 2> headers {{
+                {"content-length", "0"}, {"allow", {allow.data(), size}}}};
             (void)state.respond(incoming.stream_id, incoming.method == "OPTIONS" ? 204 : 405,
                                 std::span(headers).subspan(incoming.method == "OPTIONS" ? 1 : 0),
                                 {});
@@ -108,8 +109,7 @@ auto serve_request(session& state, request incoming, native_socket root,
         }
     }
     if (incoming.method == "OPTIONS") {
-        const std::array<field, 1> headers {
-            field {"allow", "GET, HEAD, OPTIONS"}};
+        const std::array<http::header, 1> headers {{{"allow", "GET, HEAD, OPTIONS"}}};
         (void)state.respond(incoming.stream_id, 204, headers, {});
         return;
     }
@@ -143,8 +143,8 @@ auto serve_request(session& state, request incoming, native_socket root,
     const auto raw_path = path_without_suffix(incoming.target);
     if (raw_path.empty() || raw_path.back() != '/') {
         const auto location = make_redirect(incoming.target);
-        const std::array<field, 2> headers {
-            field {"content-length", "0"}, field {"location", location}};
+        const std::array<http::header, 2> headers {{
+            {"content-length", "0"}, {"location", location}}};
         (void)state.respond(incoming.stream_id, 308, headers, {});
         return;
     }
@@ -172,14 +172,15 @@ auto serve_request(session& state, request incoming, native_socket root,
                 std::memcpy(body.data(), http::directory_listing_error_body.data(),
                             body.size());
             }
-            const std::array<field, 2> fields {
-                field {"content-length", std::to_string(body.size())},
-                field {"content-type", "text/plain"}};
+            const length_text length(body.size());
+            const std::array<http::header, 2> fields {{
+                {"content-length", length.view()}, {"content-type", "text/plain"}}};
             (void)state.respond(incoming.stream_id, 500, fields, std::move(body));
             return;
         }
-        const auto size = listing->size();
-        const auto fields = status_fields(size, "text/html; charset=utf-8");
+        const length_text length(listing->size());
+        const std::array<http::header, 2> fields {{
+            {"content-length", length.view()}, {"content-type", "text/html; charset=utf-8"}}};
         if (headers_only) {
             (void)state.respond(incoming.stream_id, 200, fields, {});
             return;
@@ -376,26 +377,35 @@ auto http2_exchange::write_ready() const noexcept -> bool
     return !owner->state.chunk_pending(id);
 }
 
-// Response fields in HPACK form: :status is added by the session.
-auto response_fields(std::span<const http::header> headers, bool emit_length,
-                     std::optional<std::uint64_t> length, bool add_date) -> std::vector<field>
-{
-    std::vector<field> fields;
-    fields.reserve(headers.size() + 2);
-    for (const auto& entry : headers) fields.push_back({std::string(entry.name), std::string(entry.value)});
-    if (emit_length) fields.push_back({"content-length", std::to_string(*length)});
-    if (add_date) {
-        std::array<char, 64> date {};
-        const auto size = http::detail::format_http_time(std::time(nullptr), date);
-        fields.push_back({"date", std::string(date.data(), size)});
+// Fields the server adds after the handler's: content-length and date. The
+// views borrow this object, which lives on the caller's stack.
+struct generated_fields {
+    generated_fields(bool emit_length, std::uint64_t length, bool add_date) noexcept
+        : length_digits(length)
+    {
+        if (emit_length) fields[count++] = {"content-length", length_digits.view()};
+        if (add_date) {
+            const auto size = http::detail::format_http_time(std::time(nullptr), date);
+            fields[count++] = {"date", {date.data(), size}};
+        }
     }
-    return fields;
-}
+    generated_fields(const generated_fields&) = delete;
+    auto operator=(const generated_fields&) -> generated_fields& = delete;
+    [[nodiscard]] auto view() const noexcept -> std::span<const http::header>
+    {
+        return std::span(fields).first(count);
+    }
+
+    length_text length_digits;
+    std::array<char, 64> date {};
+    std::array<http::header, 2> fields {};
+    std::size_t count {0};
+};
 
 auto http2_exchange::respond_status(unsigned status) -> void
 {
-    const auto fields = response_fields({}, true, 0, true);
-    if (owner->state.start_streamed(id, status, fields)) {
+    const generated_fields extra(true, 0, true);
+    if (owner->state.start_streamed(id, status, {}, extra.view())) {
         started = true;
         if (owner->state.finish_streamed(id, {})) finished = true;
     }
@@ -440,8 +450,8 @@ auto start_task(event_loop& loop, http2_exchange& self, unsigned status,
     if (self.started) co_return std::unexpected(failure(std::errc::invalid_argument));
     const auto checked = http::detail::check_response_start(status, headers, length);
     if (!checked) co_return std::unexpected(checked.error());
-    const auto fields = response_fields(headers, checked->emit_length, length, !checked->has_date);
-    if (!self.owner->state.start_streamed(self.id, status, fields)) {
+    const generated_fields extra(checked->emit_length, length.value_or(0), !checked->has_date);
+    if (!self.owner->state.start_streamed(self.id, status, headers, extra.view())) {
         self.broken = true;
         co_return std::unexpected(failure(std::errc::connection_reset));
     }
@@ -499,9 +509,8 @@ auto finish_task(event_loop& loop, http2_exchange& self, std::span<const http::h
         if (!http::detail::valid_response_field(entry.name, entry.value) ||
             entry.name == "content-length")
             co_return std::unexpected(failure(std::errc::invalid_argument));
-    const auto fields = self.head_only ? std::vector<field> {}
-                                       : response_fields(trailers, false, {}, false);
-    if (!self.owner->state.finish_streamed(self.id, fields)) {
+    if (!self.owner->state.finish_streamed(self.id,
+            self.head_only ? std::span<const http::header> {} : trailers)) {
         self.broken = true;
         co_return std::unexpected(failure(std::errc::connection_reset));
     }
@@ -596,7 +605,10 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
     }
     auto& exchange = connection.exchanges[index];
     exchange.reset(routed.stream_id);
+    // The slot's previous fields go back to the decoder with their strings.
+    auto previous = std::move(exchange.routed.fields);
     exchange.routed = std::move(routed);
+    state.recycle_fields(std::move(previous));
     if (exchange.routed.too_large) {
         exchange.respond_status(413);
         exchange.in_use = false;

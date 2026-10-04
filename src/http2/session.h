@@ -77,10 +77,11 @@ public:
     auto consume_output(std::size_t size) -> void;
     [[nodiscard]] auto pop_request(request& value) -> bool;
 
+    // Header fields are borrowed only during the call.
     [[nodiscard]] auto respond(std::uint32_t stream_id, unsigned status,
-        std::span<const field> headers, std::vector<std::byte> body) -> bool;
+        std::span<const http::header> headers, std::vector<std::byte> body) -> bool;
     [[nodiscard]] auto respond_file(std::uint32_t stream_id, unsigned status,
-        std::span<const field> headers, unique_fd file, std::uint64_t size,
+        std::span<const http::header> headers, unique_fd file, std::uint64_t size,
         bool send_body, std::uint64_t offset = 0) -> bool;
 
     [[nodiscard]] auto closed() const noexcept -> bool;
@@ -88,17 +89,23 @@ public:
     // Routed streams. Operations on a released stream report failure.
     auto set_release_hook(release_hook hook, void* context) noexcept -> void;
     [[nodiscard]] auto pop_routed(routed_request& value) -> bool;
+    // Returns a finished request's field vector so later header blocks
+    // decode into its existing strings.
+    auto recycle_fields(std::vector<field>&& fields) noexcept -> void;
     enum class body_state { data, waiting, ended, too_large, failed };
     [[nodiscard]] auto read_body(std::uint32_t stream_id, std::span<std::byte> output,
                                  std::size_t& count) -> body_state;
+    // headers then extra are sent after :status; both are borrowed only
+    // during the call.
     [[nodiscard]] auto start_streamed(std::uint32_t stream_id, unsigned status,
-                                      std::span<const field> headers) -> bool;
+                                      std::span<const http::header> headers,
+                                      std::span<const http::header> extra = {}) -> bool;
     // Borrows data until chunk_pending() turns false.
     [[nodiscard]] auto queue_chunk(std::uint32_t stream_id, std::span<const std::byte> data)
         -> bool;
     [[nodiscard]] auto chunk_pending(std::uint32_t stream_id) const noexcept -> bool;
-    [[nodiscard]] auto finish_streamed(std::uint32_t stream_id, std::span<const field> trailers)
-        -> bool;
+    [[nodiscard]] auto finish_streamed(std::uint32_t stream_id,
+                                       std::span<const http::header> trailers) -> bool;
     [[nodiscard]] auto send_streamed_file(std::uint32_t stream_id, unique_fd file,
                                           std::uint64_t offset, std::uint64_t size) -> bool;
     auto abandon(std::uint32_t stream_id, std::uint32_t error) -> void;
@@ -161,7 +168,10 @@ private:
     [[nodiscard]] auto acquire_body_slot() noexcept -> std::uint8_t;
     [[nodiscard]] auto body_slot(const stream& value) noexcept -> std::byte*;
     auto complete_stream(stream& value) -> void;
-    [[nodiscard]] auto append_header_block(stream& value, std::span<const field> fields,
+    // Encodes an optional :status, then first and second, as one block.
+    [[nodiscard]] auto append_header_block(stream& value, unsigned status,
+                                           std::span<const http::header> first,
+                                           std::span<const http::header> second,
                                            bool end_stream) -> bool;
     auto dispatch_frame() -> void;
     auto dispatch_headers() -> void;
@@ -185,7 +195,8 @@ private:
                       std::span<const std::byte> payload = {},
                       std::size_t file_payload_size = 0) -> bool;
     auto append_response_headers(stream& value, unsigned status,
-                                 std::span<const field> headers, bool end_stream) -> bool;
+                                 std::span<const http::header> headers,
+                                 std::span<const http::header> extra, bool end_stream) -> bool;
     auto pump_responses() -> void;
     [[nodiscard]] auto next_response() const noexcept -> std::optional<std::size_t>;
 
@@ -239,6 +250,7 @@ private:
     std::vector<std::byte> header_block_;
     std::vector<std::byte> output_;
     std::vector<field> decoded_fields_;
+    std::vector<std::byte> encoded_block_;
     hpack_decoder decoder_;
 };
 

@@ -527,26 +527,35 @@ auto hpack_decoder::insert(field entry) -> void
     table_bytes_ += size;
 }
 
+// Decodes into output's existing elements first, so their strings keep their
+// capacity across blocks; output is trimmed to the decoded fields at the end.
 auto hpack_decoder::decode(std::span<const std::byte> block,
                            std::vector<field>& output) -> hpack_error
 {
-    output.clear();
-    if (block.size() > hpack_max_block_size) return hpack_error::limit_exceeded;
+    if (block.size() > hpack_max_block_size) {
+        output.clear();
+        return hpack_error::limit_exceeded;
+    }
     std::size_t offset = 0;
     std::size_t list_bytes = 0;
+    std::size_t used = 0;
     bool saw_field = false;
     bool saw_update = false;
     auto fail = [&](hpack_error error) {
         output.clear();
         return error;
     };
-    auto append = [&](field entry) -> hpack_error {
+    // The slot for the next field, or null at the field limit.
+    auto next_slot = [&]() -> field* {
+        if (used == hpack_max_fields) return nullptr;
+        if (used == output.size()) output.emplace_back();
+        return &output[used];
+    };
+    auto commit = [&](const field& entry) -> hpack_error {
         const auto size = entry.name.size() + entry.value.size() + 32;
-        if (output.size() == hpack_max_fields || size > hpack_max_field_list_size - list_bytes) {
-            return hpack_error::limit_exceeded;
-        }
+        if (size > hpack_max_field_list_size - list_bytes) return hpack_error::limit_exceeded;
         list_bytes += size;
-        output.push_back(std::move(entry));
+        ++used;
         return hpack_error::none;
     };
     while (offset < block.size()) {
@@ -556,11 +565,10 @@ auto hpack_decoder::decode(std::span<const std::byte> block,
             if (update_required_ && !saw_update) return fail(hpack_error::invalid);
             saw_field = true;
             if (!read_integer(block, offset, 7, index)) return fail(hpack_error::invalid);
-            field entry;
-            if (!resolve(index, entry)) return fail(hpack_error::invalid);
-            if (const auto error = append(std::move(entry)); error != hpack_error::none) {
-                return fail(error);
-            }
+            auto* entry = next_slot();
+            if (entry == nullptr) return fail(hpack_error::limit_exceeded);
+            if (!resolve(index, *entry)) return fail(hpack_error::invalid);
+            if (const auto error = commit(*entry); error != hpack_error::none) return fail(error);
             continue;
         }
         if ((lead & 0xe0) == 0x20) {
@@ -580,34 +588,37 @@ auto hpack_decoder::decode(std::span<const std::byte> block,
         const bool indexed = (lead & 0xc0) == 0x40;
         const unsigned prefix = indexed ? 6 : 4;
         if (!read_integer(block, offset, prefix, index)) return fail(hpack_error::invalid);
-        field entry;
+        auto* entry = next_slot();
+        if (entry == nullptr) return fail(hpack_error::limit_exceeded);
         if (index != 0) {
-            if (!resolve(index, entry)) return fail(hpack_error::invalid);
-        } else if (const auto error = read_string(block, offset, entry.name);
+            if (!resolve(index, *entry)) return fail(hpack_error::invalid);
+        } else if (const auto error = read_string(block, offset, entry->name);
                    error != hpack_error::none) {
             return fail(error);
         }
-        if (const auto error = read_string(block, offset, entry.value);
+        if (const auto error = read_string(block, offset, entry->value);
             error != hpack_error::none) {
             return fail(error);
         }
-        if (entry.name.empty()) return fail(hpack_error::invalid);
-        if (indexed) insert(entry);
-        if (const auto error = append(std::move(entry)); error != hpack_error::none) {
-            return fail(error);
-        }
+        if (entry->name.empty()) return fail(hpack_error::invalid);
+        if (indexed) insert(*entry);
+        if (const auto error = commit(*entry); error != hpack_error::none) return fail(error);
     }
     if (update_required_ && !saw_update) return fail(hpack_error::invalid);
+    output.resize(used);
     return hpack_error::none;
 }
 
-auto hpack_encode(std::span<const field> fields,
-                  std::vector<std::byte>& output) -> hpack_error
+namespace {
+
+template<typename Field>
+auto encode_fields(std::span<const Field> fields, std::vector<std::byte>& output, bool append)
+    -> hpack_error
 {
-    output.clear();
+    if (!append) output.clear();
     if (fields.size() > hpack_max_fields) return hpack_error::limit_exceeded;
     std::size_t list_bytes = 0;
-    for (const auto& entry : fields) {
+    for (const Field& entry : fields) {
         const auto size = entry.name.size() + entry.value.size() + 32;
         if (entry.name.empty()) return hpack_error::invalid;
         if (size > hpack_max_field_list_size - list_bytes ||
@@ -623,6 +634,20 @@ auto hpack_encode(std::span<const field> fields,
         write_string(entry.value, output);
     }
     return hpack_error::none;
+}
+
+} // namespace
+
+auto hpack_encode(std::span<const field> fields, std::vector<std::byte>& output,
+                  bool append) -> hpack_error
+{
+    return encode_fields(fields, output, append);
+}
+
+auto hpack_encode(std::span<const http::header> fields, std::vector<std::byte>& output,
+                  bool append) -> hpack_error
+{
+    return encode_fields(fields, output, append);
 }
 
 } // namespace eventloop::http2::detail

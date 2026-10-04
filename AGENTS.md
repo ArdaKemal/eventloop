@@ -84,8 +84,9 @@ ownership, and error visibility.
   fall back to static files with secure resource traversal. Plain HTTP uses
   `sendfile` for larger files on Linux. Static HTTP/2 and HTTP/3 support
   bounded GET, HEAD, and OPTIONS operations. Routed handler frames must fit
-  their size classes; HTTP/1.1 and HTTP/3 routed requests are measured
-  allocation-free, so keep them that way.
+  their size classes; steady-state routed requests on all three protocols,
+  and static HTTP/2 and HTTP/3 file requests, are measured allocation-free,
+  so keep them that way.
 - QUIC v1/v2 public endpoints, streams, and DATAGRAMs are implemented. The
   Wayfarer and Stonegate examples exercise HTTP/1.1, HTTP/2, and HTTP/3 through
   public APIs. Root HTTP/3 test fixtures and optional aioquic v1/v2 tests are

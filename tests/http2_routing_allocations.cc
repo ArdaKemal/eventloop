@@ -1,9 +1,9 @@
-// Measures general-heap allocations per request on one HTTP/2 connection for
+// Counts general-heap allocations per request on one HTTP/2 connection for
 // routed GET and POST requests and for static file GETs. The raw client
 // reuses pre-encoded frames and fixed buffers, so the counts cover the server,
-// TLS, and the loop. HPACK decoding allocates field strings, so HTTP/2
-// requests are not allocation-free; routing must not add to the static cost
-// beyond the per-request figure checked here.
+// TLS, and the loop. Requests carry header values longer than the small-string
+// buffer, as browsers do, so HPACK decoding must reuse string capacity.
+// Steady-state requests must not allocate.
 #include "eventloop/event_loop.h"
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
@@ -102,8 +102,10 @@ auto append_frame(std::vector<std::byte>& out, unsigned type, unsigned flags,
 auto encode(std::string_view method, std::string_view path, std::string_view body)
     -> std::vector<std::byte>
 {
-    const std::array<http2::detail::field, 4> fields {{{":method", std::string(method)},
-        {":scheme", "https"}, {":authority", "localhost"}, {":path", std::string(path)}}};
+    const std::array<http2::detail::field, 6> fields {{{":method", std::string(method)},
+        {":scheme", "https"}, {":authority", "localhost"}, {":path", std::string(path)},
+        {"user-agent", "Mozilla/5.0 (X11; Linux x86_64) eventloop-allocation-test/1.0"},
+        {"cookie", "session=0123456789abcdef0123456789abcdef; theme=dark; locale=en-GB"}}};
     std::vector<std::byte> block;
     check(http2::detail::hpack_encode(fields, block) == http2::detail::hpack_error::none,
           "encode request");
@@ -285,7 +287,5 @@ auto main() -> int
     check(result.done, "requests did not complete");
     std::cout << "HTTP/2 allocations over " << result.requests << " requests: routed "
               << result.routed << ", static " << result.static_files << '\n';
-    // Both paths pay for HPACK field strings and header encoding; routing
-    // itself must not add to that.
-    check(result.routed <= result.static_files, "routed requests allocate more than static");
+    check(result.routed == 0 && result.static_files == 0, "steady-state requests allocate");
 }

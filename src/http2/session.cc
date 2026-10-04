@@ -380,7 +380,7 @@ auto session::pop_request(request& value) -> bool
 }
 
 auto session::respond(std::uint32_t stream_id, unsigned status,
-                      std::span<const field> headers,
+                      std::span<const http::header> headers,
                       std::vector<std::byte> body) -> bool
 {
     auto* value = find_stream(stream_id);
@@ -392,7 +392,7 @@ auto session::respond(std::uint32_t stream_id, unsigned status,
     value->response_accounted = body.size();
     inline_response_bytes_ += body.size();
     value->response_body = std::move(body);
-    if (!append_response_headers(*value, status, headers, value->response_size == 0)) {
+    if (!append_response_headers(*value, status, headers, {}, value->response_size == 0)) {
         reset_stream(*value);
         return false;
     }
@@ -401,7 +401,7 @@ auto session::respond(std::uint32_t stream_id, unsigned status,
 }
 
 auto session::respond_file(std::uint32_t stream_id, unsigned status,
-                           std::span<const field> headers, unique_fd file,
+                           std::span<const http::header> headers, unique_fd file,
                            std::uint64_t size, bool send_body, std::uint64_t offset) -> bool
 {
     auto* value = find_stream(stream_id);
@@ -410,7 +410,7 @@ auto session::respond_file(std::uint32_t stream_id, unsigned status,
     value->response_offset = 0;
     value->response_file_start = offset;
     if (send_body) value->response_file = std::move(file);
-    if (!append_response_headers(*value, status, headers, value->response_size == 0)) {
+    if (!append_response_headers(*value, status, headers, {}, value->response_size == 0)) {
         reset_stream(*value);
         return false;
     }
@@ -1238,6 +1238,11 @@ auto session::set_release_hook(release_hook hook, void* context) noexcept -> voi
     release_context_ = context;
 }
 
+auto session::recycle_fields(std::vector<field>&& fields) noexcept -> void
+{
+    if (decoded_fields_.capacity() == 0) decoded_fields_.swap(fields);
+}
+
 auto session::pop_routed(routed_request& value) -> bool
 {
     if (routed_.empty()) return false;
@@ -1269,12 +1274,13 @@ auto session::read_body(std::uint32_t stream_id, std::span<std::byte> output,
 }
 
 auto session::start_streamed(std::uint32_t stream_id, unsigned status,
-                             std::span<const field> headers) -> bool
+                             std::span<const http::header> headers,
+                             std::span<const http::header> extra) -> bool
 {
     auto* value = find_stream(stream_id);
     if (value == nullptr || !value->routed || value->response_started || fatal_) return false;
     value->streaming = true;
-    if (!append_response_headers(*value, status, headers, false)) {
+    if (!append_response_headers(*value, status, headers, extra, false)) {
         stream_error(stream_id, internal_error);
         return false;
     }
@@ -1297,14 +1303,15 @@ auto session::chunk_pending(std::uint32_t stream_id) const noexcept -> bool
     return found != streams_.end() && !found->chunk.empty() && !fatal_;
 }
 
-auto session::finish_streamed(std::uint32_t stream_id, std::span<const field> trailers) -> bool
+auto session::finish_streamed(std::uint32_t stream_id, std::span<const http::header> trailers)
+    -> bool
 {
     auto* value = find_stream(stream_id);
     if (value == nullptr || !value->streaming || value->stream_finished ||
         !value->chunk.empty() || fatal_) return false;
     const bool queued = trailers.empty()
         ? append_frame(data_frame, flag_end_stream, stream_id)
-        : append_header_block(*value, trailers, true);
+        : append_header_block(*value, 0, trailers, {}, true);
     if (!queued) {
         stream_error(stream_id, internal_error);
         return false;
@@ -1450,29 +1457,37 @@ auto session::append_frame(std::uint8_t type, std::uint8_t flags,
 }
 
 auto session::append_response_headers(stream& value, unsigned status,
-                                      std::span<const field> headers, bool end_stream) -> bool
+                                      std::span<const http::header> headers,
+                                      std::span<const http::header> extra,
+                                      bool end_stream) -> bool
 {
-    std::array<char, 3> status_text {
-        static_cast<char>('0' + (status / 100) % 10),
-        static_cast<char>('0' + (status / 10) % 10),
-        static_cast<char>('0' + status % 10),
-    };
-    std::vector<field> fields;
-    fields.reserve(headers.size() + 1);
-    fields.push_back(field {":status", std::string(status_text.data(), status_text.size())});
-    fields.insert(fields.end(), headers.begin(), headers.end());
-    if (!append_header_block(value, fields, end_stream)) return false;
+    if (!append_header_block(value, status, headers, extra, end_stream)) return false;
     value.response_started = true;
     return true;
 }
 
-// Encodes fields as HEADERS plus CONTINUATION frames for value.
-auto session::append_header_block(stream& value, std::span<const field> fields,
+// Encodes the fields as HEADERS plus CONTINUATION frames for value. Status 0
+// means no :status (trailers). The encoded block reuses one session buffer.
+auto session::append_header_block(stream& value, unsigned status,
+                                  std::span<const http::header> first_fields,
+                                  std::span<const http::header> second_fields,
                                   bool end_stream) -> bool
 {
-    std::vector<std::byte> block;
-    const auto encoded = hpack_encode(fields, block);
-    if (encoded != hpack_error::none) return false;
+    if (first_fields.size() + second_fields.size() >= hpack_max_fields) return false;
+    auto& block = encoded_block_;
+    block.clear();
+    if (status != 0) {
+        const std::array<char, 3> status_text {
+            static_cast<char>('0' + (status / 100) % 10),
+            static_cast<char>('0' + (status / 10) % 10),
+            static_cast<char>('0' + status % 10),
+        };
+        const std::array<http::header, 1> status_field {{
+            {":status", {status_text.data(), status_text.size()}}}};
+        if (hpack_encode(status_field, block, true) != hpack_error::none) return false;
+    }
+    if (hpack_encode(first_fields, block, true) != hpack_error::none ||
+        hpack_encode(second_fields, block, true) != hpack_error::none) return false;
     const auto frames = (block.size() + max_frame_payload - 1) / max_frame_payload;
     const auto needed = block.size() + 9 * std::max<std::size_t>(frames, 1);
     const auto reserved = file_send_active_ ? file_send_.size : 0;

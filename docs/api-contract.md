@@ -385,12 +385,15 @@ every running connection has sent its close and retired.
     that request's scratch buffer. Request concurrency and refusal follow the
     `http3_server` request capacity below.
   - Steady-state routed requests make no general-heap allocation on a
-    kept-alive HTTP/1.1 connection or on an HTTP/3 connection, including the
-    QUIC stack. `tests/http_routing_allocations.cc` and
-    `tests/http3_routing_allocations.cc` check this. HTTP/2 requests allocate
-    for HPACK field strings and header encoding, routed or static; routed
-    requests allocate no more than static ones, as
-    `tests/http2_routing_allocations.cc` checks.
+    kept-alive HTTP/1.1 connection, on an HTTP/2 connection (TLS included),
+    or on an HTTP/3 connection (QUIC included). Static HTTP/2 and HTTP/3 file
+    requests make none either. HTTP/2 decodes request fields into the
+    connection's existing strings and encodes response fields from views
+    into one reused buffer, so a header value longer than earlier ones on
+    the connection, or a new dynamic-table entry, can still allocate.
+    `tests/http_routing_allocations.cc`,
+    `tests/http2_routing_allocations.cc`, and
+    `tests/http3_routing_allocations.cc` check these paths.
 - `eventloop::http::https_server` advertises `h2` and `http/1.1` with ALPN by
   default. Set `eventloop::http::server_options::enable_http2` to `false` to
   disable HTTP/2. The
