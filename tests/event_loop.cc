@@ -1,6 +1,7 @@
 #include "eventloop/task.h"
 
 #include <atomic>
+#include <pthread.h>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -13,6 +14,7 @@
 #if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
 #include <sys/timerfd.h>
 #endif
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -264,6 +266,36 @@ auto nested_signal_mask_test() -> bool
     sigprocmask(SIG_SETMASK, &original, nullptr);
     return valid;
 }
+
+// While a loop lives on this thread, a write to a closed socket without
+// MSG_NOSIGNAL (as OpenSSL kTLS does) returns EPIPE instead of ending the
+// process. The last loop discards the pending signal and restores the mask.
+auto sigpipe_test() -> bool
+{
+    int sockets[2] {};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == -1) return false;
+    bool written = false;
+    bool still_blocked = false;
+    {
+        auto first = std::make_unique<event_loop>();
+        auto second = std::make_unique<event_loop>();
+        close(sockets[1]);
+        const char byte = 'x';
+        errno = 0;
+        written = ::write(sockets[0], &byte, 1) == -1 && errno == EPIPE;
+        first.reset();
+        sigset_t current {};
+        still_blocked = pthread_sigmask(SIG_SETMASK, nullptr, &current) == 0 &&
+                        sigismember(&current, SIGPIPE) == 1;
+    }
+    close(sockets[0]);
+    sigset_t current {};
+    sigset_t pending {};
+    return written && still_blocked &&
+           pthread_sigmask(SIG_SETMASK, nullptr, &current) == 0 &&
+           sigismember(&current, SIGPIPE) == 0 &&
+           sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE) == 0;
+}
 #endif
 } // namespace
 
@@ -271,6 +303,7 @@ auto main() -> int
 {
 #ifndef _WIN32
     if (!nested_signal_mask_test()) return 1;
+    if (!sigpipe_test()) return 1;
 #endif
     if (!post_tests()) return 1;
     if (!executor_integration_test()) return 1;

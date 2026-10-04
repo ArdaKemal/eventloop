@@ -1,6 +1,6 @@
-#include "eventloop/http/session.h"
+#include "session.h"
 
-#include "eventloop/http/directory_listing.h"
+#include "directory_listing.h"
 #include "eventloop/http/mime_types.h"
 #include "resource.h"
 #include "file_operations.h"
@@ -18,7 +18,7 @@
 #include <string>
 #include <utility>
 
-namespace eventloop::http {
+namespace eventloop::http::detail {
 namespace {
 
 constexpr std::string_view bad_request =
@@ -52,8 +52,10 @@ constexpr std::size_t sendfile_min_size = 11 * 1024;
 
 } // namespace
 
-session::session(native_socket root_descriptor, bool directory_listing) noexcept
-    : root_descriptor_(root_descriptor), directory_listing_(directory_listing)
+session::session(native_socket root_descriptor, bool directory_listing,
+                 route_state* routing, bool static_files) noexcept
+    : root_descriptor_(root_descriptor), routing_(routing),
+      directory_listing_(directory_listing), static_files_(static_files)
 {
 }
 
@@ -81,7 +83,7 @@ auto session::receive(std::span<const std::byte> data) -> void
 {
     if (data.empty() || closed_) return;
     if (data.size() > max_message_size - input_size_) {
-        if (responding_) closed_ = true;
+        if (responding_ || routed_) closed_ = true;
         else send_error(parse_status::payload_too_large);
         return;
     }
@@ -91,7 +93,7 @@ auto session::receive(std::span<const std::byte> data) -> void
     }
     std::memcpy(input_data() + input_size_, data.data(), data.size());
     input_size_ += data.size();
-    if (!responding_) process_requests();
+    process_requests();
 }
 
 auto session::commit_read(std::size_t size) -> void
@@ -102,13 +104,13 @@ auto session::commit_read(std::size_t size) -> void
         return;
     }
     input_size_ += size;
-    if (!responding_) process_requests();
+    process_requests();
 }
 
 auto session::shutdown() -> void
 {
     close_after_response_ = true;
-    if (!responding_) closed_ = true;
+    if (!responding_ && !routed_) closed_ = true;
 }
 
 auto session::response() const noexcept -> std::span<const char>
@@ -121,9 +123,22 @@ auto session::response() const noexcept -> std::span<const char>
 
 auto session::process_requests() -> void
 {
-    if (responding_ || input_size_ == 0) return;
+    if (responding_ || routed_ || closed_ || input_size_ == 0) return;
 
-    request parsed;
+    if (routing_ != nullptr) {
+        auto& head = routing_->request;
+        const auto parsed_head = parse_request_head(
+            std::string_view {input_data(), input_size_}, head);
+        if (parsed_head.status == parse_status::incomplete) return;
+        if (parsed_head.status != parse_status::complete) {
+            request_size_ = 0;
+            send_error(parsed_head.status);
+            return;
+        }
+        if (dispatch_route(parsed_head.consumed)) return;
+    }
+
+    parsed_request parsed;
     const auto result = parse_request(
         std::string_view {input_data(), input_size_}, parsed);
     if (result.status == parse_status::incomplete) return;
@@ -135,6 +150,10 @@ auto session::process_requests() -> void
 
     request_size_ = result.consumed;
     close_after_response_ = parsed.close_after_response;
+    if (!static_files_) {
+        send_static_response(not_found);
+        return;
+    }
     if (parsed.method == method_type::get ||
         parsed.method == method_type::head) {
         serve_resource(parsed, parsed.method == method_type::head);
@@ -143,13 +162,93 @@ auto session::process_requests() -> void
     }
 }
 
-auto session::handle_request(const request& parsed) -> void
+// Runs routing for a parsed head. Returns false when the path has no route
+// and the request continues to static files.
+auto session::dispatch_route(std::size_t head_size) -> bool
+{
+    auto& state = *routing_;
+    const auto& head = state.request;
+    const auto path = head.target.substr(0, head.target.find('?'));
+    state.match = router_access::match(*state.routes, head.method, path);
+    if (state.match.allowed == 0) return false;
+    if (state.match.function == nullptr) {
+        // A routed path without a handler for this method: 204 or 405 with
+        // Allow. A Content-Length body must already be buffered, as for
+        // static requests; a chunked body is left unread and the connection
+        // closes after the answer.
+        if (head.chunked) {
+            request_size_ = head_size;
+            close_after_response_ = true;
+        } else if (head.content_length > max_message_size - head_size) {
+            send_error(parse_status::payload_too_large);
+            return true;
+        } else {
+            if (input_size_ - head_size < head.content_length) return true;
+            request_size_ = head_size + head.content_length;
+            close_after_response_ = head.close_after_response;
+        }
+        std::array<char, 96> allow {};
+        const auto allow_size = format_allow(state.match.allowed, allow);
+        const bool options = head.method == method_type::options;
+        const int size = std::snprintf(state.reply.data(), state.reply.size(),
+            "HTTP/1.1 %s\r\nAllow: %.*s\r\nContent-Length: 0\r\n%s\r\n",
+            options ? "204 No Content" : "405 Method Not Allowed",
+            static_cast<int>(allow_size), allow.data(),
+            close_after_response_ ? "Connection: close\r\n" : "");
+        if (size < 0 || static_cast<std::size_t>(size) >= state.reply.size()) {
+            send_error(parse_status::headers_too_large);
+            return true;
+        }
+        send_static_response({state.reply.data(), static_cast<std::size_t>(size)});
+        return true;
+    }
+    if (head.content_length > state.max_request_body) {
+        send_error(parse_status::payload_too_large);
+        return true;
+    }
+    state.head_size = head_size;
+    state.buffered_consumed = 0;
+    routed_ = true;
+    return true;
+}
+
+auto session::buffered_body() noexcept -> std::span<const std::byte>
+{
+    if (!routed_) return {};
+    const auto& state = *routing_;
+    const auto start = state.head_size + state.buffered_consumed;
+    // A chunked body's end is found by its decoder, so all input is offered.
+    const auto body_end = state.request.chunked
+        ? input_size_ : state.head_size + state.request.content_length;
+    const auto end = std::min<std::size_t>(input_size_, body_end);
+    if (start >= end) return {};
+    return std::as_bytes(std::span {input_data() + start, end - start});
+}
+
+auto session::consume_buffered_body(std::size_t size) noexcept -> void
+{
+    if (routed_) routing_->buffered_consumed += std::min(size, buffered_body().size());
+}
+
+auto session::finish_routed(bool keep_alive) -> void
+{
+    if (!routed_) return;
+    routed_ = false;
+    if (!keep_alive) {
+        closed_ = true;
+        return;
+    }
+    consume_request(routing_->head_size + routing_->buffered_consumed);
+    process_requests();
+}
+
+auto session::handle_request(const parsed_request& parsed) -> void
 {
     if (parsed.method == method_type::options) send_options();
     else send_static_response(method_not_allowed);
 }
 
-auto session::serve_resource(const request& parsed, bool headers_only) -> void
+auto session::serve_resource(const parsed_request& parsed, bool headers_only) -> void
 {
     auto opened = detail::open_resource(root_descriptor_, parsed.target);
     if (!opened && opened.error() == detail::resource_error::target_too_long) {
@@ -203,7 +302,7 @@ auto session::serve_resource(const request& parsed, bool headers_only) -> void
     serve_directory(std::move(descriptor), headers_only);
 }
 
-auto session::serve_file(const request& parsed, unique_fd descriptor, const detail::file_info& info,
+auto session::serve_file(const parsed_request& parsed, unique_fd descriptor, const file_info& info,
                          bool headers_only, std::string_view mime_path) -> void
 {
     if (info.size > (std::numeric_limits<std::size_t>::max)()) {
@@ -448,4 +547,4 @@ auto session::allocate_response(std::size_t size) -> std::span<char>
     return {file_output_.get(), size};
 }
 
-} // namespace eventloop::http
+} // namespace eventloop::http::detail

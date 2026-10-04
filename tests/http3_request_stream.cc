@@ -5,6 +5,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -29,6 +30,7 @@ struct result {
     std::optional<h3_error> error;
     std::size_t blocks {0};
     bool finished {false};
+    std::string body {};
     auto operator==(const result&) const -> bool = default;
 };
 
@@ -49,6 +51,8 @@ auto run(std::span<const std::byte> input, std::optional<std::uint64_t> content_
             if (!event) { r.error = event.error(); break; }
             if (*event == request_frames::event::header_block) {
                 if (r.blocks++ == 0) frames.set_content_length(content_length);
+            } else if (*event == request_frames::event::data) {
+                for (auto byte : frames.data()) r.body.push_back(static_cast<char>(byte));
             }
         }
         if (!r.error && fin) {
@@ -75,7 +79,9 @@ auto framing() -> void
     // HEADERS(2) is the minimal static-only section prefix.
     check(run({0x01, 0x02, 0x00, 0x00}) == result {{}, 1, true}, "headers only");
     check(run({0x01, 0x02, 0x00, 0x00, 0x00, 0x03, 0x61, 0x62, 0x63, 0x01, 0x02, 0x00, 0x00}) ==
-          result {{}, 2, true}, "headers, DATA, trailers");
+          result {{}, 2, true, "abc"}, "headers, DATA, trailers");
+    check(run({0x01, 0x02, 0x00, 0x00, 0x00, 0x02, 0x61, 0x62, 0x00, 0x00, 0x21, 0x01, 0xff,
+               0x00, 0x01, 0x63}).body == "abc", "DATA split by empty and unknown frames");
     check(run({0x21, 0x01, 0xff, 0x01, 0x02, 0x00, 0x00, 0x21, 0x00}) == result {{}, 1, true},
           "unknown frames before and after HEADERS");
     check(run({0x01, 0x00}).blocks == 1, "empty HEADERS payload is delivered");

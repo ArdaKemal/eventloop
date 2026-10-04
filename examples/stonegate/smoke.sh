@@ -126,7 +126,16 @@ body=$(curl --silent --fail --http1.1 --cacert "$work/cert.pem" \
 [[ "$body" == stonegate-ok ]] || { echo 'HTTP/1.1 body mismatch' >&2; exit 1; }
 echo 'HTTP/1.1 redirect and TLS response: PASS'
 
+health=$(curl --silent --fail --http1.1 --cacert "$work/cert.pem" \
+    --resolve "localhost:$https_port:127.0.0.1" "https://localhost:$https_port/healthz")
+[[ "$health" == ok ]] || { echo "unexpected /healthz body: $health" >&2; exit 1; }
+echo 'HTTP/1.1 /healthz route: PASS'
+
 if curl --version | grep -q HTTP2; then
+    health=$(curl --silent --fail --http2 --cacert "$work/cert.pem" \
+        --resolve "localhost:$https_port:127.0.0.1" "https://localhost:$https_port/healthz")
+    [[ "$health" == ok ]] || { echo "unexpected HTTP/2 /healthz body: $health" >&2; exit 1; }
+    echo 'HTTP/2 /healthz route: PASS'
     version=$(curl --silent --fail --http2 --cacert "$work/cert.pem" \
         --resolve "localhost:$https_port:127.0.0.1" \
         --output "$work/h2-body" --write-out '%{http_version}' \
@@ -323,6 +332,10 @@ if curl --version | grep -Eq '(^|[[:space:]])HTTP3([[:space:]]|$)'; then
     check_directory_listing http3 --http3-only
     h3_url="https://localhost:$http3_port/"
     h3_resolve="localhost:$http3_port:127.0.0.1"
+    health=$(curl --silent --show-error --fail --http3-only --max-time 8 \
+        --cacert "$work/cert.pem" --resolve "$h3_resolve" "${h3_url}healthz")
+    [[ "$health" == ok ]] || { echo "unexpected HTTP/3 /healthz body: $health" >&2; exit 1; }
+    echo 'HTTP/3 /healthz route: PASS'
     for round in 1 2 3; do
         get_result=$(curl --silent --show-error --fail --http3-only --max-time 8 \
             --cacert "$work/cert.pem" --resolve "$h3_resolve" \

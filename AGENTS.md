@@ -78,11 +78,16 @@ ownership, and error visibility.
 - WebSocket parsing and outbound framing are bounded and shared across
   transports. Protocol or transport failures close the stream. A full
   recipient in broadcast drops that message without blocking healthy peers.
-- TLS uses OpenSSL 3.5+ with fixed-capacity stream buffers. Do not claim that
-  OpenSSL itself is allocation free.
-- HTTP/1.1, TLS HTTP/2, and HTTP/3 static-file servers use secure resource
-  traversal. Plain HTTP uses `sendfile` for larger files on Linux. HTTP/2 and
-  HTTP/3 support bounded GET, HEAD, and OPTIONS operations.
+- TLS uses OpenSSL 3.5+ with fixed-capacity stream buffers. Steady-state
+  HTTP/2 and HTTP/3 requests are measured to make no OpenSSL allocations,
+  but handshakes allocate inside OpenSSL; do not claim more than that.
+- HTTP/1.1, TLS HTTP/2, and HTTP/3 servers run `http::router` handlers and
+  fall back to static files with secure resource traversal. Plain HTTP uses
+  `sendfile` for larger files on Linux. Static HTTP/2 and HTTP/3 support
+  bounded GET, HEAD, and OPTIONS operations. Routed handler frames must fit
+  their size classes; steady-state routed requests on all three protocols,
+  and static HTTP/2 and HTTP/3 file requests, are measured allocation-free,
+  so keep them that way.
 - QUIC v1/v2 public endpoints, streams, and DATAGRAMs are implemented. The
   Wayfarer and Stonegate examples exercise HTTP/1.1, HTTP/2, and HTTP/3 through
   public APIs. Root HTTP/3 test fixtures and optional aioquic v1/v2 tests are

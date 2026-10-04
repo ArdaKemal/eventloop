@@ -1,0 +1,417 @@
+// Routed HTTP/3 requests: a public quic_endpoint client sends requests to a
+// public http3_server with routes. Request and response framing use the
+// private QPACK and frame codecs; handlers use only the public API.
+#include "eventloop/event_loop.h"
+#include "eventloop/http/http3_server.h"
+#include "eventloop/http/router.h"
+#include "eventloop/quic.h"
+#include "http3/frames.h"
+#include "http3/qpack.h"
+#include "tls_test_certificate.h"
+
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <random>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+using namespace eventloop;
+using namespace std::chrono_literals;
+namespace h3 = eventloop::http3::detail;
+
+namespace {
+
+auto check(bool condition, std::string_view message) -> void
+{
+    if (condition) return;
+    std::cerr << "HTTP/3 routing: " << message << '\n';
+    std::exit(1);
+}
+
+auto text(std::string_view value) -> std::span<const std::byte>
+{
+    return std::as_bytes(std::span(value));
+}
+
+// Handlers, shared in spirit with the HTTP/1.1 routing test.
+auto hello(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    check(request.protocol() == http::protocol::http3, "protocol is HTTP/3");
+    const std::array<http::header, 1> fields {{{"content-type", "text/plain"}}};
+    (void)co_await response.async_send(200, fields, text("hello"));
+}
+
+auto info(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    std::array<char, 256> body {};
+    const auto custom = request.header_value("X-Test").value_or("-");
+    const int size = std::snprintf(body.data(), body.size(), "%.*s|%.*s|%.*s|%.*s",
+        static_cast<int>(request.path().size()), request.path().data(),
+        static_cast<int>(request.query().size()), request.query().data(),
+        static_cast<int>(custom.size()), custom.data(),
+        static_cast<int>(request.authority().size()), request.authority().data());
+    (void)co_await response.async_send(200, {},
+        std::as_bytes(std::span(body.data(), static_cast<std::size_t>(size))));
+}
+
+auto upload(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    std::array<std::byte, 700> chunk {};
+    std::uint64_t count = 0;
+    std::uint64_t sum = 0;
+    for (;;) {
+        auto read = co_await request.async_read_body(chunk);
+        if (!read) co_return;
+        if (!*read) {
+            // Report the read error as the body so the client can see it.
+            const auto message = read->error() == std::make_error_code(std::errc::message_size)
+                ? std::string_view("too large") : std::string_view("bad body");
+            (void)co_await response.async_send(400, {}, text(message));
+            co_return;
+        }
+        if (**read == 0) break;
+        count += **read;
+        for (std::size_t index = 0; index < **read; ++index)
+            sum += std::to_integer<unsigned>(chunk[index]);
+    }
+    std::array<char, 64> body {};
+    const int size = std::snprintf(body.data(), body.size(), "%llu %llu",
+        static_cast<unsigned long long>(count), static_cast<unsigned long long>(sum));
+    (void)co_await response.async_send(200, {},
+        std::as_bytes(std::span(body.data(), static_cast<std::size_t>(size))));
+}
+
+auto partial(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    std::array<std::byte, 10> chunk {};
+    (void)co_await request.async_read_body(chunk);
+    (void)co_await response.async_send(200, {}, text("partial"));
+}
+
+auto stream(event_loop&, http::request&, http::response& response) -> task<void>
+{
+    const std::array<http::header, 1> fields {{{"content-type", "text/plain"}}};
+    if (!co_await response.async_start(200, fields)) co_return;
+    (void)co_await response.async_write(text("abc"));
+    (void)co_await response.async_write(text("defgh"));
+    const std::array<http::header, 1> trailers {{{"x-done", "yes"}}};
+    (void)co_await response.async_finish(trailers);
+}
+
+auto silent(event_loop&, http::request&, http::response&) -> task<void>
+{
+    co_return;
+}
+
+auto short_body(event_loop&, http::request&, http::response& response) -> task<void>
+{
+    const std::array<http::header, 1> fields {{{"content-length", "5"}}};
+    if (!co_await response.async_start(200, fields)) co_return;
+    (void)co_await response.async_write(text("abc"));
+    (void)co_await response.async_finish();
+}
+
+auto file(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    const auto* path = static_cast<const std::string*>(request.route_context());
+    unique_fd descriptor(::open(path->c_str(), O_RDONLY | O_CLOEXEC));
+    (void)co_await response.async_send_file(200, {}, std::move(descriptor), 2, 5);
+}
+
+// --- client side -----------------------------------------------------------
+
+auto headers_frame(std::vector<h3::field> fields) -> std::vector<std::byte>
+{
+    std::vector<std::byte> block(4096);
+    const auto size = h3::qpack_encode(fields, block);
+    check(size.has_value(), "encode field section");
+    block.resize(*size);
+    std::vector<std::byte> frame(block.size() + 16);
+    const auto framed = h3::encode_frame(h3::headers_frame, block, frame);
+    check(framed.has_value(), "frame HEADERS");
+    frame.resize(*framed);
+    return frame;
+}
+
+auto data_frame(std::string_view payload) -> std::vector<std::byte>
+{
+    std::vector<std::byte> output(payload.size() + 16);
+    const auto framed = h3::encode_frame(h3::data_frame, text(payload), output);
+    check(framed.has_value(), "frame DATA");
+    output.resize(*framed);
+    return output;
+}
+
+struct request_spec {
+    std::string method {"GET"};
+    std::string path {"/"};
+    std::vector<std::pair<std::string, std::string>> fields {};
+    std::vector<std::string> body {};  // One DATA frame per entry.
+};
+
+auto encode(const request_spec& spec) -> std::vector<std::byte>
+{
+    std::vector<h3::field> fields {{":method", spec.method}, {":scheme", "https"},
+                                   {":authority", "example.test"}, {":path", spec.path}};
+    for (const auto& [name, value] : spec.fields) fields.push_back({name, value});
+    auto bytes = headers_frame(fields);
+    for (const auto& part : spec.body) {
+        auto frame = data_frame(part);
+        bytes.insert(bytes.end(), frame.begin(), frame.end());
+    }
+    return bytes;
+}
+
+struct response_view {
+    unsigned status {0};
+    std::vector<std::pair<std::string, std::string>> fields {};
+    std::string body {};
+    std::vector<std::pair<std::string, std::string>> trailers {};
+    std::error_code error {};
+
+    [[nodiscard]] auto field(std::string_view name) const -> std::string
+    {
+        for (const auto& [key, value] : fields) if (key == name) return value;
+        return "<none>";
+    }
+};
+
+auto parse_response(std::span<const std::byte> bytes, response_view& view) -> void
+{
+    bool seen_headers = false;
+    while (!bytes.empty()) {
+        const auto frame = h3::decode_frame(bytes, bytes.size());
+        check(frame.has_value(), "decode response frame");
+        if (frame->type == h3::headers_frame) {
+            std::array<h3::field, 32> fields {};
+            std::array<char, 2048> strings {};
+            const auto count = h3::qpack_decode(frame->payload, fields, strings);
+            check(count.has_value(), "decode response section");
+            auto& target = seen_headers ? view.trailers : view.fields;
+            for (std::size_t index = 0; index < *count; ++index) {
+                if (fields[index].name == ":status")
+                    view.status = static_cast<unsigned>(std::stoul(std::string(fields[index].value)));
+                else
+                    target.emplace_back(std::string(fields[index].name),
+                                        std::string(fields[index].value));
+            }
+            seen_headers = true;
+        } else if (frame->type == h3::data_frame) {
+            view.body.append(reinterpret_cast<const char*>(frame->payload.data()),
+                             frame->payload.size());
+        }
+        bytes = bytes.subspan(frame->encoded_size);
+    }
+}
+
+auto send_all(event_loop&, quic_connection& connection, std::uint64_t id,
+              std::span<const std::byte> bytes, bool fin) -> task<bool>
+{
+    while (!bytes.empty()) {
+        const auto sent = flatten_result(co_await connection.async_write(id, bytes, false));
+        if (!sent || *sent == 0) co_return false;
+        bytes = bytes.subspan(*sent);
+    }
+    if (fin && !flatten_result(co_await connection.async_write(id, {}, true))) co_return false;
+    co_return true;
+}
+
+auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::byte> request,
+              response_view& view) -> task<void>
+{
+    const auto id = flatten_result(co_await connection.async_open_stream(
+        quic_stream_direction::bidirectional));
+    check(id.has_value(), "open request stream");
+    (void)co_await send_all(loop, connection, *id, request, true);
+    std::vector<std::byte> bytes;
+    std::array<std::byte, 1024> buffer {};
+    for (;;) {
+        const auto got = flatten_result(co_await connection.async_read(*id, buffer));
+        if (!got) { view.error = got.error(); break; }
+        if (*got == 0) break;
+        bytes.insert(bytes.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*got));
+    }
+    if (!view.error) parse_response(bytes, view);
+}
+
+auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
+            std::vector<std::vector<std::byte>>& requests, std::vector<response_view>& responses,
+            bool& done) -> task<void>
+{
+    auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
+    check(connected.has_value(), "connect");
+    auto connection = std::move(*connected);
+    const auto control = flatten_result(co_await connection.async_open_stream(
+        quic_stream_direction::unidirectional));
+    const std::array<std::byte, 3> settings {std::byte {0}, std::byte {4}, std::byte {0}};
+    check(control && (co_await send_all(loop, connection, *control, settings, false))
+              .value_or(false), "client control stream");
+    for (std::size_t index = 0; index < requests.size(); ++index)
+        (void)co_await exchange(loop, connection, std::move(requests[index]), responses[index]);
+    done = true;
+}
+
+auto watch(event_loop& loop, http::http3_server& server, quic_endpoint& endpoint,
+           bool& done) -> task<void>
+{
+    for (int i = 0; i < 2000 && !done; ++i) (void)co_await sleep_for(loop, 5ms);
+    co_await server.async_close();
+    co_await endpoint.async_close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto serve(const std::filesystem::path& directory, http::server_options options,
+           std::vector<request_spec> specs) -> std::vector<response_view>
+{
+    std::vector<std::vector<std::byte>> requests;
+    for (const auto& spec : specs) requests.push_back(encode(spec));
+    std::vector<response_view> responses(requests.size());
+    bool done = false;
+    {
+        event_loop loop;
+        http::http3_server server(loop, ip_endpoint::loopback_v4(0),
+            directory / "cert.pem", directory / "key.pem", std::move(options));
+        quic_client_options client_options;
+        constexpr std::array<std::uint8_t, 2> alpn {'h', '3'};
+        client_options.alpn = alpn;
+        client_options.trusted_ca = directory / "cert.pem";
+        quic_endpoint endpoint(loop, ip_endpoint::loopback_v4(0), std::move(client_options));
+        task_handle<void> serving;
+        check(loop.spawn(server.run(), serving) == task_spawn_result::accepted, "spawn server");
+        check(loop.spawn(client(loop, endpoint, server.local_endpoint(), requests, responses,
+                                done)) == task_spawn_result::accepted, "spawn client");
+        check(loop.spawn(watch(loop, server, endpoint, done)) == task_spawn_result::accepted,
+              "spawn watch");
+        (void)loop.run();
+    }
+    check(done, "requests did not complete");
+    return responses;
+}
+
+class temporary_directory {
+public:
+    temporary_directory()
+    {
+        std::random_device random;
+        path_ = std::filesystem::temp_directory_path() /
+            ("eventloop-h3-routing-" + std::to_string(random()));
+        std::filesystem::create_directories(path_ / "www");
+    }
+    ~temporary_directory()
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(path_, ignored);
+    }
+    temporary_directory(const temporary_directory&) = delete;
+    auto operator=(const temporary_directory&) -> temporary_directory& = delete;
+    [[nodiscard]] auto path() const -> const std::filesystem::path& { return path_; }
+
+private:
+    std::filesystem::path path_;
+};
+
+} // namespace
+
+auto main() -> int
+{
+    temporary_directory directory;
+    test::make_localhost_certificate(directory.path() / "cert.pem", directory.path() / "key.pem");
+    std::ofstream(directory.path() / "www" / "index.html") << "static";
+    std::ofstream(directory.path() / "www" / "data.txt") << "0123456789";
+    const auto file_path = (directory.path() / "www" / "data.txt").string();
+
+    auto routes = std::make_shared<http::router>();
+    check(routes->add(http::method_type::get, "/hello", hello).has_value() &&
+          routes->add_prefix(http::method_type::get, "/api/", info).has_value() &&
+          routes->add(http::method_type::post, "/upload", upload).has_value() &&
+          routes->add(http::method_type::post, "/partial", partial).has_value() &&
+          routes->add(http::method_type::get, "/stream", stream).has_value() &&
+          routes->add(http::method_type::get, "/silent", silent).has_value() &&
+          routes->add(http::method_type::get, "/short", short_body).has_value() &&
+          routes->add(http::method_type::get, "/file", file,
+                      const_cast<std::string*>(&file_path)).has_value(),
+          "register routes");
+
+    std::string large(10000, '\0');
+    std::uint64_t large_sum = 0;
+    for (std::size_t index = 0; index < large.size(); ++index) {
+        large[index] = static_cast<char>('a' + index % 26);
+        large_sum += static_cast<unsigned char>(large[index]);
+    }
+    const auto length = [](std::size_t size) {
+        return std::pair<std::string, std::string> {"content-length", std::to_string(size)};
+    };
+
+    const auto responses = serve(directory.path(),
+        {.routes = routes, .document_root = directory.path() / "www",
+         .max_request_body = 20000, .connection_capacity = 1, .request_capacity = 2},
+        {
+            {.path = "/hello"},
+            {.method = "HEAD", .path = "/hello"},
+            {.method = "OPTIONS", .path = "/hello"},
+            {.method = "POST", .path = "/hello"},
+            {.path = "/api/items?id=7", .fields = {{"x-test", "seen"}}},
+            {.method = "POST", .path = "/upload", .fields = {length(large.size())},
+             .body = {large.substr(0, 3000), large.substr(3000, 2), large.substr(3002)}},
+            {.method = "POST", .path = "/upload", .body = {"no", "-length"}},
+            {.path = "/stream"},
+            {.path = "/silent"},
+            {.path = "/short"},
+            {.path = "/file"},
+            {.path = "/"},
+            {.method = "POST", .path = "/upload", .fields = {length(20001)}},
+            {.method = "POST", .path = "/upload", .body = {std::string(20001, 'x')}},
+            {.method = "POST", .path = "/partial", .fields = {length(5000)},
+             .body = {std::string(5000, 'p')}},
+            {.path = "/hello"},
+        });
+
+    const auto& hello_response = responses[0];
+    check(hello_response.status == 200 && hello_response.body == "hello" &&
+          hello_response.field("content-type") == "text/plain" &&
+          hello_response.field("content-length") == "5" &&
+          hello_response.field("date") != "<none>", "exact route");
+    check(responses[1].status == 200 && responses[1].body.empty() &&
+          responses[1].field("content-length") == "5", "HEAD runs GET without body");
+    check(responses[2].status == 204 && responses[2].field("allow") == "GET, HEAD, OPTIONS",
+          "OPTIONS lists methods");
+    check(responses[3].status == 405 && responses[3].field("allow") == "GET, HEAD, OPTIONS",
+          "wrong method");
+    check(responses[4].body == "/api/items|id=7|seen|example.test", "prefix route");
+    check(responses[5].body == "10000 " + std::to_string(large_sum), "streamed request body");
+    std::uint64_t unframed_sum = 0;
+    for (const char c : std::string_view("no-length")) unframed_sum += static_cast<unsigned char>(c);
+    check(responses[6].body == "9 " + std::to_string(unframed_sum), "body without content-length");
+    check(responses[7].status == 200 && responses[7].body == "abcdefgh" &&
+          responses[7].field("content-length") == "<none>" &&
+          responses[7].trailers.size() == 1 && responses[7].trailers[0].first == "x-done",
+          "streamed response with trailers");
+    check(responses[8].status == 500, "handler without response");
+    check(responses[9].error == make_error_code(quic_errc::stream_reset),
+          "short body resets the stream");
+    check(responses[10].status == 200 && responses[10].body == "23456", "file range");
+    check(responses[11].status == 200 && responses[11].body == "static", "static fallback");
+    check(responses[12].status == 413, "declared body above max_request_body");
+    check(responses[13].status == 400 && responses[13].body == "too large",
+          "streamed body above max_request_body");
+    check(responses[14].body == "partial", "unread body stopped");
+    check(responses[15].body == "hello", "connection survives");
+
+    // Routes only: unmatched paths answer 404.
+    const auto routed_only = serve(directory.path(), {.routes = routes},
+                                   {{.path = "/index.html"}, {.path = "/hello"}});
+    check(routed_only[0].status == 404 && routed_only[1].body == "hello",
+          "routes without document root");
+}

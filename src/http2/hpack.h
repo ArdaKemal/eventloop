@@ -1,5 +1,7 @@
 #pragma once
 
+#include "eventloop/http/request.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -44,7 +46,13 @@ private:
 };
 
 // Stateless response encoder: literal fields, no indexing or Huffman coding.
+// Replaces output, or with append adds to it; the field limits then count
+// the whole block. Reusing output keeps its capacity.
 [[nodiscard]] auto hpack_encode(std::span<const field> fields,
-                                std::vector<std::byte>& output) -> hpack_error;
+                                std::vector<std::byte>& output,
+                                bool append = false) -> hpack_error;
+[[nodiscard]] auto hpack_encode(std::span<const http::header> fields,
+                                std::vector<std::byte>& output,
+                                bool append = false) -> hpack_error;
 
 } // namespace eventloop::http2::detail

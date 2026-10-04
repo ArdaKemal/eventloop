@@ -42,8 +42,8 @@ auto serve(std::uint16_t port, const char* root, bool reuse_port) -> void
 {
     event_loop loop;
     auto server = std::make_unique<http::server>(
-        loop, port, root, "127.0.0.1",
-        http::server_options {.reuse_port = reuse_port});
+        loop, ip_endpoint::loopback_v4(port),
+        http::server_options {.document_root = root, .reuse_port = reuse_port});
     auto* active = server.get();
     loop.add(std::move(server));
     if (loop.spawn(active->run()) != task_spawn_result::accepted) {

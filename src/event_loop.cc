@@ -8,6 +8,10 @@
 #include "eventloop/task.h"
 
 #include "executor/bounded_task_queue.h"
+#ifndef _WIN32
+#include <pthread.h>
+#include <signal.h>
+#endif
 #ifdef _WIN32
 #include "windows/iocp_loop.h"
 #elif defined(__APPLE__)
@@ -47,6 +51,51 @@
 namespace eventloop {
 
 namespace {
+
+#ifndef _WIN32
+// Blocks SIGPIPE in the owning thread while any event loop lives there.
+// Socket writes that cannot pass MSG_NOSIGNAL (OpenSSL kTLS write() and
+// sendfile()) then fail with EPIPE instead of killing the process. The last
+// loop on the thread discards a pending SIGPIPE and restores the mask.
+class sigpipe_block {
+public:
+    sigpipe_block() noexcept
+    {
+        if (depth++ != 0) return;
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGPIPE);
+        sigset_t previous;
+        blocked = pthread_sigmask(SIG_BLOCK, &set, &previous) == 0 &&
+                  sigismember(&previous, SIGPIPE) == 0;
+    }
+    ~sigpipe_block()
+    {
+        if (--depth != 0 || !blocked) return;
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGPIPE);
+        sigset_t pending;
+        int signal = 0;
+        while (sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE) == 1 &&
+               sigwait(&set, &signal) == 0) {}
+        (void)pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+        blocked = false;
+    }
+    sigpipe_block(const sigpipe_block&) = delete;
+    auto operator=(const sigpipe_block&) -> sigpipe_block& = delete;
+
+private:
+    // Per thread: the number of live loops and whether the first one blocked.
+    static thread_local std::size_t depth;
+    static thread_local bool blocked;
+};
+thread_local std::size_t sigpipe_block::depth = 0;
+thread_local bool sigpipe_block::blocked = false;
+#else
+struct sigpipe_block {};
+#endif
+
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
 constexpr std::size_t max_timers_per_iteration = 64;
 #if defined(_WIN32) || defined(__APPLE__)
@@ -754,6 +803,9 @@ public:
 
     using timer_key = std::pair<event_loop::clock::time_point,
                                 std::uint64_t>;
+    // First member: blocks SIGPIPE before any socket exists and restores the
+    // mask after every socket and worker is gone.
+    [[no_unique_address]] sigpipe_block sigpipe;
     coroutine_frame_pool coroutine_frames;
 #ifdef _WIN32
     iocp_loop poller;

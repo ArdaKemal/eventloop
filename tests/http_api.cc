@@ -144,8 +144,9 @@ auto watchdog(event_loop& loop, bool& timed_out) -> task<void>
                                 http::server_options options = {}) -> std::string
 {
     event_loop loop;
+    options.document_root = root;
     auto listener = std::make_unique<http::server>(
-        loop, 0, root.string(), "127.0.0.1", options);
+        loop, ip_endpoint::loopback_v4(0), options);
     auto* server = listener.get();
     const auto port = listener_port(*server);
     auto client = std::make_unique<tcp_stream>(loop, ip_endpoint::loopback_v4(port));
@@ -369,8 +370,8 @@ auto h2_request_client(event_loop& loop, tls_stream& peer,
     auto client_context = tls_context::make_client(certificate);
     event_loop loop;
     auto listener = std::make_unique<http::https_server>(
-        loop, 0, std::move(server_context), root.string(), "127.0.0.1",
-        http::server_options {.enable_http2 = true});
+        loop, ip_endpoint::loopback_v4(0), std::move(server_context),
+        http::server_options {.document_root = root, .enable_http2 = true});
     auto* server = listener.get();
     const auto port = listener_port(*server);
     auto client = std::make_unique<tls_stream>(
@@ -456,8 +457,8 @@ auto check_h2_response(std::string_view response, std::string_view expected_body
     auto client_context = tls_context::make_client(certificate);
     event_loop loop;
     auto listener = std::make_unique<http::https_server>(
-        loop, 0, std::move(server_context), root.string(), "127.0.0.1",
-        http::server_options {.enable_http2 = false});
+        loop, ip_endpoint::loopback_v4(0), std::move(server_context),
+        http::server_options {.document_root = root, .enable_http2 = false});
     auto* server = listener.get();
     const auto port = listener_port(*server);
     auto client = std::make_unique<tls_stream>(

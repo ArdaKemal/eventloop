@@ -287,8 +287,9 @@ auto main() -> int
     {
         event_loop loop;
         http::http3_server server(loop, ip_endpoint::loopback_v4(0),
-            (directory / "www").string(), directory / "cert.pem", directory / "key.pem",
-            false, 1, 1);
+            directory / "cert.pem", directory / "key.pem",
+            http::server_options {.document_root = directory / "www",
+                                  .connection_capacity = 1, .request_capacity = 1});
         quic_client_options options;
         options.alpn = alpn;
         options.trusted_ca = directory / "cert.pem";

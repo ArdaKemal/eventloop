@@ -4,7 +4,9 @@
 #include "../http2/connection.h"
 #endif
 #include "file_operations.h"
-#include "eventloop/http/session.h"
+#include "http1_exchange.h"
+#include "parser.h"
+#include "session.h"
 #include "eventloop/tcp_stream.h"
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 #include "eventloop/tls_stream.h"
@@ -26,6 +28,35 @@
 
 namespace eventloop::http {
 namespace {
+
+using detail::max_message_size;
+using detail::parse_request;
+using detail::parse_status;
+
+// The options a connection task needs, kept small because they live in its
+// coroutine frame for the whole connection.
+struct connection_options {
+    std::shared_ptr<const router> routes;
+    std::uint64_t max_request_body {0};
+    bool directory_listing {false};
+    bool enable_http2 {false};
+};
+
+[[nodiscard]] auto for_connection(const server_options& options) -> connection_options
+{
+    return {options.routes, options.max_request_body, options.directory_listing,
+            options.enable_http2};
+}
+
+// An empty document root means routes only; static requests answer 404.
+[[nodiscard]] auto open_document_root(const server_options& options)
+    -> std::shared_ptr<unique_fd>
+{
+    if (!options.routes && options.document_root.empty())
+        throw std::invalid_argument("server needs routes or a document root");
+    if (options.document_root.empty()) return std::make_shared<unique_fd>();
+    return std::make_shared<unique_fd>(detail::open_root(options.document_root.string()));
+}
 
 auto validate_hostname(std::string_view hostname) -> void
 {
@@ -70,7 +101,7 @@ template<typename T>
 template<typename Stream>
 [[nodiscard]] auto serve_connection(event_loop& loop, unique_fd descriptor,
                                     std::shared_ptr<unique_fd> root,
-                                    server_options options,
+                                    connection_options options,
                                     std::shared_ptr<tls_context> context)
     -> task<void>
 {
@@ -105,7 +136,8 @@ template<typename Stream>
             }
             if (options.enable_http2 && peer->application_protocol() == "h2") {
                 const auto served = co_await http2::detail::serve(
-                    loop, *peer, root, options.directory_listing);
+                    loop, *peer, root, options.directory_listing, options.routes,
+                    options.max_request_body);
                 if (served && *served) {
                     const auto closed = co_await peer->async_close();
                     (void)closed;
@@ -116,11 +148,24 @@ template<typename Stream>
         }
 #endif
 
-        // The parser and I/O buffers live outside the bounded coroutine frame.
-        auto state = std::make_unique<session>(root->get(), options.directory_listing);
+        // The parser, routing state and I/O buffers live outside the bounded
+        // coroutine frame, allocated once per connection.
+        std::unique_ptr<detail::route_state> routing;
+        if (options.routes) {
+            routing = std::make_unique<detail::route_state>();
+            routing->routes = options.routes.get();
+            routing->max_request_body = options.max_request_body;
+        }
+        auto state = std::make_unique<detail::session>(root->get(), options.directory_listing,
+                                                       routing.get(), static_cast<bool>(*root));
+        std::unique_ptr<detail::http1_exchange<Stream>> exchange;
+        if (routing) {
+            exchange = std::make_unique<detail::http1_exchange<Stream>>(
+                loop, *peer, *state, *routing);
+        }
         std::unique_ptr<std::byte[]> tls_file_buffer;
         while (!state->closed()) {
-            while (!state->has_response() && !state->closed()) {
+            while (!state->has_response() && !state->routed() && !state->closed()) {
                 auto buffer = state->read_space();
                 if (buffer.empty()) {
                     constexpr std::byte excess {0};
@@ -135,6 +180,11 @@ template<typename Stream>
                 state->commit_read(*received);
             }
             if (state->closed()) break;
+            if (state->routed()) {
+                const auto kept = co_await detail::http1_exchange<Stream>::serve(loop, *exchange);
+                state->finish_routed(kept && *kept);
+                continue;
+            }
             if (!state->has_response()) continue;
 
             auto response = std::as_bytes(state->response());
@@ -253,7 +303,7 @@ struct redirect_state {
         std::span<const std::byte> response;
         for (;;) {
             {
-                request request;
+                detail::parsed_request request;
                 const auto parsed = parse_request(
                     std::string_view {state->input.data(), state->input_size}, request);
                 if (parsed.status == parse_status::complete) {
@@ -310,11 +360,10 @@ struct redirect_state {
 
 } // namespace
 
-server::server(event_loop& loop, std::uint16_t port, std::string_view root,
-               std::string_view address, server_options options)
-    : tcp_acceptor(loop, ip_endpoint::parse(address, port), options.reuse_port), options_(options)
+server::server(event_loop& loop, ip_endpoint local, server_options options)
+    : tcp_acceptor(loop, local, options.reuse_port),
+      root_descriptor_(open_document_root(options)), options_(std::move(options))
 {
-    root_descriptor_ = std::make_shared<unique_fd>(detail::open_root(root));
 }
 
 server::~server() = default;
@@ -330,7 +379,7 @@ auto server::accept_loop(event_loop& loop, server& listener,
 {
     while (auto accepted = co_await listener.async_accept()) {
         const auto result = loop.spawn(serve_connection<tcp_stream>(
-            loop, std::move(*accepted), root, options, {}));
+            loop, std::move(*accepted), root, for_connection(options), {}));
         if (result != task_spawn_result::accepted) {
             // Frame allocation can fail before the descriptor is moved into
             // the task. Close it here in that case (and for any other
@@ -341,13 +390,11 @@ auto server::accept_loop(event_loop& loop, server& listener,
 }
 
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
-https_server::https_server(event_loop& loop, std::uint16_t port,
-                           std::shared_ptr<tls_context> context,
-                           std::string_view root, std::string_view address,
-                           server_options options)
-    : tcp_acceptor(loop, ip_endpoint::parse(address, port), options.reuse_port),
-      root_descriptor_(std::make_shared<unique_fd>(detail::open_root(root))),
-      context_(std::move(context)), options_(options)
+https_server::https_server(event_loop& loop, ip_endpoint local,
+                           std::shared_ptr<tls_context> context, server_options options)
+    : tcp_acceptor(loop, local, options.reuse_port),
+      root_descriptor_(open_document_root(options)),
+      context_(std::move(context)), options_(std::move(options))
 {
     if (!context_) throw std::invalid_argument("HTTPS context is required");
 }
@@ -366,17 +413,15 @@ auto https_server::accept_loop(event_loop& loop, https_server& listener,
 {
     while (auto accepted = co_await listener.async_accept()) {
         const auto result = loop.spawn(serve_connection<tls_stream>(
-            loop, std::move(*accepted), root, options, context));
+            loop, std::move(*accepted), root, for_connection(options), context));
         if (result != task_spawn_result::accepted) accepted->reset();
     }
 }
 #endif
 
-redirect_server::redirect_server(event_loop& loop, std::uint16_t port,
-                                 std::string_view hostname,
-                                 std::uint16_t https_port,
-                                 std::string_view address)
-    : tcp_acceptor(loop, ip_endpoint::parse(address, port)), https_port_(https_port)
+redirect_server::redirect_server(event_loop& loop, ip_endpoint local,
+                                 std::string_view hostname, std::uint16_t https_port)
+    : tcp_acceptor(loop, local), https_port_(https_port)
 {
     validate_hostname(hostname);
     hostname_ = std::make_shared<const std::string>(hostname);

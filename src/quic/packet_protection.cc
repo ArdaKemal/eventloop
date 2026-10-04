@@ -63,40 +63,71 @@ auto valid_retry_prefix(std::uint32_t version,
            packet.size() - source_length_offset - 1;
 }
 
-using kdf_algorithm = std::unique_ptr<EVP_KDF, decltype(&EVP_KDF_free)>;
-using kdf_context = std::unique_ptr<EVP_KDF_CTX, decltype(&EVP_KDF_CTX_free)>;
 using cipher_context = std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)>;
 
+// HMAC-SHA256 with the algorithm and digest fetched once per thread. Each
+// call only re-keys the context, which avoids OpenSSL's per-derivation KDF
+// context, digest fetch and HMAC context allocations.
+class hmac_sha256 {
+public:
+    hmac_sha256() noexcept
+    {
+        EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+        if (mac == nullptr) return;
+        context_ = EVP_MAC_CTX_new(mac);
+        EVP_MAC_free(mac);
+        char digest[] = "SHA256";
+        const std::array params {
+            OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
+            OSSL_PARAM_construct_end(),
+        };
+        if (context_ != nullptr && EVP_MAC_CTX_set_params(context_, params.data()) <= 0) {
+            EVP_MAC_CTX_free(context_);
+            context_ = nullptr;
+        }
+    }
+    ~hmac_sha256() { EVP_MAC_CTX_free(context_); }
+    hmac_sha256(const hmac_sha256&) = delete;
+    auto operator=(const hmac_sha256&) -> hmac_sha256& = delete;
+
+    // HMAC(key, first || second) into output.
+    [[nodiscard]] auto compute(std::span<const std::uint8_t> key,
+                               std::span<const std::uint8_t> first,
+                               std::span<const std::uint8_t> second,
+                               std::array<std::uint8_t, 32>& output) noexcept -> bool
+    {
+        std::size_t written = 0;
+        return context_ != nullptr && !key.empty() &&
+               EVP_MAC_init(context_, key.data(), key.size(), nullptr) > 0 &&
+               EVP_MAC_update(context_, first.data(), first.size()) > 0 &&
+               EVP_MAC_update(context_, second.data(), second.size()) > 0 &&
+               EVP_MAC_final(context_, output.data(), &written, output.size()) > 0 &&
+               written == output.size();
+    }
+
+private:
+    EVP_MAC_CTX* context_ {nullptr};
+};
+
+// HKDF (RFC 5869) with SHA-256. Extract takes the input keying material as
+// key; expand produces at most one 32-byte block, which covers every QUIC
+// secret, key, IV and header-protection key.
 auto hkdf(std::span<const std::uint8_t> key,
           std::span<const std::uint8_t> salt,
           std::span<const std::uint8_t> info,
           int mode, std::span<std::uint8_t> output) -> bool
 {
-    kdf_algorithm algorithm(EVP_KDF_fetch(nullptr, "HKDF", nullptr), EVP_KDF_free);
-    if (!algorithm) {
-        return false;
+    thread_local hmac_sha256 hmac;
+    std::array<std::uint8_t, 32> block {};
+    if (mode == EVP_KDF_HKDF_MODE_EXTRACT_ONLY) {
+        if (output.size() != block.size() || !hmac.compute(salt, key, {}, block)) return false;
+    } else {
+        constexpr std::array<std::uint8_t, 1> counter {1};
+        if (output.size() > block.size() || !hmac.compute(key, info, counter, block)) return false;
     }
-    kdf_context ctx(EVP_KDF_CTX_new(algorithm.get()), EVP_KDF_CTX_free);
-    char digest[] = "SHA256";
-    std::uint8_t empty_key = 0;
-    // OpenSSL's parameter builder takes mutable pointers but does not modify
-    // these octet strings during derivation.
-    std::array params {
-        OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, 0),
-        OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode),
-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY,
-            key.empty() ? &empty_key : const_cast<std::uint8_t*>(key.data()),
-            key.size()),
-        OSSL_PARAM_construct_octet_string(
-            mode == EVP_KDF_HKDF_MODE_EXTRACT_ONLY
-                ? OSSL_KDF_PARAM_SALT : OSSL_KDF_PARAM_INFO,
-            const_cast<std::uint8_t*>(mode == EVP_KDF_HKDF_MODE_EXTRACT_ONLY
-                ? salt.data() : info.data()),
-            mode == EVP_KDF_HKDF_MODE_EXTRACT_ONLY ? salt.size() : info.size()),
-        OSSL_PARAM_construct_end(),
-    };
-    return ctx && EVP_KDF_derive(ctx.get(), output.data(), output.size(),
-                                  params.data()) > 0;
+    std::copy_n(block.begin(), output.size(), output.begin());
+    std::fill(block.begin(), block.end(), std::uint8_t {0});
+    return true;
 }
 
 auto cipher() -> cipher_context

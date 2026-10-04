@@ -2,7 +2,7 @@
 
 #include "eventloop/native_socket.h"
 #include "eventloop/unique_fd.h"
-#include "eventloop/http/directory_listing.h"
+#include "directory_listing.h"
 
 #include <cstddef>
 #include <cstdint>
