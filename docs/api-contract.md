@@ -393,7 +393,13 @@ every running connection has sent its close and retired.
     the connection, or a new dynamic-table entry, can still allocate.
     `tests/http_routing_allocations.cc`,
     `tests/http2_routing_allocations.cc`, and
-    `tests/http3_routing_allocations.cc` check these paths.
+    `tests/http3_routing_allocations.cc` check these paths. The HTTP/2 and
+    HTTP/3 tests also count OpenSSL's own allocations through its allocator
+    hook, and those are zero per request too. TLS and QUIC handshakes do
+    allocate inside OpenSSL, for key exchange, transcript hashing, and the key
+    schedule, on every new connection. QUIC packet-protection keys are derived
+    with one per-thread HMAC-SHA256 context instead of an OpenSSL KDF context
+    per derivation.
 - `eventloop::http::https_server` advertises `h2` and `http/1.1` with ALPN by
   default. Set `eventloop::http::server_options::enable_http2` to `false` to
   disable HTTP/2. The

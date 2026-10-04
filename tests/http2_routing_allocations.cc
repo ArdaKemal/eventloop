@@ -3,7 +3,8 @@
 // reuses pre-encoded frames and fixed buffers, so the counts cover the server,
 // TLS, and the loop. Requests carry header values longer than the small-string
 // buffer, as browsers do, so HPACK decoding must reuse string capacity.
-// Steady-state requests must not allocate.
+// OpenSSL's own allocations are counted separately through its allocator
+// hook. Steady-state requests must not allocate in either.
 #include "eventloop/event_loop.h"
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
@@ -11,6 +12,7 @@
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
 #include "http2/hpack.h"
+#include "openssl_allocation_counter.h"
 #include "tls_test_certificate.h"
 
 #include <array>
@@ -128,6 +130,8 @@ auto write_all(event_loop&, tls_stream& peer, std::span<const std::byte> bytes) 
 struct measurement {
     std::size_t routed {0};
     std::size_t static_files {0};
+    std::size_t routed_openssl {0};
+    std::size_t static_openssl {0};
     std::size_t requests {0};
     bool done {false};
 };
@@ -213,14 +217,20 @@ auto client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> c
     constexpr std::size_t measured = 40;
     for (int phase = 0; phase < 2; ++phase) {
         std::size_t before = 0;
+        std::size_t openssl_before = 0;
         for (std::size_t index = 0; index < warmup + measured; ++index) {
-            if (index == warmup) before = allocations.load();
+            if (index == warmup) {
+                before = allocations.load();
+                openssl_before = test::openssl_allocations.load();
+            }
             const auto& request = phase == 1 ? requests[2] : requests[index % 2];
             check((co_await round_trip(loop, *peer, request, stream_id, *buffers)).value_or(false),
                   "request failed");
             stream_id += 2;
         }
         (phase == 0 ? result.routed : result.static_files) = allocations.load() - before;
+        (phase == 0 ? result.routed_openssl : result.static_openssl) =
+            test::openssl_allocations.load() - openssl_before;
     }
     result.requests = measured;
     result.done = true;
@@ -240,6 +250,7 @@ auto watchdog(event_loop& loop, bool& timed_out) -> task<void>
 
 auto main() -> int
 {
+    check(test::install_openssl_allocation_counter(), "install OpenSSL allocation counter");
     std::random_device random;
     const auto directory = std::filesystem::temp_directory_path() /
         ("eventloop-h2-allocations-" + std::to_string(random()));
@@ -285,7 +296,14 @@ auto main() -> int
     }
     std::filesystem::remove_all(directory);
     check(result.done, "requests did not complete");
+    // Setup (keys, handshake, certificate) allocates, proving the hook counts.
+    check(test::openssl_allocations.load() > 0, "OpenSSL allocation counter is not active");
+    std::cout << "OpenSSL allocations in total, including setup: "
+              << test::openssl_allocations.load() << '\n';
     std::cout << "HTTP/2 allocations over " << result.requests << " requests: routed "
-              << result.routed << ", static " << result.static_files << '\n';
-    check(result.routed == 0 && result.static_files == 0, "steady-state requests allocate");
+              << result.routed << ", static " << result.static_files << "; OpenSSL routed "
+              << result.routed_openssl << ", static " << result.static_openssl << '\n';
+    check(result.routed == 0 && result.static_files == 0 &&
+          result.routed_openssl == 0 && result.static_openssl == 0,
+          "steady-state requests allocate");
 }

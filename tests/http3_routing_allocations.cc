@@ -1,13 +1,15 @@
 // Counts general-heap allocations while one HTTP/3 connection serves routed
-// GET and POST requests, and, for comparison, static file GETs. Requests are
-// encoded before measuring and the client reads into fixed buffers, so the
-// count covers the server, the QUIC stack on both sides, and the loop.
+// GET and POST requests and static file GETs. Requests are encoded before
+// measuring and the client reads into fixed buffers, so the count covers the
+// server, the QUIC stack on both sides, and the loop. OpenSSL's own
+// allocations are counted separately through its allocator hook.
 #include "eventloop/event_loop.h"
 #include "eventloop/http/http3_server.h"
 #include "eventloop/http/router.h"
 #include "eventloop/quic.h"
 #include "http3/frames.h"
 #include "http3/qpack.h"
+#include "openssl_allocation_counter.h"
 #include "tls_test_certificate.h"
 
 #include <array>
@@ -107,6 +109,8 @@ auto encode(std::string_view method, std::string_view path, std::string_view bod
 struct measurement {
     std::size_t routed {0};
     std::size_t static_files {0};
+    std::size_t routed_openssl {0};
+    std::size_t static_openssl {0};
     std::size_t requests {0};
     bool done {false};
 };
@@ -151,14 +155,20 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
     // Phase 0 alternates routed GET and POST; phase 1 repeats a static GET.
     for (int phase = 0; phase < 2; ++phase) {
         std::size_t before = 0;
+        std::size_t openssl_before = 0;
         for (std::size_t index = 0; index < warmup + measured; ++index) {
-            if (index == warmup) before = allocations.load();
+            if (index == warmup) {
+                before = allocations.load();
+                openssl_before = test::openssl_allocations.load();
+            }
             const auto& request = phase == 1 ? requests[2] : requests[index % 2];
             if (!(co_await round_trip(loop, connection, request, buffer)).value_or(false)) {
                 check(false, "request failed");
             }
         }
         (phase == 0 ? result.routed : result.static_files) = allocations.load() - before;
+        (phase == 0 ? result.routed_openssl : result.static_openssl) =
+            test::openssl_allocations.load() - openssl_before;
     }
     result.requests = measured;
     result.done = true;
@@ -177,6 +187,7 @@ auto watch(event_loop& loop, http::http3_server& server, quic_endpoint& endpoint
 
 auto main() -> int
 {
+    check(test::install_openssl_allocation_counter(), "install OpenSSL allocation counter");
     std::random_device random;
     const auto directory = std::filesystem::temp_directory_path() /
         ("eventloop-h3-allocations-" + std::to_string(random()));
@@ -216,7 +227,13 @@ auto main() -> int
     }
     std::filesystem::remove_all(directory);
     check(result.done, "requests did not complete");
+    // Setup (keys, handshake, certificate) allocates, proving the hook counts.
+    check(test::openssl_allocations.load() > 0, "OpenSSL allocation counter is not active");
+    std::cout << "OpenSSL allocations in total, including setup: "
+              << test::openssl_allocations.load() << '\n';
     std::cout << "HTTP/3 allocations over " << result.requests << " requests: routed "
-              << result.routed << ", static " << result.static_files << '\n';
-    if (result.routed != 0) return 1;
+              << result.routed << ", static " << result.static_files << "; OpenSSL routed "
+              << result.routed_openssl << ", static " << result.static_openssl << '\n';
+    if (result.routed != 0 || result.static_files != 0 || result.routed_openssl != 0 ||
+        result.static_openssl != 0) return 1;
 }
