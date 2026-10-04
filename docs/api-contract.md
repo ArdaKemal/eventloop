@@ -284,9 +284,9 @@ every running connection has sent its close and retired.
   calls remain synchronous; large plain HTTP files use `sendfile`. Preserve
   the component-by-component `O_NOFOLLOW` path walk.
 - Include `eventloop/http/router.h` to route requests to handlers. Routing
-  currently runs on HTTP/1.1 (`http::server`, and `https_server` connections
-  that negotiate `http/1.1`). HTTP/2 and HTTP/3 connections still serve only
-  static files and ignore `routes`.
+  runs on HTTP/1.1 (`http::server`, and `https_server` connections that
+  negotiate `http/1.1`) and on HTTP/3 (`http3_server`, for `https` requests).
+  HTTP/2 connections still serve only static files and ignore `routes`.
   - A `http::router` holds up to 64 routes (`max_routes`) and is built before
     a server takes it as `std::shared_ptr<const router>`.
     - `add(method, path, handler, context)` matches a path exactly, and
@@ -315,11 +315,19 @@ every running connection has sent its close and retired.
     Content-Length until the handler completes; `header_value` compares names
     case-insensitively. `async_read_body(buffer)` reads up to `buffer.size()`
     body bytes and returns 0 at the end. One read may be pending; another
-    returns `operation_in_progress`. Connection loss returns
-    `connection_reset`. On HTTP/1.1, a request declaring more than
+    returns `operation_in_progress`. Connection loss or a peer reset returns
+    `connection_reset`. A request declaring more than
     `server_options::max_request_body` (default 1 MiB) answers 413 without
-    running the handler. Chunked request bodies still answer 501. The first
-    body read answers `Expect: 100-continue` with 100 Continue.
+    running the handler.
+    - HTTP/1.1 bodies need Content-Length; chunked request bodies still answer
+      501. The first body read answers `Expect: 100-continue` with
+      100 Continue.
+    - HTTP/3 bodies may omit Content-Length. A read past
+      `max_request_body` returns `message_size`, and the server answers 413
+      if the handler then returns without a response. A malformed body
+      (DATA beyond Content-Length, a truncated frame, invalid trailers)
+      returns `bad_message` and resets the stream with the RFC 9114 code.
+      Request trailers are validated but not exposed.
   - `http::response` sends the status and fields with `async_start`, body
     bytes with `async_write`, and the end with `async_finish(trailers)`.
     `async_send` does all three with content-length set, and `async_send_file`
@@ -331,19 +339,29 @@ every running connection has sent its close and retired.
     - A declared content-length is enforced: writing past it is
       `invalid_argument`, and finishing short is `invalid_argument` and
       abandons the response. Without content-length, HTTP/1.1 uses chunked
-      transfer coding. Trailers are sent only on chunked responses to
-      requests with `TE: trailers`. Status 204 and 304 carry no body.
+      transfer coding and HTTP/3 ends the stream. On HTTP/1.1, trailers are
+      sent only on chunked responses to requests with `TE: trailers`; HTTP/3
+      always sends them. Status 204 and 304 carry no body. HTTP/3 response
+      sections and trailers are limited to 61 and 64 fields; more is
+      `message_size`.
     - A handler that returns before `async_start` gets a 500 response. One that
       returns after `async_start` but before `async_finish` closes the
-      HTTP/1.1 connection.
-    - An unread request body is discarded before the next request on the
-      connection, except after `Expect: 100-continue` without a read, which
-      closes the connection.
+      HTTP/1.1 connection, or resets the HTTP/3 stream with
+      `H3_INTERNAL_ERROR`.
+    - An unread HTTP/1.1 request body is discarded before the next request on
+      the connection, except after `Expect: 100-continue` without a read,
+      which closes the connection. An unread HTTP/3 body is stopped with
+      STOP_SENDING `H3_NO_ERROR` after the response (RFC 9114 4.1).
   - HTTP/1.1 runs one handler at a time per connection. Routing state, a 4 KiB
     response buffer, and the request view are allocated once per connection
-    when the server has routes. Steady-state routed requests on a kept-alive
-    connection make no general-heap allocation; this is checked by
-    `tests/http_routing_allocations.cc`.
+    when the server has routes.
+  - HTTP/3 runs a handler inside each request's existing coroutine, using
+    that request's scratch buffer. Request concurrency and refusal follow the
+    `http3_server` request capacity below.
+  - Steady-state routed requests make no general-heap allocation on a
+    kept-alive HTTP/1.1 connection or on an HTTP/3 connection, including the
+    QUIC stack. `tests/http_routing_allocations.cc` and
+    `tests/http3_routing_allocations.cc` check this.
 - `eventloop::http::https_server` advertises `h2` and `http/1.1` with ALPN by
   default. Set `eventloop::http::server_options::enable_http2` to `false` to
   disable HTTP/2. The
@@ -472,7 +490,7 @@ every running connection has sent its close and retired.
   handshake packets remain at 1200 so anti-amplification is unaffected. It
   defaults to 1472 (the standard Ethernet payload) because path MTU discovery
   is not implemented; constrained paths may lower it.
-  Each scratch buffer is about 40 KiB. Ordinary static-file responses use that
+  Each scratch buffer is about 52 KiB. Ordinary static-file responses use that
   storage for HTTP/3 headers and I/O; directory listing still allocates its
   bounded entry and output vectors, and OpenSSL may allocate separately.
   Each active request holds one

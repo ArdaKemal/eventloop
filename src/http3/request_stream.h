@@ -18,20 +18,22 @@ namespace eventloop::http3::detail {
 // HEADERS, then DATA frames, then at most one trailing HEADERS. Unknown and
 // reserved extension frames may appear anywhere and are skipped by length.
 // HEADERS payloads are copied into caller storage that must outlive the
-// parser; DATA payloads are counted and dropped. No other input is buffered.
+// parser. DATA payloads are delivered as views of the input and counted. No
+// other input is buffered.
 //
 // Errors are RFC codes; stream_scoped() tells whether to reset the stream or
 // close the connection.
 class request_frames {
 public:
-    enum class event { need_input, header_block };
+    enum class event { need_input, header_block, data };
 
     explicit request_frames(std::span<std::byte> block_storage) noexcept
         : storage_(block_storage) {}
 
-    // Consumes input until a complete header block is available, leaving
-    // input positioned after it, or until input is exhausted. The block
-    // stays valid until the next call.
+    // Consumes input until a complete header block or some DATA payload is
+    // available, leaving input positioned after it, or until input is
+    // exhausted. The block stays valid until the next call; data() views the
+    // payload bytes in input.
     [[nodiscard]] auto receive(std::span<const std::byte>& input) noexcept
         -> std::expected<event, h3_error>
     {
@@ -66,6 +68,13 @@ public:
                 input = input.subspan(take(input));
                 if (remaining_ == 0) state_ = state::frame_type;
                 break;
+            case state::data_payload: {
+                const auto count = take(input);
+                data_ = input.first(count);
+                input = input.subspan(count);
+                if (remaining_ == 0) state_ = state::frame_type;
+                return event::data;
+            }
             }
         }
         return event::need_input;
@@ -90,13 +99,22 @@ public:
 
     [[nodiscard]] auto block() const noexcept -> std::span<const std::byte>
     { return std::span<const std::byte>(storage_).first(block_size_); }
+    // The DATA payload bytes of the last data event.
+    [[nodiscard]] auto data() const noexcept -> std::span<const std::byte> { return data_; }
+    // Storage for later HEADERS payloads (trailers), for example once the
+    // request section has been decoded and its storage is in use elsewhere.
+    auto set_block_storage(std::span<std::byte> storage) noexcept -> void { storage_ = storage; }
+    // DATA frames may still follow.
+    [[nodiscard]] auto in_body() const noexcept -> bool { return phase_ == phase::body; }
     [[nodiscard]] auto trailers() const noexcept -> bool
     { return phase_ == phase::complete; }
     [[nodiscard]] auto data_received() const noexcept -> std::uint64_t
     { return data_received_; }
 
 private:
-    enum class state : std::uint8_t { frame_type, frame_length, header_payload, skip_payload };
+    enum class state : std::uint8_t {
+        frame_type, frame_length, header_payload, skip_payload, data_payload,
+    };
     enum class phase : std::uint8_t { request_headers, body, complete };
 
     auto take(std::span<const std::byte> input) noexcept -> std::size_t
@@ -123,6 +141,8 @@ private:
             data_received_ += remaining_;
             if (content_length_ && data_received_ > *content_length_)
                 return std::unexpected(h3_error::message_error);
+            state_ = remaining_ == 0 ? state::frame_type : state::data_payload;
+            return {};
         } else if (known_frame_type(frame_type_) || forbidden_frame_type(frame_type_)) {
             // Control-stream frames, PUSH_PROMISE from a client, and reserved
             // HTTP/2 types are invalid on a request stream (7.2).
@@ -141,6 +161,7 @@ private:
 
     static constexpr std::uint64_t max_varint = (std::uint64_t {1} << 62) - 1;
     std::span<std::byte> storage_;
+    std::span<const std::byte> data_;
     std::optional<std::uint64_t> content_length_;
     std::uint64_t frame_type_ {0};
     std::uint64_t remaining_ {0};

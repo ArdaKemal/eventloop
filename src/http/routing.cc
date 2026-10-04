@@ -140,6 +140,38 @@ auto valid_response_field(std::string_view name, std::string_view value) noexcep
     return true;
 }
 
+auto check_response_start(unsigned status, std::span<const header> headers,
+                          std::optional<std::uint64_t> length) noexcept
+    -> std::expected<response_start, std::error_code>
+{
+    if (status < 200 || status > 599) return std::unexpected(failure(std::errc::invalid_argument));
+    response_start result;
+    result.bodyless = status == 204 || status == 304;
+    std::optional<std::uint64_t> declared;
+    for (const auto& field : headers) {
+        if (!valid_response_field(field.name, field.value))
+            return std::unexpected(failure(std::errc::invalid_argument));
+        if (field.name == "date") result.has_date = true;
+        if (field.name != "content-length") continue;
+        const auto value = parse_length(field.value);
+        if (!value || (declared && *declared != *value) || status == 204 ||
+            (length && *length != *value))
+            return std::unexpected(failure(std::errc::invalid_argument));
+        declared = value;
+    }
+    result.emit_length = length && !declared && !result.bodyless;
+    if (!declared) declared = length;
+    if (!result.bodyless) result.declared = declared;
+    return result;
+}
+
+auto method_from_name(std::string_view name) noexcept -> method_type
+{
+    for (std::size_t index = 0; index < method_names.size(); ++index)
+        if (name == method_names[index]) return static_cast<method_type>(index);
+    return method_type::unknown;
+}
+
 auto parse_length(std::string_view value) noexcept -> std::optional<std::uint64_t>
 {
     std::uint64_t parsed = 0;

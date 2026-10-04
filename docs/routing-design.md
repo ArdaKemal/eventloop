@@ -1,8 +1,8 @@
 # Request routing (design draft)
 
-Status: step 1 (HTTP/1.1) is implemented and its behavior is in
-[api-contract.md](api-contract.md), which takes precedence over this draft.
-Steps 2 to 4 remain. This file is removed when routing covers all three
+Status: steps 1 (HTTP/1.1) and 2 (HTTP/3) are implemented and their behavior
+is in [api-contract.md](api-contract.md), which takes precedence over this
+draft. Steps 3 (HTTP/2) and 4 remain. This file is removed when routing covers all three
 protocols.
 
 Changes from the reviewed draft, made during step 1:
@@ -23,6 +23,25 @@ Changes from the reviewed draft, made during step 1:
 - HTTP/1.1 still rejects methods outside `method_type` with 400.
 - Connection tasks take a private slim copy of the options, because the full
   struct pushed the HTTP/1.1 connection frame past the 1024-byte class.
+
+Changes made during step 2:
+
+- HTTP/3 QPACK decoding does not allocate, so routed and static HTTP/3
+  requests both measure zero heap allocations, QUIC stack included
+  (`tests/http3_routing_allocations.cc`).
+- The request frame parser now delivers DATA payloads as views of its input
+  and can move trailer blocks to other storage after the request section is
+  decoded.
+- Each HTTP/3 request scratch buffer grows by 12 KiB, to about 52 KiB: a
+  copy of the regular request fields as `http::header`, and 8 KiB for
+  response HEADERS, trailers and file DATA. Request trailers use the free
+  HEADERS buffer.
+- HTTP/3 bodies may omit Content-Length. The body limit is then enforced on
+  read (`message_size`, then 413 if the handler returns without a response).
+  Request trailers are validated but not exposed to handlers.
+- HTTP/3 response sections are limited to 61 caller fields and trailers to 64.
+- Routing runs in its own coroutine. Inlined in the request coroutine, it
+  pushed that frame from 1800 to 2208 bytes, past the 2048-byte class.
 
 ## Goals
 
@@ -252,10 +271,10 @@ The connection task and its handler tasks share one session on one loop.
 
 ## Capacity and allocation
 
-Routing adds no general-heap allocation per request. On HTTP/1.1 a routed
-request performs none. HTTP/2 HPACK and HTTP/3 QPACK field decoding allocate
-strings as they do today; reducing that is separate work. An allocation-count
-test covers a routed GET and POST on each protocol.
+Routing adds no general-heap allocation per request. Routed HTTP/1.1 and
+HTTP/3 requests perform none (measured). HTTP/2 HPACK field decoding
+allocates strings as it does today; reducing that is separate work. An
+allocation-count test covers a routed GET and POST on each protocol.
 
 | Bound | Value | When exhausted |
 |---|---|---|

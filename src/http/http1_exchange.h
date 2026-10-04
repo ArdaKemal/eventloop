@@ -273,30 +273,14 @@ private:
     {
         if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
         if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
-        if (self.started_ || status < 200 || status > 599)
-            co_return std::unexpected(failure(std::errc::invalid_argument));
-        const bool bodyless = status == 204 || status == 304;
-        std::optional<std::uint64_t> declared;
-        bool has_date = false;
-        for (const auto& field : headers) {
-            if (!valid_response_field(field.name, field.value))
-                co_return std::unexpected(failure(std::errc::invalid_argument));
-            if (field.name == "date") has_date = true;
-            if (field.name != "content-length") continue;
-            const auto value = parse_length(field.value);
-            if (!value || (declared && *declared != *value) || status == 204 ||
-                (length && *length != *value))
-                co_return std::unexpected(failure(std::errc::invalid_argument));
-            declared = value;
-        }
-        // An implied length is emitted only when the caller did not send one.
-        const bool emit_length = length && !declared && !bodyless;
-        if (!declared) declared = length;
+        if (self.started_) co_return std::unexpected(failure(std::errc::invalid_argument));
+        const auto checked = check_response_start(status, headers, length);
+        if (!checked) co_return std::unexpected(checked.error());
         busy writing(self.writing_);
         self.started_ = true;
-        self.bodyless_ = bodyless;
-        self.declared_ = bodyless ? std::nullopt : declared;
-        self.chunked_ = !bodyless && !declared;
+        self.bodyless_ = checked->bodyless;
+        self.declared_ = checked->declared;
+        self.chunked_ = !checked->bodyless && !checked->declared;
 
         std::array<char, 64> status_line {};
         const auto reason = reason_phrase(status);
@@ -308,13 +292,13 @@ private:
             std::memcpy(trailer_lines.data() + extra, text.data(), text.size());
             extra += text.size();
         };
-        if (!has_date) {
+        if (!checked->has_date) {
             std::array<char, 64> date {};
             add("date: ");
             add({date.data(), format_http_time(std::time(nullptr), date)});
             add("\r\n");
         }
-        if (emit_length) {
+        if (checked->emit_length) {
             std::array<char, 24> digits {};
             const auto end = std::to_chars(digits.data(), digits.data() + digits.size(),
                                            *length).ptr;

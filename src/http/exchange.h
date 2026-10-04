@@ -83,6 +83,26 @@ struct router_access {
 [[nodiscard]] auto valid_response_field(std::string_view name, std::string_view value) noexcept
     -> bool;
 
+// The checked framing of a response start.
+struct response_start {
+    // The length to enforce; empty for chunked or stream-delimited bodies and
+    // for 204 and 304, which carry no body.
+    std::optional<std::uint64_t> declared;
+    // Emit content-length from the implied length (no caller field).
+    bool emit_length {false};
+    bool bodyless {false};
+    bool has_date {false};
+};
+
+// Validates a response start shared by every protocol: status 200..599,
+// valid fields, and one consistent content-length (none on 204). length is
+// the implied length from async_send or async_send_file.
+[[nodiscard]] auto check_response_start(unsigned status, std::span<const header> headers,
+                                        std::optional<std::uint64_t> length) noexcept
+    -> std::expected<response_start, std::error_code>;
+
+[[nodiscard]] auto method_from_name(std::string_view name) noexcept -> method_type;
+
 // Parses a decimal content-length value.
 [[nodiscard]] auto parse_length(std::string_view value) noexcept -> std::optional<std::uint64_t>;
 

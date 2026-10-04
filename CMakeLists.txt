@@ -1403,6 +1403,31 @@ if(BUILD_TESTING)
     add_test(NAME http3_server_errors COMMAND http3_server_errors_test)
     set_tests_properties(http3_server_errors PROPERTIES TIMEOUT 20)
 
+    add_executable(http3_routing_test tests/http3_routing.cc src/http3/qpack.cc)
+    target_include_directories(http3_routing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_routing_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(http3_routing_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(http3_routing_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME http3_routing COMMAND http3_routing_test)
+    set_tests_properties(http3_routing PROPERTIES TIMEOUT 20)
+
+    add_executable(http3_routing_allocations_test tests/http3_routing_allocations.cc
+        src/http3/qpack.cc)
+    target_include_directories(http3_routing_allocations_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_routing_allocations_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(http3_routing_allocations_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(http3_routing_allocations_test PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME http3_routing_allocations COMMAND http3_routing_allocations_test)
+    set_tests_properties(http3_routing_allocations PROPERTIES TIMEOUT 20)
+
     add_executable(quic_packet_protection_test
         tests/quic_packet_protection.cc)
     target_include_directories(quic_packet_protection_test PRIVATE

@@ -3,6 +3,7 @@
 #include "eventloop/event_loop.h"
 #include "eventloop/http/mime_types.h"
 #include "eventloop/unique_fd.h"
+#include "../http/exchange.h"
 #include "../http/file_operations.h"
 #include "../http/resource.h"
 #include "../http/file_response.h"
@@ -29,11 +30,18 @@ constexpr std::size_t max_streams = 40;
 constexpr std::size_t header_limit = 16 * 1024;
 using stream_handlers = std::array<std::optional<task_handle<void>>, max_streams>;
 
+// Per-request scratch reserved at startup. A routed request decodes its
+// section into fields and strings and copies the regular fields into
+// request_headers; headers then holds trailer blocks (first half) and their
+// decoded strings (second half), and body holds encoded response HEADERS,
+// trailers and file DATA.
 struct stream_storage {
     std::array<std::byte, header_limit> headers {};
     std::array<char, header_limit> strings {};
     std::array<h3::field, h3::qpack_max_fields> fields {};
     std::array<std::byte, 4096> io {};
+    std::array<http::header, h3::qpack_max_fields> request_headers {};
+    std::array<std::byte, 8 * 1024> body {};
     bool in_use {false};
 };
 
@@ -78,7 +86,8 @@ auto write_all(event_loop& loop, quic_connection& connection, std::uint64_t id,
 auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t id,
                   unsigned status, std::uint64_t length, std::string_view mime,
                   bool fin, std::span<std::byte> buffer,
-                  const detail::file_response* selected = nullptr) -> task<bool>
+                  const detail::file_response* selected = nullptr,
+                  std::string_view allow = "GET, HEAD, OPTIONS") -> task<bool>
 {
     std::array<char, 32> status_text {}, length_text {};
     auto status_end = std::to_chars(status_text.data(), status_text.data() + status_text.size(), status);
@@ -92,7 +101,7 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
         fields[field_count++] = {"content-type", mime};
     }
     if (status == 204 || status == 405)
-        fields[field_count++] = {"allow", "GET, HEAD, OPTIONS"};
+        fields[field_count++] = {"allow", allow};
     if (selected != nullptr) {
         fields[field_count++] = {"etag", {selected->etag.data(), selected->etag_size}};
         fields[field_count++] = {"last-modified", {selected->modified.data(), selected->modified_size}};
@@ -192,9 +201,408 @@ auto finish_request(event_loop& loop, quic_connection& connection, std::uint64_t
     }
 }
 
+using void_result = detail::void_result;
+using size_result = detail::size_result;
+
+[[nodiscard]] auto failure(std::errc code) -> std::error_code
+{
+    return std::make_error_code(code);
+}
+
+// Response field encoding uses the first half of stream_storage::fields and
+// trailer decoding the second, so a body read can run beside a response write.
+constexpr std::size_t response_fields = h3::qpack_max_fields / 2;
+constexpr std::size_t trailer_block = header_limit / 2;
+
+// One routed request on a request stream. Lives in serve_route's frame; the
+// connection, storage and parser outlive it.
+class http3_exchange final : public detail::exchange {
+public:
+    http3_exchange(event_loop& loop, quic_connection& connection, std::uint64_t id,
+                   stream_storage& storage, h3::request_frames& frames,
+                   std::span<const std::byte>& pending, std::uint64_t max_request_body,
+                   bool head_only) noexcept
+        : loop_(loop), connection_(connection), storage_(storage), frames_(frames),
+          pending_(pending), id_(id), max_request_body_(max_request_body),
+          head_only_(head_only)
+    {
+        frames_.set_block_storage(std::span(storage_.headers).first(trailer_block));
+    }
+
+    auto read_body(std::span<std::byte> buffer) -> task<size_result> override
+    {
+        return read_task(loop_, *this, buffer);
+    }
+    auto start(unsigned status, std::span<const header> headers,
+               std::optional<std::uint64_t> length) -> task<void_result> override
+    {
+        return start_task(loop_, *this, status, headers, length);
+    }
+    auto write(std::span<const std::byte> data) -> task<void_result> override
+    {
+        return write_task(loop_, *this, data);
+    }
+    auto finish(std::span<const header> trailers) -> task<void_result> override
+    {
+        return finish_task(loop_, *this, trailers);
+    }
+    auto send_file(unsigned status, std::span<const header> headers, unique_fd file,
+                   std::uint64_t offset, std::uint64_t size) -> task<void_result> override
+    {
+        return send_file_task(loop_, *this, status, headers, std::move(file), offset, size);
+    }
+    [[nodiscard]] auto loop() noexcept -> event_loop& override { return loop_; }
+
+    http::request request_ = detail::request_access::make_request();
+    http::response response_ = detail::request_access::make_response();
+    bool started_ {false};
+    bool finished_ {false};
+    bool broken_ {false};
+    bool body_ended_ {false};
+    bool too_large_ {false};
+
+    static auto start_task(event_loop& loop, http3_exchange& self, unsigned status,
+                           std::span<const header> headers, std::optional<std::uint64_t> length)
+        -> task<void_result>
+    {
+        if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
+        if (self.started_) co_return std::unexpected(failure(std::errc::invalid_argument));
+        const auto checked = detail::check_response_start(status, headers, length);
+        if (!checked) co_return std::unexpected(checked.error());
+        if (headers.size() + 3 > response_fields)
+            co_return std::unexpected(failure(std::errc::message_size));
+        busy writing(self.writing_);
+        std::array<char, 4> status_text {};
+        const auto status_end = std::to_chars(status_text.data(), status_text.data() + 3, status).ptr;
+        std::array<char, 24> length_text {};
+        std::array<char, 64> date {};
+        auto fields = std::span(self.storage_.fields).first(response_fields);
+        std::size_t count = 0;
+        fields[count++] = {":status", {status_text.data(), status_end}};
+        for (const auto& field : headers) fields[count++] = {field.name, field.value};
+        if (checked->emit_length) {
+            const auto end = std::to_chars(length_text.data(),
+                length_text.data() + length_text.size(), *length).ptr;
+            fields[count++] = {"content-length", {length_text.data(), end}};
+        }
+        if (!checked->has_date) {
+            const auto size = detail::format_http_time(std::time(nullptr), date);
+            fields[count++] = {"date", {date.data(), size}};
+        }
+        if (!(co_await write_section(loop, self, fields.first(count), false)).value_or(false)) {
+            self.broken_ = true;
+            co_return std::unexpected(failure(std::errc::connection_reset));
+        }
+        self.started_ = true;
+        self.bodyless_ = checked->bodyless;
+        self.declared_ = checked->declared;
+        co_return void_result {};
+    }
+
+private:
+    struct busy {
+        explicit busy(bool& flag) noexcept : flag(flag) { flag = true; }
+        ~busy() { flag = false; }
+        busy(const busy&) = delete;
+        auto operator=(const busy&) -> busy& = delete;
+        bool& flag;
+    };
+
+    // Encodes fields as one HEADERS frame in storage.body and writes it.
+    static auto write_section(event_loop& loop, http3_exchange& self,
+                              std::span<const h3::field> fields, bool fin) -> task<bool>
+    {
+        const auto buffer = std::span(self.storage_.body);
+        const auto encoded = h3::qpack_encode(fields, buffer.subspan(16));
+        if (!encoded) co_return false;
+        const auto framed = h3::encode_frame(h3::headers_frame,
+            buffer.subspan(16, *encoded), buffer);
+        if (!framed) co_return false;
+        co_return (co_await write_all(loop, self.connection_, self.id_,
+                                      buffer.first(*framed), fin)).value_or(false);
+    }
+
+    // Validates a trailer section against the trailer rules (RFC 9114 4.1.2).
+    auto check_trailers() noexcept -> std::expected<void, h3::h3_error>
+    {
+        auto strings = std::span(reinterpret_cast<char*>(storage_.headers.data()) + trailer_block,
+                                 header_limit - trailer_block);
+        auto fields = std::span(storage_.fields).subspan(response_fields);
+        const auto decoded = h3::qpack_decode(frames_.block(), fields, strings);
+        if (!decoded) return std::unexpected(h3::qpack_failure(decoded.error()));
+        return h3::validate_trailers(fields.first(*decoded));
+    }
+
+    static auto read_task(event_loop& loop, http3_exchange& self, std::span<std::byte> buffer)
+        -> task<size_result>
+    {
+        (void)loop;
+        if (self.reading_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.too_large_) co_return std::unexpected(failure(std::errc::message_size));
+        busy reading(self.reading_);
+        const auto input_area = std::span(self.storage_.io).subspan(response_header_area);
+        for (;;) {
+            if (!self.data_.empty()) {
+                if (buffer.empty()) co_return std::unexpected(failure(std::errc::invalid_argument));
+                const auto count = std::min(buffer.size(), self.data_.size());
+                std::memcpy(buffer.data(), self.data_.data(), count);
+                self.data_ = self.data_.subspan(count);
+                co_return count;
+            }
+            if (self.body_ended_) co_return 0;
+            if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
+            if (!self.pending_.empty()) {
+                const auto parsed = self.frames_.receive(self.pending_);
+                std::expected<void, h3::h3_error> valid {};
+                if (!parsed) valid = std::unexpected(parsed.error());
+                else if (*parsed == h3::request_frames::event::header_block)
+                    valid = self.check_trailers();
+                if (!valid) {
+                    fail(self.connection_, self.id_, valid.error());
+                    self.broken_ = true;
+                    co_return std::unexpected(failure(std::errc::bad_message));
+                }
+                if (*parsed == h3::request_frames::event::data) {
+                    if (self.frames_.data_received() > self.max_request_body_) {
+                        self.too_large_ = true;
+                        co_return std::unexpected(failure(std::errc::message_size));
+                    }
+                    self.data_ = self.frames_.data();
+                }
+                continue;
+            }
+            const auto got = flatten_result(co_await self.connection_.async_read(self.id_, input_area));
+            if (!got) {
+                self.broken_ = true;
+                co_return std::unexpected(failure(std::errc::connection_reset));
+            }
+            if (*got == 0) {
+                if (const auto finished = self.frames_.finish(); !finished) {
+                    fail(self.connection_, self.id_, finished.error());
+                    self.broken_ = true;
+                    co_return std::unexpected(failure(std::errc::bad_message));
+                }
+                self.body_ended_ = true;
+                co_return 0;
+            }
+            self.pending_ = std::span<const std::byte>(input_area).first(*got);
+        }
+    }
+
+    static auto write_task(event_loop& loop, http3_exchange& self, std::span<const std::byte> data)
+        -> task<void_result>
+    {
+        if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
+        if (!self.started_ || self.finished_ || (self.bodyless_ && !data.empty()) ||
+            (self.declared_ && data.size() > *self.declared_ - self.sent_))
+            co_return std::unexpected(failure(std::errc::invalid_argument));
+        busy writing(self.writing_);
+        self.sent_ += data.size();
+        if (self.head_only_ || data.empty()) co_return void_result {};
+        const auto buffer = std::span(self.storage_.body);
+        const auto header_size = h3::encode_frame_header(h3::data_frame, data.size(),
+                                                         buffer.first(16));
+        if (!header_size) co_return std::unexpected(failure(std::errc::message_size));
+        bool written = false;
+        if (data.size() <= buffer.size() - *header_size) {
+            // Small writes go out as one contiguous frame.
+            std::memcpy(buffer.data() + *header_size, data.data(), data.size());
+            written = (co_await write_all(loop, self.connection_, self.id_,
+                buffer.first(*header_size + data.size()), false)).value_or(false);
+        } else {
+            written = (co_await write_all(loop, self.connection_, self.id_,
+                          buffer.first(*header_size), false)).value_or(false) &&
+                      (co_await write_all(loop, self.connection_, self.id_, data, false))
+                          .value_or(false);
+        }
+        if (!written) {
+            self.broken_ = true;
+            co_return std::unexpected(failure(std::errc::connection_reset));
+        }
+        co_return void_result {};
+    }
+
+    static auto finish_task(event_loop& loop, http3_exchange& self, std::span<const header> trailers)
+        -> task<void_result>
+    {
+        if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
+        if (!self.started_ || self.finished_)
+            co_return std::unexpected(failure(std::errc::invalid_argument));
+        if (self.declared_ && self.sent_ != *self.declared_ && !self.head_only_) {
+            self.broken_ = true;
+            fail(self.connection_, self.id_, h3::h3_error::internal_error);
+            co_return std::unexpected(failure(std::errc::invalid_argument));
+        }
+        if (trailers.size() > response_fields)
+            co_return std::unexpected(failure(std::errc::message_size));
+        for (const auto& field : trailers)
+            if (!detail::valid_response_field(field.name, field.value) ||
+                field.name == "content-length")
+                co_return std::unexpected(failure(std::errc::invalid_argument));
+        busy writing(self.writing_);
+        bool written = false;
+        if (!trailers.empty() && !self.head_only_) {
+            auto fields = std::span(self.storage_.fields).first(response_fields);
+            for (std::size_t index = 0; index < trailers.size(); ++index)
+                fields[index] = {trailers[index].name, trailers[index].value};
+            written = (co_await write_section(loop, self, fields.first(trailers.size()), true))
+                .value_or(false);
+        } else {
+            written = (co_await write_all(loop, self.connection_, self.id_, {}, true))
+                .value_or(false);
+        }
+        if (!written) {
+            self.broken_ = true;
+            co_return std::unexpected(failure(std::errc::connection_reset));
+        }
+        self.finished_ = true;
+        co_return void_result {};
+    }
+
+    static auto send_file_task(event_loop& loop, http3_exchange& self, unsigned status,
+                               std::span<const header> headers, unique_fd file,
+                               std::uint64_t offset, std::uint64_t size) -> task<void_result>
+    {
+        auto started = co_await start_task(loop, self, status, headers, size);
+        if (!started) co_return std::unexpected(failure(std::errc::operation_canceled));
+        if (!*started) co_return std::unexpected(started->error());
+        if (self.bodyless_ || self.head_only_ || size == 0)
+            co_return (co_await finish_task(loop, self, {}))
+                .value_or(std::unexpected(failure(std::errc::operation_canceled)));
+        busy writing(self.writing_);
+        const auto buffer = std::span(self.storage_.body);
+        constexpr std::size_t frame_header_limit = 16;
+        std::uint64_t sent = 0;
+        while (sent < size) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                buffer.size() - frame_header_limit, size - sent));
+            const auto header_size = h3::encode_frame_header(h3::data_frame, count,
+                                                             buffer.first(frame_header_limit));
+            if (!header_size ||
+                !detail::read_file_at(file.get(), offset + sent,
+                                      buffer.subspan(*header_size, count))) {
+                self.broken_ = true;
+                fail(self.connection_, self.id_, h3::h3_error::internal_error);
+                co_return std::unexpected(failure(std::errc::io_error));
+            }
+            sent += count;
+            if (!(co_await write_all(loop, self.connection_, self.id_,
+                    buffer.first(*header_size + count), sent == size)).value_or(false)) {
+                self.broken_ = true;
+                co_return std::unexpected(failure(std::errc::connection_reset));
+            }
+        }
+        self.sent_ = size;
+        self.finished_ = true;
+        co_return void_result {};
+    }
+
+    event_loop& loop_;
+    quic_connection& connection_;
+    stream_storage& storage_;
+    h3::request_frames& frames_;
+    std::span<const std::byte>& pending_;
+    std::span<const std::byte> data_;
+    std::uint64_t id_;
+    std::uint64_t max_request_body_;
+    std::uint64_t sent_ {0};
+    std::optional<std::uint64_t> declared_;
+    bool head_only_;
+    bool bodyless_ {false};
+    bool reading_ {false};
+    bool writing_ {false};
+};
+
+// Runs a route handler for a decoded, validated request.
+auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id,
+                 stream_storage& s, h3::request_frames& frames,
+                 std::span<const std::byte>& pending, const h3::request_head& head,
+                 std::span<const h3::field> fields, detail::route_match match,
+                 std::uint64_t max_request_body) -> task<void>
+{
+    std::size_t count = 0;
+    for (const auto& field : fields)
+        if (field.name.empty() || field.name.front() != ':')
+            s.request_headers[count++] = {field.name, field.value};
+    http3_exchange exchange(loop, connection, id, s, frames, pending, max_request_body,
+                            head.method == "HEAD");
+    const detail::request_fields request {
+        .headers = std::span<const header>(s.request_headers).first(count),
+        .method_name = head.method,
+        .target = head.path,
+        .authority = head.authority,
+        .content_length = head.content_length,
+        .method = detail::method_from_name(head.method),
+        .protocol = http::protocol::http3,
+    };
+    detail::request_access::bind(exchange.request_, exchange, request, match.context);
+    detail::request_access::bind(exchange.response_, exchange);
+    const auto handled = co_await match.function(loop, exchange.request_, exchange.response_);
+    if (handled == task_result::cancelled) co_return;
+    if (!exchange.started_ && !exchange.broken_) {
+        const unsigned status = exchange.too_large_ ? 413
+            : handled == task_result::frame_allocation_failure ? 503 : 500;
+        const auto started = co_await http3_exchange::start_task(loop, exchange, status, {}, 0);
+        if (started && *started)
+            (void)co_await exchange.finish(std::span<const header> {});
+    }
+    if (exchange.broken_) co_return;
+    if (!exchange.finished_) {
+        fail(connection, id, h3::h3_error::internal_error);
+        co_return;
+    }
+    // RFC 9114 4.1: the rest of the body is not needed.
+    if (!exchange.body_ended_)
+        (void)connection.stop_sending(id, static_cast<std::uint64_t>(h3::h3_error::no_error));
+}
+
+// The server-wide request settings, shared by every connection.
+struct request_settings {
+    const router* routes {nullptr};
+    std::uint64_t max_request_body {0};
+    bool directory_listing {false};
+};
+
+// Answers a request whose path has routes. Returns false when no route
+// matches, so the caller serves static files.
+auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
+                   stream_storage& s, h3::request_frames& frames,
+                   std::span<const std::byte>& pending, const h3::request_head& head,
+                   std::span<const h3::field> fields, const request_settings& settings)
+    -> task<bool>
+{
+    const auto match = detail::router_access::match(*settings.routes,
+        detail::method_from_name(head.method), head.path.substr(0, head.path.find('?')));
+    if (match.allowed == 0) co_return false;
+    const bool too_large = match.function != nullptr && head.content_length &&
+                           *head.content_length > settings.max_request_body;
+    if (match.function != nullptr && !too_large) {
+        (void)co_await serve_route(loop, connection, id, s, frames, pending, head, fields,
+                                   match, settings.max_request_body);
+        co_return true;
+    }
+    std::array<char, 96> allow {};
+    const auto allow_size = detail::format_allow(match.allowed, allow);
+    const unsigned status = too_large ? 413 : head.method == "OPTIONS" ? 204 : 405;
+    if (!(co_await send_headers(loop, connection, id, status, 0, "text/plain", true,
+            std::span(s.io).first(response_header_area), nullptr,
+            {allow.data(), allow_size})).value_or(false)) {
+        fail(connection, id, h3::h3_error::request_cancelled);
+        co_return true;
+    }
+    if (too_large)
+        (void)connection.stop_sending(id, static_cast<std::uint64_t>(h3::h3_error::no_error));
+    else
+        (void)co_await finish_request(loop, connection, id, s, frames, pending);
+    co_return true;
+}
+
 auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
                    native_socket root, stream_storage* storage,
-                   bool directory_listing)
+                   const request_settings& settings)
     -> task<void>
 {
     struct release_storage {
@@ -227,6 +635,12 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     frames.set_content_length(head->content_length);
     const auto method = head->method;
     const auto path = head->path;
+    // Routes see https requests; others keep the static answers below. The
+    // routed path runs in its own frame so this one stays in its size class.
+    if (settings.routes != nullptr && head->scheme == "https" &&
+        (co_await route_request(loop, connection, id, s, frames, pending, *head,
+                                request_fields, settings)).value_or(true))
+        co_return;
     std::size_t match_size = 0;
     std::string_view if_modified_since, range;
     bool duplicate_range = false;
@@ -281,7 +695,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
                         {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
                     size = selected.length; offset = selected.offset; status = selected.status;
                     have_file = true; mime = http::mime_type_from_path("index.html");
-                } else if (!directory_listing) {
+                } else if (!settings.directory_listing) {
                     status = 403;
                 } else {
                     auto rendered = http::detail::render_directory_listing(std::move(file));
@@ -395,7 +809,7 @@ auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t 
 auto serve_connection(event_loop& loop, quic_connection connection,
                       std::shared_ptr<unique_fd> root,
                       stream_handlers& handlers, storage_pool& pool,
-                      bool directory_listing) -> task<void>
+                      const request_settings& settings) -> task<void>
 {
     h3::peer_critical_streams critical;
     auto control = flatten_result(co_await connection.async_open_stream(quic_stream_direction::unidirectional));
@@ -403,10 +817,10 @@ auto serve_connection(event_loop& loop, quic_connection connection,
     const auto general = static_cast<std::uint64_t>(h3::h3_error::general_protocol_error);
     if (!control) { connection.close_application(general); co_return; }
     // Server control stream: stream type 0, SETTINGS with zero QPACK dynamic table.
-    const std::array<std::byte, 6> settings {std::byte{0}, std::byte{4}, std::byte{4},
+    const std::array<std::byte, 6> control_settings {std::byte{0}, std::byte{4}, std::byte{4},
         std::byte{1}, std::byte{0}, std::byte{7}};
     const std::array<std::byte, 1> last {std::byte{0}};
-    if (!(co_await write_all(loop, connection, *control, settings, false)).value_or(false) ||
+    if (!(co_await write_all(loop, connection, *control, control_settings, false)).value_or(false) ||
         !(co_await write_all(loop, connection, *control, last, false)).value_or(false)) {
         connection.close(); co_return;
     }
@@ -434,7 +848,7 @@ auto serve_connection(event_loop& loop, quic_connection connection,
             slot->emplace();
             spawned = request
                 ? loop.spawn(serve_request(loop, connection, id, root->get(),
-                      storage, directory_listing), **slot)
+                      storage, settings), **slot)
                 : loop.spawn(read_peer_uni(loop, connection, id, critical), **slot);
             if (spawned != task_spawn_result::accepted) slot->reset();
         }
@@ -489,7 +903,8 @@ public:
           endpoint_(loop, local, quic_server_options{std::move(cert), std::move(key),
               std::span(alpn_), make_limits(options.max_udp_payload_size),
               options.connection_capacity}),
-          directory_listing_(options.directory_listing),
+          routes_(options.routes),
+          settings_ {routes_.get(), options.max_request_body, options.directory_listing},
           connections_(options.connection_capacity),
           request_storage_(options.request_capacity == 0 ? options.connection_capacity * 4
                                                          : options.request_capacity) {}
@@ -498,7 +913,8 @@ public:
     std::shared_ptr<unique_fd> root_;
     const std::array<std::uint8_t, 2> alpn_ {'h', '3'};
     quic_endpoint endpoint_;
-    bool directory_listing_ {false};
+    std::shared_ptr<const router> routes_;
+    request_settings settings_;
     std::vector<connection_slot> connections_;
     storage_pool request_storage_;
 };
@@ -529,7 +945,7 @@ auto http3_server::run_loop(event_loop& loop, http3_server& server) -> task<void
         if (slot == impl.connections_.end()) { accepted->close(); continue; }
         slot->handle.emplace();
         const auto spawned = loop.spawn(serve_connection(loop, std::move(*accepted), impl.root_,
-                slot->handlers, impl.request_storage_, impl.directory_listing_), *slot->handle);
+                slot->handlers, impl.request_storage_, impl.settings_), *slot->handle);
         if (spawned != task_spawn_result::accepted) {
             slot->handle.reset();
             if (spawned == task_spawn_result::frame_allocation_failure) {
