@@ -329,6 +329,8 @@ every running connection has sent its close and retired.
   Requests own their method, target, authority override, header strings, and
   body bytes or a `request_body_source` callback. Any valid HTTP method token
   is accepted, including GET, HEAD, POST, PUT, PATCH, DELETE, and OPTIONS.
+  CONNECT returns `operation_not_supported` because a tunnel does not fit one
+  buffered exchange.
   The owned body is limited to 4 MiB; a source can produce up to 1 TiB in
   chunks of at most 16 KiB. Set either the owned body or the source. The source
   is task-owned and called on the loop thread with a writable borrowed span;
@@ -353,10 +355,14 @@ every running connection has sent its close and retired.
   only during the call; a nonzero callback error aborts the request. Final
   response headers and trailers remain owned in the returned response.
   Responses are malformed, reporting `protocol_error`, when they carry
-  connection-specific fields or TE other than `trailers`, a non-numeric or
+  connection-specific fields or any TE field, a non-numeric or
   conflicting Content-Length, DATA whose total differs from Content-Length,
   or any DATA content after a HEAD request or with status 204 or 304.
   Content-Length on those bodyless responses is not compared.
+  RST_STREAM on the request stream returns `connection_reset`. A GOAWAY
+  whose last stream ID is zero returns `connection_reset` because the request
+  was not processed; otherwise the response continues to completion.
+  A malformed RST_STREAM or GOAWAY frame is `protocol_error`.
   Streamed response bodies are limited to 1 TiB while buffering remains one
   16 KiB frame. The operation uses one
   stream per connection. Connection reuse and server push are outside its scope.

@@ -148,13 +148,11 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
     return true;
 }
 
-// RFC 9113 section 8.2.2.
-[[nodiscard]] auto connection_specific(const std::string_view name,
-                                       const std::string_view value) -> bool
+// RFC 9113 section 8.2.2. TE is allowed only in requests, as "trailers".
+[[nodiscard]] auto connection_specific(const std::string_view name) -> bool
 {
     return name == "connection" || name == "upgrade" || name == "keep-alive" ||
-           name == "proxy-connection" || name == "transfer-encoding" ||
-           (name == "te" && value != "trailers");
+           name == "proxy-connection" || name == "transfer-encoding";
 }
 
 // Every content-length field must hold the same decimal value. Absent returns
@@ -204,7 +202,7 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
         } else if (!field.name.empty() && field.name.front() == ':') {
             return failure(std::errc::protocol_error);
         } else if (!valid_name(field.name) || !valid_value(field.value) ||
-                   connection_specific(field.name, field.value)) {
+                   connection_specific(field.name) || field.name == "te") {
             return failure(std::errc::protocol_error);
         } else {
             regular_seen = true;
@@ -228,6 +226,9 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
         !valid_method(request.method) ||
         (request.body_source && !request.body.empty()))
         co_return std::unexpected(failure(std::errc::invalid_argument));
+    // A CONNECT tunnel (RFC 9113 section 8.5) does not fit one buffered exchange.
+    if (request.method == "CONNECT")
+        co_return std::unexpected(failure(std::errc::operation_not_supported));
     if (request.body.size() > max_body ||
         request.headers.size() > detail::hpack_max_fields - 4)
         co_return std::unexpected(failure(std::errc::message_size));
@@ -239,7 +240,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     fields.push_back({":path", request.target});
     for (auto& item : request.headers) {
         if (!valid_name(item.name) || !valid_value(item.value) ||
-            connection_specific(item.name, item.value))
+            connection_specific(item.name) || (item.name == "te" && item.value != "trailers"))
             co_return std::unexpected(failure(std::errc::invalid_argument));
     }
     // A declared request length must match the owned body, or the source total.
@@ -558,8 +559,18 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
             auto& window = id == 0 ? connection_send_window : stream_send_window;
             window += increment;
             if (window > 0x7fffffff) error = failure(std::errc::protocol_error);
-        } else if (type == 3 || type == 7) {
+        } else if (type == 3) {
+            // RFC 9113 section 6.4. Every stream other than 1 is idle here.
+            if (id != 1) { error = failure(std::errc::protocol_error); break; }
+            if (length != 4) { error = failure(std::errc::protocol_error); break; }
             error = failure(std::errc::connection_reset);
+        } else if (type == 7) {
+            // RFC 9113 section 6.8. Stream 1 still completes if the peer
+            // processed it; otherwise the request was not handled.
+            if (id != 0) { error = failure(std::errc::protocol_error); break; }
+            if (length < 8) { error = failure(std::errc::protocol_error); break; }
+            if ((u32(data.data()) & 0x7fffffffu) == 0)
+                error = failure(std::errc::connection_reset);
         } else if (type == 5) {
             error = failure(std::errc::protocol_error);
         }

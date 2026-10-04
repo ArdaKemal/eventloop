@@ -197,7 +197,7 @@ auto responses(const certificate_files& files) -> void
 
     for (auto field : {std::pair {"connection", "close"}, {"keep-alive", "1"},
                        {"proxy-connection", "close"}, {"transfer-encoding", "chunked"},
-                       {"upgrade", "h2c"}, {"te", "gzip"}})
+                       {"upgrade", "h2c"}, {"te", "gzip"}, {"te", "trailers"}})
         check(fails_with(exchange(files, get(), response("200", {field}, true)),
                          std::errc::protocol_error), "connection-specific response field");
 
@@ -240,6 +240,52 @@ auto responses(const certificate_files& files) -> void
     check(cached && cached->status == 304, "304 with Content-Length and empty DATA");
 }
 
+[[nodiscard]] auto goaway(unsigned last_stream, std::size_t size = 8, unsigned stream = 0)
+    -> std::string
+{
+    std::string payload(size, '\0');
+    if (size >= 4) payload[3] = static_cast<char>(last_stream);
+    std::string out;
+    append_frame(out, 7, 0, stream, payload);
+    return out;
+}
+
+[[nodiscard]] auto reset(unsigned stream, std::size_t size = 4) -> std::string
+{
+    std::string out;
+    append_frame(out, 3, 0, stream, std::string(size, '\0'));
+    return out;
+}
+
+auto shutdown_frames(const certificate_files& files) -> void
+{
+    // A GOAWAY that covers stream 1 lets the response finish.
+    std::string settings;
+    append_frame(settings, 4, 0, 0, {});
+    std::string finishing = settings + goaway(1);
+    std::string body = response("200", {}, false);
+    finishing += body.substr(9); // HEADERS without a second SETTINGS.
+    append_frame(finishing, 0, end_stream, 1, "ok");
+    const auto completed = exchange(files, get(), finishing);
+    check(completed && completed->status == 200 && completed->body == bytes("ok"),
+          "GOAWAY covering the request");
+
+    check(fails_with(exchange(files, get(), settings + goaway(0)), std::errc::connection_reset),
+          "GOAWAY before the request");
+    check(fails_with(exchange(files, get(), settings + goaway(1, 8, 1)),
+                     std::errc::protocol_error), "GOAWAY on a request stream");
+    check(fails_with(exchange(files, get(), settings + goaway(1, 7)), std::errc::protocol_error),
+          "short GOAWAY");
+
+    check(fails_with(exchange(files, get(), settings + reset(1)), std::errc::connection_reset),
+          "RST_STREAM on the request");
+    for (unsigned stream : {0u, 3u, 2u})
+        check(fails_with(exchange(files, get(), settings + reset(stream)),
+                         std::errc::protocol_error), "RST_STREAM on another stream");
+    check(fails_with(exchange(files, get(), settings + reset(1, 5)), std::errc::protocol_error),
+          "RST_STREAM with a wrong length");
+}
+
 auto requests(const certificate_files& files) -> void
 {
     auto declared = [](std::string_view value) {
@@ -259,6 +305,12 @@ auto requests(const certificate_files& files) -> void
     te.headers.push_back({"te", "gzip"});
     check(fails_with(exchange(files, std::move(te), {}), std::errc::invalid_argument),
           "TE other than trailers");
+    auto trailers = get();
+    trailers.headers.push_back({"te", "trailers"});
+    check(exchange(files, std::move(trailers), response("200", {}, true)).has_value(),
+          "request TE: trailers");
+    check(fails_with(exchange(files, get("CONNECT"), {}), std::errc::operation_not_supported),
+          "CONNECT is unsupported");
 
     const auto sourced = [&](std::string_view value, std::size_t produce) {
         auto request = declared(value);
@@ -311,5 +363,6 @@ auto main() -> int
     const certificate_files files {directory.path() / "cert.pem", directory.path() / "key.pem"};
     test::make_localhost_certificate(files.certificate, files.key);
     responses(files);
+    shutdown_frames(files);
     requests(files);
 }
