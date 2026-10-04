@@ -37,7 +37,16 @@ public:
     }
     connection_driver(const connection_driver&)=delete;
     auto operator=(const connection_driver&)-> connection_driver& = delete;
-    auto stop() noexcept -> void { check_owner(); stopped_=true; notify(); }
+    // A local close: stop after sending one transport CONNECTION_CLOSE with
+    // NO_ERROR (RFC 9000 10.2). The closing period is not retained; late peer
+    // packets are dropped.
+    auto stop() noexcept -> void
+    { check_owner(); if (!close_frame_) close_frame_={0x1c,0x00}; stopped_=true; notify(); }
+    // As stop(), with an application CONNECTION_CLOSE (RFC 9000 19.19). Before
+    // 1-RTT keys exist it is sent as APPLICATION_ERROR in a transport close
+    // (10.2.3). The first close requested wins.
+    auto stop_with_application_error(std::uint64_t error) noexcept -> void
+    { check_owner(); if (!close_frame_) close_frame_={0x1d,error}; stop(); }
     // New packets or application send/receive credit can interrupt an idle
     // retry. Resumption remains a timer-loop action, outside router dispatch.
     auto notify() noexcept -> void
@@ -378,6 +387,9 @@ private:
         if (*sent) ++self.candidate_attempts_;
         co_return std::expected<void,connection_error>{};
     }
+    // Runs the packet loop, then sends at most one CONNECTION_CLOSE before
+    // retiring: a transport close after a local failure, or the requested
+    // application close. running_ stays set until that send completes.
     static auto pump(event_loop& loop,connection_driver& self) -> task<std::expected<void,connection_error>>
     {
         self.check_owner();
@@ -385,6 +397,41 @@ private:
         self.running_=true;
         self.started_=true;
         struct reset { bool& flag; ~reset(){flag=false;} } guard{self.running_};
+        auto outcome=co_await pump_loop(loop,self);
+        // Event-loop shutdown cancels this task too, so its sends would fail.
+        const bool cancelled=!outcome && outcome.error()==task_result::cancelled;
+        const auto result=unwrap_task(std::move(outcome));
+        if (cancelled) {
+        } else if (!result) {
+            if (const auto code=transport_close_code(self,result.error()))
+                (void)co_await send_close(loop,self,0x1c,*code);
+        } else if (self.close_frame_) {
+            (void)co_await send_close(loop,self,self.close_frame_->first,self.close_frame_->second);
+        }
+        co_return result;
+    }
+    // RFC 9000 20.1 codes for local failures. Stream and flow violations in
+    // peer frames are reported as PROTOCOL_VIOLATION, which 20.1 permits when
+    // no more specific code is tracked. A UDP failure sends nothing.
+    [[nodiscard]] static auto transport_close_code(connection_driver& self,
+        connection_error error) noexcept -> std::optional<std::uint64_t>
+    {
+        switch (error) {
+        case connection_error::provider_failure: return std::nullopt;
+        case connection_error::protocol_violation:
+        case connection_error::malformed_packet:
+        case connection_error::authentication_failed: return 0x0a;
+        case connection_error::unsupported_frame: return 0x07;
+        case connection_error::key_update_violation: return 0x0e;
+        case connection_error::aead_limit_reached: return 0x0f;
+        case connection_error::tls_failure:
+            if (const auto alert=self.connection_.core().tls_alert()) return 0x100+*alert;
+            return 0x01;
+        default: return 0x01;
+        }
+    }
+    static auto pump_loop(event_loop& loop,connection_driver& self) -> task<std::expected<void,connection_error>>
+    {
         if (const auto start=self.connection_.core().advance(lifecycle_time_point::clock::now()); !start)
             co_return std::unexpected(start.error());
         if (const auto synchronized=self.connection_.synchronize_discarded_spaces(); !synchronized)
@@ -453,6 +500,58 @@ private:
         }
         co_return std::expected<void,connection_error>{};
     }
+    // One CONNECTION_CLOSE at the highest level with write keys. An
+    // application close below 1-RTT becomes APPLICATION_ERROR (0x0c).
+    static auto send_close(event_loop& loop,connection_driver& self,
+                           std::uint64_t type,std::uint64_t code) -> task<void>
+    {
+        (void)loop;
+        auto& core=self.connection_.core();
+        const auto state=core.state();
+        if ((state!=connection_state::active && state!=connection_state::handshake) ||
+            self.scheduler_.pending())
+            co_return;
+        std::optional<tls_level> level;
+        for (const auto candidate : {tls_level::application,tls_level::handshake,tls_level::initial})
+            if (!core.level_discarded(candidate) &&
+                core.keys_available(candidate,tls_direction::write)) { level=candidate; break; }
+        if (!level) co_return;
+        decoded_frame frame; frame.type=type; frame.error_code=code;
+        if (*level!=tls_level::application && type==0x1d) {
+            frame.type=0x1c; frame.error_code=0x0c;
+        }
+        protected_packet_fields fields;
+        fields.kind=*level==tls_level::initial ? packet_kind::initial :
+            *level==tls_level::handshake ? packet_kind::handshake : packet_kind::short_header;
+        fields.destination_cid={self.peer_.data(),self.peer_size_};
+        if (*level!=tls_level::application) fields.source_cid={self.local_.data(),self.local_size_};
+        if (*level==tls_level::initial) fields.token=self.initial_token_;
+        // The receive scratch is idle once the pump has stopped.
+        const auto payload=std::as_writable_bytes(std::span(self.packet_scratch_));
+        const auto encoded=encode_frame(frame,payload);
+        if (!encoded) co_return;
+        std::size_t size=*encoded;
+        if (*level==tls_level::initial) {
+            // Datagrams carrying Initial packets are at least 1200 bytes
+            // (RFC 9000 14.1); pad with PADDING frames as the scheduler does.
+            const auto overhead=7+fields.destination_cid.size()+fields.source_cid.size()+
+                varint_size(fields.token.size())+fields.token.size()+2+
+                fields.packet_number_length+16;
+            if (overhead<1200 && size<1200-overhead) {
+                std::fill(payload.begin()+static_cast<std::ptrdiff_t>(size),
+                          payload.begin()+static_cast<std::ptrdiff_t>(1200-overhead),std::byte{});
+                size=1200-overhead;
+            }
+        }
+        const auto built=core.build(fields,
+            {self.packet_scratch_.data(),size},self.output_,self.build_scratch_);
+        if (!built) co_return;
+        // Best effort: a lost close leaves the peer to its idle timeout.
+        (void)co_await self.endpoint_.async_send(self.route_,
+            std::as_bytes(std::span(self.output_).first(*built)));
+        const auto now=lifecycle_time_point::clock::now();
+        (void)core.close_sent(now,self.connection_.application_pto().value_or(std::chrono::seconds(1)));
+    }
     event_loop& loop_;
     udp_endpoint& endpoint_;
     bounded_connection& connection_;
@@ -471,6 +570,8 @@ private:
     std::uint8_t candidate_attempts_{};
     tls_level probe_level_{};
     std::uint8_t probes_{};
+    // Requested CONNECTION_CLOSE frame type and error code.
+    std::optional<std::pair<std::uint64_t,std::uint64_t>> close_frame_{};
     void* progress_argument_{};
     idle_wait* idle_ {};
     void (*progress_)(void*) noexcept {};

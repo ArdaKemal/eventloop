@@ -304,13 +304,23 @@ public:
         state->wake_all();
     }
 
+    // Drivers send their CONNECTION_CLOSE before retiring, so the socket
+    // stays open until the last running driver finishes (see drive()).
     auto stop_all() noexcept -> void
     {
         closing_ = true;
-        endpoint_.close();
         for (auto& entry : slots_)
-            if (entry.driver) entry.driver->stop();
+            if (entry.driver && !entry.driver_finished) entry.driver->stop();
+        close_socket_when_idle();
         wake_all();
+    }
+
+    auto close_socket_when_idle() noexcept -> void
+    {
+        if (!closing_) return;
+        for (const auto& entry : slots_)
+            if (entry.driver && !entry.driver_finished) return;
+        endpoint_.close();
     }
 
     [[nodiscard]] auto all_retired() const noexcept -> bool
@@ -495,6 +505,7 @@ private:
             result = co_await entry.driver->run();
         }
         entry.driver_finished = true;
+        self.close_socket_when_idle();
         if (!entry.terminal_error) {
             if (!result)
                 entry.terminal_error = detail::task_error_code(result.error());
@@ -748,6 +759,8 @@ auto read_stream(event_loop&, quic_endpoint::implementation& impl,
             co_return std::size_t {0};
         if (stream == nullptr || !stream->receive)
             co_return std::unexpected(make_error_code(quic_errc::invalid_argument));
+        if (stream->receive_abandoned)
+            co_return std::unexpected(make_error_code(quic_errc::invalid_state));
         if (stream->state.receiving() == stream_receive_state::reset_received) {
             (void)slot.connection->consume_reset(stream_id);
             co_return std::unexpected(make_error_code(quic_errc::stream_reset));
@@ -786,8 +799,13 @@ auto write_stream(event_loop&, quic_endpoint::implementation& impl,
         if (!slot.occupied || slot.generation != generation || !slot.connection)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         auto* stream = slot.connection->stream(stream_id);
-        if (stream == nullptr || !stream->receive)
+        // The receive buffer is released once a peer reset is read, so the
+        // send side alone decides whether this stream is writable.
+        if (stream == nullptr || stream->state.sending() == stream_send_state::absent)
             co_return std::unexpected(make_error_code(quic_errc::invalid_argument));
+        if (stream->state.sending() == stream_send_state::reset_sent ||
+            stream->state.sending() == stream_send_state::reset_received)
+            co_return std::unexpected(make_error_code(quic_errc::stream_reset));
         if (buffer.empty() && !fin) co_return std::size_t {0};
         const auto writable = stream->send.writable_bytes();
         if (writable >= buffer.size()) {
@@ -1038,6 +1056,44 @@ auto quic_connection::async_receive_datagram(std::span<std::byte> buffer)
     return receive_datagram_task(impl.loop_, impl, slot_, generation_, buffer);
 }
 
+namespace {
+auto stream_control(quic_endpoint::implementation& impl, std::size_t slot_index,
+    std::uint32_t generation, std::uint64_t stream_id, std::uint64_t error_code,
+    bool reset) noexcept -> std::expected<void, std::error_code>
+{
+    auto& slot = impl.slots_[slot_index];
+    if (!slot.occupied || !slot.connection || slot.generation != generation || slot.closing)
+        return std::unexpected(make_error_code(quic_errc::not_connected));
+    const auto result = reset ? slot.connection->reset_stream(stream_id, error_code)
+                              : slot.connection->stop_sending(stream_id, error_code);
+    if (!result)
+        return std::unexpected(make_error_code(
+            result.error() == connection_error::invalid_configuration
+                ? quic_errc::invalid_argument : quic_errc::invalid_state));
+    // Wake the driver to send the frame and any waiter on this stream.
+    if (slot.driver) slot.driver->notify();
+    return {};
+}
+} // namespace
+
+auto quic_connection::reset_stream(std::uint64_t stream_id,
+                                   std::uint64_t error_code) noexcept
+    -> std::expected<void, std::error_code>
+{
+    if (!valid()) return std::unexpected(make_error_code(quic_errc::not_connected));
+    return stream_control(*endpoint_->implementation_, slot_, generation_,
+                          stream_id, error_code, true);
+}
+
+auto quic_connection::stop_sending(std::uint64_t stream_id,
+                                   std::uint64_t error_code) noexcept
+    -> std::expected<void, std::error_code>
+{
+    if (!valid()) return std::unexpected(make_error_code(quic_errc::not_connected));
+    return stream_control(*endpoint_->implementation_, slot_, generation_,
+                          stream_id, error_code, false);
+}
+
 auto quic_connection::close(std::error_code) noexcept -> void
 {
     if (!valid()) return;
@@ -1049,6 +1105,18 @@ auto quic_connection::close(std::error_code) noexcept -> void
         return;
     slot.closing = true;
     if (slot.driver) slot.driver->stop();
+}
+
+auto quic_connection::close_application(std::uint64_t error_code) noexcept -> void
+{
+    if (!valid()) return;
+    auto& slot = endpoint_->implementation_->slots_[slot_];
+    if (!slot.occupied || !slot.connection || slot.generation != generation_)
+        return;
+    slot.closing = true;
+    if (slot.driver)
+        slot.driver->stop_with_application_error(
+            std::min(error_code, quic::detail::max_varint_value));
 }
 
 quic_endpoint::quic_endpoint(event_loop& loop, ip_endpoint local,

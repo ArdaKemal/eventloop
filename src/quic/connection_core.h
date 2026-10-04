@@ -123,6 +123,9 @@ public:
     [[nodiscard]] auto next_deadline(lifecycle_duration current_pto) const noexcept
         -> std::optional<lifecycle_time_point>;
     [[nodiscard]] auto failure() const noexcept -> std::optional<connection_error>;
+    // TLS alert raised by the local handshake, for CRYPTO_ERROR (0x100+alert).
+    [[nodiscard]] auto tls_alert() const noexcept -> std::optional<std::uint8_t>
+    { check_owner(); return tls_.alert(); }
     // Available before authenticated TLS transport-parameter validation runs.
     [[nodiscard]] auto peer_initial_source_cid() const noexcept
         -> std::optional<std::span<const std::byte>>

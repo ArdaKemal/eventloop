@@ -1,6 +1,7 @@
 // Public QUIC API end-to-end test: in-house client and server over loopback
 // for QUIC v1 and v2, exercising the handshake, bidirectional stream I/O, and
-// the RFC 9221 DATAGRAM extension. The certificate is generated in-process.
+// the RFC 9221 DATAGRAM extension, and application stream resets,
+// STOP_SENDING, and CONNECTION_CLOSE. The certificate is generated in-process.
 #include "eventloop/quic.h"
 #include "eventloop/event_loop.h"
 
@@ -241,6 +242,191 @@ auto watch(event_loop& loop, quic_endpoint& server, quic_endpoint& client,
     loop.shutdown(event_loop::clock::duration::zero());
 }
 
+// More rounds than the server's 32 concurrent bidirectional streams, so every
+// abandoned stream must retire and return its stream credit.
+constexpr std::size_t control_rounds = 40;
+constexpr std::uint64_t stream_error = 0x10c;
+
+struct control_outcome {
+    std::size_t server_rounds {0};
+    std::size_t client_rounds {0};
+    bool server_closed {false};
+    bool client_saw_close {false};
+    event_loop::clock::time_point closed_at {};
+    event_loop::clock::time_point observed_at {};
+};
+
+auto control_server(event_loop& loop, quic_endpoint& server, control_outcome& result)
+    -> task<void>
+{
+    auto accepted = flatten_result(co_await server.async_accept());
+    if (!accepted) co_return;
+    auto connection = std::move(*accepted);
+    std::array<std::byte, 8> buffer {};
+    for (std::size_t round = 0; round < control_rounds; ++round) {
+        const auto id = flatten_result(co_await connection.async_accept_stream());
+        if (!id) break;
+        if (!connection.stop_sending(*id, stream_error) ||
+            !connection.reset_stream(*id, stream_error)) break;
+        // Both operations are idempotent once applied.
+        if (!connection.stop_sending(*id, stream_error) ||
+            !connection.reset_stream(*id, stream_error)) break;
+        const auto read = flatten_result(co_await connection.async_read(*id, buffer));
+        const auto write = flatten_result(co_await connection.async_write(*id, reply, false));
+        if (read || read.error() != make_error_code(quic_errc::invalid_state) ||
+            write || write.error() != make_error_code(quic_errc::stream_reset)) break;
+        ++result.server_rounds;
+    }
+    const auto bogus = connection.reset_stream(1u << 20, stream_error);
+    if (bogus || bogus.error() != make_error_code(quic_errc::invalid_argument)) co_return;
+    // Let the final RESET_STREAM reach the client before the close.
+    while (result.client_rounds < control_rounds) (void)co_await sleep_for(loop, 1ms);
+    result.closed_at = event_loop::clock::now();
+    connection.close_application(0x100);
+    result.server_closed = true;
+}
+
+auto control_client(event_loop& loop, quic_endpoint& client, ip_endpoint server,
+                    control_outcome& result) -> task<void>
+{
+    auto connected = flatten_result(co_await client.async_connect(server, "localhost"));
+    if (!connected) co_return;
+    auto connection = std::move(*connected);
+    std::array<std::byte, 8> buffer {};
+    for (std::size_t round = 0; round < control_rounds; ++round) {
+        auto id = flatten_result(co_await connection.async_open_stream(
+            quic_stream_direction::bidirectional));
+        for (int retry = 0; !id && retry < 400; ++retry) {
+            if (id.error() != make_error_code(quic_errc::stream_limit)) break;
+            (void)co_await sleep_for(loop, 5ms);
+            id = flatten_result(co_await connection.async_open_stream(
+                quic_stream_direction::bidirectional));
+        }
+        if (!id || !flatten_result(co_await connection.async_write(*id, reply, false)))
+            co_return;
+        const auto read = flatten_result(co_await connection.async_read(*id, buffer));
+        if (read || read.error() != make_error_code(quic_errc::stream_reset)) co_return;
+        // The peer's STOP_SENDING turns local writes into stream_reset.
+        bool stopped = false;
+        for (int attempt = 0; attempt < 400 && !stopped; ++attempt) {
+            const auto write = flatten_result(co_await connection.async_write(*id, reply, false));
+            stopped = !write && write.error() == make_error_code(quic_errc::stream_reset);
+            if (!stopped) (void)co_await sleep_for(loop, 5ms);
+        }
+        if (!stopped) co_return;
+        ++result.client_rounds;
+    }
+    // A peer CONNECTION_CLOSE ends the connection without an idle timeout.
+    const auto next = flatten_result(co_await connection.async_accept_stream());
+    result.observed_at = event_loop::clock::now();
+    result.client_saw_close = !next && result.server_closed;
+}
+
+auto control_watch(event_loop& loop, quic_endpoint& server, quic_endpoint& client,
+                   control_outcome& result) -> task<void>
+{
+    for (int i = 0; i < 2000 && !result.client_saw_close; ++i)
+        (void)co_await sleep_for(loop, 5ms);
+    co_await server.async_close();
+    co_await client.async_close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto control_scenario(const std::filesystem::path& certificate) -> bool
+{
+    event_loop loop;
+    quic_server_options server_options;
+    server_options.certificate_chain = certificate / "cert.pem";
+    server_options.private_key = certificate / "key.pem";
+    server_options.alpn = protocol;
+    quic_client_options client_options;
+    client_options.alpn = protocol;
+    client_options.trusted_ca = certificate / "cert.pem";
+    quic_endpoint server(loop, ip_endpoint::loopback_v4(0), std::move(server_options));
+    quic_endpoint client(loop, ip_endpoint::loopback_v4(0), std::move(client_options));
+    control_outcome result;
+    check(loop.spawn(control_server(loop, server, result)) == task_spawn_result::accepted,
+          "spawn control server");
+    check(loop.spawn(control_client(loop, client, server.local_endpoint(), result)) ==
+              task_spawn_result::accepted, "spawn control client");
+    check(loop.spawn(control_watch(loop, server, client, result)) ==
+              task_spawn_result::accepted, "spawn control watch");
+    (void)loop.run();
+    check(result.server_rounds == control_rounds, "server stream reset and STOP_SENDING");
+    check(result.client_rounds == control_rounds, "client observed reset and STOP_SENDING");
+    check(result.client_saw_close &&
+              result.observed_at - result.closed_at < std::chrono::seconds(2),
+          "application CONNECTION_CLOSE reaches the peer");
+    return true;
+}
+
+// Closing the server endpoint sends CONNECTION_CLOSE (NO_ERROR) on every
+// connection before the socket closes, so peers do not wait for idle timeout.
+struct shutdown_outcome {
+    bool accepted {false};
+    bool client_saw_close {false};
+    event_loop::clock::time_point closed_at {};
+    event_loop::clock::time_point observed_at {};
+};
+
+auto shutdown_server(event_loop& loop, quic_endpoint& server, shutdown_outcome& result)
+    -> task<void>
+{
+    auto accepted = flatten_result(co_await server.async_accept());
+    if (!accepted) co_return;
+    result.accepted = true;
+    (void)co_await sleep_for(loop, 20ms);
+    result.closed_at = event_loop::clock::now();
+    co_await server.async_close();
+}
+
+auto shutdown_client(event_loop&, quic_endpoint& client, ip_endpoint server,
+                     shutdown_outcome& result) -> task<void>
+{
+    auto connected = flatten_result(co_await client.async_connect(server, "localhost"));
+    if (!connected) co_return;
+    auto connection = std::move(*connected);
+    const auto next = flatten_result(co_await connection.async_accept_stream());
+    result.observed_at = event_loop::clock::now();
+    result.client_saw_close = !next;
+}
+
+auto shutdown_watch(event_loop& loop, quic_endpoint& client, shutdown_outcome& result)
+    -> task<void>
+{
+    for (int i = 0; i < 1000 && !result.client_saw_close; ++i)
+        (void)co_await sleep_for(loop, 5ms);
+    co_await client.async_close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto shutdown_scenario(const std::filesystem::path& certificate) -> bool
+{
+    event_loop loop;
+    quic_server_options server_options;
+    server_options.certificate_chain = certificate / "cert.pem";
+    server_options.private_key = certificate / "key.pem";
+    server_options.alpn = protocol;
+    quic_client_options client_options;
+    client_options.alpn = protocol;
+    client_options.trusted_ca = certificate / "cert.pem";
+    quic_endpoint server(loop, ip_endpoint::loopback_v4(0), std::move(server_options));
+    quic_endpoint client(loop, ip_endpoint::loopback_v4(0), std::move(client_options));
+    shutdown_outcome result;
+    check(loop.spawn(shutdown_server(loop, server, result)) == task_spawn_result::accepted,
+          "spawn shutdown server");
+    check(loop.spawn(shutdown_client(loop, client, server.local_endpoint(), result)) ==
+              task_spawn_result::accepted, "spawn shutdown client");
+    check(loop.spawn(shutdown_watch(loop, client, result)) == task_spawn_result::accepted,
+          "spawn shutdown watch");
+    (void)loop.run();
+    check(result.accepted, "shutdown scenario connected");
+    check(result.client_saw_close &&
+              result.observed_at - result.closed_at < std::chrono::seconds(2),
+          "endpoint close reaches the peer");
+    return true;
+}
+
 auto scenario(quic_version version, const std::filesystem::path& certificate,
               bool small_windows = false) -> bool
 {
@@ -302,6 +488,8 @@ auto main() -> int
     const bool v2 = scenario(quic_version::v2, directory);
     const bool small_v1 = scenario(quic_version::v1, directory, true);
     const bool small_v2 = scenario(quic_version::v2, directory, true);
+    const bool control = control_scenario(directory);
+    const bool shutdown = shutdown_scenario(directory);
     std::filesystem::remove_all(directory);
 #ifdef _WIN32
     (void)WSACleanup();
@@ -310,6 +498,8 @@ auto main() -> int
     check(v2, "QUIC v2 public API scenario");
     check(small_v1, "QUIC v1 small receive windows");
     check(small_v2, "QUIC v2 small receive windows");
+    check(control, "QUIC stream control and application close");
+    check(shutdown, "QUIC endpoint close notifies peers");
     std::puts("QUIC public API tests passed (v1 and v2)");
     return 0;
 }

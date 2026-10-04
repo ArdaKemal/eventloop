@@ -1,5 +1,7 @@
 // Driver failure must wake a pending public accept operation and preserve
-// its error. Mismatched ALPN deterministically fails the server TLS driver.
+// its error. Mismatched ALPN deterministically fails the server TLS driver,
+// whose CONNECTION_CLOSE (CRYPTO_ERROR) must end the client's connect before
+// any timeout.
 #include "eventloop/quic.h"
 #include "eventloop/event_loop.h"
 
@@ -90,6 +92,7 @@ struct outcome {
     bool accepted_finished {false};
     bool connected_finished {false};
     bool timed_out {false};
+    bool connect_failed_before_shutdown {false};
     std::error_code error {};
 };
 
@@ -103,16 +106,17 @@ auto accept_failure(event_loop&, quic_endpoint& server, outcome& result) -> task
 auto connect_peer(event_loop&, quic_endpoint& client, ip_endpoint address,
                   outcome& result) -> task<void>
 {
-    (void)flatten_result(co_await client.async_connect(address, "localhost"));
+    const auto connected = flatten_result(co_await client.async_connect(address, "localhost"));
+    result.connect_failed_before_shutdown = !connected && !result.timed_out;
     result.connected_finished = true;
 }
 
 auto watch(event_loop& loop, quic_endpoint& server, quic_endpoint& client,
            outcome& result) -> task<void>
 {
-    for (int i = 0; i < 400 && !result.accepted_finished; ++i)
+    for (int i = 0; i < 400 && !(result.accepted_finished && result.connected_finished); ++i)
         (void)co_await sleep_for(loop, 5ms);
-    result.timed_out = !result.accepted_finished;
+    result.timed_out = !result.accepted_finished || !result.connected_finished;
     co_await server.async_close();
     co_await client.async_close();
     loop.shutdown(event_loop::clock::duration::zero());
@@ -141,7 +145,9 @@ auto scenario(quic_version version, const std::filesystem::path& certificate) ->
     (void)loop.run();
     check(!result.timed_out, "driver failure wakes pending accept before watchdog");
     check(result.accepted_finished, "accept completed");
-    check(result.connected_finished, "endpoint shutdown wakes pending connect");
+    check(result.connected_finished, "connect completed");
+    check(result.connect_failed_before_shutdown,
+          "server CONNECTION_CLOSE fails the client connect");
     check(std::string_view(result.error.category().name()) == "eventloop.quic.driver",
           "accept reports the driver error category");
     check(result.error.message() == "TLS failure", "accept preserves TLS failure");

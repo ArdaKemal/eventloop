@@ -125,9 +125,30 @@ public:
         -> task<std::expected<void, std::error_code>>;
     [[nodiscard]] auto async_receive_datagram(std::span<std::byte> buffer)
         -> task<std::expected<std::size_t, std::error_code>>;
+    // Abandons the send side with RESET_STREAM and an application error code
+    // (at most 2^62-1). Queued bytes not yet transmitted are discarded and
+    // later writes fail with quic_errc::stream_reset. A send side that already
+    // ended in a reset or fully acknowledged data is left unchanged. Unknown or
+    // receive-only streams return quic_errc::invalid_argument.
+    [[nodiscard]] auto reset_stream(std::uint64_t stream_id,
+                                    std::uint64_t error_code) noexcept
+        -> std::expected<void, std::error_code>;
+    // Asks the peer to stop sending with STOP_SENDING and an application error
+    // code. Buffered and later data on the stream are discarded, the peer's
+    // RESET_STREAM is consumed internally, and later reads fail with
+    // quic_errc::invalid_state. Unknown or send-only streams return
+    // quic_errc::invalid_argument.
+    [[nodiscard]] auto stop_sending(std::uint64_t stream_id,
+                                    std::uint64_t error_code) noexcept
+        -> std::expected<void, std::error_code>;
     // Requests a graceful close. The endpoint slot is released once the driver
-    // retires; await valid() to observe release.
+    // retires; await valid() to observe release. One transport CONNECTION_CLOSE
+    // with NO_ERROR is sent first; it is not retransmitted.
     auto close(std::error_code reason = {}) noexcept -> void;
+    // Closes like close(), sending an application CONNECTION_CLOSE with
+    // error_code instead (APPLICATION_ERROR before 1-RTT keys exist); codes
+    // above 2^62-1 are clamped. The first close requested wins.
+    auto close_application(std::uint64_t error_code) noexcept -> void;
 
     // Internal: constructs a handle into an endpoint-owned slot. Only
     // quic_endpoint produces valid handles.

@@ -52,7 +52,13 @@ public:
         stream_send_buffer<send_bytes> send;
         stream_state state;
         std::uint64_t sent_highest {}, receive_window {}, receive_limit {}, consumed {};
+        // Application codes carried by queued RESET_STREAM and STOP_SENDING.
+        std::uint64_t reset_error {}, stop_sending_error {};
         bool credit_pending {false}, reset_pending {false};
+        bool stop_sending_pending {false};
+        // The application stopped reading: data and a peer reset are consumed
+        // here so the slot can retire without further application reads.
+        bool receive_abandoned {false};
         bool accepted {false};
         bool occupied {false};
     };
@@ -260,6 +266,54 @@ public:
         retire_closed_streams();
         return true;
     }
+    // Local RESET_STREAM (RFC 9000 3.1). Unsent queued bytes are discarded;
+    // the final size is the highest offset already transmitted. A stream whose
+    // send side already ended in reset or acknowledged data is left unchanged.
+    [[nodiscard]] auto reset_stream(std::uint64_t id, std::uint64_t error)
+        -> std::expected<void, connection_error>
+    {
+        check_owner();
+        auto* s = stream(id);
+        if (!s || s->state.sending() == stream_send_state::absent || error > max_varint_value)
+            return std::unexpected(connection_error::invalid_configuration);
+        const auto sending = s->state.sending();
+        if (sending == stream_send_state::reset_sent || sending == stream_send_state::reset_received ||
+            sending == stream_send_state::data_received) return {};
+        return queue_reset(*s, error)
+            ? std::expected<void, connection_error> {}
+            : std::unexpected(connection_error::invalid_state);
+    }
+    // Local STOP_SENDING (RFC 9000 3.5). Buffered and later data are discarded,
+    // and the peer's answering RESET_STREAM is consumed without an application
+    // read. A receive side that already finished is left unchanged.
+    [[nodiscard]] auto stop_sending(std::uint64_t id, std::uint64_t error)
+        -> std::expected<void, connection_error>
+    {
+        check_owner();
+        auto* s = stream(id);
+        if (!s || s->state.receiving() == stream_receive_state::absent ||
+            error > max_varint_value)
+            return std::unexpected(connection_error::invalid_configuration);
+        // A consumed peer reset already released the receive buffer.
+        if (s->receive_abandoned || !s->receive) return {};
+        s->receive_abandoned = true;
+        const auto receiving = s->state.receiving();
+        if ((receiving == stream_receive_state::receive ||
+             receiving == stream_receive_state::size_known) && s->state.send_stop_sending()) {
+            s->stop_sending_error = error;
+            s->stop_sending_pending = true;
+            stream_control_pending_ = true;
+        }
+        return drain_abandoned(*s)
+            ? std::expected<void, connection_error> {}
+            : std::unexpected(connection_error::invalid_state);
+    }
+    [[nodiscard]] auto receive_abandoned(std::uint64_t id) const noexcept -> bool
+    {
+        check_owner();
+        for (const auto& s : slots_) if (s.occupied && s.id == id) return s.receive_abandoned;
+        return false;
+    }
     // Pending controls stay in fixed connection storage until copied into the
     // scheduler's reliable control queue. New credit supersedes older credit.
     [[nodiscard]] auto pending_control() noexcept -> std::optional<decoded_frame>
@@ -273,7 +327,11 @@ public:
         for (auto& s : slots_) if (s.occupied && s.reset_pending) {
             frame.type = 4; frame.stream_id = s.id;
             frame.final_size = *s.state.send_final_size();
-            frame.error_code = *s.state.stop_error(); return frame;
+            frame.error_code = s.reset_error; return frame;
+        }
+        for (auto& s : slots_) if (s.occupied && s.stop_sending_pending) {
+            frame.type = 5; frame.stream_id = s.id;
+            frame.error_code = s.stop_sending_error; return frame;
         }
         if (data_credit_pending_) { frame.type = 0x10; frame.limit = flow_.receive_max_data(); return frame; }
         for (auto& s : slots_) if (s.occupied && s.credit_pending) {
@@ -297,6 +355,7 @@ public:
             stream_credit_pending_[frame.type == 0x12 ? 0 : 1] = false;
         else if (auto* s = stream(frame.stream_id)) {
             if (frame.type == 4) s->reset_pending = false;
+            if (frame.type == 5) s->stop_sending_pending = false;
             if (frame.type == 0x11) s->credit_pending = false;
         }
     }
@@ -523,6 +582,29 @@ private:
         }
         return nullptr;
     }
+    auto queue_reset(stream_slot& s, std::uint64_t error) noexcept -> bool
+    {
+        const auto final = s.state.send_final_size().value_or(s.sent_highest);
+        if (!flow_.set_send_final_size(s.id, final) || !s.state.send_reset(final)) return false;
+        s.reset_error = error;
+        s.reset_pending = true;
+        stream_control_pending_ = true;
+        return true;
+    }
+    // Consume everything an abandoned receive side holds. This may retire the
+    // slot, so callers must not use it afterwards.
+    auto drain_abandoned(stream_slot& s) noexcept -> bool
+    {
+        const auto id = s.id;
+        if (s.state.receiving() == stream_receive_state::reset_received)
+            return consume_reset(id).has_value();
+        if (!s.receive) return true;
+        if (const auto readable = s.receive->readable().size(); readable != 0)
+            if (!consume_stream(id, readable)) return false;
+        if (auto* current = stream(id); current && current->receive && current->receive->complete())
+            (void)finish_read(id);
+        return true;
+    }
     auto retire_closed_streams() noexcept -> void
     {
         const auto local_role = role_ == endpoint_role::client ? stream_role::client : stream_role::server;
@@ -551,6 +633,8 @@ private:
             slot.id = slot.sent_highest = slot.receive_window = 0;
             slot.receive_limit = slot.consumed = 0;
             slot.credit_pending = slot.reset_pending = false;
+            slot.reset_error = slot.stop_sending_error = 0;
+            slot.stop_sending_pending = slot.receive_abandoned = false;
             slot.accepted = slot.occupied = false;
             std::move(active_slots_.begin() + active + 1,
                 active_slots_.begin() + active_count_,
@@ -642,22 +726,22 @@ private:
             if (s->state.receiving() == stream_receive_state::reset_received ||
                 s->state.receiving() == stream_receive_state::reset_read) return true;
             if (!s->receive->insert(frame.offset, frame.data, frame.fin)) return false;
-            return s->state.receive_contiguous(s->receive->next_offset() + s->receive->readable().size()).has_value();
+            if (!s->state.receive_contiguous(s->receive->next_offset() + s->receive->readable().size()))
+                return false;
+            return !s->receive_abandoned || drain_abandoned(*s);
         }
         switch (frame.type) {
         case 4: {
             auto* s = admit(frame.stream_id);
-            return s && flow_.set_receive_final_size(frame.stream_id, frame.final_size) && s->state.receive_reset(frame.final_size);
+            if (!s || !flow_.set_receive_final_size(frame.stream_id, frame.final_size) ||
+                !s->state.receive_reset(frame.final_size)) return false;
+            return !s->receive_abandoned || drain_abandoned(*s);
         }
         case 5: {
             auto* s = admit(frame.stream_id);
             if (!s || !s->state.receive_stop_sending(frame.error_code)) return false;
             if (!s->state.reset_required()) return true;
-            const auto final = s->state.send_final_size().value_or(s->sent_highest);
-            if (!flow_.set_send_final_size(s->id, final) || !s->state.send_reset(final)) return false;
-            s->reset_pending = true;
-            stream_control_pending_ = true;
-            return true;
+            return queue_reset(*s, frame.error_code);
         }
         case 0x10: return flow_.update_send_max_data(frame.limit).has_value();
         case 0x11: {
