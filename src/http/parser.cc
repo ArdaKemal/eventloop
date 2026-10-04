@@ -1,5 +1,6 @@
 #include "parser.h"
 
+#include <algorithm>
 #include <charconv>
 
 namespace eventloop::http::detail {
@@ -227,7 +228,11 @@ auto parse_request_head(std::string_view input, parsed_request& output) noexcept
             content_length_seen = true;
         } else if (ascii_equal(name, "Transfer-Encoding") &&
                    !ascii_equal(value, "identity")) {
-            return {parse_status::unsupported_transfer_encoding};
+            // Only a lone chunked coding is understood (RFC 9112 6.1).
+            if (!ascii_equal(value, "chunked") || output.chunked) {
+                return {parse_status::unsupported_transfer_encoding};
+            }
+            output.chunked = true;
         } else if (ascii_equal(name, "Connection") && contains_token(value, "close")) {
             output.close_after_response = true;
         } else if (ascii_equal(name, "TE") && contains_token(value, "trailers")) {
@@ -239,6 +244,10 @@ auto parse_request_head(std::string_view input, parsed_request& output) noexcept
     }
 
     if (!host_seen) {
+        return {parse_status::bad_request};
+    }
+    // Both framings at once is a request-smuggling hazard (RFC 9112 6.3).
+    if (output.chunked && content_length_seen) {
         return {parse_status::bad_request};
     }
     const std::size_t body_start = header_end + 4;
@@ -254,6 +263,8 @@ auto parse_request(std::string_view input, parsed_request& output) noexcept -> p
 {
     const auto head = parse_request_head(input, output);
     if (head.status != parse_status::complete) return head;
+    // Static requests need the whole body in the input buffer.
+    if (output.chunked) return {parse_status::unsupported_transfer_encoding};
     if (output.content_length > max_message_size - head.consumed) {
         return {parse_status::payload_too_large};
     }
@@ -263,6 +274,108 @@ auto parse_request(std::string_view input, parsed_request& output) noexcept -> p
     output.body = input.substr(head.consumed, output.content_length);
     return {.status = parse_status::complete,
             .consumed = head.consumed + output.content_length};
+}
+
+auto chunked_decoder::feed(std::span<const std::byte>& input, std::size_t max_data,
+                           std::span<const std::byte>& data) noexcept -> status
+{
+    data = {};
+    const auto fail = [this] {
+        state_ = state::error;
+        return status::error;
+    };
+    while (!input.empty()) {
+        if (state_ == state::done) return status::done;
+        if (state_ == state::error) return status::error;
+        if (state_ == state::data) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                {remaining_, input.size(), max_data}));
+            if (count == 0) return status::need_input;
+            data = input.first(count);
+            input = input.subspan(count);
+            remaining_ -= count;
+            if (remaining_ == 0) state_ = state::data_cr;
+            return status::data;
+        }
+        const auto c = std::to_integer<unsigned char>(input.front());
+        input = input.subspan(1);
+        switch (state_) {
+        case state::size: {
+            const int value = c >= '0' && c <= '9' ? c - '0'
+                : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (++line_ > max_line) return fail();
+            if (value >= 0) {
+                if (++digits_ > 15) return fail();
+                remaining_ = remaining_ * 16 + static_cast<unsigned>(value);
+            } else if (digits_ == 0) {
+                return fail();
+            } else if (c == ';' || c == ' ' || c == '\t') {
+                state_ = state::extension;
+            } else if (c == '\r') {
+                state_ = state::size_lf;
+            } else {
+                return fail();
+            }
+            break;
+        }
+        case state::extension:
+            if (++line_ > max_line) return fail();
+            if (c == '\r') state_ = state::size_lf;
+            else if ((c < 0x20 && c != '\t') || c == 0x7f) return fail();
+            break;
+        case state::size_lf:
+            if (c != '\n') return fail();
+            line_ = 0;
+            digits_ = 0;
+            state_ = remaining_ == 0 ? state::trailer_start : state::data;
+            break;
+        case state::data_cr:
+            if (c != '\r') return fail();
+            state_ = state::data_lf;
+            break;
+        case state::data_lf:
+            if (c != '\n') return fail();
+            state_ = state::size;
+            break;
+        case state::trailer_start:
+            if (c == '\r') {
+                state_ = state::final_lf;
+                break;
+            }
+            // A field line needs a name before its colon; no line folding.
+            if (c == ':' || c == ' ' || c == '\t' || c < 0x20 || c == 0x7f) return fail();
+            trailer_colon_ = false;
+            state_ = state::trailer;
+            if (++trailers_ > max_trailers) return fail();
+            break;
+        case state::trailer:
+            if (++trailers_ > max_trailers) return fail();
+            if (c == ':') trailer_colon_ = true;
+            else if (c == '\r') {
+                if (!trailer_colon_) return fail();
+                state_ = state::trailer_lf;
+            } else if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                return fail();
+            }
+            break;
+        case state::trailer_lf:
+            if (c != '\n') return fail();
+            state_ = state::trailer_start;
+            break;
+        case state::final_lf:
+            if (c != '\n') return fail();
+            state_ = state::done;
+            return status::done;
+        case state::data:
+        case state::done:
+        case state::error:
+            break;
+        }
+    }
+    if (state_ == state::done) return status::done;
+    if (state_ == state::error) return status::error;
+    return status::need_input;
 }
 
 } // namespace eventloop::http::detail

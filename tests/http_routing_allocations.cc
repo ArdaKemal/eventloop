@@ -1,5 +1,5 @@
 // Counts general-heap allocations made while a kept-alive HTTP/1.1
-// connection serves routed GET and POST requests. Connection setup and the
+// connection serves routed GET, POST and chunked POST requests. Connection setup and the
 // first requests may allocate (sockets, session, pool slabs); steady-state
 // routed requests must not.
 #include "eventloop/event_loop.h"
@@ -128,15 +128,21 @@ auto client(event_loop& loop, std::uint16_t port, measurement& result) -> task<v
         "POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\n"
         "0123456789012345678901234567890123456789012345678901234567890123456789"
         "012345678901234567890123456789";
+    constexpr std::string_view chunked_post =
+        "POST /upload HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "1e;part=1\r\n012345678901234567890123456789\r\n"
+        "46\r\n0123456789012345678901234567890123456789012345678901234567890123456789\r\n"
+        "0\r\nX-Sum: 100\r\n\r\n";
+    const std::array<std::string_view, 3> rotation {get, post, chunked_post};
     std::array<std::byte, 1024> buffer {};
     if (co_await peer->async_connect()) {
         constexpr std::size_t warmup = 4;
-        constexpr std::size_t measured = 40;
+        constexpr std::size_t measured = 42;
         std::size_t before = 0;
         bool ok = true;
         for (std::size_t index = 0; ok && index < warmup + measured; ++index) {
             if (index == warmup) before = allocations.load();
-            ok = (co_await round_trip(loop, *peer, index % 2 == 0 ? get : post, buffer))
+            ok = (co_await round_trip(loop, *peer, rotation[index % rotation.size()], buffer))
                      .value_or(false);
         }
         if (ok) {

@@ -622,6 +622,90 @@ auto invalid_configuration_test() -> bool
 
 } // namespace
 
+auto chunked_head_tests() -> bool
+{
+    using http::detail::parse_status;
+    http::detail::parsed_request head;
+    const auto chunked = http::detail::parse_request_head(
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", head);
+    http::detail::parsed_request both;
+    const auto smuggled = http::detail::parse_request_head(
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+        "Content-Length: 3\r\n\r\n", both);
+    http::detail::parsed_request gzip;
+    const auto other = http::detail::parse_request_head(
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", gzip);
+    http::detail::parsed_request full;
+    const auto whole = http::detail::parse_request(
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", full);
+    return chunked.status == parse_status::complete && head.chunked &&
+           smuggled.status == parse_status::bad_request &&
+           other.status == parse_status::unsupported_transfer_encoding &&
+           whole.status == parse_status::unsupported_transfer_encoding;
+}
+
+struct chunked_result {
+    std::string body;
+    std::string rest;
+    http::detail::chunked_decoder::status status {};
+    auto operator==(const chunked_result&) const -> bool = default;
+};
+
+// Feeds input in pieces of step bytes, taking at most max_data per call.
+auto decode_chunked(std::string_view input, std::size_t step, std::size_t max_data)
+    -> chunked_result
+{
+    using status = http::detail::chunked_decoder::status;
+    http::detail::chunked_decoder decoder;
+    chunked_result result;
+    auto bytes = std::as_bytes(std::span(input));
+    while (!bytes.empty()) {
+        auto piece = bytes.first(std::min(step, bytes.size()));
+        const auto before = piece.size();
+        for (;;) {
+            std::span<const std::byte> data;
+            result.status = decoder.feed(piece, max_data, data);
+            result.body.append(reinterpret_cast<const char*>(data.data()), data.size());
+            if (result.status != status::data) break;
+        }
+        bytes = bytes.subspan(before - piece.size());
+        if (result.status == status::done || result.status == status::error) break;
+    }
+    result.rest.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    return result;
+}
+
+auto chunked_decoder_tests() -> bool
+{
+    using status = http::detail::chunked_decoder::status;
+    const auto both = [](std::string_view input, std::size_t max_data = 7) {
+        const auto whole = decode_chunked(input, input.size() == 0 ? 1 : input.size(), max_data);
+        const auto bytewise = decode_chunked(input, 1, max_data);
+        return whole == bytewise ? std::optional(whole) : std::nullopt;
+    };
+    const auto decodes = [&](std::string_view input, std::string_view body,
+                             std::string_view rest = {}) {
+        const auto result = both(input);
+        return result && result->status == status::done && result->body == body &&
+               result->rest == rest;
+    };
+    const auto rejects = [&](std::string_view input) {
+        const auto result = both(input);
+        return result && result->status == status::error;
+    };
+    const std::string long_extension = "1;" + std::string(1100, 'x') + "\r\na\r\n0\r\n\r\n";
+    return decodes("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", "hello world") &&
+        decodes("A\r\n0123456789\r\n0\r\n\r\n", "0123456789") &&
+        decodes("3;name=value\r\nabc\r\n0;last\r\n\r\n", "abc") &&
+        decodes("3\r\nabc\r\n0\r\nX-Sum: 1\r\nX-Other: two\r\n\r\n", "abc") &&
+        decodes("0\r\n\r\nGET / HTTP/1.1\r\n", "", "GET / HTTP/1.1\r\n") &&
+        rejects("z\r\n") && rejects(";\r\n") && rejects("5\nhello") &&
+        rejects("3\r\nabcd\r\n") && rejects("1000000000000000\r\n") &&
+        rejects("0\r\n:bad\r\n\r\n") && rejects("0\r\n folded\r\n\r\n") &&
+        rejects("0\r\nno-colon\r\n\r\n") && rejects(long_extension) &&
+        rejects("0\r\n\r\r") && chunked_head_tests();
+}
+
 auto main() -> int
 {
     const bool parser = parser_and_mime_tests();
@@ -632,14 +716,15 @@ auto main() -> int
     const bool pipeline = pipelined_sendfile_test();
     const bool capacity = concurrent_connection_capacity_test();
     const bool configuration = invalid_configuration_test();
+    const bool chunked = chunked_decoder_tests();
     if (!parser || !session || !input_growth || !listener || !redirect || !pipeline ||
-        !capacity || !configuration) {
+        !capacity || !configuration || !chunked) {
         std::cerr << "HTTP tests failed: parser=" << parser
                   << " session=" << session << " listener=" << listener
                   << " input_growth=" << input_growth
                   << " redirect=" << redirect << " pipeline=" << pipeline
                   << " capacity=" << capacity
-                  << " configuration=" << configuration << '\n';
+                  << " configuration=" << configuration << " chunked=" << chunked << '\n';
         return 1;
     }
     return 0;

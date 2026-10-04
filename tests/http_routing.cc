@@ -9,7 +9,9 @@
 #include "eventloop/tls_stream.h"
 #include "tls_test_certificate.h"
 
+#include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -307,6 +309,42 @@ auto request(std::string_view head, std::string_view body = {}) -> std::string
     return value;
 }
 
+// A chunked body in pieces of at most piece bytes, with an extension on the
+// first chunk and an optional trailer section.
+auto chunked(std::string_view body, std::size_t piece, std::string_view trailers = {})
+    -> std::string
+{
+    std::string value;
+    bool first = true;
+    while (!body.empty()) {
+        const auto count = std::min(piece, body.size());
+        std::array<char, 20> size {};
+        const auto end = std::to_chars(size.data(), size.data() + size.size(), count, 16).ptr;
+        value.append(size.data(), end);
+        if (first) value += ";note=first";
+        first = false;
+        value += "\r\n";
+        value += body.substr(0, count);
+        value += "\r\n";
+        body.remove_prefix(count);
+    }
+    value += "0\r\n";
+    value += trailers;
+    value += "\r\n";
+    return value;
+}
+
+auto chunked_request(std::string_view head, std::string_view body, std::size_t piece,
+                     bool close = true, std::string_view trailers = {}) -> std::string
+{
+    std::string value(head);
+    value += "Host: example.test\r\nTransfer-Encoding: chunked\r\n";
+    if (close) value += "Connection: close\r\n";
+    value += "\r\n";
+    value += chunked(body, piece, trailers);
+    return value;
+}
+
 class temporary_directory {
 public:
     temporary_directory()
@@ -406,6 +444,19 @@ auto main() -> int
             "POST /partial HTTP/1.1\r\nHost: a\r\nContent-Length: 5000\r\n\r\n" +
                 std::string(5000, 'p') + request("GET /hello HTTP/1.1\r\n"),
             "GET /hello HTTP/1.1\r\nHost: a\r\n\r\n" + request("GET /api/x HTTP/1.1\r\n"),
+            // Chunked request bodies.
+            chunked_request("POST /upload HTTP/1.1\r\n", large, 3000, true, "X-Sum: 1\r\n"),
+            chunked_request("POST /upload HTTP/1.1\r\n", "abc", 1, false) +
+                request("GET /hello HTTP/1.1\r\n"),
+            chunked_request("POST /partial HTTP/1.1\r\n", large, 700, false) +
+                request("GET /hello HTTP/1.1\r\n"),
+            "POST /upload HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+                "Connection: close\r\n\r\n3\r\nabc\r\nzz\r\n",
+            chunked_request("POST /upload HTTP/1.1\r\n", std::string(20001, 'x'), 4000),
+            "POST /upload HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"
+                "Content-Length: 3\r\nConnection: close\r\n\r\n0\r\n\r\n",
+            chunked_request("POST /index.html HTTP/1.1\r\n", "abc", 3),
+            chunked_request("POST /hello HTTP/1.1\r\n", "abc", 3),
         });
 
     const std::string hello_head =
@@ -438,6 +489,20 @@ auto main() -> int
           responses[14].ends_with("\r\n\r\nhello"), "unread body discarded");
     check(responses[15].find("hello") != std::string::npos &&
           responses[15].ends_with("\r\n\r\n/api/x||-|example.test"), "pipelined requests");
+    check(responses[16].ends_with("\r\n\r\n10000 " + std::to_string(large_sum)),
+          "chunked body with extension and trailers");
+    check(responses[17].find("\r\n\r\n3 " + std::to_string('a' + 'b' + 'c')) !=
+              std::string::npos && responses[17].ends_with("\r\n\r\nhello"),
+          "pipelined request after a chunked body");
+    check(responses[18].find("partial") != std::string::npos &&
+          responses[18].ends_with("\r\n\r\nhello"), "unread chunked body discarded");
+    check(responses[19].starts_with("HTTP/1.1 400 "), "malformed chunked body");
+    check(responses[20].starts_with("HTTP/1.1 413 "), "chunked body above max_request_body");
+    check(responses[21].starts_with("HTTP/1.1 400 "), "chunked with Content-Length");
+    check(responses[22].starts_with("HTTP/1.1 501 "), "static request with chunked body");
+    check(responses[23].starts_with("HTTP/1.1 405 ") &&
+          responses[23].find("Connection: close") != std::string::npos,
+          "chunked body on a path without a handler for the method");
 
     // Expect: 100-continue is answered when the handler reads the body.
     {

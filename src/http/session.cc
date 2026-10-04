@@ -173,14 +173,20 @@ auto session::dispatch_route(std::size_t head_size) -> bool
     if (state.match.allowed == 0) return false;
     if (state.match.function == nullptr) {
         // A routed path without a handler for this method: 204 or 405 with
-        // Allow. Any body must already be buffered, as for static requests.
-        if (head.content_length > max_message_size - head_size) {
+        // Allow. A Content-Length body must already be buffered, as for
+        // static requests; a chunked body is left unread and the connection
+        // closes after the answer.
+        if (head.chunked) {
+            request_size_ = head_size;
+            close_after_response_ = true;
+        } else if (head.content_length > max_message_size - head_size) {
             send_error(parse_status::payload_too_large);
             return true;
+        } else {
+            if (input_size_ - head_size < head.content_length) return true;
+            request_size_ = head_size + head.content_length;
+            close_after_response_ = head.close_after_response;
         }
-        if (input_size_ - head_size < head.content_length) return true;
-        request_size_ = head_size + head.content_length;
-        close_after_response_ = head.close_after_response;
         std::array<char, 96> allow {};
         const auto allow_size = format_allow(state.match.allowed, allow);
         const bool options = head.method == method_type::options;
@@ -211,7 +217,9 @@ auto session::buffered_body() noexcept -> std::span<const std::byte>
     if (!routed_) return {};
     const auto& state = *routing_;
     const auto start = state.head_size + state.buffered_consumed;
-    const auto body_end = state.head_size + state.request.content_length;
+    // A chunked body's end is found by its decoder, so all input is offered.
+    const auto body_end = state.request.chunked
+        ? input_size_ : state.head_size + state.request.content_length;
     const auto end = std::min<std::size_t>(input_size_, body_end);
     if (start >= end) return {};
     return std::as_bytes(std::span {input_data() + start, end - start});

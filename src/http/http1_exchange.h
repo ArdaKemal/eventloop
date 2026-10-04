@@ -107,10 +107,24 @@ public:
         const bool rejected = handled == task_result::frame_allocation_failure;
         if (handled == task_result::cancelled) co_return false;
         if (!self.started_ && !self.broken_) {
-            auto started = co_await start_task(loop, self, rejected ? 503 : 500, {}, 0);
+            const unsigned status = self.malformed_ ? 400 : self.too_large_ ? 413
+                : rejected ? 503 : 500;
+            auto started = co_await start_task(loop, self, status, {}, 0);
             if (started && *started) (void)co_await finish_task(loop, self, {});
         }
-        if (self.broken_ || !self.finished_) co_return false;
+        // After a malformed or oversized body, the next request cannot be found.
+        if (self.broken_ || !self.finished_ || self.malformed_ || self.too_large_) co_return false;
+        if (head.chunked) {
+            // A client waiting for 100 Continue may never send the body.
+            if (head.expect_continue && !self.continued_ && !self.decoder_.done()) co_return false;
+            // Discard the rest of the body within the body limit; the
+            // response buffer is free once the response has finished.
+            while (!self.decoder_.done()) {
+                const auto read = co_await read_chunked_task(loop, self, self.buffer_);
+                if (!read || !*read) co_return false;
+            }
+            co_return !head.close_after_response;
+        }
         // A client waiting for 100 Continue may never send the body.
         if (head.expect_continue && !self.continued_ && self.body_read_ < self.body_length_)
             co_return false;
@@ -134,7 +148,8 @@ public:
 
     auto read_body(std::span<std::byte> buffer) -> task<size_result> override
     {
-        return read_task(loop_, *this, buffer);
+        return routing_.request.chunked ? read_chunked_task(loop_, *this, buffer)
+                                        : read_task(loop_, *this, buffer);
     }
     auto start(unsigned status, std::span<const header> headers,
                std::optional<std::uint64_t> length) -> task<void_result> override
@@ -189,6 +204,9 @@ private:
         reading_ = writing_ = false;
         continued_ = false;
         started_ = finished_ = broken_ = false;
+        decoder_ = chunked_decoder {};
+        staging_begin_ = staging_end_ = 0;
+        malformed_ = too_large_ = false;
         chunked_ = bodyless_ = false;
     }
 
@@ -248,15 +266,9 @@ private:
             self.body_read_ += count;
             co_return count;
         }
-        // RFC 9110 section 10.1.1: ask for the body only once it is read.
-        if (self.routing_.request.expect_continue && !self.continued_ && !self.started_ &&
-            !self.writing_) {
-            constexpr std::string_view proceed = "HTTP/1.1 100 Continue\r\n\r\n";
-            self.continued_ = true;
-            busy writing(self.writing_);
-            auto sent = co_await write_all(loop, self, std::as_bytes(std::span(proceed)));
-            if (!sent || !*sent) co_return std::unexpected(failure(std::errc::connection_reset));
-        }
+        const auto proceeded = co_await send_continue(loop, self);
+        if (!proceeded || !*proceeded)
+            co_return std::unexpected(failure(std::errc::connection_reset));
         const auto received = io_value(co_await self.peer_.async_read_some(buffer.first(want)));
         if (!received || *received == 0) {
             self.broken_ = true;
@@ -265,6 +277,77 @@ private:
         }
         self.body_read_ += *received;
         co_return *received;
+    }
+
+    // RFC 9110 section 10.1.1: ask for the body only once it is read.
+    static auto send_continue(event_loop& loop, http1_exchange& self) -> task<bool>
+    {
+        if (!self.routing_.request.expect_continue || self.continued_ || self.started_ ||
+            self.writing_) co_return true;
+        constexpr std::string_view proceed = "HTTP/1.1 100 Continue\r\n\r\n";
+        self.continued_ = true;
+        busy writing(self.writing_);
+        auto sent = co_await write_all(loop, self, std::as_bytes(std::span(proceed)));
+        co_return sent && *sent;
+    }
+
+    // Decodes a chunked body: buffered session input first, then socket reads
+    // through the staging buffer. Bytes read past the body go back to the
+    // session for the next request.
+    static auto read_chunked_task(event_loop& loop, http1_exchange& self,
+                                  std::span<std::byte> buffer) -> task<size_result>
+    {
+        if (self.reading_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
+        if (self.malformed_) co_return std::unexpected(failure(std::errc::bad_message));
+        if (self.too_large_) co_return std::unexpected(failure(std::errc::message_size));
+        if (buffer.empty()) co_return std::unexpected(failure(std::errc::invalid_argument));
+        busy reading(self.reading_);
+        for (;;) {
+            if (self.decoder_.done()) co_return 0;
+            const auto buffered = self.session_.buffered_body();
+            std::span<const std::byte> input = !buffered.empty() ? buffered
+                : std::span<const std::byte>(self.staging_)
+                      .subspan(self.staging_begin_, self.staging_end_ - self.staging_begin_);
+            if (input.empty()) {
+                const auto proceeded = co_await send_continue(loop, self);
+                if (!proceeded || !*proceeded)
+                    co_return std::unexpected(failure(std::errc::connection_reset));
+                const auto received = io_value(co_await self.peer_.async_read_some(self.staging_));
+                if (!received || *received == 0) {
+                    self.broken_ = true;
+                    co_return std::unexpected(received ? failure(std::errc::connection_reset)
+                                                       : received.error());
+                }
+                self.staging_begin_ = 0;
+                self.staging_end_ = *received;
+                continue;
+            }
+            const auto available = input.size();
+            std::span<const std::byte> data;
+            const auto status = self.decoder_.feed(input, buffer.size(), data);
+            const auto consumed = available - input.size();
+            const auto count = data.size();
+            if (count != 0) std::memcpy(buffer.data(), data.data(), count);
+            if (!buffered.empty()) self.session_.consume_buffered_body(consumed);
+            else self.staging_begin_ += consumed;
+            if (status == chunked_decoder::status::error) {
+                self.malformed_ = true;
+                co_return std::unexpected(failure(std::errc::bad_message));
+            }
+            self.body_read_ += count;
+            if (self.body_read_ > self.routing_.max_request_body) {
+                self.too_large_ = true;
+                co_return std::unexpected(failure(std::errc::message_size));
+            }
+            if (status == chunked_decoder::status::done &&
+                self.staging_begin_ != self.staging_end_) {
+                self.session_.receive(std::span<const std::byte>(self.staging_)
+                    .subspan(self.staging_begin_, self.staging_end_ - self.staging_begin_));
+                self.staging_begin_ = self.staging_end_ = 0;
+            }
+            if (count != 0) co_return count;
+        }
     }
 
     static auto start_task(event_loop& loop, http1_exchange& self, unsigned status,
@@ -481,6 +564,13 @@ private:
     bool chunked_ {false};
     bool bodyless_ {false};
     bool continued_ {false};
+    // Chunked request bodies.
+    chunked_decoder decoder_;
+    std::array<std::byte, 1024> staging_ {};
+    std::size_t staging_begin_ {0};
+    std::size_t staging_end_ {0};
+    bool malformed_ {false};
+    bool too_large_ {false};
 };
 
 } // namespace eventloop::http::detail

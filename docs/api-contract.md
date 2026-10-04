@@ -319,9 +319,18 @@ every running connection has sent its close and retired.
     `connection_reset`. A request declaring more than
     `server_options::max_request_body` (default 1 MiB) answers 413 without
     running the handler.
-    - HTTP/1.1 bodies need Content-Length; chunked request bodies still answer
-      501. The first body read answers `Expect: 100-continue` with
-      100 Continue.
+    - HTTP/1.1 bodies use Content-Length or `Transfer-Encoding: chunked`.
+      Chunk extensions are skipped and request trailers are checked for a
+      name and colon, then dropped. Chunk-size lines are limited to 1 KiB
+      and the trailer section to 8 KiB. A malformed chunked body returns
+      `bad_message` and answers 400 if the handler returns without a
+      response. A read past `max_request_body` returns `message_size` and
+      answers 413 the same way. Either one closes the connection.
+      Content-Length together with chunked answers 400; other transfer
+      codings, and chunked bodies on static requests, answer 501. A chunked
+      body on a routed path without a handler for the method gets its 204 or
+      405 and the connection closes. The first body read answers
+      `Expect: 100-continue` with 100 Continue.
     - HTTP/3 bodies may omit Content-Length. A read past
       `max_request_body` returns `message_size`, and the server answers 413
       if the handler then returns without a response. A malformed body

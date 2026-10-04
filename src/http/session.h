@@ -55,7 +55,8 @@ public:
 
     // A routed request head is parsed and waiting for its handler.
     [[nodiscard]] auto routed() const noexcept -> bool { return routed_; }
-    // Body bytes of the routed request already in the input buffer.
+    // Body bytes of the routed request already in the input buffer; for a
+    // chunked request, all input after the head, including framing.
     [[nodiscard]] auto buffered_body() noexcept -> std::span<const std::byte>;
     auto consume_buffered_body(std::size_t size) noexcept -> void;
     // Releases the routed request. Without keep_alive the session closes.
