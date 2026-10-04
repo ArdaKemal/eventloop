@@ -5,6 +5,7 @@
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
 #include "eventloop/http2/client.h"
+#include "eventloop/task_composition.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
@@ -159,6 +160,17 @@ auto slow(event_loop& loop, http::request&, http::response& response) -> task<vo
     (void)co_await response.async_send(200, {}, text("slow"));
 }
 
+// Waits at most 100 ms for a body, using the library's timeout composition.
+auto timed(event_loop& loop, http::request& request, http::response& response) -> task<void>
+{
+    std::array<std::byte, 64> chunk {};
+    const auto waited = co_await with_timeout(loop, request.async_read_body(chunk), 100ms);
+    const bool timed_out = waited && waited->state == timeout_result<
+        std::expected<std::size_t, std::error_code>>::outcome::timed_out;
+    (void)co_await response.async_send(timed_out ? 408 : 200, {},
+                                       text(timed_out ? "timed out" : "read"));
+}
+
 // --- public client ---------------------------------------------------------
 
 struct result {
@@ -301,6 +313,101 @@ auto get_frame(std::string_view path, unsigned stream) -> std::vector<std::byte>
     return out;
 }
 
+auto open_h2(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context)
+    -> task<tls_stream*>
+{
+    auto owned = std::make_unique<tls_stream>(loop, ip_endpoint::loopback_v4(port),
+        std::move(context), tls_client_options {.hostname = "localhost",
+                                                .application_protocols = {"h2"}});
+    auto* peer = owned.get();
+    loop.add(std::move(owned));
+    if (!co_await peer->async_connect()) co_return nullptr;
+    const auto handshake = co_await peer->async_handshake();
+    if (!handshake || !*handshake) co_return nullptr;
+    co_return peer;
+}
+
+auto send_bytes(event_loop&, tls_stream& peer, std::vector<std::byte> out) -> task<bool>
+{
+    auto pending = std::span<const std::byte>(out);
+    while (!pending.empty()) {
+        const auto written = co_await peer.async_write_some(pending);
+        if (!written || !*written || **written == 0) co_return false;
+        pending = pending.subspan(**written);
+    }
+    co_return true;
+}
+
+auto preface_bytes() -> std::vector<std::byte>
+{
+    constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    std::vector<std::byte> out(text(preface).begin(), text(preface).end());
+    append_frame(out, 4, 0, 0, {});
+    return out;
+}
+
+// Sends a POST with HEADERS but no body and returns the response DATA.
+auto timed_client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
+                  std::string& body) -> task<void>
+{
+    auto* peer = (co_await open_h2(loop, port, std::move(context))).value_or(nullptr);
+    if (peer != nullptr) {
+        const std::array<http2::detail::field, 4> fields {{{":method", "POST"},
+            {":scheme", "https"}, {":authority", "localhost"}, {":path", "/timed"}}};
+        std::vector<std::byte> block;
+        check(http2::detail::hpack_encode(fields, block) == http2::detail::hpack_error::none,
+              "encode request");
+        auto out = preface_bytes();
+        append_frame(out, 1, 4, 1, block);
+        if ((co_await send_bytes(loop, *peer, std::move(out))).value_or(false)) {
+            std::vector<std::byte> input;
+            std::array<std::byte, 1024> buffer {};
+            bool ended = false;
+            while (!ended) {
+                const auto received = co_await peer->async_read_some(buffer);
+                if (!received || !*received || **received == 0) break;
+                input.insert(input.end(), buffer.begin(), buffer.begin() +
+                             static_cast<std::ptrdiff_t>(**received));
+                while (input.size() >= 9) {
+                    const auto size = (std::to_integer<std::size_t>(input[0]) << 16) |
+                        (std::to_integer<std::size_t>(input[1]) << 8) |
+                        std::to_integer<std::size_t>(input[2]);
+                    if (input.size() < 9 + size) break;
+                    if (std::to_integer<unsigned>(input[3]) == 0 &&
+                        std::to_integer<unsigned>(input[8]) == 1) {
+                        body.append(reinterpret_cast<const char*>(input.data() + 9), size);
+                        ended = (std::to_integer<unsigned>(input[4]) & 1u) != 0;
+                    }
+                    input.erase(input.begin(), input.begin() + static_cast<std::ptrdiff_t>(9 + size));
+                }
+            }
+        }
+        peer->close();
+    }
+    loop.stop();
+}
+
+// Keeps an idle routed connection open with a pending read, which loop
+// shutdown cancels; the stream is not touched afterwards.
+auto idle_client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
+                 bool& connected) -> task<void>
+{
+    auto* peer = (co_await open_h2(loop, port, std::move(context))).value_or(nullptr);
+    if (peer == nullptr || !(co_await send_bytes(loop, *peer, preface_bytes())).value_or(false))
+        co_return;
+    std::array<std::byte, 256> buffer {};
+    connected = static_cast<bool>(co_await peer->async_read_some(buffer));
+    (void)co_await peer->async_read_some(buffer);
+}
+
+auto shutdown_when_connected(event_loop& loop, const bool& connected) -> task<void>
+{
+    for (int attempt = 0; attempt < 200 && !connected; ++attempt)
+        (void)co_await sleep_for(loop, 5ms);
+    (void)co_await sleep_for(loop, 50ms);
+    loop.shutdown(0ms);
+}
+
 // Opens /slow on stream 1 and /hello on stream 3 together, and records the
 // order in which their response DATA arrives.
 auto multiplex(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
@@ -395,6 +502,7 @@ auto main() -> int
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
           routes->add(http::method_type::get, "/short", short_body).has_value() &&
           routes->add(http::method_type::get, "/slow", slow).has_value() &&
+          routes->add(http::method_type::post, "/timed", timed).has_value() &&
           routes->add(http::method_type::get, "/file", file,
                       const_cast<std::string*>(&file_path)).has_value(),
           "register routes");
@@ -506,6 +614,36 @@ auto main() -> int
               "spawn watchdog");
         finish(loop, timer);
         check(!timed_out && order == std::vector<unsigned> {3, 1}, "concurrent handlers");
+    }
+
+    // A handler's body read is cancelled by with_timeout on HTTP/2.
+    {
+        event_loop loop;
+        const auto fixture = start_server(loop, files, {.routes = routes});
+        std::string body;
+        check(loop.spawn(timed_client(loop, fixture.port, tls_context::make_client(files.certificate),
+                                      body)) == task_spawn_result::accepted, "spawn timed client");
+        bool timed_out = false;
+        task_handle<void> timer;
+        check(loop.spawn(watchdog(loop, timed_out), timer) == task_spawn_result::accepted,
+              "spawn watchdog");
+        finish(loop, timer);
+        check(!timed_out && body == "timed out", "cancelled body read");
+    }
+
+    // loop.shutdown() ends an idle routed connection without peer activity.
+    {
+        event_loop loop;
+        const auto fixture = start_server(loop, files, {.routes = routes});
+        bool connected = false;
+        check(loop.spawn(idle_client(loop, fixture.port, tls_context::make_client(files.certificate),
+                                     connected)) == task_spawn_result::accepted, "spawn idle client");
+        check(loop.spawn(shutdown_when_connected(loop, connected)) == task_spawn_result::accepted,
+              "spawn shutdown");
+        const auto started = std::chrono::steady_clock::now();
+        while (loop.run() == event_loop_result::interrupted) {}
+        check(connected && std::chrono::steady_clock::now() - started < 5s,
+              "shutdown with an idle routed connection");
     }
 
     // Routes only: unmatched paths answer 404.

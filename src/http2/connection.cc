@@ -234,17 +234,54 @@ using size_result = http::detail::size_result;
     return std::make_error_code(code);
 }
 
-// Parks the awaiting coroutine in slot unless ready already holds.
+// Parks the awaiting coroutine in slot unless ready already holds. drain()
+// resumes it through the slot; cancelling the awaiting task resumes it at
+// once. await_resume() is false after cancellation.
 class park {
 public:
-    park(std::coroutine_handle<>& slot, bool ready) noexcept : slot_(slot), ready_(ready) {}
+    park(std::coroutine_handle<>& slot, bool ready) noexcept : slot_(slot), ready_(ready)
+    {
+        node_.operation = this;
+        node_.cancel = &cancel;
+    }
+    park(const park&) = delete;
+    auto operator=(const park&) -> park& = delete;
+    ~park() { eventloop::detail::coroutine_frame_access::detach_cancellation(node_); }
+
     [[nodiscard]] auto await_ready() const noexcept -> bool { return ready_; }
-    auto await_suspend(std::coroutine_handle<> handle) noexcept -> void { slot_ = handle; }
-    auto await_resume() const noexcept -> void {}
+    template<typename Promise>
+    auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
+    {
+        auto& state = *handle.promise().cancellation_state();
+        if (!eventloop::detail::coroutine_frame_access::attach_cancellation(state, node_)) {
+            cancelled_ = true;
+            return false;
+        }
+        handle_ = handle;
+        slot_ = handle;
+        return true;
+    }
+    [[nodiscard]] auto await_resume() noexcept -> bool
+    {
+        eventloop::detail::coroutine_frame_access::detach_cancellation(node_);
+        return !cancelled_;
+    }
 
 private:
+    static auto cancel(eventloop::detail::coroutine_cancellation_node& node) noexcept -> void
+    {
+        auto& self = *static_cast<park*>(node.operation);
+        eventloop::detail::coroutine_frame_access::detach_cancellation(node);
+        self.cancelled_ = true;
+        self.slot_ = {};
+        self.handle_.resume();
+    }
+
     std::coroutine_handle<>& slot_;
+    std::coroutine_handle<> handle_;
+    eventloop::detail::coroutine_cancellation_node node_ {};
     bool ready_;
+    bool cancelled_ {false};
 };
 
 class http2_exchange final : public http::detail::exchange {
@@ -433,7 +470,8 @@ auto read_task(event_loop& loop, http2_exchange& self, std::span<std::byte> buff
         case session::body_state::failed:
             co_return std::unexpected(failure(std::errc::connection_reset));
         case session::body_state::waiting:
-            co_await park(self.read_waiter, self.read_ready());
+            if (!co_await park(self.read_waiter, self.read_ready()))
+                co_return std::unexpected(failure(std::errc::operation_canceled));
             break;
         }
     }
@@ -481,7 +519,15 @@ auto write_task(event_loop& loop, http2_exchange& self, std::span<const std::byt
         co_return std::unexpected(failure(std::errc::connection_reset));
     }
     self.owner->drain();
-    while (!self.write_ready()) co_await park(self.write_waiter, self.write_ready());
+    while (!self.write_ready()) {
+        if (!co_await park(self.write_waiter, self.write_ready())) {
+            // The session must not keep borrowing the caller's span.
+            self.broken = true;
+            self.owner->state.abandon(self.id, cancel_error);
+            self.owner->drain();
+            co_return std::unexpected(failure(std::errc::operation_canceled));
+        }
+    }
     // The chunk is accepted once it has left the borrowed span.
     if (self.owner->broken || !self.owner->state.stream_open(self.id)) {
         self.broken = true;
@@ -537,7 +583,15 @@ auto send_file_task(event_loop& loop, http2_exchange& self, unsigned status,
         co_return std::unexpected(failure(std::errc::connection_reset));
     }
     self.owner->drain();
-    while (!self.write_ready()) co_await park(self.write_waiter, self.write_ready());
+    while (!self.write_ready()) {
+        if (!co_await park(self.write_waiter, self.write_ready())) {
+            self.waiting_file = false;
+            self.broken = true;
+            self.owner->state.abandon(self.id, cancel_error);
+            self.owner->drain();
+            co_return std::unexpected(failure(std::errc::operation_canceled));
+        }
+    }
     self.waiting_file = false;
     if (!self.completed) {
         self.broken = true;
@@ -664,7 +718,8 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
         if (connection.broken || state.closed()) co_return;
         const auto buffer = state.read_buffer();
         if (buffer.empty()) {
-            co_await park(connection.reader_waiter, connection.broken || !state.input_paused());
+            if (!co_await park(connection.reader_waiter,
+                               connection.broken || !state.input_paused())) co_return;
             continue;
         }
         const auto received = operation_result(co_await connection.peer.async_read_some(buffer));
@@ -713,8 +768,10 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
             break;
         }
         if (connection->broken) break;
-        co_await park(connection->writer_waiter,
-                      connection->broken || state->has_output() || state->closed());
+        // Cancellation (server close or loop shutdown) ends the connection.
+        if (!co_await park(connection->writer_waiter,
+                           connection->broken || state->has_output() || state->closed()))
+            break;
     }
     // Wake every parked task with the connection marked broken, then wait for
     // the reader and handlers before releasing the shared state they borrow.

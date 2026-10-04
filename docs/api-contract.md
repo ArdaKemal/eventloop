@@ -385,11 +385,12 @@ every running connection has sent its close and retired.
       that SETTINGS. A DATA frame that does not fit its stream buffer pauses
       reading the connection until the handler reads, so other streams wait
       meanwhile; a handler that never reads is ended when it responds.
-    - A handler waiting in `async_read_body` or `async_write` is resumed by
-      connection progress or teardown, not by cancelling its task alone:
-      `event_loop::shutdown()` and connection loss mark the connection
-      broken, resume every waiting handler with `connection_reset`, and wait
-      for all handlers before releasing the connection.
+    - Cancelling a handler task, for example with `with_timeout` around
+      `async_read_body`, resumes a waiting read or write with
+      `operation_canceled`. A cancelled write or file send also resets the
+      stream with CANCEL, so the connection stops borrowing its data.
+      Connection loss resumes every waiting handler with `connection_reset`,
+      and the connection waits for all handlers before it is released.
   - HTTP/3 runs a handler inside each request's existing coroutine, using
     that request's scratch buffer. Request concurrency and refusal follow the
     `http3_server` request capacity below.
