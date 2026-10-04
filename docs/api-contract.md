@@ -497,9 +497,10 @@ every running connection has sent its close and retired.
   `document_root` is set. Its
   `run()` task accepts connections; `close()` stops acceptance and
   `async_close()` waits for endpoint retirement. Keep the server and its
-  observed `run()` task alive until both operations complete. GET, HEAD, and
-  OPTIONS serve static files or `index.html` using the shared secure resource
-  walk. Request header blocks are capped at 16 KiB and 128 fields, dynamic
+  observed `run()` task alive until both operations complete. Routed
+  requests run their handlers as described above; other GET, HEAD, and
+  OPTIONS requests serve static files or `index.html` using the shared secure
+  resource walk. Request header blocks are capped at 16 KiB and 128 fields, dynamic
   QPACK tables are disabled, and QUIC caps each connection at 32 peer
   simultaneously active bidirectional and eight peer unidirectional streams.
   The server has eight

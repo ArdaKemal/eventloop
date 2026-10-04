@@ -11,7 +11,8 @@ behavior under load.
 
 The library provides awaitable TCP, TLS, UDP, and Unix domain stream operations
 (Unix sockets on Linux and macOS); QUIC endpoints
-and streams; HTTP/1.1, TLS HTTP/2, and HTTP/3 static-file servers; a bounded HTTP/2
+and streams; HTTP/1.1, TLS HTTP/2, and HTTP/3 servers with coroutine request
+routing and static files; a bounded HTTP/2
 client API; WebSocket framing; and bounded file I/O. It has Linux epoll,
 macOS kqueue, and Windows IOCP backends.
 
@@ -221,8 +222,11 @@ separately; Wayfarer and the WebSocket client do so on a bounded worker.
 
 ## Protocol scope
 
-- The static-file server APIs support HTTP/1.1, TLS HTTP/2, and HTTP/3.
-  Stonegate composes them into one configurable program. File access uses
+- The server APIs support HTTP/1.1, TLS HTTP/2, and HTTP/3. One
+  `http::router` runs coroutine handlers that stream request and response
+  bodies on all three; unmatched paths serve static files.
+  `examples/routing_server.cc` shows the routing API, and Stonegate composes
+  the servers into one configurable program with a `/healthz` route. File access uses
   bounded buffers and a component-by-component path walk that blocks symlink
   escapes. Stonegate supports conditional requests, single byte ranges, and
   bounded directory listings. Linux plain HTTP uses `sendfile` for larger
