@@ -387,6 +387,43 @@ auto timed_client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_cont
     loop.stop();
 }
 
+// Requests a large streamed response and a large static file, reads one
+// chunk, and disconnects while the server is still writing; the server must
+// keep serving. Whether a write then raises SIGPIPE depends on timing, so
+// tests/event_loop.cc checks the SIGPIPE handling itself.
+auto abandon_client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
+                    bool& abandoned) -> task<void>
+{
+    auto* peer = (co_await open_h2(loop, port, std::move(context))).value_or(nullptr);
+    if (peer == nullptr) co_return;
+    // Open every window so the server keeps writing until the disconnect.
+    constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    std::vector<std::byte> out(text(preface).begin(), text(preface).end());
+    constexpr std::array<std::byte, 6> window_setting {std::byte {0}, std::byte {4},
+        std::byte {0x7f}, std::byte {0xff}, std::byte {0xff}, std::byte {0xff}};
+    append_frame(out, 4, 0, 0, window_setting);
+    constexpr std::array<std::byte, 4> connection_credit {std::byte {0x7f}, std::byte {0xfe},
+        std::byte {0}, std::byte {0}};
+    append_frame(out, 8, 0, 0, connection_credit);
+    for (auto frame : {get_frame("/big", 1), get_frame("/large.bin", 3)})
+        out.insert(out.end(), frame.begin(), frame.end());
+    if ((co_await send_bytes(loop, *peer, std::move(out))).value_or(false)) {
+        std::array<std::byte, 1024> buffer {};
+        abandoned = static_cast<bool>(co_await peer->async_read_some(buffer));
+    }
+    peer->close();
+}
+
+auto abandon_then_request(event_loop& loop, std::uint16_t port,
+                          std::shared_ptr<tls_context> context, bool& abandoned,
+                          result& after) -> task<void>
+{
+    (void)co_await abandon_client(loop, port, context, abandoned);
+    (void)co_await sleep_for(loop, 200ms);
+    (void)co_await request_task(loop, port, context, request("GET", "/hello"), after);
+    loop.stop();
+}
+
 // Keeps an idle routed connection open with a pending read, which loop
 // shutdown cancels; the stream is not touched afterwards.
 auto idle_client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
@@ -614,6 +651,30 @@ auto main() -> int
               "spawn watchdog");
         finish(loop, timer);
         check(!timed_out && order == std::vector<unsigned> {3, 1}, "concurrent handlers");
+    }
+
+    // A client that disconnects mid-response does not end the server process.
+    {
+        {
+            std::ofstream large(directory.path() / "www" / "large.bin", std::ios::binary);
+            const std::string block(64 * 1024, 'L');
+            for (int index = 0; index < 64; ++index) large << block;
+        }
+        event_loop loop;
+        const auto fixture = start_server(loop, files,
+            {.routes = routes, .document_root = directory.path() / "www"});
+        bool abandoned = false;
+        result after;
+        check(loop.spawn(abandon_then_request(loop, fixture.port,
+                  tls_context::make_client(files.certificate), abandoned, after)) ==
+              task_spawn_result::accepted, "spawn abandoning client");
+        bool timed_out = false;
+        task_handle<void> timer;
+        check(loop.spawn(watchdog(loop, timed_out), timer) == task_spawn_result::accepted,
+              "spawn watchdog");
+        finish(loop, timer);
+        check(!timed_out && abandoned && ok(after).body == bytes("hello"),
+              "server survives a client that disconnects mid-response");
     }
 
     // A handler's body read is cancelled by with_timeout on HTTP/2.

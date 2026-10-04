@@ -109,6 +109,13 @@ every running connection has sent its close and retired.
 - `task_executor()` runs independent work away from the loop. Worker code must
   not access loop-owned objects; use `post()` or the coroutine blocking/file
   operations to return work to the loop safely.
+- On POSIX, an `event_loop` blocks SIGPIPE in the signal mask of the thread
+  that constructs it, for as long as any loop lives on that thread. Socket
+  writes that cannot pass `MSG_NOSIGNAL`, such as OpenSSL's kernel-TLS
+  `write()` and `sendfile()`, then fail with EPIPE instead of ending the
+  process when a peer disconnects. The last loop on the thread discards a
+  pending SIGPIPE and unblocks it again. Other threads' masks and the
+  process-wide disposition are unchanged.
 
 ## Results and errors
 
