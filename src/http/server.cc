@@ -136,7 +136,8 @@ template<typename Stream>
             }
             if (options.enable_http2 && peer->application_protocol() == "h2") {
                 const auto served = co_await http2::detail::serve(
-                    loop, *peer, root, options.directory_listing);
+                    loop, *peer, root, options.directory_listing, options.routes,
+                    options.max_request_body);
                 if (served && *served) {
                     const auto closed = co_await peer->async_close();
                     (void)closed;

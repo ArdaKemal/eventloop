@@ -273,15 +273,17 @@ auto write_u32(std::byte* output, std::uint32_t value) noexcept -> void
 
 } // namespace
 
-session::session(bool file_sendfile)
-    : file_sendfile_(file_sendfile)
+session::session(bool file_sendfile, const http::router* routes,
+                 std::uint64_t max_request_body)
+    : file_sendfile_(file_sendfile), routes_(routes), max_routed_body_(max_request_body)
 {
     requests_.reserve(8);
+    if (routes_ != nullptr) routed_.reserve(route_body_slots);
     header_block_.reserve(4096);
     output_.resize(4096);
     decoded_fields_.reserve(16);
 
-    std::array<std::byte, 30> settings {};
+    std::array<std::byte, 36> settings {};
     auto setting = [&](std::size_t offset, std::uint16_t id,
                        std::uint32_t value) {
         settings[offset] = static_cast<std::byte>(id >> 8);
@@ -293,11 +295,19 @@ session::session(bool file_sendfile)
     setting(12, 3, static_cast<std::uint32_t>(max_concurrent_streams));
     setting(18, 6, static_cast<std::uint32_t>(hpack_max_field_list_size));
     setting(24, 9, 1); // SETTINGS_NO_RFC7540_PRIORITIES: RFC 9218 signals only.
-    if (!append_frame(settings_frame, 0, 0, settings)) fatal_ = true;
+    // With routes, a stream window is one body buffer slot.
+    std::size_t settings_size = 30;
+    if (routes_ != nullptr) {
+        setting(30, 4, static_cast<std::uint32_t>(route_body_slot_size));
+        settings_size = 36;
+    }
+    if (!append_frame(settings_frame, 0, 0, std::span {settings}.first(settings_size)))
+        fatal_ = true;
 }
 
 auto session::read_buffer() noexcept -> std::span<std::byte>
 {
+    if (stalled_) return {};
     return read_buffer_;
 }
 
@@ -382,7 +392,7 @@ auto session::respond(std::uint32_t stream_id, unsigned status,
     value->response_accounted = body.size();
     inline_response_bytes_ += body.size();
     value->response_body = std::move(body);
-    if (!append_response_headers(*value, status, headers)) {
+    if (!append_response_headers(*value, status, headers, value->response_size == 0)) {
         reset_stream(*value);
         return false;
     }
@@ -400,7 +410,7 @@ auto session::respond_file(std::uint32_t stream_id, unsigned status,
     value->response_offset = 0;
     value->response_file_start = offset;
     if (send_body) value->response_file = std::move(file);
-    if (!append_response_headers(*value, status, headers)) {
+    if (!append_response_headers(*value, status, headers, value->response_size == 0)) {
         reset_stream(*value);
         return false;
     }
@@ -420,6 +430,12 @@ auto session::closed() const noexcept -> bool
 auto session::consume_input(std::span<const std::byte> input) -> void
 {
     while (!input.empty() && !fatal_) {
+        if (stalled_) {
+            // Keep the rest for resume_input(); input lies in read_buffer_.
+            std::memmove(read_buffer_.data(), input.data(), input.size());
+            held_input_ = input.size();
+            return;
+        }
         if (preface_size_ < client_preface.size()) {
             const auto expected = static_cast<unsigned char>(
                 client_preface[preface_size_]);
@@ -478,6 +494,8 @@ auto session::consume_input(std::span<const std::byte> input) -> void
         }
         if (frame_payload_size_ == expected_payload_size_) {
             dispatch_frame();
+            // A paused DATA frame stays buffered and is dispatched again.
+            if (stalled_) continue;
             frame_header_size_ = 0;
             frame_payload_size_ = 0;
             expected_payload_size_ = 0;
@@ -664,6 +682,19 @@ auto session::dispatch_data() -> void
         }
     };
     auto* value = find_stream(frame_stream_id_);
+    if (value != nullptr && value->routed && value->body_slot != no_slot && !value->too_large) {
+        // Checked before any accounting so a paused frame can be redispatched.
+        std::size_t payload = frame_payload_size_;
+        if ((frame_flags_ & flag_padded) != 0 && payload != 0) {
+            const auto pad = byte_value(frame_payload_[0]);
+            payload = pad < payload ? payload - 1 - pad : 0;
+        }
+        if (payload > route_body_slot_size - (value->body_end - value->body_begin)) {
+            stalled_ = true;
+            stalled_need_ = payload;
+            return;
+        }
+    }
     if (value == nullptr) {
         if (frame_stream_id_ > last_stream_id_) {
             connection_error(protocol_error);
@@ -716,9 +747,36 @@ auto session::dispatch_data() -> void
         return;
     }
     value->request_body_size += data_size;
-    if (value->request_body_size > max_request_body ||
-        (value->content_length &&
-         value->request_body_size > *value->content_length)) {
+    if (value->content_length && value->request_body_size > *value->content_length) {
+        return_connection_credit();
+        stream_error(frame_stream_id_, value->routed ? protocol_error : enhance_your_calm_error);
+        return;
+    }
+    if (value->routed) {
+        return_connection_credit();
+        if (value->request_body_size > max_routed_body_) value->too_large = true;
+        // Buffered bytes return their stream credit when the handler reads
+        // them; padding, and bodies past the limit, return it now.
+        std::int64_t credit = flow_size;
+        if (!value->too_large && value->body_slot != no_slot && data_size != 0) {
+            auto* slot = body_slot(*value);
+            if (route_body_slot_size - value->body_end < data_size) {
+                std::memmove(slot, slot + value->body_begin, value->body_end - value->body_begin);
+                value->body_end -= value->body_begin;
+                value->body_begin = 0;
+            }
+            std::memcpy(slot + value->body_end, frame_payload_.data() + offset, data_size);
+            value->body_end += data_size;
+            credit -= static_cast<std::int64_t>(data_size);
+        }
+        if (credit > 0) {
+            value->receive_window += credit;
+            send_window_update(frame_stream_id_, static_cast<std::uint32_t>(credit));
+        }
+        if ((frame_flags_ & flag_end_stream) != 0) finish_request(*value);
+        return;
+    }
+    if (value->request_body_size > max_request_body) {
         return_connection_credit();
         stream_error(frame_stream_id_, enhance_your_calm_error);
         return;
@@ -886,7 +944,9 @@ auto session::finish_header_block() -> void
         stream_error(header_stream_id_, protocol_error);
     } else {
         value->initial_headers = true;
-        if (header_end_stream_) finish_request(*value);
+        if (routes_ != nullptr) (void)route_stream(*value);
+        // Routing may refuse the stream when no body buffer is free.
+        if (header_end_stream_ && value->active) finish_request(*value);
     }
     header_block_.clear();
 }
@@ -902,6 +962,12 @@ auto session::finish_request(stream& value) -> void
         return;
     }
     value.remote_closed = true;
+    if (value.routed) {
+        // The handler already has the request; its body is complete.
+        value.body_ended = true;
+        if (value.stream_finished) complete_stream(value);
+        return;
+    }
     value.request_ready = true;
     requests_.push_back(request {
         .stream_id = value.id,
@@ -1095,7 +1161,211 @@ auto session::reset_stream(stream& value) noexcept -> void
     std::erase_if(requests_, [&value](const request& pending) {
         return pending.stream_id == value.id;
     });
+    if (value.body_slot != no_slot) slot_used_[value.body_slot] = false;
+    if (value.routed) {
+        std::erase_if(routed_, [&value](const routed_request& pending) {
+            return pending.stream_id == value.id;
+        });
+        if (release_hook_ != nullptr)
+            release_hook_(release_context_, value.id, value.stream_finished);
+    }
     value = stream {};
+}
+
+// Routes a stream whose request headers were just validated. Returns false
+// when the path has no handler for the method, leaving static dispatch.
+auto session::route_stream(stream& value) -> bool
+{
+    const std::string_view target = value.target;
+    const auto match = http::detail::router_access::match(*routes_,
+        http::detail::method_from_name(value.method), target.substr(0, target.find('?')));
+    if (match.function == nullptr) return false;
+    value.routed = true;
+    const bool too_large = value.content_length && *value.content_length > max_routed_body_;
+    if (!header_end_stream_ && !too_large) {
+        value.body_slot = acquire_body_slot();
+        if (value.body_slot == no_slot) {
+            // Every body buffer is busy: the request was not processed and a
+            // client may retry it (RFC 9113 8.7).
+            value.routed = false;
+            stream_error(value.id, refused_stream_error);
+            return true;
+        }
+    }
+    value.too_large = too_large;
+    routed_request announced {
+        .stream_id = value.id,
+        .match = match,
+        .fields = {},
+        .content_length = value.content_length,
+        .too_large = too_large,
+    };
+    announced.fields.swap(decoded_fields_);
+    routed_.push_back(std::move(announced));
+    return true;
+}
+
+auto session::acquire_body_slot() noexcept -> std::uint8_t
+{
+    if (!body_arena_) {
+        body_arena_.reset(new (std::nothrow) std::byte[route_body_slots * route_body_slot_size]);
+        if (!body_arena_) return no_slot;
+    }
+    for (std::uint8_t index = 0; index < route_body_slots; ++index) {
+        if (slot_used_[index]) continue;
+        slot_used_[index] = true;
+        return index;
+    }
+    return no_slot;
+}
+
+auto session::body_slot(const stream& value) noexcept -> std::byte*
+{
+    return body_arena_.get() + std::size_t {value.body_slot} * route_body_slot_size;
+}
+
+// Releases a routed stream whose response has ended. A request body still
+// arriving is no longer needed (RFC 9113 8.1).
+auto session::complete_stream(stream& value) -> void
+{
+    if (!value.body_ended) stream_error(value.id, 0);
+    else reset_stream(value);
+}
+
+auto session::set_release_hook(release_hook hook, void* context) noexcept -> void
+{
+    release_hook_ = hook;
+    release_context_ = context;
+}
+
+auto session::pop_routed(routed_request& value) -> bool
+{
+    if (routed_.empty()) return false;
+    value = std::move(routed_.front());
+    routed_.erase(routed_.begin());
+    return true;
+}
+
+auto session::read_body(std::uint32_t stream_id, std::span<std::byte> output,
+                        std::size_t& count) -> body_state
+{
+    count = 0;
+    auto* value = find_stream(stream_id);
+    if (value == nullptr || !value->routed || fatal_) return body_state::failed;
+    if (value->too_large) return body_state::too_large;
+    const auto available = value->body_end - value->body_begin;
+    if (available != 0) {
+        count = std::min(output.size(), available);
+        std::memcpy(output.data(), body_slot(*value) + value->body_begin, count);
+        value->body_begin += count;
+        if (value->body_begin == value->body_end) value->body_begin = value->body_end = 0;
+        if (!value->remote_closed) {
+            value->receive_window += static_cast<std::int64_t>(count);
+            send_window_update(stream_id, static_cast<std::uint32_t>(count));
+        }
+        return body_state::data;
+    }
+    return value->body_ended ? body_state::ended : body_state::waiting;
+}
+
+auto session::start_streamed(std::uint32_t stream_id, unsigned status,
+                             std::span<const field> headers) -> bool
+{
+    auto* value = find_stream(stream_id);
+    if (value == nullptr || !value->routed || value->response_started || fatal_) return false;
+    value->streaming = true;
+    if (!append_response_headers(*value, status, headers, false)) {
+        stream_error(stream_id, internal_error);
+        return false;
+    }
+    return true;
+}
+
+auto session::queue_chunk(std::uint32_t stream_id, std::span<const std::byte> data) -> bool
+{
+    auto* value = find_stream(stream_id);
+    if (value == nullptr || !value->streaming || value->stream_finished || fatal_) return false;
+    value->chunk = data;
+    pump_responses();
+    return true;
+}
+
+auto session::chunk_pending(std::uint32_t stream_id) const noexcept -> bool
+{
+    const auto found = std::find_if(streams_.begin(), streams_.end(),
+        [stream_id](const stream& value) { return value.active && value.id == stream_id; });
+    return found != streams_.end() && !found->chunk.empty() && !fatal_;
+}
+
+auto session::finish_streamed(std::uint32_t stream_id, std::span<const field> trailers) -> bool
+{
+    auto* value = find_stream(stream_id);
+    if (value == nullptr || !value->streaming || value->stream_finished ||
+        !value->chunk.empty() || fatal_) return false;
+    const bool queued = trailers.empty()
+        ? append_frame(data_frame, flag_end_stream, stream_id)
+        : append_header_block(*value, trailers, true);
+    if (!queued) {
+        stream_error(stream_id, internal_error);
+        return false;
+    }
+    value->stream_finished = true;
+    complete_stream(*value);
+    return true;
+}
+
+auto session::send_streamed_file(std::uint32_t stream_id, unique_fd file,
+                                 std::uint64_t offset, std::uint64_t size) -> bool
+{
+    auto* value = find_stream(stream_id);
+    if (value == nullptr || !value->streaming || value->stream_finished || size == 0 ||
+        fatal_) return false;
+    // The file is sent by the static scheduler, which ends the stream.
+    value->streaming = false;
+    value->response_file = std::move(file);
+    value->response_file_start = offset;
+    value->response_offset = 0;
+    value->response_size = size;
+    pump_responses();
+    return true;
+}
+
+auto session::stream_open(std::uint32_t stream_id) const noexcept -> bool
+{
+    return !fatal_ && std::any_of(streams_.begin(), streams_.end(),
+        [stream_id](const stream& value) { return value.active && value.id == stream_id; });
+}
+
+auto session::body_ready(std::uint32_t stream_id) const noexcept -> bool
+{
+    const auto found = std::find_if(streams_.begin(), streams_.end(),
+        [stream_id](const stream& value) { return value.active && value.id == stream_id; });
+    return found == streams_.end() || fatal_ || found->too_large ||
+           found->body_end != found->body_begin || found->body_ended;
+}
+
+auto session::abandon(std::uint32_t stream_id, std::uint32_t error) -> void
+{
+    if (find_stream(stream_id) != nullptr) stream_error(stream_id, error);
+}
+
+auto session::resume_input() -> void
+{
+    if (!stalled_ || fatal_) return;
+    // Retry only once the stream has released room, or is gone.
+    const auto* value = find_stream(frame_stream_id_);
+    if (value != nullptr && value->routed && value->body_slot != no_slot && !value->too_large &&
+        stalled_need_ > route_body_slot_size - (value->body_end - value->body_begin)) return;
+    stalled_ = false;
+    dispatch_frame();
+    if (stalled_) return;
+    frame_header_size_ = 0;
+    frame_payload_size_ = 0;
+    expected_payload_size_ = 0;
+    const auto held = held_input_;
+    held_input_ = 0;
+    consume_input(std::span {read_buffer_}.first(held));
+    pump_responses();
 }
 
 auto session::stream_error(std::uint32_t id, std::uint32_t error) -> void
@@ -1180,7 +1450,7 @@ auto session::append_frame(std::uint8_t type, std::uint8_t flags,
 }
 
 auto session::append_response_headers(stream& value, unsigned status,
-                                      std::span<const field> headers) -> bool
+                                      std::span<const field> headers, bool end_stream) -> bool
 {
     std::array<char, 3> status_text {
         static_cast<char>('0' + (status / 100) % 10),
@@ -1191,6 +1461,15 @@ auto session::append_response_headers(stream& value, unsigned status,
     fields.reserve(headers.size() + 1);
     fields.push_back(field {":status", std::string(status_text.data(), status_text.size())});
     fields.insert(fields.end(), headers.begin(), headers.end());
+    if (!append_header_block(value, fields, end_stream)) return false;
+    value.response_started = true;
+    return true;
+}
+
+// Encodes fields as HEADERS plus CONTINUATION frames for value.
+auto session::append_header_block(stream& value, std::span<const field> fields,
+                                  bool end_stream) -> bool
+{
     std::vector<std::byte> block;
     const auto encoded = hpack_encode(fields, block);
     if (encoded != hpack_error::none) return false;
@@ -1206,14 +1485,13 @@ auto session::append_response_headers(stream& value, unsigned status,
                                                   block.size() - offset);
         const bool last = offset + count == block.size();
         std::uint8_t flags = last ? flag_end_headers : 0;
-        if (first && value.response_size == 0) flags |= flag_end_stream;
+        if (first && end_stream) flags |= flag_end_stream;
         const auto type = first ? headers_frame : continuation_frame;
         if (!append_frame(type, flags, value.id,
                 std::span {block}.subspan(offset, count))) return false;
         first = false;
         offset += count;
     } while (offset < block.size());
-    value.response_started = true;
     return true;
 }
 
@@ -1225,7 +1503,9 @@ auto session::next_response() const noexcept -> std::optional<std::size_t>
 {
     const auto sendable = [this](const stream& value) {
         if (!value.active || !value.response_started) return false;
-        if (value.response_size == 0) return true;
+        if (value.streaming)
+            return !value.chunk.empty() && connection_send_window_ > 0 && value.send_window > 0;
+        if (value.response_size == 0) return !value.routed;
         return value.response_offset < value.response_size &&
                connection_send_window_ > 0 && value.send_window > 0;
     };
@@ -1256,6 +1536,18 @@ auto session::pump_responses() -> void
     while (const auto next = next_response()) {
         const auto index = *next;
         auto& value = streams_[index];
+        if (value.streaming) {
+            // A handler's borrowed chunk; finish_streamed() ends the stream.
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>({
+                value.chunk.size(), static_cast<std::uint64_t>(max_frame_payload),
+                static_cast<std::uint64_t>(connection_send_window_),
+                static_cast<std::uint64_t>(value.send_window)}));
+            if (!append_frame(data_frame, 0, value.id, value.chunk.first(count))) return;
+            value.chunk = value.chunk.subspan(count);
+            connection_send_window_ -= static_cast<std::int64_t>(count);
+            value.send_window -= static_cast<std::int64_t>(count);
+            continue;
+        }
         if (value.response_size == 0) {
             reset_stream(value);
             continue;
@@ -1292,7 +1584,14 @@ auto session::pump_responses() -> void
             connection_send_window_ -= static_cast<std::int64_t>(count);
             value.send_window -= static_cast<std::int64_t>(count);
             response_cursor_ = (index + 1) % streams_.size();
-            if (last) reset_stream(value);
+            if (last) {
+                if (value.routed) {
+                    value.stream_finished = true;
+                    complete_stream(value);
+                } else {
+                    reset_stream(value);
+                }
+            }
             return;
 #endif
         }
@@ -1320,7 +1619,14 @@ auto session::pump_responses() -> void
         value.response_offset += count;
         connection_send_window_ -= static_cast<std::int64_t>(count);
         value.send_window -= static_cast<std::int64_t>(count);
-        if (last) reset_stream(value);
+        if (last) {
+                if (value.routed) {
+                    value.stream_finished = true;
+                    complete_stream(value);
+                } else {
+                    reset_stream(value);
+                }
+            }
     }
 }
 

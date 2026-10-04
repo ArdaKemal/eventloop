@@ -285,8 +285,8 @@ every running connection has sent its close and retired.
   the component-by-component `O_NOFOLLOW` path walk.
 - Include `eventloop/http/router.h` to route requests to handlers. Routing
   runs on HTTP/1.1 (`http::server`, and `https_server` connections that
-  negotiate `http/1.1`) and on HTTP/3 (`http3_server`, for `https` requests).
-  HTTP/2 connections still serve only static files and ignore `routes`.
+  negotiate `http/1.1`), on HTTP/2 (`https_server` connections that negotiate
+  `h2`), and on HTTP/3 (`http3_server`, for `https` requests).
   - A `http::router` holds up to 64 routes (`max_routes`) and is built before
     a server takes it as `std::shared_ptr<const router>`.
     - `add(method, path, handler, context)` matches a path exactly, and
@@ -328,6 +328,11 @@ every running connection has sent its close and retired.
       (DATA beyond Content-Length, a truncated frame, invalid trailers)
       returns `bad_message` and resets the stream with the RFC 9114 code.
       Request trailers are validated but not exposed.
+    - HTTP/2 bodies may omit Content-Length and follow the same 413 rule as
+      HTTP/3. A malformed body (DATA beyond Content-Length, or a body shorter
+      than it at END_STREAM) resets the stream with PROTOCOL_ERROR, and reads
+      return `connection_reset`. Request trailers are validated but not
+      exposed.
   - `http::response` sends the status and fields with `async_start`, body
     bytes with `async_write`, and the end with `async_finish(trailers)`.
     `async_send` does all three with content-length set, and `async_send_file`
@@ -339,36 +344,61 @@ every running connection has sent its close and retired.
     - A declared content-length is enforced: writing past it is
       `invalid_argument`, and finishing short is `invalid_argument` and
       abandons the response. Without content-length, HTTP/1.1 uses chunked
-      transfer coding and HTTP/3 ends the stream. On HTTP/1.1, trailers are
-      sent only on chunked responses to requests with `TE: trailers`; HTTP/3
-      always sends them. Status 204 and 304 carry no body. HTTP/3 response
+      transfer coding, and HTTP/2 and HTTP/3 end the stream. On HTTP/1.1,
+      trailers are sent only on chunked responses to requests with
+      `TE: trailers`; HTTP/2 and HTTP/3 always send them. Status 204 and 304 carry no body. HTTP/3 response
       sections and trailers are limited to 61 and 64 fields; more is
       `message_size`.
     - A handler that returns before `async_start` gets a 500 response. One that
       returns after `async_start` but before `async_finish` closes the
-      HTTP/1.1 connection, or resets the HTTP/3 stream with
-      `H3_INTERNAL_ERROR`.
+      HTTP/1.1 connection, resets the HTTP/2 stream with INTERNAL_ERROR, or
+      resets the HTTP/3 stream with `H3_INTERNAL_ERROR`.
     - An unread HTTP/1.1 request body is discarded before the next request on
       the connection, except after `Expect: 100-continue` without a read,
-      which closes the connection. An unread HTTP/3 body is stopped with
-      STOP_SENDING `H3_NO_ERROR` after the response (RFC 9114 4.1).
+      which closes the connection. An unread HTTP/2 body is ended with
+      RST_STREAM NO_ERROR after the response (RFC 9113 8.1), and an unread
+      HTTP/3 body with STOP_SENDING `H3_NO_ERROR` (RFC 9114 4.1).
   - HTTP/1.1 runs one handler at a time per connection. Routing state, a 4 KiB
     response buffer, and the request view are allocated once per connection
     when the server has routes.
+  - HTTP/2 runs one handler task per stream, up to 32 per connection, next to
+    a reader task and the connection task, which writes. A handler's
+    `async_write` completes once its bytes enter the connection's 256 KiB
+    output queue under flow control and RFC 9218 priority; `async_send_file`
+    completes once the last range is queued. Each connection allocates its
+    session, 32 handler slots, and their request views once.
+    - Routed uploads use a pool of eight 16 KiB stream buffers, allocated the
+      first time a routed request with a body arrives. With routes, the
+      server advertises a 16 KiB initial stream window and returns credit as
+      handlers read. An upload arriving while all eight buffers are busy is
+      refused with RST_STREAM REFUSED_STREAM, which clients may retry.
+    - A client may send up to the default 64 KiB window before it applies
+      that SETTINGS. A DATA frame that does not fit its stream buffer pauses
+      reading the connection until the handler reads, so other streams wait
+      meanwhile; a handler that never reads is ended when it responds.
+    - A handler waiting in `async_read_body` or `async_write` is resumed by
+      connection progress or teardown, not by cancelling its task alone:
+      `event_loop::shutdown()` and connection loss mark the connection
+      broken, resume every waiting handler with `connection_reset`, and wait
+      for all handlers before releasing the connection.
   - HTTP/3 runs a handler inside each request's existing coroutine, using
     that request's scratch buffer. Request concurrency and refusal follow the
     `http3_server` request capacity below.
   - Steady-state routed requests make no general-heap allocation on a
     kept-alive HTTP/1.1 connection or on an HTTP/3 connection, including the
     QUIC stack. `tests/http_routing_allocations.cc` and
-    `tests/http3_routing_allocations.cc` check this.
+    `tests/http3_routing_allocations.cc` check this. HTTP/2 requests allocate
+    for HPACK field strings and header encoding, routed or static; routed
+    requests allocate no more than static ones, as
+    `tests/http2_routing_allocations.cc` checks.
 - `eventloop::http::https_server` advertises `h2` and `http/1.1` with ALPN by
   default. Set `eventloop::http::server_options::enable_http2` to `false` to
   disable HTTP/2. The
-  HTTP/2 path serves GET, HEAD, and OPTIONS over TLS, supports up to 32 active
-  streams per connection, decodes bounded HPACK header blocks, and observes
-  connection and stream DATA flow control. Request bodies are discarded and
-  limited to 1 MiB. File responses stream from their owned descriptors; inline
+  HTTP/2 path serves static GET, HEAD, and OPTIONS over TLS and routed
+  requests as described above, supports up to 32 active streams per
+  connection, decodes bounded HPACK header blocks, and observes connection and
+  stream DATA flow control. Static request bodies are discarded and limited to
+  1 MiB. File responses stream from their owned descriptors; inline
   response bodies are bounded to 4 MiB per connection. Responses are scheduled
   by RFC 9218 priority, taken from the request `priority` field and replaced
   by PRIORITY_UPDATE frames. Lower urgency goes first. Within one urgency,

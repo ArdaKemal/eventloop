@@ -7,8 +7,7 @@ versions when the directory has no index file.
 The built-in servers own their sockets and document-root descriptors and use
 secure path traversal; this program does not implement file walking.
 `GET /healthz` answers `ok` through a route registered with the public
-`http::router`; it runs on HTTP/1.1 and HTTP/3 connections, while HTTP/2
-serves that path from the document root.
+`http::router` on all three HTTP versions.
 Static files include ETag and Last-Modified validators and support single
 byte ranges on all three HTTP versions. A matching `If-None-Match` (which
 takes precedence over `If-Modified-Since`) or `If-Modified-Since` returns

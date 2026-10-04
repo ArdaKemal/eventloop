@@ -11,6 +11,9 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <optional>
+#include <ctime>
+#include <coroutine>
 #include <expected>
 #include <limits>
 #include <span>
@@ -85,8 +88,25 @@ auto respond_static_file(session& state, const request& incoming, unique_fd desc
 }
 
 auto serve_request(session& state, request incoming, native_socket root,
-                   bool directory_listing) -> void
+                   bool directory_listing, const http::router* routes) -> void
 {
+    // A routed path reaches here only without a handler for the method.
+    if (routes != nullptr) {
+        const std::string_view target = incoming.target;
+        const auto match = http::detail::router_access::match(*routes,
+            http::detail::method_from_name(incoming.method), target.substr(0, target.find('?')));
+        if (match.allowed != 0) {
+            std::array<char, 96> allow {};
+            const auto size = http::detail::format_allow(match.allowed, allow);
+            const std::array<field, 2> headers {
+                field {"content-length", "0"},
+                field {"allow", std::string(allow.data(), size)}};
+            (void)state.respond(incoming.stream_id, incoming.method == "OPTIONS" ? 204 : 405,
+                                std::span(headers).subspan(incoming.method == "OPTIONS" ? 1 : 0),
+                                {});
+            return;
+        }
+    }
     if (incoming.method == "OPTIONS") {
         const std::array<field, 1> headers {
             field {"allow", "GET, HEAD, OPTIONS"}};
@@ -190,19 +210,538 @@ template<typename T>
     return std::move(*result);
 }
 
+// --- Routed connections ----------------------------------------------------
+//
+// With routes, a connection runs as one writer task (this coordinator), one
+// reader task, and up to max_concurrent_streams handler tasks, all on the
+// connection's loop. They share the session. A task that must wait for the
+// session parks a coroutine handle; drain() resumes parked handles whose
+// condition holds, at points where the session is not mid-update.
+
+struct connection_state;
+
+// RFC 9113 section 7 error codes used by routed streams.
+constexpr std::uint32_t internal_error = 2;
+constexpr std::uint32_t refused_stream_error = 7;
+constexpr std::uint32_t cancel_error = 8;
+
+using void_result = http::detail::void_result;
+using size_result = http::detail::size_result;
+
+[[nodiscard]] auto failure(std::errc code) -> std::error_code
+{
+    return std::make_error_code(code);
+}
+
+// Parks the awaiting coroutine in slot unless ready already holds.
+class park {
+public:
+    park(std::coroutine_handle<>& slot, bool ready) noexcept : slot_(slot), ready_(ready) {}
+    [[nodiscard]] auto await_ready() const noexcept -> bool { return ready_; }
+    auto await_suspend(std::coroutine_handle<> handle) noexcept -> void { slot_ = handle; }
+    auto await_resume() const noexcept -> void {}
+
+private:
+    std::coroutine_handle<>& slot_;
+    bool ready_;
+};
+
+class http2_exchange final : public http::detail::exchange {
+public:
+    auto read_body(std::span<std::byte> buffer) -> task<size_result> override;
+    auto start(unsigned status, std::span<const http::header> headers,
+               std::optional<std::uint64_t> length) -> task<void_result> override;
+    auto write(std::span<const std::byte> data) -> task<void_result> override;
+    auto finish(std::span<const http::header> trailers) -> task<void_result> override;
+    auto send_file(unsigned status, std::span<const http::header> headers, unique_fd file,
+                   std::uint64_t offset, std::uint64_t size) -> task<void_result> override;
+    auto loop() noexcept -> event_loop& override;
+
+    // Read-side and write-side waits resume when these hold.
+    [[nodiscard]] auto read_ready() const noexcept -> bool;
+    [[nodiscard]] auto write_ready() const noexcept -> bool;
+    // Starts and finishes a response synchronously with an empty body.
+    auto respond_status(unsigned status) -> void;
+    // Prepares the slot for a new stream; headers keeps its capacity.
+    auto reset(std::uint32_t stream_id) noexcept -> void
+    {
+        id = stream_id;
+        in_use = true;
+        headers.clear();
+        read_waiter = write_waiter = {};
+        declared.reset();
+        sent = 0;
+        head_only = bodyless = reading = writing = false;
+        started = finished = broken = released = completed = false;
+        waiting_file = too_large = false;
+    }
+
+    connection_state* owner {nullptr};
+    std::uint32_t id {0};
+    bool in_use {false};
+    routed_request routed {};
+    std::vector<http::header> headers;
+    http::request request_ = http::detail::request_access::make_request();
+    http::response response_ = http::detail::request_access::make_response();
+    std::coroutine_handle<> read_waiter;
+    std::coroutine_handle<> write_waiter;
+    std::optional<std::uint64_t> declared;
+    std::uint64_t sent {0};
+    bool head_only {false};
+    bool bodyless {false};
+    bool reading {false};
+    bool writing {false};
+    bool started {false};
+    bool finished {false};
+    bool broken {false};
+    bool released {false};
+    bool completed {false};
+    bool waiting_file {false};
+    bool too_large {false};
+};
+
+struct connection_state {
+    connection_state(event_loop& loop, tls_stream& peer, session& state,
+                     const http::router& routes, native_socket root, bool directory_listing)
+        : loop(loop), peer(peer), state(state), routes(routes), root(root),
+          directory_listing(directory_listing)
+    {
+        for (auto& exchange : exchanges) exchange.owner = this;
+    }
+
+    // Resumes parked tasks whose condition holds; reentrant calls repeat the
+    // pass instead of nesting.
+    auto drain() -> void
+    {
+        if (waking) {
+            wake_again = true;
+            return;
+        }
+        waking = true;
+        do {
+            wake_again = false;
+            state.resume_input();
+            const auto wake = [](std::coroutine_handle<>& slot) {
+                auto handle = std::exchange(slot, {});
+                if (handle && !handle.done()) handle.resume();
+            };
+            if (reader_waiter && (broken || !state.input_paused())) wake(reader_waiter);
+            for (auto& exchange : exchanges) {
+                if (exchange.read_waiter && exchange.read_ready()) wake(exchange.read_waiter);
+                if (exchange.write_waiter && exchange.write_ready()) wake(exchange.write_waiter);
+            }
+            if (writer_waiter && (broken || state.has_output() || state.closed()))
+                wake(writer_waiter);
+        } while (wake_again);
+        waking = false;
+    }
+
+    static auto released(void* context, std::uint32_t stream_id, bool completed) noexcept
+        -> void
+    {
+        auto& self = *static_cast<connection_state*>(context);
+        for (auto& exchange : self.exchanges) {
+            if (!exchange.in_use || exchange.id != stream_id) continue;
+            exchange.released = true;
+            exchange.completed = completed;
+        }
+    }
+
+    event_loop& loop;
+    tls_stream& peer;
+    session& state;
+    const http::router& routes;
+    native_socket root;
+    bool directory_listing;
+    std::array<http2_exchange, max_concurrent_streams> exchanges {};
+    std::array<std::optional<task_handle<void>>, max_concurrent_streams> handlers {};
+    std::coroutine_handle<> reader_waiter;
+    std::coroutine_handle<> writer_waiter;
+    bool broken {false};
+    bool waking {false};
+    bool wake_again {false};
+};
+
+auto http2_exchange::loop() noexcept -> event_loop& { return owner->loop; }
+
+auto http2_exchange::read_ready() const noexcept -> bool
+{
+    return owner->broken || owner->state.body_ready(id);
+}
+
+auto http2_exchange::write_ready() const noexcept -> bool
+{
+    if (owner->broken) return true;
+    if (waiting_file) return released;
+    return !owner->state.chunk_pending(id);
+}
+
+// Response fields in HPACK form: :status is added by the session.
+auto response_fields(std::span<const http::header> headers, bool emit_length,
+                     std::optional<std::uint64_t> length, bool add_date) -> std::vector<field>
+{
+    std::vector<field> fields;
+    fields.reserve(headers.size() + 2);
+    for (const auto& entry : headers) fields.push_back({std::string(entry.name), std::string(entry.value)});
+    if (emit_length) fields.push_back({"content-length", std::to_string(*length)});
+    if (add_date) {
+        std::array<char, 64> date {};
+        const auto size = http::detail::format_http_time(std::time(nullptr), date);
+        fields.push_back({"date", std::string(date.data(), size)});
+    }
+    return fields;
+}
+
+auto http2_exchange::respond_status(unsigned status) -> void
+{
+    const auto fields = response_fields({}, true, 0, true);
+    if (owner->state.start_streamed(id, status, fields)) {
+        started = true;
+        if (owner->state.finish_streamed(id, {})) finished = true;
+    }
+}
+
+auto read_task(event_loop& loop, http2_exchange& self, std::span<std::byte> buffer)
+    -> task<size_result>
+{
+    (void)loop;
+    if (self.reading) co_return std::unexpected(failure(std::errc::operation_in_progress));
+    if (buffer.empty()) co_return std::unexpected(failure(std::errc::invalid_argument));
+    self.reading = true;
+    struct done { bool& flag; ~done() { flag = false; } } guard {self.reading};
+    for (;;) {
+        if (self.owner->broken) co_return std::unexpected(failure(std::errc::connection_reset));
+        std::size_t count = 0;
+        switch (self.owner->state.read_body(self.id, buffer, count)) {
+        case session::body_state::data:
+            self.owner->drain();
+            co_return count;
+        case session::body_state::ended: co_return 0;
+        case session::body_state::too_large:
+            self.too_large = true;
+            co_return std::unexpected(failure(std::errc::message_size));
+        case session::body_state::failed:
+            co_return std::unexpected(failure(std::errc::connection_reset));
+        case session::body_state::waiting:
+            co_await park(self.read_waiter, self.read_ready());
+            break;
+        }
+    }
+}
+
+auto start_task(event_loop& loop, http2_exchange& self, unsigned status,
+                std::span<const http::header> headers, std::optional<std::uint64_t> length)
+    -> task<void_result>
+{
+    (void)loop;
+    if (self.writing) co_return std::unexpected(failure(std::errc::operation_in_progress));
+    if (self.broken || self.owner->broken)
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    if (self.started) co_return std::unexpected(failure(std::errc::invalid_argument));
+    const auto checked = http::detail::check_response_start(status, headers, length);
+    if (!checked) co_return std::unexpected(checked.error());
+    const auto fields = response_fields(headers, checked->emit_length, length, !checked->has_date);
+    if (!self.owner->state.start_streamed(self.id, status, fields)) {
+        self.broken = true;
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    }
+    self.started = true;
+    self.bodyless = checked->bodyless;
+    self.declared = checked->declared;
+    self.owner->drain();
+    co_return void_result {};
+}
+
+auto write_task(event_loop& loop, http2_exchange& self, std::span<const std::byte> data)
+    -> task<void_result>
+{
+    (void)loop;
+    if (self.writing) co_return std::unexpected(failure(std::errc::operation_in_progress));
+    if (self.broken || self.owner->broken)
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    if (!self.started || self.finished || (self.bodyless && !data.empty()) ||
+        (self.declared && data.size() > *self.declared - self.sent))
+        co_return std::unexpected(failure(std::errc::invalid_argument));
+    self.sent += data.size();
+    if (self.head_only || data.empty()) co_return void_result {};
+    self.writing = true;
+    struct done { bool& flag; ~done() { flag = false; } } guard {self.writing};
+    if (!self.owner->state.queue_chunk(self.id, data)) {
+        self.broken = true;
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    }
+    self.owner->drain();
+    while (!self.write_ready()) co_await park(self.write_waiter, self.write_ready());
+    // The chunk is accepted once it has left the borrowed span.
+    if (self.owner->broken || !self.owner->state.stream_open(self.id)) {
+        self.broken = true;
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    }
+    co_return void_result {};
+}
+
+auto finish_task(event_loop& loop, http2_exchange& self, std::span<const http::header> trailers)
+    -> task<void_result>
+{
+    (void)loop;
+    if (self.writing) co_return std::unexpected(failure(std::errc::operation_in_progress));
+    if (self.broken || self.owner->broken)
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    if (!self.started || self.finished)
+        co_return std::unexpected(failure(std::errc::invalid_argument));
+    if (self.declared && self.sent != *self.declared && !self.head_only) {
+        self.broken = true;
+        self.owner->state.abandon(self.id, internal_error);
+        self.owner->drain();
+        co_return std::unexpected(failure(std::errc::invalid_argument));
+    }
+    for (const auto& entry : trailers)
+        if (!http::detail::valid_response_field(entry.name, entry.value) ||
+            entry.name == "content-length")
+            co_return std::unexpected(failure(std::errc::invalid_argument));
+    const auto fields = self.head_only ? std::vector<field> {}
+                                       : response_fields(trailers, false, {}, false);
+    if (!self.owner->state.finish_streamed(self.id, fields)) {
+        self.broken = true;
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    }
+    self.finished = true;
+    self.owner->drain();
+    co_return void_result {};
+}
+
+auto send_file_task(event_loop& loop, http2_exchange& self, unsigned status,
+                    std::span<const http::header> headers, unique_fd file,
+                    std::uint64_t offset, std::uint64_t size) -> task<void_result>
+{
+    auto started = co_await start_task(loop, self, status, headers, size);
+    if (!started) co_return std::unexpected(failure(std::errc::operation_canceled));
+    if (!*started) co_return std::unexpected(started->error());
+    if (self.bodyless || self.head_only || size == 0)
+        co_return (co_await finish_task(loop, self, {}))
+            .value_or(std::unexpected(failure(std::errc::operation_canceled)));
+    self.writing = true;
+    struct done { bool& flag; ~done() { flag = false; } } guard {self.writing};
+    self.waiting_file = true;
+    if (!self.owner->state.send_streamed_file(self.id, std::move(file), offset, size)) {
+        self.broken = true;
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    }
+    self.owner->drain();
+    while (!self.write_ready()) co_await park(self.write_waiter, self.write_ready());
+    self.waiting_file = false;
+    if (!self.completed) {
+        self.broken = true;
+        co_return std::unexpected(failure(std::errc::connection_reset));
+    }
+    self.sent = size;
+    self.finished = true;
+    co_return void_result {};
+}
+
+auto http2_exchange::read_body(std::span<std::byte> buffer) -> task<size_result>
+{
+    return read_task(owner->loop, *this, buffer);
+}
+auto http2_exchange::start(unsigned status, std::span<const http::header> headers,
+                           std::optional<std::uint64_t> length) -> task<void_result>
+{
+    return start_task(owner->loop, *this, status, headers, length);
+}
+auto http2_exchange::write(std::span<const std::byte> data) -> task<void_result>
+{
+    return write_task(owner->loop, *this, data);
+}
+auto http2_exchange::finish(std::span<const http::header> trailers) -> task<void_result>
+{
+    return finish_task(owner->loop, *this, trailers);
+}
+auto http2_exchange::send_file(unsigned status, std::span<const http::header> headers,
+                               unique_fd file, std::uint64_t offset, std::uint64_t size)
+    -> task<void_result>
+{
+    return send_file_task(owner->loop, *this, status, headers, std::move(file), offset, size);
+}
+
+// Runs one handler, then settles a response it did not finish.
+auto run_route(event_loop& loop, http2_exchange& self, http::handler function) -> task<void>
+{
+    const auto handled = co_await function(loop, self.request_, self.response_);
+    auto& state = self.owner->state;
+    if (!self.owner->broken && !self.released) {
+        if (handled == task_result::cancelled) {
+            state.abandon(self.id, cancel_error);
+        } else if (!self.started && !self.broken) {
+            self.respond_status(self.too_large ? 413
+                : handled == task_result::frame_allocation_failure ? 503 : 500);
+        } else if (!self.finished) {
+            state.abandon(self.id, internal_error);
+        }
+    }
+    self.in_use = false;
+    self.owner->drain();
+}
+
+auto dispatch_routed(connection_state& connection, routed_request routed) -> void
+{
+    auto& state = connection.state;
+    std::size_t index = 0;
+    for (; index < connection.exchanges.size(); ++index) {
+        const auto& handle = connection.handlers[index];
+        if (!connection.exchanges[index].in_use && (!handle || handle->done())) break;
+    }
+    if (index == connection.exchanges.size()) {
+        state.abandon(routed.stream_id, refused_stream_error);
+        return;
+    }
+    auto& exchange = connection.exchanges[index];
+    exchange.reset(routed.stream_id);
+    exchange.routed = std::move(routed);
+    if (exchange.routed.too_large) {
+        exchange.respond_status(413);
+        exchange.in_use = false;
+        return;
+    }
+    std::string_view method, target, authority, host;
+    exchange.headers.reserve(hpack_max_fields);
+    for (const auto& entry : exchange.routed.fields) {
+        if (entry.name == ":method") method = entry.value;
+        else if (entry.name == ":path") target = entry.value;
+        else if (entry.name == ":authority") authority = entry.value;
+        else if (!entry.name.empty() && entry.name.front() != ':') {
+            if (entry.name == "host") host = entry.value;
+            exchange.headers.push_back({entry.name, entry.value});
+        }
+    }
+    exchange.head_only = method == "HEAD";
+    const http::detail::request_fields fields {
+        .headers = exchange.headers,
+        .method_name = method,
+        .target = target,
+        .authority = authority.empty() ? host : authority,
+        .content_length = exchange.routed.content_length,
+        .method = http::detail::method_from_name(method),
+        .protocol = http::protocol::http2,
+    };
+    http::detail::request_access::bind(exchange.request_, exchange, fields,
+                                       exchange.routed.match.context);
+    http::detail::request_access::bind(exchange.response_, exchange);
+    auto& slot = connection.handlers[index];
+    slot.reset();
+    slot.emplace();
+    if (connection.loop.spawn(run_route(connection.loop, exchange, exchange.routed.match.function),
+                              *slot) != task_spawn_result::accepted) {
+        slot.reset();
+        exchange.respond_status(503);
+        exchange.in_use = false;
+    }
+}
+
+auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
+{
+    (void)loop;
+    auto& state = connection.state;
+    for (;;) {
+        request incoming;
+        while (state.pop_request(incoming))
+            serve_request(state, std::move(incoming), connection.root,
+                          connection.directory_listing, &connection.routes);
+        routed_request routed;
+        while (state.pop_routed(routed)) dispatch_routed(connection, std::move(routed));
+        connection.drain();
+        if (connection.broken || state.closed()) co_return;
+        const auto buffer = state.read_buffer();
+        if (buffer.empty()) {
+            co_await park(connection.reader_waiter, connection.broken || !state.input_paused());
+            continue;
+        }
+        const auto received = operation_result(co_await connection.peer.async_read_some(buffer));
+        if (!received || *received == 0) {
+            connection.broken = true;
+            connection.drain();
+            co_return;
+        }
+        state.commit_read(*received);
+    }
+}
+
+auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
+                  bool directory_listing, const http::router& routes,
+                  std::uint64_t max_request_body) -> task<bool>
+{
+    // Session, task slots and exchanges are allocated once per connection.
+    auto state = std::make_unique<session>(peer.kernel_sendfile_available(), &routes,
+                                           max_request_body);
+    auto connection = std::make_unique<connection_state>(loop, peer, *state, routes, root,
+                                                         directory_listing);
+    state->set_release_hook(&connection_state::released, connection.get());
+    task_handle<void> reader;
+    if (loop.spawn(read_loop(loop, *connection), reader) != task_spawn_result::accepted)
+        co_return false;
+    bool clean = false;
+    for (;;) {
+        if (auto file = state->take_file_send(true)) {
+            auto sent = operation_result(co_await peer.async_send_file(
+                file->file.get(), file->offset, file->size, file->prefix));
+            if (!sent) break;
+            state->consume_output(file->prefix.size());
+            state->complete_file_send(std::move(file->file));
+            connection->drain();
+            continue;
+        }
+        if (!state->output().empty()) {
+            auto written = operation_result(co_await peer.async_write_some(state->output()));
+            if (!written || *written == 0) break;
+            state->consume_output(*written);
+            connection->drain();
+            continue;
+        }
+        if (state->closed()) {
+            clean = true;
+            break;
+        }
+        if (connection->broken) break;
+        co_await park(connection->writer_waiter,
+                      connection->broken || state->has_output() || state->closed());
+    }
+    // Wake every parked task with the connection marked broken, then wait for
+    // the reader and handlers before releasing the shared state they borrow.
+    connection->broken = true;
+    connection->drain();
+    if (!reader.done()) (void)reader.cancel();
+    (void)co_await reader;
+    for (auto& handler : connection->handlers) {
+        if (!handler) continue;
+        if (!handler->done()) (void)handler->cancel();
+        connection->drain();
+        (void)co_await *handler;
+        handler.reset();
+    }
+    co_return clean;
+}
+
 } // namespace
 
 auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
            std::shared_ptr<unique_fd> document_root,
-           bool directory_listing) -> task<bool>
+           bool directory_listing, std::shared_ptr<const http::router> routes,
+           std::uint64_t max_request_body) -> task<bool>
 {
+    if (routes) {
+        try {
+            co_return (co_await serve_routed(loop, peer, document_root->get(), directory_listing,
+                                             *routes, max_request_body)).value_or(false);
+        } catch (...) {
+            co_return false;
+        }
+    }
     try {
         auto state = std::make_unique<session>(peer.kernel_sendfile_available());
         for (;;) {
             request incoming;
             while (state->pop_request(incoming)) {
                 serve_request(*state, std::move(incoming), document_root->get(),
-                              directory_listing);
+                              directory_listing, nullptr);
             }
 
             for (;;) {

@@ -1,11 +1,13 @@
 #pragma once
 
 #include "eventloop/unique_fd.h"
+#include "../http/exchange.h"
 #include "hpack.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -17,6 +19,10 @@ inline constexpr std::size_t max_frame_payload = 16 * 1024;
 inline constexpr std::size_t max_concurrent_streams = 32;
 inline constexpr std::size_t max_request_body = 1024 * 1024;
 inline constexpr std::size_t max_queued_response_body = 4 * 1024 * 1024;
+// Routed request bodies are buffered per stream in a pool allocated the
+// first time a connection receives one. The stream window equals one slot.
+inline constexpr std::size_t route_body_slots = 8;
+inline constexpr std::size_t route_body_slot_size = 16 * 1024;
 
 struct request {
     std::uint32_t stream_id = 0;
@@ -28,9 +34,25 @@ struct request {
     std::uint64_t body_size = 0;
 };
 
+// A request whose path and method have a route handler. Delivered when its
+// HEADERS complete; the body follows through read_body().
+struct routed_request {
+    std::uint32_t stream_id = 0;
+    http::detail::route_match match;
+    std::vector<field> fields;
+    std::optional<std::uint64_t> content_length;
+    bool too_large = false;
+};
+
 class session final {
 public:
-    explicit session(bool file_sendfile = false);
+    // Called when a routed stream is released; completed tells whether its
+    // response ended normally. It must not call back into the session.
+    using release_hook = void (*)(void* context, std::uint32_t stream_id,
+                                  bool completed) noexcept;
+
+    explicit session(bool file_sendfile = false, const http::router* routes = nullptr,
+                     std::uint64_t max_request_body = 0);
 
     struct file_send {
         unique_fd file;
@@ -63,6 +85,36 @@ public:
 
     [[nodiscard]] auto closed() const noexcept -> bool;
 
+    // Routed streams. Operations on a released stream report failure.
+    auto set_release_hook(release_hook hook, void* context) noexcept -> void;
+    [[nodiscard]] auto pop_routed(routed_request& value) -> bool;
+    enum class body_state { data, waiting, ended, too_large, failed };
+    [[nodiscard]] auto read_body(std::uint32_t stream_id, std::span<std::byte> output,
+                                 std::size_t& count) -> body_state;
+    [[nodiscard]] auto start_streamed(std::uint32_t stream_id, unsigned status,
+                                      std::span<const field> headers) -> bool;
+    // Borrows data until chunk_pending() turns false.
+    [[nodiscard]] auto queue_chunk(std::uint32_t stream_id, std::span<const std::byte> data)
+        -> bool;
+    [[nodiscard]] auto chunk_pending(std::uint32_t stream_id) const noexcept -> bool;
+    [[nodiscard]] auto finish_streamed(std::uint32_t stream_id, std::span<const field> trailers)
+        -> bool;
+    [[nodiscard]] auto send_streamed_file(std::uint32_t stream_id, unique_fd file,
+                                          std::uint64_t offset, std::uint64_t size) -> bool;
+    auto abandon(std::uint32_t stream_id, std::uint32_t error) -> void;
+    // Input waits while a routed DATA frame does not fit its stream's buffer.
+    // That happens only before the client applies the advertised window.
+    [[nodiscard]] auto input_paused() const noexcept -> bool { return stalled_; }
+    [[nodiscard]] auto stream_open(std::uint32_t stream_id) const noexcept -> bool;
+    // read_body() would not report waiting.
+    [[nodiscard]] auto body_ready(std::uint32_t stream_id) const noexcept -> bool;
+    // Bytes or a file range wait for the transport.
+    [[nodiscard]] auto has_output() const noexcept -> bool
+    {
+        return output_size_ != 0 || file_send_active_;
+    }
+    auto resume_input() -> void;
+
 private:
     struct stream {
         std::uint32_t id = 0;
@@ -87,12 +139,30 @@ private:
         bool remote_closed = false;
         bool request_ready = false;
         bool response_started = false;
+        // Routed streams: body buffering and handler-driven responses.
+        bool routed = false;
+        bool body_ended = false;
+        bool too_large = false;
+        bool streaming = false;
+        bool stream_finished = false;
+        std::uint8_t body_slot = no_slot;
+        std::size_t body_begin = 0;
+        std::size_t body_end = 0;
+        std::span<const std::byte> chunk;
         // RFC 9218 priority; the defaults apply when the client sends none.
         std::uint8_t urgency = 3;
         bool incremental = false;
     };
 
+    static constexpr std::uint8_t no_slot = 0xff;
+
     auto consume_input(std::span<const std::byte> input) -> void;
+    [[nodiscard]] auto route_stream(stream& value) -> bool;
+    [[nodiscard]] auto acquire_body_slot() noexcept -> std::uint8_t;
+    [[nodiscard]] auto body_slot(const stream& value) noexcept -> std::byte*;
+    auto complete_stream(stream& value) -> void;
+    [[nodiscard]] auto append_header_block(stream& value, std::span<const field> fields,
+                                           bool end_stream) -> bool;
     auto dispatch_frame() -> void;
     auto dispatch_headers() -> void;
     auto dispatch_data() -> void;
@@ -115,7 +185,7 @@ private:
                       std::span<const std::byte> payload = {},
                       std::size_t file_payload_size = 0) -> bool;
     auto append_response_headers(stream& value, unsigned status,
-                                 std::span<const field> headers) -> bool;
+                                 std::span<const field> headers, bool end_stream) -> bool;
     auto pump_responses() -> void;
     [[nodiscard]] auto next_response() const noexcept -> std::optional<std::size_t>;
 
@@ -154,8 +224,18 @@ private:
     bool server_settings_acked_ = false;
     bool fatal_ = false;
     bool peer_goaway_ = false;
+    bool stalled_ = false;
+    std::size_t held_input_ = 0;
+    std::size_t stalled_need_ = 0;
+    const http::router* routes_ = nullptr;
+    std::uint64_t max_routed_body_ = 0;
+    release_hook release_hook_ = nullptr;
+    void* release_context_ = nullptr;
+    std::unique_ptr<std::byte[]> body_arena_;
+    std::array<bool, route_body_slots> slot_used_ {};
     std::array<stream, max_concurrent_streams> streams_ {};
     std::vector<request> requests_;
+    std::vector<routed_request> routed_;
     std::vector<std::byte> header_block_;
     std::vector<std::byte> output_;
     std::vector<field> decoded_fields_;

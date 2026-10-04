@@ -132,6 +132,10 @@ health=$(curl --silent --fail --http1.1 --cacert "$work/cert.pem" \
 echo 'HTTP/1.1 /healthz route: PASS'
 
 if curl --version | grep -q HTTP2; then
+    health=$(curl --silent --fail --http2 --cacert "$work/cert.pem" \
+        --resolve "localhost:$https_port:127.0.0.1" "https://localhost:$https_port/healthz")
+    [[ "$health" == ok ]] || { echo "unexpected HTTP/2 /healthz body: $health" >&2; exit 1; }
+    echo 'HTTP/2 /healthz route: PASS'
     version=$(curl --silent --fail --http2 --cacert "$work/cert.pem" \
         --resolve "localhost:$https_port:127.0.0.1" \
         --output "$work/h2-body" --write-out '%{http_version}' \
