@@ -64,10 +64,15 @@ struct coroutine_root_node {
     coroutine_cancellation_state cancellation;
 };
 
+// A node of the loop's intrusive pairing heap: previous is the parent for a
+// first child and the preceding sibling otherwise.
 struct coroutine_timer_node {
     coroutine_timer_node* previous {nullptr};
     coroutine_timer_node* next {nullptr};
+    coroutine_timer_node* child {nullptr};
     std::chrono::steady_clock::time_point deadline;
+    // Registration order, so equal deadlines fire first-in first-out.
+    std::uint64_t sequence {0};
     std::coroutine_handle<> handle {};
     event_loop* owner {nullptr};
     coroutine_cancellation_node cancellation;

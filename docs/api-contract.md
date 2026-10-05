@@ -159,7 +159,10 @@ every running connection has sent its close and retired.
 - `eventloop::sleep_for` and `eventloop::sleep_until` are the public timer
   interface. Positive relative durations saturate at the latest representable
   time point; zero or negative durations are immediately due. Callback timer scheduling is not a
-  public API.
+  public API. A waiting timer lives in the awaiting coroutine frame and joins
+  the loop's timer heap without allocating: registration costs O(1), and
+  expiry or cancellation O(log n) amortized in the number of pending timers.
+  Timers with equal deadlines fire in registration order.
 - `eventloop::event_loop::shutdown(timeout)` stops new registrations and
   requests cancellation of every active root immediately. It then calls
   `on_shutdown()` on registered handlers; the built-in acceptors and streams close immediately.

@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -771,6 +772,116 @@ auto run_child_mode(std::string_view mode) -> int
     return 1;
 }
 #endif
+auto ordered_sleeper(event_loop& loop, event_loop::clock::time_point deadline, int id,
+                     std::array<int, 16>& order, std::size_t& count) -> task<void>
+{
+    if (co_await sleep_until(loop, deadline) == timer_wait_result::expired)
+        order[count++] = id;
+}
+
+auto stop_at(event_loop& loop, event_loop::clock::time_point deadline) -> task<void>
+{
+    (void)co_await sleep_until(loop, deadline);
+    loop.stop();
+}
+
+struct fired_timer {
+    event_loop::clock::time_point deadline;
+    int id;
+};
+
+auto recorded_sleeper(event_loop& loop, event_loop::clock::time_point deadline, int id,
+                      std::vector<fired_timer>& fired) -> task<void>
+{
+    if (co_await sleep_until(loop, deadline) == timer_wait_result::expired)
+        fired.push_back({deadline, id});
+}
+
+// Many timers with colliding deadlines and random cancellations exercise the
+// timer heap's pairing and removal paths.
+auto timer_heap_stress_test() -> bool
+{
+    constexpr int count = 3000;
+    event_loop_options options;
+    options.coroutine_frame_capacities = {4096, 4096, 4096, 10240, 4, 2};
+    event_loop loop(options);
+    const auto base = event_loop::clock::now() + std::chrono::milliseconds {30};
+    std::vector<fired_timer> fired;
+    fired.reserve(count);
+    std::vector<event_loop::clock::time_point> deadlines;
+    std::vector<task_handle<void>> handles(count);
+    std::vector<bool> cancelled(count);
+    std::uint32_t state = 7;
+    auto next = [&state](std::uint32_t bound) {
+        state = state * 1664525u + 1013904223u;
+        return (state >> 8) % bound;
+    };
+    for (int id = 0; id < count; ++id) {
+        deadlines.push_back(base + std::chrono::milliseconds {next(40)});
+        if (loop.spawn(recorded_sleeper(loop, deadlines.back(), id, fired),
+                       handles[static_cast<std::size_t>(id)]) != task_spawn_result::accepted)
+            return false;
+        // Cancel earlier timers at random while registration continues.
+        if (next(10) < 3) {
+            const auto victim = static_cast<std::size_t>(next(static_cast<std::uint32_t>(id + 1)));
+            if (!cancelled[victim] && handles[victim].cancel()) cancelled[victim] = true;
+        }
+    }
+    if (loop.spawn(stop_at(loop, base + std::chrono::milliseconds {80})) !=
+        task_spawn_result::accepted)
+        return false;
+    (void)loop.run();
+    std::size_t expected = 0;
+    for (const bool value : cancelled) expected += value ? 0 : 1;
+    if (fired.size() != expected) return false;
+    for (std::size_t index = 0; index < fired.size(); ++index) {
+        const auto& entry = fired[index];
+        if (cancelled[static_cast<std::size_t>(entry.id)] ||
+            entry.deadline != deadlines[static_cast<std::size_t>(entry.id)])
+            return false;
+        if (index != 0) {
+            const auto& previous = fired[index - 1];
+            if (entry.deadline < previous.deadline ||
+                (entry.deadline == previous.deadline && entry.id < previous.id))
+                return false;
+        }
+    }
+    for (const auto& handle : handles)
+        if (!handle.done()) return false;
+    return true;
+}
+
+// Timers registered at the tail, before the head, in the middle, and with
+// equal deadlines, with the head and a middle timer cancelled, fire in
+// deadline order and keep registration order for equal deadlines.
+auto timer_order_test() -> bool
+{
+    event_loop loop;
+    const auto base = event_loop::clock::now() + std::chrono::milliseconds {30};
+    constexpr std::array<int, 9> offsets {10, 10, 5, 20, 15, 10, 1, 25, 20};
+    std::array<int, 16> order {};
+    std::size_t count = 0;
+    std::array<task_handle<void>, 9> handles;
+    for (std::size_t id = 0; id < offsets.size(); ++id) {
+        const auto deadline = base + std::chrono::milliseconds {offsets[id]};
+        if (loop.spawn(ordered_sleeper(loop, deadline, static_cast<int>(id), order, count),
+                       handles[id]) != task_spawn_result::accepted)
+            return false;
+    }
+    if (!handles[6].cancel() || !handles[4].cancel()) return false;
+    if (loop.spawn(stop_at(loop, base + std::chrono::milliseconds {60})) !=
+        task_spawn_result::accepted)
+        return false;
+    (void)loop.run();
+    constexpr std::array<int, 7> expected {2, 0, 1, 5, 3, 8, 7};
+    if (count != expected.size()) return false;
+    for (std::size_t index = 0; index < expected.size(); ++index)
+        if (order[index] != expected[index]) return false;
+    for (const auto& handle : handles)
+        if (!handle.done()) return false;
+    return true;
+}
+
 } // namespace
 
 auto main(int argc, char** argv) -> int
@@ -778,6 +889,14 @@ auto main(int argc, char** argv) -> int
 #ifdef _WIN32
     if (argc == 2) return run_child_mode(argv[1]);
 #endif
+    if (!timer_heap_stress_test()) {
+        std::cerr << "timer heap stress test failed\n";
+        return 1;
+    }
+    if (!timer_order_test()) {
+        std::cerr << "timer order test failed\n";
+        return 1;
+    }
     if (!wrong_loop_awaiter_test()) {
         std::cerr << "wrong-loop awaiter test failed\n";
         return 1;
