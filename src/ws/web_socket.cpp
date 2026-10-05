@@ -6,6 +6,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <utility>
 
 namespace eventloop::ws {
 namespace {
@@ -306,7 +307,8 @@ auto web_socket_core::handle_close(std::span<const std::byte> payload)
 auto web_socket_core::enqueue(opcode type, std::span<const std::byte> payload)
     -> bool
 {
-    if (output_offset_) {
+    // A borrowed write reads output_ in place, so compact only between writes.
+    if (output_offset_ && !output_borrowed_) {
         const auto remaining = output_.size() - output_offset_;
         std::memmove(output_.data(), output_.data() + output_offset_, remaining);
         output_.resize(remaining);
@@ -315,10 +317,20 @@ auto web_socket_core::enqueue(opcode type, std::span<const std::byte> payload)
     const auto size = static_cast<std::uint64_t>(payload.size());
     const std::size_t header_size = size <= 125 ? 2 : size <= 0xffff ? 4 : 10;
     const auto frame_offset = output_.size();
+    const auto pending = frame_offset - output_offset_;
     if (payload.size() > maximum_pending_output_ - header_size ||
-        frame_offset > maximum_pending_output_ - header_size - payload.size())
+        pending > maximum_pending_output_ - header_size - payload.size())
         return false;
-    output_.resize(frame_offset + header_size + payload.size());
+    const auto needed = frame_offset + header_size + payload.size();
+    if (output_borrowed_ && retired_output_.empty() && needed > output_.capacity()) {
+        // Growing would free the borrowed bytes; keep them until the write ends.
+        std::vector<std::byte> grown;
+        grown.reserve(std::max(needed, std::min(output_.capacity() * 2,
+                                                output_offset_ + maximum_pending_output_)));
+        grown.assign(output_.begin(), output_.end());
+        retired_output_ = std::exchange(output_, std::move(grown));
+    }
+    output_.resize(needed);
     auto* frame = output_.data() + frame_offset;
     frame[0] = static_cast<std::byte>(0x80u | static_cast<std::uint8_t>(type));
     if (header_size == 2) {
@@ -343,13 +355,19 @@ auto web_socket_core::output_pending() const noexcept -> bool
 
 auto web_socket_core::output_chunk() noexcept -> std::span<const std::byte>
 {
-    const auto size = std::min(output_chunk_.size(), output_.size() - output_offset_);
-    std::memcpy(output_chunk_.data(), output_.data() + output_offset_, size);
-    return std::span {output_chunk_}.first(size);
+    output_borrowed_ = true;
+    return std::span {output_}.subspan(output_offset_);
+}
+
+auto web_socket_core::release_output() noexcept -> void
+{
+    output_borrowed_ = false;
+    std::vector<std::byte> {}.swap(retired_output_);
 }
 
 auto web_socket_core::consume_output(std::size_t size) -> void
 {
+    release_output();
     output_offset_ += size;
     if (output_offset_ == output_.size()) {
         clear_buffer(output_);
@@ -385,7 +403,10 @@ auto web_socket_core::retire() noexcept -> void
     fragmented_type_.reset();
     clear_buffer(input_);
     clear_buffer(fragmented_message_);
-    clear_buffer(output_);
+    if (output_borrowed_ && retired_output_.empty())
+        retired_output_ = std::exchange(output_, {});
+    else
+        clear_buffer(output_);
     output_offset_ = 0;
     pending_consumed_ = 0;
 }

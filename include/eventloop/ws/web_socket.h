@@ -63,8 +63,11 @@ protected:
     [[nodiscard]] auto validate_close(std::uint16_t code,
                                       std::u8string_view reason) const noexcept -> bool;
     [[nodiscard]] auto output_pending() const noexcept -> bool;
+    // The transport borrows the returned bytes until consume_output() or
+    // release_output(); frames queued meanwhile leave them in place.
     [[nodiscard]] auto output_chunk() noexcept -> std::span<const std::byte>;
     auto consume_output(std::size_t size) -> void;
+    auto release_output() noexcept -> void;
     [[nodiscard]] auto receive_buffer() noexcept -> std::span<std::byte>
     {
         return receive_buffer_;
@@ -93,17 +96,20 @@ private:
     std::size_t maximum_message_size_;
     std::size_t maximum_pending_output_;
     std::array<std::byte, 4096> receive_buffer_ {};
-    std::array<std::byte, 4096> output_chunk_ {};
     std::vector<std::byte> input_;
     std::vector<std::byte> fragmented_message_;
     std::optional<opcode> fragmented_type_;
     std::vector<std::byte> output_;
+    // Storage a borrowed write still reads after output_ had to grow or be
+    // released.
+    std::vector<std::byte> retired_output_;
     std::size_t output_offset_ {0};
     std::size_t pending_consumed_ {0};
     bool clear_fragment_on_next_receive_ {false};
     bool close_sent_ {false};
     bool close_received_ {false};
     bool close_after_write_ {false};
+    bool output_borrowed_ {false};
     std::error_code error_ {};
 };
 
@@ -201,6 +207,7 @@ private:
             if (!written || *written == 0) {
                 const auto error = written ? std::make_error_code(std::errc::broken_pipe)
                                            : written.error();
+                self.release_output();
                 self.retire_transport();
                 co_return std::unexpected(error);
             }

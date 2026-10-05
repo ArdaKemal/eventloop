@@ -308,11 +308,23 @@ session::session(bool file_sendfile, const http::router* routes,
 auto session::read_buffer() noexcept -> std::span<std::byte>
 {
     if (stalled_) return {};
+    // A large payload remainder is read straight into its frame buffer.
+    if (const auto payload = payload_read_space(); !payload.empty()) return payload;
     return read_buffer_;
 }
 
 auto session::commit_read(std::size_t size) -> void
 {
+    if (const auto payload = payload_read_space(); !payload.empty()) {
+        if (size > payload.size()) {
+            connection_error(internal_error);
+            return;
+        }
+        frame_payload_size_ += size;
+        if (frame_payload_size_ == expected_payload_size_) complete_frame();
+        pump_responses();
+        return;
+    }
     if (size > read_buffer_.size()) {
         connection_error(internal_error);
         return;
@@ -485,6 +497,21 @@ auto session::consume_input(std::span<const std::byte> input) -> void
         }
 
         const auto remaining = expected_payload_size_ - frame_payload_size_;
+        if (frame_payload_size_ == 0 && input.size() >= remaining) {
+            // The whole payload is in input: dispatch it where it lies.
+            frame_data_ = input.data();
+            frame_payload_size_ = remaining;
+            input = input.subspan(remaining);
+            dispatch_frame();
+            if (stalled_) {
+                // read_buffer_ moves while paused; keep the frame for redispatch.
+                std::memcpy(frame_payload_.data(), frame_data_, frame_payload_size_);
+            } else {
+                clear_frame_state();
+            }
+            frame_data_ = frame_payload_.data();
+            continue;
+        }
         const auto count = std::min(input.size(), remaining);
         if (count != 0) {
             std::memcpy(frame_payload_.data() + frame_payload_size_,
@@ -492,15 +519,32 @@ auto session::consume_input(std::span<const std::byte> input) -> void
             frame_payload_size_ += count;
             input = input.subspan(count);
         }
-        if (frame_payload_size_ == expected_payload_size_) {
-            dispatch_frame();
-            // A paused DATA frame stays buffered and is dispatched again.
-            if (stalled_) continue;
-            frame_header_size_ = 0;
-            frame_payload_size_ = 0;
-            expected_payload_size_ = 0;
-        }
+        if (frame_payload_size_ == expected_payload_size_) complete_frame();
     }
+}
+
+auto session::complete_frame() -> void
+{
+    dispatch_frame();
+    // A paused DATA frame stays buffered and is dispatched again.
+    if (!stalled_) clear_frame_state();
+}
+
+auto session::clear_frame_state() noexcept -> void
+{
+    frame_header_size_ = 0;
+    frame_payload_size_ = 0;
+    expected_payload_size_ = 0;
+}
+
+auto session::payload_read_space() noexcept -> std::span<std::byte>
+{
+    if (stalled_ || fatal_ || preface_size_ < client_preface.size() ||
+        frame_header_size_ < frame_header_.size()) return {};
+    const auto remaining = expected_payload_size_ - frame_payload_size_;
+    // Smaller remainders share one read with the frames that follow.
+    if (remaining < read_buffer_.size()) return {};
+    return std::span {frame_payload_}.subspan(frame_payload_size_, remaining);
 }
 
 auto session::record_closed(std::uint32_t id, closed_reason reason) noexcept -> void
@@ -535,7 +579,7 @@ auto session::dispatch_frame() -> void
             connection_error(frame_size_error);
             return;
         }
-        const auto dependency = read_u32(frame_payload_.data()) & 0x7fffffffu;
+        const auto dependency = read_u32(frame_data_) & 0x7fffffffu;
         if (dependency == frame_stream_id_) {
             stream_error(frame_stream_id_, protocol_error);
         }
@@ -573,7 +617,7 @@ auto session::dispatch_frame() -> void
             connection_error(frame_size_error);
         } else if ((frame_flags_ & flag_ack) == 0 &&
                    !append_frame(ping_frame, flag_ack, 0,
-                                 std::span {frame_payload_}.first(8))) {
+                                 std::span {frame_data_, 8})) {
             connection_error(internal_error);
         }
         break;
@@ -598,8 +642,8 @@ auto session::dispatch_frame() -> void
             connection_error(enhance_your_calm_error);
             return;
         }
-        header_block_.insert(header_block_.end(), frame_payload_.begin(),
-            frame_payload_.begin() + static_cast<std::ptrdiff_t>(frame_payload_size_));
+        header_block_.insert(header_block_.end(), frame_data_,
+            frame_data_ + static_cast<std::ptrdiff_t>(frame_payload_size_));
         if ((frame_flags_ & flag_end_headers) != 0) finish_header_block();
         break;
     default:
@@ -661,14 +705,14 @@ auto session::dispatch_headers() -> void
             connection_error(protocol_error);
             return;
         }
-        padding = byte_value(frame_payload_[offset++]);
+        padding = byte_value(frame_data_[offset++]);
     }
     if ((frame_flags_ & flag_priority) != 0) {
         if (frame_payload_size_ - offset < 5) {
             connection_error(frame_size_error);
             return;
         }
-        const auto dependency = read_u32(frame_payload_.data() + offset) & 0x7fffffffu;
+        const auto dependency = read_u32(frame_data_ + offset) & 0x7fffffffu;
         if (dependency == frame_stream_id_) {
             header_refused_ = true;
             header_reject_error_ = protocol_error;
@@ -689,8 +733,8 @@ auto session::dispatch_headers() -> void
         return;
     }
     header_block_.insert(header_block_.end(),
-        frame_payload_.begin() + static_cast<std::ptrdiff_t>(offset),
-        frame_payload_.begin() + static_cast<std::ptrdiff_t>(offset + fragment_size));
+        frame_data_ + static_cast<std::ptrdiff_t>(offset),
+        frame_data_ + static_cast<std::ptrdiff_t>(offset + fragment_size));
     if ((frame_flags_ & flag_end_headers) != 0) {
         finish_header_block();
     } else {
@@ -720,7 +764,7 @@ auto session::dispatch_data() -> void
         // Checked before any accounting so a paused frame can be redispatched.
         std::size_t payload = frame_payload_size_;
         if ((frame_flags_ & flag_padded) != 0 && payload != 0) {
-            const auto pad = byte_value(frame_payload_[0]);
+            const auto pad = byte_value(frame_data_[0]);
             payload = pad < payload ? payload - 1 - pad : 0;
         }
         if (payload > route_body_slot_size - (value->body_end - value->body_begin)) {
@@ -779,7 +823,7 @@ auto session::dispatch_data() -> void
             connection_error(protocol_error);
             return;
         }
-        padding = byte_value(frame_payload_[offset++]);
+        padding = byte_value(frame_data_[offset++]);
     }
     if (padding > frame_payload_size_ - offset) {
         connection_error(protocol_error);
@@ -811,7 +855,7 @@ auto session::dispatch_data() -> void
                 value->body_end -= value->body_begin;
                 value->body_begin = 0;
             }
-            std::memcpy(slot + value->body_end, frame_payload_.data() + offset, data_size);
+            std::memcpy(slot + value->body_end, frame_data_ + offset, data_size);
             value->body_end += data_size;
             credit -= static_cast<std::int64_t>(data_size);
         }
@@ -860,9 +904,9 @@ auto session::dispatch_settings() -> void
     got_first_settings_ = true;
     for (std::size_t offset = 0; offset < frame_payload_size_; offset += 6) {
         const auto id = static_cast<std::uint16_t>(
-            (byte_value(frame_payload_[offset]) << 8) |
-             byte_value(frame_payload_[offset + 1]));
-        const auto value = read_u32(frame_payload_.data() + offset + 2);
+            (byte_value(frame_data_[offset]) << 8) |
+             byte_value(frame_data_[offset + 1]));
+        const auto value = read_u32(frame_data_ + offset + 2);
         if ((id == 2 || id == 9) && value > 1) {
             connection_error(protocol_error);
             return;
@@ -906,7 +950,7 @@ auto session::dispatch_priority_update() -> void
         connection_error(frame_size_error);
         return;
     }
-    const auto id = read_u32(frame_payload_.data()) & 0x7fffffffu;
+    const auto id = read_u32(frame_data_) & 0x7fffffffu;
     if (id == 0) {
         connection_error(protocol_error);
         return;
@@ -915,7 +959,7 @@ auto session::dispatch_priority_update() -> void
     if (value == nullptr) return;
     std::uint8_t urgency = 3;
     bool incremental = false;
-    const std::string_view text(reinterpret_cast<const char*>(frame_payload_.data()) + 4,
+    const std::string_view text(reinterpret_cast<const char*>(frame_data_) + 4,
                                 frame_payload_size_ - 4);
     if (!parse_priority(text, urgency, incremental)) return;
     value->urgency = urgency;
@@ -928,7 +972,7 @@ auto session::dispatch_window_update() -> void
         connection_error(frame_size_error);
         return;
     }
-    const auto increment = read_u32(frame_payload_.data()) & 0x7fffffffu;
+    const auto increment = read_u32(frame_data_) & 0x7fffffffu;
     if (increment == 0) {
         if (frame_stream_id_ == 0) connection_error(protocol_error);
         else stream_error(frame_stream_id_, protocol_error);
@@ -1423,11 +1467,8 @@ auto session::resume_input() -> void
     if (value != nullptr && value->routed && value->body_slot != no_slot && !value->too_large &&
         stalled_need_ > route_body_slot_size - (value->body_end - value->body_begin)) return;
     stalled_ = false;
-    dispatch_frame();
+    complete_frame();
     if (stalled_) return;
-    frame_header_size_ = 0;
-    frame_payload_size_ = 0;
-    expected_payload_size_ = 0;
     const auto held = held_input_;
     held_input_ = 0;
     consume_input(std::span {read_buffer_}.first(held));
@@ -1467,14 +1508,8 @@ auto session::send_window_update(std::uint32_t id,
     }
 }
 
-auto session::append_frame(std::uint8_t type, std::uint8_t flags,
-                           std::uint32_t stream_id,
-                           std::span<const std::byte> payload,
-                           std::size_t file_payload_size) -> bool
+auto session::reserve_output(std::size_t needed, std::size_t file_payload_size) -> bool
 {
-    if (file_payload_size > max_frame_payload ||
-        payload.size() > max_frame_payload - file_payload_size) return false;
-    const auto needed = payload.size() + 9;
     const auto reserved = file_send_active_ ? file_send_.size : 0;
     if (needed + file_payload_size > max_output_size - output_size_ - reserved)
         return false;
@@ -1492,27 +1527,66 @@ auto session::append_frame(std::uint8_t type, std::uint8_t flags,
         output_ = std::move(grown);
         output_offset_ = 0;
     }
+    return true;
+}
+
+auto session::append_output(std::span<const std::byte> bytes) noexcept -> void
+{
+    if (bytes.empty()) return;
+    const auto tail = (output_offset_ + output_size_) % output_.size();
+    if (bytes.size() <= output_.size() - tail) {
+        // Keeps fixed-size headers a fixed-size copy once inlined.
+        std::memcpy(output_.data() + tail, bytes.data(), bytes.size());
+    } else {
+        const auto first = output_.size() - tail;
+        std::memcpy(output_.data() + tail, bytes.data(), first);
+        std::memcpy(output_.data(), bytes.data() + first, bytes.size() - first);
+    }
+    output_size_ += bytes.size();
+}
+
+auto session::frame_header(std::size_t size, std::uint8_t type, std::uint8_t flags,
+                           std::uint32_t stream_id) noexcept -> std::array<std::byte, 9>
+{
     std::array<std::byte, 9> header {};
-    const auto wire_size = payload.size() + file_payload_size;
-    header[0] = static_cast<std::byte>((wire_size >> 16) & 0xff);
-    header[1] = static_cast<std::byte>((wire_size >> 8) & 0xff);
-    header[2] = static_cast<std::byte>(wire_size & 0xff);
+    header[0] = static_cast<std::byte>((size >> 16) & 0xff);
+    header[1] = static_cast<std::byte>((size >> 8) & 0xff);
+    header[2] = static_cast<std::byte>(size & 0xff);
     header[3] = static_cast<std::byte>(type);
     header[4] = static_cast<std::byte>(flags);
     write_u32(header.data() + 5, stream_id & 0x7fffffffu);
-    auto append = [this](std::span<const std::byte> bytes) {
-        if (bytes.empty()) return;
-        const auto tail = (output_offset_ + output_size_) % output_.size();
-        const auto first = std::min(bytes.size(), output_.size() - tail);
-        std::memcpy(output_.data() + tail, bytes.data(), first);
-        if (first != bytes.size()) {
-            std::memcpy(output_.data(), bytes.data() + first, bytes.size() - first);
-        }
-        output_size_ += bytes.size();
-    };
-    append(header);
-    append(payload);
+    return header;
+}
+
+auto session::append_frame(std::uint8_t type, std::uint8_t flags,
+                           std::uint32_t stream_id,
+                           std::span<const std::byte> payload,
+                           std::size_t file_payload_size) -> bool
+{
+    if (file_payload_size > max_frame_payload ||
+        payload.size() > max_frame_payload - file_payload_size) return false;
+    if (!reserve_output(payload.size() + 9, file_payload_size)) return false;
+    append_output(frame_header(payload.size() + file_payload_size, type, flags, stream_id));
+    append_output(payload);
     return true;
+}
+
+auto session::append_file_frame(std::uint8_t flags, std::uint32_t stream_id,
+                                native_socket file, std::uint64_t offset,
+                                std::size_t size) -> file_frame
+{
+    if (size > max_frame_payload || !reserve_output(size + 9, 0)) return file_frame::full;
+    append_output(frame_header(size, data_frame, flags, stream_id));
+    const auto tail = (output_offset_ + output_size_) % output_.size();
+    const auto first = std::min(size, output_.size() - tail);
+    if (!http::detail::read_file_at(file, offset, std::span {output_}.subspan(tail, first)) ||
+        (first != size && !http::detail::read_file_at(file, offset + first,
+                              std::span {output_}.first(size - first)))) {
+        output_size_ -= 9;
+        return file_frame::read_failed;
+    }
+    output_size_ += size;
+    return file_frame::appended;
 }
 
 auto session::append_response_headers(stream& value, unsigned status,
@@ -1639,7 +1713,6 @@ auto session::pump_responses() -> void
             // consume_output() retries after the transport drains output.
             return;
         }
-        std::span<const std::byte> body;
         if (value.response_file && file_sendfile_) {
 #if defined(__linux__)
             // Move the response owner into the frame instead of duplicating
@@ -1669,22 +1742,20 @@ auto session::pump_responses() -> void
             return;
 #endif
         }
+        const bool last = value.response_offset + count == value.response_size;
+        const auto flags = static_cast<std::uint8_t>(last ? flag_end_stream : 0);
         if (value.response_file) {
-            if (!http::detail::read_file_at(value.response_file.get(),
-                    value.response_file_start + value.response_offset,
-                    std::span {frame_payload_}.first(count))) {
+            const auto appended = append_file_frame(flags, value.id, value.response_file.get(),
+                value.response_file_start + value.response_offset, count);
+            if (appended == file_frame::read_failed) {
                 stream_error(value.id, internal_error);
                 if (fatal_) return;
                 continue;
             }
-            body = std::span {frame_payload_}.first(count);
-        } else {
-            body = std::span {value.response_body}.subspan(
-                static_cast<std::size_t>(value.response_offset), count);
-        }
-        const bool last = value.response_offset + count == value.response_size;
-        if (!append_frame(data_frame, last ? flag_end_stream : 0,
-                          value.id, body)) {
+            // consume_output() resumes pumping after the transport drains.
+            if (appended == file_frame::full) return;
+        } else if (!append_frame(data_frame, flags, value.id, std::span {value.response_body}
+                       .subspan(static_cast<std::size_t>(value.response_offset), count))) {
             // The bounded output queue is full. consume_output() resumes
             // pumping after the transport drains it.
             return;

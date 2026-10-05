@@ -49,6 +49,11 @@ public:
         if (fail_write)
             return {{std::unexpected(std::make_error_code(std::errc::broken_pipe))}};
         const auto size = std::min(buffer.size(), max_write_chunk);
+        if (block_write && defer_write_copy) {
+            // Like a socket retrying after EAGAIN, read the bytes on completion.
+            deferred_write = buffer.first(size);
+            return {{size}, this};
+        }
         output.insert(output.end(), buffer.begin(), buffer.begin() +
                                              static_cast<std::ptrdiff_t>(size));
         return {{size}, this};
@@ -58,6 +63,8 @@ public:
     auto release_write() -> void
     {
         block_write = false;
+        output.insert(output.end(), deferred_write.begin(), deferred_write.end());
+        deferred_write = {};
         auto handle = std::exchange(pending_write, {});
         if (handle) handle.resume();
     }
@@ -74,6 +81,8 @@ public:
     bool open {true};
     bool fail_write {false};
     bool block_write {false};
+    bool defer_write_copy {false};
+    std::span<const std::byte> deferred_write {};
     std::coroutine_handle<> pending_write {};
 };
 
@@ -331,6 +340,36 @@ auto concurrent_writer_test() -> bool
            stream.output.size() == 7;
 }
 
+// Frames queued while a write borrows the output must not move its bytes.
+auto borrowed_write_test() -> bool
+{
+    event_loop loop;
+    memory_stream stream;
+    stream.block_write = true;
+    stream.defer_write_copy = true;
+    stream.max_write_chunk = 1024 * 1024;
+    ws::web_socket socket(loop, stream, 128 * 1024);
+    std::vector<std::byte> payload(70 * 1024);
+    for (std::size_t index = 0; index < payload.size(); ++index)
+        payload[index] = static_cast<std::byte>(index * 7);
+    auto send = socket.async_send_binary(payload);
+    if (send.start() != task_state::suspended || !stream.pending_write) return false;
+    // The ping's pong grows the output while the first write borrows it.
+    stream.append(masked_frame(0x9, true, bytes("ping")));
+    auto receive = socket.async_receive();
+    const auto message = complete(receive);
+    stream.release_write();
+    if (!message || !*message || (*message)->type != ws::message_type::ping) return false;
+    if (send.state() != task_state::completed || !send.result()) return false;
+    const auto& out = stream.output;
+    if (out.size() != 10 + payload.size() + 6 || byte_at(out, 0) != 0x82 ||
+        !std::equal(payload.begin(), payload.end(), out.begin() + 10))
+        return false;
+    const auto pong = out.begin() + 10 + static_cast<std::ptrdiff_t>(payload.size());
+    return pong[0] == std::byte {0x8a} && pong[1] == std::byte {4} &&
+           std::ranges::equal(std::span(pong + 2, 4), bytes("ping"));
+}
+
 } // namespace
 
 auto main() -> int
@@ -355,6 +394,9 @@ auto main() -> int
     }
     if (!concurrent_writer_test()) {
         std::cerr << "concurrent writer test failed\n"; return 1;
+    }
+    if (!borrowed_write_test()) {
+        std::cerr << "borrowed write test failed\n"; return 1;
     }
     return 0;
 }
