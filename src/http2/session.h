@@ -2,6 +2,7 @@
 
 #include "eventloop/unique_fd.h"
 #include "../http/exchange.h"
+#include "../http/open_file_cache.h"
 #include "hpack.h"
 
 #include <array>
@@ -55,7 +56,7 @@ public:
                      std::uint64_t max_request_body = 0);
 
     struct file_send {
-        unique_fd file;
+        http::detail::static_file file;
         std::uint64_t offset = 0;
         std::size_t size = 0;
         std::span<const std::byte> prefix {};
@@ -66,7 +67,7 @@ public:
     [[nodiscard]] auto take_file_send(bool include_prefix = false) noexcept
         -> std::optional<file_send>;
     // Return the descriptor after the borrowed transport send has completed.
-    auto complete_file_send(unique_fd file) -> void;
+    auto complete_file_send(http::detail::static_file file) -> void;
 
     session(const session&) = delete;
     auto operator=(const session&) -> session& = delete;
@@ -75,13 +76,16 @@ public:
     auto commit_read(std::size_t size) -> void;
     [[nodiscard]] auto output() const noexcept -> std::span<const std::byte>;
     auto consume_output(std::size_t size) -> void;
+    // Assigns into value's existing strings, so a caller reusing one request
+    // keeps their capacity across requests.
     [[nodiscard]] auto pop_request(request& value) -> bool;
 
     // Header fields are borrowed only during the call.
     [[nodiscard]] auto respond(std::uint32_t stream_id, unsigned status,
         std::span<const http::header> headers, std::vector<std::byte> body) -> bool;
     [[nodiscard]] auto respond_file(std::uint32_t stream_id, unsigned status,
-        std::span<const http::header> headers, unique_fd file, std::uint64_t size,
+        std::span<const http::header> headers, http::detail::static_file file,
+        std::uint64_t size,
         bool send_body, std::uint64_t offset = 0) -> bool;
 
     [[nodiscard]] auto closed() const noexcept -> bool;
@@ -138,7 +142,7 @@ private:
         bool duplicate_range = false;
         std::uint64_t response_file_start = 0;
         std::vector<std::byte> response_body;
-        unique_fd response_file;
+        http::detail::static_file response_file;
         std::uint64_t response_size = 0;
         std::uint64_t response_offset = 0;
         std::size_t response_accounted = 0;
@@ -205,10 +209,25 @@ private:
     auto stream_error(std::uint32_t id, std::uint32_t error) -> void;
     auto connection_error(std::uint32_t error) -> void;
     auto send_window_update(std::uint32_t id, std::uint32_t increment) -> void;
+    auto complete_frame() -> void;
+    auto clear_frame_state() noexcept -> void;
+    // Unfilled payload of the current frame when it is large enough to be
+    // the next read target; empty otherwise.
+    [[nodiscard]] auto payload_read_space() noexcept -> std::span<std::byte>;
     auto append_frame(std::uint8_t type, std::uint8_t flags,
                       std::uint32_t stream_id,
                       std::span<const std::byte> payload = {},
                       std::size_t file_payload_size = 0) -> bool;
+    enum class file_frame { appended, full, read_failed };
+    // Reads the DATA payload from file straight into the output queue.
+    auto append_file_frame(std::uint8_t flags, std::uint32_t stream_id,
+                           native_socket file, std::uint64_t offset,
+                           std::size_t size) -> file_frame;
+    [[nodiscard]] auto reserve_output(std::size_t needed,
+                                      std::size_t file_payload_size) -> bool;
+    auto append_output(std::span<const std::byte> bytes) noexcept -> void;
+    [[nodiscard]] static auto frame_header(std::size_t size, std::uint8_t type,
+        std::uint8_t flags, std::uint32_t stream_id) noexcept -> std::array<std::byte, 9>;
     auto append_response_headers(stream& value, unsigned status,
                                  std::span<const http::header> headers,
                                  std::span<const http::header> extra, bool end_stream) -> bool;
@@ -226,6 +245,8 @@ private:
     std::array<std::byte, 4096> read_buffer_ {};
     std::array<std::byte, 9> frame_header_ {};
     std::array<std::byte, max_frame_payload> frame_payload_ {};
+    // The payload being dispatched: frame_payload_, or input it lies in.
+    const std::byte* frame_data_ = frame_payload_.data();
     std::size_t frame_header_size_ = 0;
     std::size_t frame_payload_size_ = 0;
     std::size_t expected_payload_size_ = 0;
@@ -265,7 +286,8 @@ private:
     std::uint32_t closed_floor_ = 0;
     bool header_closed_reply_ = false;
 
-    std::vector<request> requests_;
+    // Streams whose static request is complete, in arrival order.
+    std::vector<std::uint32_t> requests_;
     std::vector<routed_request> routed_;
     std::vector<std::byte> header_block_;
     std::vector<std::byte> output_;

@@ -614,11 +614,14 @@ public:
             (!deadline || coroutine_timers->deadline < *deadline)) {
             deadline = coroutine_timers->deadline;
         }
-        if (!deadline) {
-            poller.arm_timer(std::nullopt);
-            return;
-        }
-        poller.arm_timer(*deadline - event_loop::clock::now());
+        // Registering or cancelling a later timer leaves the earliest
+        // deadline unchanged; skip the poller syscall unless that deadline
+        // is due, since an expired poller timer must be armed again.
+        const auto now = event_loop::clock::now();
+        if (deadline == armed_deadline && (!deadline || *deadline > now)) return;
+        if (!deadline) poller.arm_timer(std::nullopt);
+        else poller.arm_timer(*deadline - now);
+        armed_deadline = deadline;
     }
 
     auto add_timer(event_loop::clock::time_point deadline,
@@ -667,20 +670,14 @@ public:
         detail::coroutine_timer_node& timer) -> void
     {
         if (timer.owner != owner || timer.previous != nullptr ||
-            timer.next != nullptr) {
+            timer.next != nullptr || timer.child != nullptr ||
+            coroutine_timers == &timer) {
             std::terminate();
         }
-        auto** position = &coroutine_timers;
-        detail::coroutine_timer_node* previous = nullptr;
-        while (*position != nullptr &&
-               (*position)->deadline <= timer.deadline) {
-            previous = *position;
-            position = &(*position)->next;
-        }
-        timer.previous = previous;
-        timer.next = *position;
-        if (timer.next != nullptr) timer.next->previous = &timer;
-        *position = &timer;
+        // Insertion is O(1) and removal O(log n) amortized, whatever the mix
+        // of timeout lengths.
+        timer.sequence = next_timer_sequence++;
+        coroutine_timers = meld_timers(coroutine_timers, &timer);
         try {
             arm_next_timer();
         } catch (...) {
@@ -791,12 +788,66 @@ private:
     auto unlink_coroutine_timer(
         detail::coroutine_timer_node& timer) noexcept -> void
     {
-        if (timer.previous != nullptr) timer.previous->next = timer.next;
-        else coroutine_timers = timer.next;
-        if (timer.next != nullptr) timer.next->previous = timer.previous;
+        if (&timer == coroutine_timers) {
+            coroutine_timers = merge_timer_pairs(timer.child);
+        } else {
+            if (timer.previous->child == &timer) timer.previous->child = timer.next;
+            else timer.previous->next = timer.next;
+            if (timer.next != nullptr) timer.next->previous = timer.previous;
+            coroutine_timers = meld_timers(coroutine_timers, merge_timer_pairs(timer.child));
+        }
         timer.previous = nullptr;
         timer.next = nullptr;
+        timer.child = nullptr;
         timer.owner = nullptr;
+    }
+
+    [[nodiscard]] static auto fires_before(const detail::coroutine_timer_node& left,
+                                           const detail::coroutine_timer_node& right) noexcept
+        -> bool
+    {
+        return left.deadline < right.deadline ||
+            (left.deadline == right.deadline && left.sequence < right.sequence);
+    }
+
+    // Joins two heap roots; the later one becomes the earlier one's first child.
+    [[nodiscard]] static auto meld_timers(detail::coroutine_timer_node* left,
+                                          detail::coroutine_timer_node* right) noexcept
+        -> detail::coroutine_timer_node*
+    {
+        if (left == nullptr) return right;
+        if (right == nullptr) return left;
+        if (fires_before(*right, *left)) std::swap(left, right);
+        right->previous = left;
+        right->next = left->child;
+        if (left->child != nullptr) left->child->previous = right;
+        left->child = right;
+        return left;
+    }
+
+    // Two-pass pairing of a sibling list into one root, without recursion.
+    [[nodiscard]] static auto merge_timer_pairs(detail::coroutine_timer_node* first) noexcept
+        -> detail::coroutine_timer_node*
+    {
+        detail::coroutine_timer_node* pairs = nullptr;
+        while (first != nullptr) {
+            auto* left = first;
+            auto* right = left->next;
+            first = right != nullptr ? right->next : nullptr;
+            left->previous = left->next = nullptr;
+            if (right != nullptr) right->previous = right->next = nullptr;
+            auto* melded = meld_timers(left, right);
+            melded->next = pairs;
+            pairs = melded;
+        }
+        detail::coroutine_timer_node* result = nullptr;
+        while (pairs != nullptr) {
+            auto* next = pairs->next;
+            pairs->next = nullptr;
+            result = meld_timers(result, pairs);
+            pairs = next;
+        }
+        return result;
     }
 
 public:
@@ -838,7 +889,11 @@ public:
     event_loop* owner {nullptr};
     detail::coroutine_root_node* active_roots {nullptr};
     detail::coroutine_root_node* completed_roots {nullptr};
+    // Root of the pairing heap of coroutine timers: the earliest deadline.
     detail::coroutine_timer_node* coroutine_timers {nullptr};
+    std::uint64_t next_timer_sequence {0};
+    // The deadline the poller timer is armed for, if any.
+    std::optional<event_loop::clock::time_point> armed_deadline;
     std::size_t active_root_count {0};
 };
 

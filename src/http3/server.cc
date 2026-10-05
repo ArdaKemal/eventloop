@@ -5,6 +5,7 @@
 #include "eventloop/unique_fd.h"
 #include "../http/exchange.h"
 #include "../http/file_operations.h"
+#include "../http/open_file_cache.h"
 #include "../http/resource.h"
 #include "../http/file_response.h"
 #include "frames.h"
@@ -601,7 +602,8 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
 }
 
 auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
-                   native_socket root, stream_storage* storage,
+                   native_socket root, http::detail::open_file_cache* files,
+                   stream_storage* storage,
                    const request_settings& settings)
     -> task<void>
 {
@@ -666,7 +668,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     const std::string_view if_none_match {
         reinterpret_cast<const char*>(s.headers.data()), match_size};
     unsigned status = 200;
-    unique_fd file;
+    http::detail::static_file file;
     std::uint64_t size = 0;
     std::uint64_t offset = 0;
     detail::file_response selected;
@@ -679,12 +681,12 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     else if (method == "OPTIONS") status = 204;
     else if (method != "GET" && method != "HEAD") status = 405;
     else {
-        auto opened = http::detail::open_resource(root, path);
+        auto opened = http::detail::open_static(root, files, path);
         if (!opened) status = opened.error() == http::detail::resource_error::invalid_target ? 400
             : opened.error() == http::detail::resource_error::target_too_long ? 414 : 404;
         else {
-            file = std::move(*opened);
-            auto info = http::detail::get_file_info(file.get());
+            file = std::move(opened->file);
+            const std::optional<http::detail::file_info> info = opened->info;
             if (!info) status = 404;
             else if (info->kind == http::detail::file_info::type::directory) {
                 auto index = http::detail::open_child(file.get(), "index.html", false);
@@ -698,7 +700,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
                 } else if (!settings.directory_listing) {
                     status = 403;
                 } else {
-                    auto rendered = http::detail::render_directory_listing(std::move(file));
+                    auto rendered = http::detail::render_directory_listing(file.take_owned());
                     if (!rendered) {
                         status = 500;
                         mime = "text/plain";
@@ -807,7 +809,7 @@ auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t 
 }
 
 auto serve_connection(event_loop& loop, quic_connection connection,
-                      std::shared_ptr<unique_fd> root,
+                      std::shared_ptr<http::detail::document_root> root,
                       stream_handlers& handlers, storage_pool& pool,
                       const request_settings& settings) -> task<void>
 {
@@ -847,8 +849,8 @@ auto serve_connection(event_loop& loop, quic_connection connection,
             slot->reset();
             slot->emplace();
             spawned = request
-                ? loop.spawn(serve_request(loop, connection, id, root->get(),
-                      storage, settings), **slot)
+                ? loop.spawn(serve_request(loop, connection, id, root->descriptor.get(),
+                      root->cache.get(), storage, settings), **slot)
                 : loop.spawn(read_peer_uni(loop, connection, id, critical), **slot);
             if (spawned != task_spawn_result::accepted) slot->reset();
         }
@@ -888,13 +890,18 @@ public:
     }
 
     // An empty document root means routes only; static requests answer 404.
-    static auto open_document_root(const server_options& options) -> std::shared_ptr<unique_fd>
+    static auto open_document_root(const server_options& options)
+        -> std::shared_ptr<http::detail::document_root>
     {
         if (!options.routes && options.document_root.empty())
             throw std::invalid_argument("server needs routes or a document root");
-        if (options.document_root.empty()) return std::make_shared<unique_fd>();
-        return std::make_shared<unique_fd>(
-            http::detail::open_root(options.document_root.string()));
+        auto root = std::make_shared<http::detail::document_root>();
+        if (options.document_root.empty()) return root;
+        root->descriptor = http::detail::open_root(options.document_root.string());
+        if (options.open_file_cache_capacity != 0)
+            root->cache = std::make_unique<http::detail::open_file_cache>(
+                options.open_file_cache_capacity);
+        return root;
     }
 
     implementation(event_loop& loop, ip_endpoint local, std::filesystem::path cert,
@@ -910,7 +917,7 @@ public:
                                                          : options.request_capacity) {}
 
     event_loop& loop_;
-    std::shared_ptr<unique_fd> root_;
+    std::shared_ptr<http::detail::document_root> root_;
     const std::array<std::uint8_t, 2> alpn_ {'h', '3'};
     quic_endpoint endpoint_;
     std::shared_ptr<const router> routes_;

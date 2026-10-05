@@ -17,6 +17,15 @@ struct server_options {
     std::shared_ptr<const router> routes {};
     std::filesystem::path document_root {};
     bool directory_listing {false};
+    // Static files: keep up to this many regular files open, per server and
+    // event loop, instead of opening them on every request; 0 disables the
+    // cache, and the limit is 65536. A cached file is checked again through
+    // the document root at most once per second, so for up to a second a
+    // changed, replaced, or deleted file can still be served as it was;
+    // replace files atomically. Each entry holds a file descriptor.
+    // HTTP/1.1 bodies of 11 KiB or more, sent with sendfile, open the file
+    // themselves. See docs/api-contract.md.
+    std::size_t open_file_cache_capacity {0};
     // TCP servers only.
     bool reuse_port {false};
     // https_server only: advertise h2 next to http/1.1.

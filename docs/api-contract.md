@@ -159,7 +159,10 @@ every running connection has sent its close and retired.
 - `eventloop::sleep_for` and `eventloop::sleep_until` are the public timer
   interface. Positive relative durations saturate at the latest representable
   time point; zero or negative durations are immediately due. Callback timer scheduling is not a
-  public API.
+  public API. A waiting timer lives in the awaiting coroutine frame and joins
+  the loop's timer heap without allocating: registration costs O(1), and
+  expiry or cancellation O(log n) amortized in the number of pending timers.
+  Timers with equal deadlines fire in registration order.
 - `eventloop::event_loop::shutdown(timeout)` stops new registrations and
   requests cancellation of every active root immediately. It then calls
   `on_shutdown()` on registered handlers; the built-in acceptors and streams close immediately.
@@ -404,10 +407,15 @@ every running connection has sent its close and retired.
   - Steady-state routed requests make no general-heap allocation on a
     kept-alive HTTP/1.1 connection, on an HTTP/2 connection (TLS included),
     or on an HTTP/3 connection (QUIC included). Static HTTP/2 and HTTP/3 file
-    requests make none either. HTTP/2 decodes request fields into the
-    connection's existing strings and encodes response fields from views
-    into one reused buffer, so a header value longer than earlier ones on
-    the connection, or a new dynamic-table entry, can still allocate.
+    requests make none either. An HTTP/1.1 connection reads request heads
+    into 256 bytes of session storage; a longer head allocates one 4 KiB
+    input buffer, released once the remaining input fits again, so idle
+    connections stay small. A browser request head is usually longer, so
+    expect one allocation per such request. HTTP/2 decodes request fields into the
+    connection's existing strings, keeps its HPACK dynamic table in one
+    4 KiB ring allocated with the first entry, and encodes response fields
+    from views into one reused buffer, so only a header value longer than
+    earlier ones on the connection can still allocate.
     `tests/http_routing_allocations.cc`,
     `tests/http2_routing_allocations.cc`, and
     `tests/http3_routing_allocations.cc` check these paths. The HTTP/2 and
@@ -464,6 +472,23 @@ every running connection has sent its close and retired.
   exceeding either returns 500 with a short plain-text body. HTTP/1.1 and
   HTTP/2 and HTTP/3 list when `server_options::directory_listing` is set. The
   component-by-component `O_NOFOLLOW` document-root walk is unchanged.
+- `server_options::open_file_cache_capacity` (default 0, off; at most 65536)
+  keeps up to that many regular files open per server, with their metadata,
+  so repeated static requests skip opening, `fstat`, and closing the file.
+  Entries are keyed by decoded path and are opened and checked only through
+  the component-by-component `O_NOFOLLOW` walk. A hit at least one second
+  after its last check walks the path again; a changed, replaced, or removed
+  file, or one replaced by a symbolic link, then drops out or is reopened.
+  Within that second the previous file and metadata are served: replace
+  files atomically (write a new file, then rename it) so that a cached
+  response stays consistent; an in-place edit can pair old metadata with new
+  bytes. Each entry holds one file descriptor; storage is allocated when the
+  server is constructed, and a hit makes no general-heap allocation. Entries
+  in use by responses stay open until those responses finish; when every
+  entry is in use, a request is served uncached. Directories, `index.html`
+  lookups, paths longer than 255 decoded bytes, and HTTP/1.1 bodies of
+  11 KiB or more (sent with `sendfile` from a private descriptor) are not
+  served from the cache. The cache belongs to the server's event loop.
 - Include `eventloop/http2/client.h` for one outbound HTTPS HTTP/2 request.
   `http2::async_request(loop, endpoint, context, hostname, request)` owns the
   TLS socket from connect through close. `hostname` is used for certificate

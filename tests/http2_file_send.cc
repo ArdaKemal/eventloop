@@ -254,6 +254,53 @@ auto reset_during_file_send() -> void
     check(fcntl(descriptor, F_GETFD) == -1, "reset file owner survived completion");
     check(!state.closed(), "reset transfer closed connection");
 }
+// Without kernel sendfile, file DATA must not overwrite a partially
+// received frame.
+auto inbound_frame_survives_file_pump() -> void
+{
+    session state(false);
+    initialize(state);
+    request_file(state, 1);
+    std::array<char, 40> name {};
+    constexpr std::string_view pattern = "/tmp/eventloop-h2-file-XXXXXX";
+    std::copy(pattern.begin(), pattern.end(), name.begin());
+    unique_fd file {mkstemp(name.data())};
+    check(static_cast<bool>(file), "create file fixture");
+    check(unlink(name.data()) == 0, "unlink file fixture");
+    const std::vector<char> contents(1000, 'F');
+    check(write(file.get(), contents.data(), contents.size()) ==
+          static_cast<ssize_t>(contents.size()), "write file fixture");
+
+    constexpr std::array<std::byte, 9> ping_header {std::byte {0}, std::byte {0},
+        std::byte {8}, std::byte {6}, std::byte {0}, std::byte {0}, std::byte {0},
+        std::byte {0}, std::byte {0}};
+    constexpr std::string_view opaque = "ABCDEFGH";
+    feed(state, ping_header);
+    feed(state, std::as_bytes(std::span(opaque)).first(4));
+    check(state.respond_file(1, 200, {}, std::move(file), contents.size(), true),
+          "file response");
+    auto output = drain(state);
+    feed(state, std::as_bytes(std::span(opaque)).subspan(4));
+    const auto rest = drain(state);
+    output.insert(output.end(), rest.begin(), rest.end());
+
+    std::span<const std::byte> frames = output;
+    bool acked = false;
+    while (frames.size() >= 9) {
+        const auto length = (std::to_integer<std::size_t>(frames[0]) << 16) |
+            (std::to_integer<std::size_t>(frames[1]) << 8) |
+            std::to_integer<std::size_t>(frames[2]);
+        check(frames.size() >= 9 + length, "truncated output frame");
+        if (frames[3] == std::byte {6} && frames[4] == std::byte {1}) {
+            check(length == 8 && std::equal(opaque.begin(), opaque.end(),
+                      reinterpret_cast<const char*>(frames.data() + 9)),
+                  "PING ACK lost the received opaque data");
+            acked = true;
+        }
+        frames = frames.subspan(9 + length);
+    }
+    check(acked, "PING was not acknowledged");
+}
 } // namespace
 
 auto main() -> int
@@ -261,5 +308,6 @@ auto main() -> int
     file_barrier();
     combined_prefix();
     reset_during_file_send();
+    inbound_frame_survives_file_pump();
     return 0;
 }

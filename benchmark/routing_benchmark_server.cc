@@ -2,6 +2,7 @@
 // HTTP/2, and HTTP/3, so a load generator can compare the two paths.
 //
 //   routing_benchmark_server <document-root> <certificate> <key> <base-port>
+//                            [open-file-cache-capacity]
 //
 // HTTP/1.1 listens on base-port, HTTPS on base-port + 1, and HTTP/3 on UDP
 // base-port + 2. GET /routed answers from memory with as many bytes as
@@ -54,9 +55,9 @@ event_loop* running = nullptr;
 
 auto main(int argc, char** argv) -> int
 {
-    if (argc != 5) {
+    if (argc != 5 && argc != 6) {
         std::cerr << "usage: routing_benchmark_server <document-root> <certificate> <key> "
-                     "<base-port>\n";
+                     "<base-port> [open-file-cache-capacity]\n";
         return 1;
     }
     try {
@@ -75,7 +76,15 @@ auto main(int argc, char** argv) -> int
         auto routes = std::make_shared<http::router>();
         if (!routes->add(http::method_type::get, "/routed", routed))
             throw std::runtime_error("register /routed");
-        const http::server_options options {.routes = routes, .document_root = root};
+        std::size_t cache_capacity = 0;
+        if (argc == 6) {
+            const std::string_view text = argv[5];
+            if (std::from_chars(text.data(), text.data() + text.size(), cache_capacity).ec !=
+                    std::errc {})
+                throw std::invalid_argument("open file cache capacity must be a number");
+        }
+        const http::server_options options {.routes = routes, .document_root = root,
+                                            .open_file_cache_capacity = cache_capacity};
 
         // Size the coroutine pools for many concurrent HTTP/3 requests.
         event_loop_options loop_options;
@@ -94,6 +103,7 @@ auto main(int argc, char** argv) -> int
         http::http3_server quic(loop, ip_endpoint::loopback_v4(static_cast<std::uint16_t>(base + 2)),
             argv[2], argv[3], http::server_options {
                 .routes = routes, .document_root = root,
+                .open_file_cache_capacity = cache_capacity,
                 .connection_capacity = 64, .request_capacity = 1024});
         auto* plain_server = plain.get();
         auto* secure_server = secure.get();

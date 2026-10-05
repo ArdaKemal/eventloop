@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string_view>
 #include <utility>
@@ -495,35 +496,64 @@ auto hpack_decoder::resolve(std::size_t index, field& result) const -> bool
         return true;
     }
     index -= static_table.size() + 1;
-    if (index >= table_.size()) return false;
-    result = table_[index];
+    if (index >= entry_count_) return false;
+    const auto& entry = entries_[(newest_ + max_entries - index) % max_entries];
+    load(entry.offset, entry.name_size, result.name);
+    load((entry.offset + entry.name_size) % hpack_max_table_size, entry.value_size,
+         result.value);
     return true;
+}
+
+auto hpack_decoder::load(std::size_t offset, std::size_t size, std::string& output) const
+    -> void
+{
+    const auto first = std::min(size, hpack_max_table_size - offset);
+    output.assign(table_octets_.get() + offset, first);
+    output.append(table_octets_.get(), size - first);
+}
+
+auto hpack_decoder::store(std::string_view octets) noexcept -> void
+{
+    const auto first = std::min(octets.size(), hpack_max_table_size - write_offset_);
+    std::memcpy(table_octets_.get() + write_offset_, octets.data(), first);
+    std::memcpy(table_octets_.get(), octets.data() + first, octets.size() - first);
+    write_offset_ = (write_offset_ + octets.size()) % hpack_max_table_size;
+}
+
+auto hpack_decoder::evict_oldest() noexcept -> void
+{
+    const auto& oldest = entries_[(newest_ + max_entries + 1 - entry_count_) % max_entries];
+    table_bytes_ -= std::size_t {oldest.name_size} + oldest.value_size + 32;
+    --entry_count_;
 }
 
 auto hpack_decoder::resize_table(std::size_t size) -> void
 {
     table_size_ = size;
-    while (table_bytes_ > table_size_) {
-        const auto& last = table_.back();
-        table_bytes_ -= last.name.size() + last.value.size() + 32;
-        table_.pop_back();
-    }
+    while (table_bytes_ > table_size_) evict_oldest();
 }
 
-auto hpack_decoder::insert(field entry) -> void
+auto hpack_decoder::insert(const field& entry) -> void
 {
     const auto size = entry.name.size() + entry.value.size() + 32;
     if (size > table_size_) {
-        table_.clear();
+        entry_count_ = 0;
         table_bytes_ = 0;
         return;
     }
-    while (table_bytes_ + size > table_size_) {
-        const auto& last = table_.back();
-        table_bytes_ -= last.name.size() + last.value.size() + 32;
-        table_.pop_back();
-    }
-    table_.insert(table_.begin(), std::move(entry));
+    while (table_bytes_ + size > table_size_) evict_oldest();
+    if (!table_octets_)
+        table_octets_ = std::make_unique_for_overwrite<char[]>(hpack_max_table_size);
+    // Live octets are contiguous before write_offset_ and, with this entry,
+    // stay below table_size_ - 32 * entries, so the ring never overwrites them.
+    const auto offset = write_offset_;
+    store(entry.name);
+    store(entry.value);
+    newest_ = (newest_ + 1) % max_entries;
+    entries_[newest_] = {static_cast<std::uint16_t>(offset),
+                         static_cast<std::uint16_t>(entry.name.size()),
+                         static_cast<std::uint16_t>(entry.value.size())};
+    ++entry_count_;
     table_bytes_ += size;
 }
 

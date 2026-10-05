@@ -411,6 +411,10 @@ private:
                 }
             }
         }
+        // A declared body follows through write(), which sends these headers
+        // with a body that fits the buffer. Streamed responses send them now.
+        if (length && *length != 0 && !self.bodyless_ && !self.head_only_)
+            co_return void_result {};
         co_return unwrap(co_await flush(loop, self));
     }
 
@@ -483,6 +487,8 @@ private:
                 }
             }
             (void)self.append("\r\n");
+        }
+        if (self.output_size_ != 0) {
             auto flushed = unwrap(co_await flush(loop, self));
             if (!flushed) co_return std::unexpected(flushed.error());
         }
@@ -497,6 +503,13 @@ private:
         auto started = co_await start_task(loop, self, status, headers, size);
         if (!started) co_return std::unexpected(failure(std::errc::operation_canceled));
         if (!*started) co_return std::unexpected(started->error());
+        // start() keeps the headers buffered for a declared body; the file
+        // goes out separately and reuses the buffer, so send them first.
+        if (self.output_size_ != 0) {
+            busy writing(self.writing_);
+            auto flushed = unwrap(co_await flush(loop, self));
+            if (!flushed) co_return std::unexpected(flushed.error());
+        }
         if (!self.bodyless_ && !self.head_only_ && size != 0) {
             busy writing(self.writing_);
             bool sent = false;

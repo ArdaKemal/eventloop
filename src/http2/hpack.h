@@ -2,8 +2,10 @@
 
 #include "eventloop/http/request.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -33,7 +35,21 @@ public:
                               std::vector<field>& output) -> hpack_error;
 
 private:
-    std::vector<field> table_;
+    // Each entry costs at least 32 octets of table size (RFC 7541 4.1).
+    static constexpr std::size_t max_entries = hpack_max_table_size / 32;
+    struct table_entry {
+        std::uint16_t offset = 0;
+        std::uint16_t name_size = 0;
+        std::uint16_t value_size = 0;
+    };
+    // The dynamic table keeps entry octets in one ring, allocated on the
+    // first insertion; live octets stay below hpack_max_table_size, so
+    // insertion and eviction do not allocate.
+    std::unique_ptr<char[]> table_octets_;
+    std::array<table_entry, max_entries> entries_ {};
+    std::size_t newest_ = 0;
+    std::size_t entry_count_ = 0;
+    std::size_t write_offset_ = 0;
     std::size_t table_bytes_ = 0;
     std::size_t table_size_ = hpack_max_table_size;
     std::size_t table_size_limit_ = hpack_max_table_size;
@@ -41,8 +57,11 @@ private:
     bool update_required_ = false;
 
     [[nodiscard]] auto resolve(std::size_t index, field& result) const -> bool;
-    auto insert(field entry) -> void;
+    auto insert(const field& entry) -> void;
+    auto evict_oldest() noexcept -> void;
     auto resize_table(std::size_t size) -> void;
+    auto store(std::string_view octets) noexcept -> void;
+    auto load(std::size_t offset, std::size_t size, std::string& output) const -> void;
 };
 
 // Stateless response encoder: literal fields, no indexing or Huffman coding.

@@ -6,6 +6,7 @@
 #include "file_operations.h"
 #include "http1_exchange.h"
 #include "parser.h"
+#include "open_file_cache.h"
 #include "session.h"
 #include "eventloop/tcp_stream.h"
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
@@ -50,12 +51,16 @@ struct connection_options {
 
 // An empty document root means routes only; static requests answer 404.
 [[nodiscard]] auto open_document_root(const server_options& options)
-    -> std::shared_ptr<unique_fd>
+    -> std::shared_ptr<detail::document_root>
 {
     if (!options.routes && options.document_root.empty())
         throw std::invalid_argument("server needs routes or a document root");
-    if (options.document_root.empty()) return std::make_shared<unique_fd>();
-    return std::make_shared<unique_fd>(detail::open_root(options.document_root.string()));
+    auto root = std::make_shared<detail::document_root>();
+    if (options.document_root.empty()) return root;
+    root->descriptor = detail::open_root(options.document_root.string());
+    if (options.open_file_cache_capacity != 0)
+        root->cache = std::make_unique<detail::open_file_cache>(options.open_file_cache_capacity);
+    return root;
 }
 
 auto validate_hostname(std::string_view hostname) -> void
@@ -100,7 +105,7 @@ template<typename T>
 
 template<typename Stream>
 [[nodiscard]] auto serve_connection(event_loop& loop, unique_fd descriptor,
-                                    std::shared_ptr<unique_fd> root,
+                                    std::shared_ptr<detail::document_root> root,
                                     connection_options options,
                                     std::shared_ptr<tls_context> context)
     -> task<void>
@@ -156,8 +161,9 @@ template<typename Stream>
             routing->routes = options.routes.get();
             routing->max_request_body = options.max_request_body;
         }
-        auto state = std::make_unique<detail::session>(root->get(), options.directory_listing,
-                                                       routing.get(), static_cast<bool>(*root));
+        auto state = std::make_unique<detail::session>(root->descriptor.get(),
+            options.directory_listing, routing.get(), static_cast<bool>(root->descriptor),
+            root->cache.get());
         std::unique_ptr<detail::http1_exchange<Stream>> exchange;
         if (routing) {
             exchange = std::make_unique<detail::http1_exchange<Stream>>(
@@ -374,7 +380,7 @@ auto server::run() -> task<void>
 }
 
 auto server::accept_loop(event_loop& loop, server& listener,
-                         std::shared_ptr<unique_fd> root,
+                         std::shared_ptr<detail::document_root> root,
                          server_options options) -> task<void>
 {
     while (auto accepted = co_await listener.async_accept()) {
@@ -407,7 +413,7 @@ auto https_server::run() -> task<void>
 }
 
 auto https_server::accept_loop(event_loop& loop, https_server& listener,
-                               std::shared_ptr<unique_fd> root,
+                               std::shared_ptr<detail::document_root> root,
                                std::shared_ptr<tls_context> context,
                                server_options options) -> task<void>
 {

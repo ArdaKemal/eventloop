@@ -18,8 +18,9 @@ namespace {
     return -1;
 }
 
-[[nodiscard]] auto decode_target(std::string_view target,
-                                 std::span<char> output) noexcept
+} // namespace
+
+auto decode_target(std::string_view target, std::span<char> output) noexcept
     -> std::expected<std::size_t, resource_error>
 {
     target = target.substr(0, target.find_first_of("?#"));
@@ -71,7 +72,7 @@ namespace {
     return size;
 }
 
-[[nodiscard]] auto open_beneath(native_socket root, std::span<char> path) noexcept
+auto open_decoded(native_socket root, std::span<const char> path) noexcept
     -> unique_fd
 {
     std::size_t start = 0;
@@ -99,8 +100,6 @@ namespace {
     return open_child(root, ".", false);
 }
 
-} // namespace
-
 auto open_resource(native_socket root, std::string_view target) noexcept
     -> std::expected<unique_fd, resource_error>
 {
@@ -108,7 +107,7 @@ auto open_resource(native_socket root, std::string_view target) noexcept
     const auto size = decode_target(target, path);
     if (!size) return std::unexpected(size.error());
 
-    auto descriptor = open_beneath(root, std::span {path}.first(*size));
+    auto descriptor = open_decoded(root, std::span {path}.first(*size));
     if (!descriptor) return std::unexpected(resource_error::open_failed);
     return descriptor;
 }

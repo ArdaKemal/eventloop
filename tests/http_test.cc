@@ -207,6 +207,40 @@ auto session_input_growth_tests() -> bool
             .find("431 Request Header Fields Too Large") != std::string_view::npos;
 }
 
+// With the open-file cache, a small file is served from its cached
+// descriptor, so it survives removal within the revalidation window, and a
+// large file is sent from a private descriptor whose position starts at 0.
+auto session_cache_tests() -> bool
+{
+    char directory_name[] = "/tmp/eventloop-http-cache-XXXXXX";
+    if (mkdtemp(directory_name) == nullptr) return false;
+    const int directory = open(directory_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory == -1) return false;
+    const std::string large(70 * 1024, 'y');
+    bool valid = write_file(directory, "site.css", "body{}") &&
+                 write_file(directory, "large.bin", large);
+    constexpr std::string_view requests =
+        "GET /site.css HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        "GET /large.bin HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    {
+        http::detail::open_file_cache cache(8);
+        http::detail::session session(directory, false, nullptr, true, &cache);
+        for (int round = 0; valid && round < 2; ++round) {
+            if (round == 1) valid = unlinkat(directory, "site.css", 0) == 0;
+            auto stream = std::make_unique<capture>();
+            session.receive(std::as_bytes(std::span {requests}));
+            collect(session, *stream);
+            valid = valid && stream->open && contains(*stream, "body{}") &&
+                    contains(*stream, "Content-Length: 71680") && contains(*stream, large);
+        }
+    }
+    (void)unlinkat(directory, "site.css", 0);
+    (void)unlinkat(directory, "large.bin", 0);
+    ::close(directory);
+    (void)rmdir(directory_name);
+    return valid;
+}
+
 auto session_tests() -> bool
 {
     char directory_name[] = "/tmp/eventloop-http-XXXXXX";
@@ -711,17 +745,19 @@ auto main() -> int
     const bool parser = parser_and_mime_tests();
     const bool session = session_tests();
     const bool input_growth = session_input_growth_tests();
+    const bool cache = session_cache_tests();
     const bool listener = listener_removal_test();
     const bool redirect = redirect_listener_removal_test();
     const bool pipeline = pipelined_sendfile_test();
     const bool capacity = concurrent_connection_capacity_test();
     const bool configuration = invalid_configuration_test();
     const bool chunked = chunked_decoder_tests();
-    if (!parser || !session || !input_growth || !listener || !redirect || !pipeline ||
-        !capacity || !configuration || !chunked) {
+    if (!parser || !session || !input_growth || !cache || !listener || !redirect ||
+        !pipeline || !capacity || !configuration || !chunked) {
         std::cerr << "HTTP tests failed: parser=" << parser
                   << " session=" << session << " listener=" << listener
                   << " input_growth=" << input_growth
+                  << " cache=" << cache
                   << " redirect=" << redirect << " pipeline=" << pipeline
                   << " capacity=" << capacity
                   << " configuration=" << configuration << " chunked=" << chunked << '\n';
