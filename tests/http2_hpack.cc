@@ -262,6 +262,97 @@ auto session_output_wraparound() -> void
         "session did not finish response after full queue retries");
 }
 
+// Decodes random blocks against a reference table so that eviction, table
+// size updates, and entries wrapping the dynamic table's storage are covered.
+auto dynamic_table_model() -> void
+{
+    struct reference {
+        std::deque<field> entries;
+        std::size_t bytes = 0;
+        std::size_t size = 4096;
+        auto evict() -> void
+        {
+            while (bytes > size) {
+                bytes -= entries.back().name.size() + entries.back().value.size() + 32;
+                entries.pop_back();
+            }
+        }
+        auto insert(const field& entry) -> void
+        {
+            const auto cost = entry.name.size() + entry.value.size() + 32;
+            if (cost > size) {
+                entries.clear();
+                bytes = 0;
+                return;
+            }
+            bytes += cost;
+            entries.push_front(entry);
+            evict();
+        }
+    };
+    auto integer = [](std::vector<std::byte>& out, unsigned bits, unsigned prefix,
+                      std::size_t value) {
+        const std::size_t mask = (std::size_t {1} << prefix) - 1;
+        if (value < mask) {
+            out.push_back(static_cast<std::byte>(bits | value));
+            return;
+        }
+        out.push_back(static_cast<std::byte>(bits | mask));
+        for (value -= mask; value >= 128; value >>= 7)
+            out.push_back(static_cast<std::byte>((value & 0x7f) | 0x80));
+        out.push_back(static_cast<std::byte>(value));
+    };
+    auto text = [&](std::vector<std::byte>& out, const std::string& value) {
+        integer(out, 0, 7, value.size());
+        for (const char c : value) out.push_back(static_cast<std::byte>(c));
+    };
+    std::uint32_t state = 12345;
+    auto next = [&](std::uint32_t bound) {
+        state = state * 1664525u + 1013904223u;
+        return (state >> 8) % bound;
+    };
+    auto random_text = [&](std::size_t size) {
+        std::string value(size, ' ');
+        for (auto& c : value) c = static_cast<char>('a' + next(26));
+        return value;
+    };
+
+    hpack_decoder decoder;
+    reference model;
+    std::vector<field> fields;
+    for (int block_index = 0; block_index < 4000; ++block_index) {
+        std::vector<std::byte> block;
+        std::vector<field> expected;
+        if (next(20) == 0) {
+            model.size = next(5) == 0 ? next(300) : 4096 - next(1200);
+            integer(block, 0x20, 5, model.size);
+            model.evict();
+        }
+        const auto count = 1 + next(6);
+        for (std::uint32_t item = 0; item < count; ++item) {
+            if (!model.entries.empty() && next(3) == 0) {
+                const auto index = next(static_cast<std::uint32_t>(model.entries.size()));
+                integer(block, 0x80, 7, 62 + index);
+                expected.push_back(model.entries[index]);
+                continue;
+            }
+            const auto length = next(25) == 0 ? 4000 + next(200) : next(300);
+            field entry {"x-" + random_text(next(12)), random_text(length)};
+            integer(block, 0x40, 6, 0);
+            text(block, entry.name);
+            text(block, entry.value);
+            expected.push_back(entry);
+            model.insert(entry);
+        }
+        check(decoder.decode(block, fields) == hpack_error::none, "model block decode");
+        check(fields.size() == expected.size(), "model field count");
+        for (std::size_t index = 0; index < fields.size(); ++index) {
+            check(fields[index].name == expected[index].name &&
+                  fields[index].value == expected[index].value, "model field value");
+        }
+    }
+}
+
 } // namespace
 
 int main()
@@ -270,4 +361,5 @@ int main()
     malformed_and_limits();
     encoder_round_trip();
     session_output_wraparound();
+    dynamic_table_model();
 }

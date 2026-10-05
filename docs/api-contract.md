@@ -405,9 +405,10 @@ every running connection has sent its close and retired.
     kept-alive HTTP/1.1 connection, on an HTTP/2 connection (TLS included),
     or on an HTTP/3 connection (QUIC included). Static HTTP/2 and HTTP/3 file
     requests make none either. HTTP/2 decodes request fields into the
-    connection's existing strings and encodes response fields from views
-    into one reused buffer, so a header value longer than earlier ones on
-    the connection, or a new dynamic-table entry, can still allocate.
+    connection's existing strings, keeps its HPACK dynamic table in one
+    4 KiB ring allocated with the first entry, and encodes response fields
+    from views into one reused buffer, so only a header value longer than
+    earlier ones on the connection can still allocate.
     `tests/http_routing_allocations.cc`,
     `tests/http2_routing_allocations.cc`, and
     `tests/http3_routing_allocations.cc` check these paths. The HTTP/2 and
