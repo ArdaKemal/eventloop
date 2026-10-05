@@ -86,6 +86,7 @@ public:
 
     [[nodiscard]] auto closed() const noexcept -> bool;
 
+
     // Routed streams. Operations on a released stream report failure.
     auto set_release_hook(release_hook hook, void* context) noexcept -> void;
     [[nodiscard]] auto pop_routed(routed_request& value) -> bool;
@@ -186,7 +187,21 @@ private:
     [[nodiscard]] auto validate_trailers(std::span<const field> fields) const -> bool;
     [[nodiscard]] auto find_stream(std::uint32_t id) noexcept -> stream*;
     [[nodiscard]] auto allocate_stream(std::uint32_t id) noexcept -> stream*;
-    auto reset_stream(stream& value) noexcept -> void;
+    // How a stream ended decides the RFC 9113 section 5.1 response to frames
+    // that arrive afterwards.
+    enum class closed_reason : std::uint8_t { ended, peer_reset, local_reset };
+    struct closed_stream {
+        std::uint32_t id = 0;
+        closed_reason reason = closed_reason::local_reset;
+    };
+    static constexpr std::size_t closed_history = 64;
+    auto reset_stream(stream& value,
+                      closed_reason reason = closed_reason::ended) noexcept -> void;
+    auto record_closed(std::uint32_t id, closed_reason reason) noexcept -> void;
+    // Streams evicted from the history count as locally reset, which permits
+    // discarding late frames. nullopt means the id was skipped and is idle.
+    [[nodiscard]] auto closed_reason_of(std::uint32_t id) const noexcept
+        -> std::optional<closed_reason>;
     auto stream_error(std::uint32_t id, std::uint32_t error) -> void;
     auto connection_error(std::uint32_t error) -> void;
     auto send_window_update(std::uint32_t id, std::uint32_t increment) -> void;
@@ -245,6 +260,11 @@ private:
     std::unique_ptr<std::byte[]> body_arena_;
     std::array<bool, route_body_slots> slot_used_ {};
     std::array<stream, max_concurrent_streams> streams_ {};
+    std::array<closed_stream, closed_history> closed_streams_ {};
+    std::size_t closed_next_ = 0;
+    std::uint32_t closed_floor_ = 0;
+    bool header_closed_reply_ = false;
+
     std::vector<request> requests_;
     std::vector<routed_request> routed_;
     std::vector<std::byte> header_block_;

@@ -81,6 +81,20 @@ ownership, and error visibility.
 - TLS uses OpenSSL 3.5+ with fixed-capacity stream buffers. Steady-state
   HTTP/2 and HTTP/3 requests are measured to make no OpenSSL allocations,
   but handshakes allocate inside OpenSSL; do not claim more than that.
+- HTTP/2 closed streams (`tests/http2_hardening.cc`): streams keep a 64-entry
+  closure history, so frames after END_STREAM are a STREAM_CLOSED connection
+  error, after the peer's RST_STREAM a stream error, and frames racing our own
+  RST_STREAM are discarded; skipped lower stream IDs are PROTOCOL_ERROR. A
+  content-length overrun is a stream PROTOCOL_ERROR. h2spec 2.6.0
+  (`-t -k -S`) passes 147/147 with none skipped; `tests/run_h2spec.sh` runs it
+  as CTest `http2_h2spec` when `h2spec` is on PATH or `-DH2SPEC_EXECUTABLE` is
+  set (the binary is not vendored). Its index.html is 300 KB because h2spec
+  skips the 6.9.2 window test against a small response. HTTP/2 has no idle,
+  SETTINGS, write-stall, or flood limits: they were built and reverted because
+  no failing test or measured problem justified them (see the change-value
+  rule). `tls_stream::close()` frees the stream, so only the owning task may
+  call it. `http2_routing_allocations`, `http2_file_transfer` and
+  `http3_server` already failed on a clean `origin/main` on this host.
 - HTTP/1.1, TLS HTTP/2, and HTTP/3 servers run `http::router` handlers and
   fall back to static files with secure resource traversal. Plain HTTP uses
   `sendfile` for larger files on Linux. Static HTTP/2 and HTTP/3 support
@@ -98,6 +112,13 @@ ownership, and error visibility.
 
 ## Working in this repository
 
+- Do not commit, and stop working on, a large code addition that neither
+  solves a demonstrated problem nor improves performance significantly. Before
+  building something sizeable, name the failing test, spec case, bug, or
+  measured bottleneck it fixes, and measure the result afterward. If it fails
+  that test, drop it (or leave it uncommitted and report why) instead of
+  polishing it. Feature volume, speculative hardening, and completeness alone
+  are not reasons to commit.
 - Before implementation, write down the intended public caller, ownership of
   every descriptor and buffer, capacity and exhaustion behavior, cancellation
   behavior, and affected platforms. Resolve unclear boundaries in the API

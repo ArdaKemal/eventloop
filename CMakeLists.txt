@@ -1045,6 +1045,12 @@ if(BUILD_TESTING)
     target_compile_options(http2_hpack_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http2_hpack COMMAND http2_hpack_test)
 
+    add_executable(http2_hardening_test tests/http2_hardening.cc)
+    target_include_directories(http2_hardening_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http2_hardening_test PRIVATE eventloop::eventloop)
+    target_compile_options(http2_hardening_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http2_hardening COMMAND http2_hardening_test)
+
     add_executable(http2_priority_test tests/http2_priority.cc)
     target_include_directories(http2_priority_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(http2_priority_test PRIVATE eventloop::eventloop)
@@ -1674,6 +1680,19 @@ if(BUILD_TESTING)
                      ${CURL_EXECUTABLE}
     )
     set_tests_properties(http2_server PROPERTIES TIMEOUT 30)
+
+    # h2spec is not vendored; point H2SPEC_EXECUTABLE at it to run the suite.
+    find_program(H2SPEC_EXECUTABLE h2spec)
+    if(H2SPEC_EXECUTABLE)
+        add_test(
+            NAME http2_h2spec
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_h2spec.sh
+                         $<TARGET_FILE:http_server>
+                         ${OPENSSL_EXECUTABLE}
+                         ${H2SPEC_EXECUTABLE}
+        )
+        set_tests_properties(http2_h2spec PROPERTIES TIMEOUT 120)
+    endif()
 
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)

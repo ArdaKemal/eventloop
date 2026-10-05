@@ -393,7 +393,7 @@ auto session::respond(std::uint32_t stream_id, unsigned status,
     inline_response_bytes_ += body.size();
     value->response_body = std::move(body);
     if (!append_response_headers(*value, status, headers, {}, value->response_size == 0)) {
-        reset_stream(*value);
+        reset_stream(*value, closed_reason::local_reset);
         return false;
     }
     pump_responses();
@@ -411,7 +411,7 @@ auto session::respond_file(std::uint32_t stream_id, unsigned status,
     value->response_file_start = offset;
     if (send_body) value->response_file = std::move(file);
     if (!append_response_headers(*value, status, headers, {}, value->response_size == 0)) {
-        reset_stream(*value);
+        reset_stream(*value, closed_reason::local_reset);
         return false;
     }
     pump_responses();
@@ -503,6 +503,24 @@ auto session::consume_input(std::span<const std::byte> input) -> void
     }
 }
 
+auto session::record_closed(std::uint32_t id, closed_reason reason) noexcept -> void
+{
+    auto& slot = closed_streams_[closed_next_];
+    if (slot.id != 0) closed_floor_ = std::max(closed_floor_, slot.id);
+    slot = closed_stream {id, reason};
+    closed_next_ = (closed_next_ + 1) % closed_history;
+}
+
+auto session::closed_reason_of(std::uint32_t id) const noexcept
+    -> std::optional<closed_reason>
+{
+    for (const auto& entry : closed_streams_) {
+        if (entry.id == id) return entry.reason;
+    }
+    if (id <= closed_floor_) return closed_reason::local_reset;
+    return std::nullopt;
+}
+
 auto session::dispatch_frame() -> void
 {
     switch (frame_type_) {
@@ -537,8 +555,9 @@ auto session::dispatch_frame() -> void
             return;
         }
         if (auto* value = find_stream(frame_stream_id_)) {
-            reset_stream(*value);
-        } else if (frame_stream_id_ > last_stream_id_) {
+            reset_stream(*value, closed_reason::peer_reset);
+        } else if (frame_stream_id_ > last_stream_id_ ||
+                   !closed_reason_of(frame_stream_id_)) {
             connection_error(protocol_error);
         }
         break;
@@ -599,18 +618,33 @@ auto session::dispatch_headers() -> void
     header_refused_ = false;
     header_trailers_ = false;
     header_reject_error_ = refused_stream_error;
+    header_closed_reply_ = false;
     if (value == nullptr) {
         if ((frame_stream_id_ & 1u) == 0) {
             connection_error(protocol_error);
             return;
         }
         if (frame_stream_id_ <= last_stream_id_) {
+            const auto reason = closed_reason_of(frame_stream_id_);
+            if (!reason) {
+                // A lower id than one already opened was never used.
+                connection_error(protocol_error);
+                return;
+            }
+            if (*reason == closed_reason::ended) {
+                connection_error(stream_closed_error);
+                return;
+            }
             header_refused_ = true;
             header_reject_error_ = stream_closed_error;
+            header_closed_reply_ = *reason == closed_reason::peer_reset;
         } else {
             last_stream_id_ = frame_stream_id_;
             value = peer_goaway_ ? nullptr : allocate_stream(frame_stream_id_);
-            if (value == nullptr) header_refused_ = true;
+            if (value == nullptr) {
+                header_refused_ = true;
+                record_closed(frame_stream_id_, closed_reason::local_reset);
+            }
         }
     } else if (!value->initial_headers || value->remote_closed ||
                value->request_ready) {
@@ -700,13 +734,25 @@ auto session::dispatch_data() -> void
             connection_error(protocol_error);
             return;
         }
+        const auto reason = closed_reason_of(frame_stream_id_);
+        if (!reason) {
+            connection_error(protocol_error);
+            return;
+        }
         connection_receive_window_ -= flow_size;
         if (connection_receive_window_ < 0) {
             connection_error(flow_control_error);
             return;
         }
         return_connection_credit();
-        stream_error(frame_stream_id_, stream_closed_error);
+        // After both sides ended RFC 9113 requires a connection error, after
+        // the peer's RST_STREAM a stream error. Frames racing our own
+        // RST_STREAM are discarded.
+        if (*reason == closed_reason::ended) {
+            connection_error(stream_closed_error);
+        } else if (*reason == closed_reason::peer_reset) {
+            stream_error(frame_stream_id_, stream_closed_error);
+        }
         return;
     }
     connection_receive_window_ -= flow_size;
@@ -749,7 +795,7 @@ auto session::dispatch_data() -> void
     value->request_body_size += data_size;
     if (value->content_length && value->request_body_size > *value->content_length) {
         return_connection_credit();
-        stream_error(frame_stream_id_, value->routed ? protocol_error : enhance_your_calm_error);
+        stream_error(frame_stream_id_, protocol_error);
         return;
     }
     if (value->routed) {
@@ -908,7 +954,8 @@ auto session::dispatch_window_update() -> void
         }
         value->send_window += increment;
         pump_responses();
-    } else if (frame_stream_id_ > last_stream_id_) {
+    } else if (frame_stream_id_ > last_stream_id_ ||
+               !closed_reason_of(frame_stream_id_)) {
         connection_error(protocol_error);
     }
 }
@@ -923,7 +970,15 @@ auto session::finish_header_block() -> void
         return;
     }
     if (header_refused_) {
-        stream_error(header_stream_id_, header_reject_error_);
+        // Frames racing our own RST_STREAM are discarded; after the peer's
+        // RST_STREAM they draw STREAM_CLOSED (RFC 9113 section 5.1).
+        const bool race = header_reject_error_ == stream_closed_error &&
+            find_stream(header_stream_id_) == nullptr && !header_closed_reply_;
+        if (!race && (header_reject_error_ != stream_closed_error ||
+                      find_stream(header_stream_id_) != nullptr ||
+                      header_closed_reply_)) {
+            stream_error(header_stream_id_, header_reject_error_);
+        }
         header_block_.clear();
         return;
     }
@@ -1151,8 +1206,9 @@ auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
     return &*found;
 }
 
-auto session::reset_stream(stream& value) noexcept -> void
+auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
 {
+    record_closed(value.id, reason);
     if (value.response_accounted <= inline_response_bytes_) {
         inline_response_bytes_ -= value.response_accounted;
     } else {
@@ -1228,8 +1284,11 @@ auto session::body_slot(const stream& value) noexcept -> std::byte*
 // arriving is no longer needed (RFC 9113 8.1).
 auto session::complete_stream(stream& value) -> void
 {
-    if (!value.body_ended) stream_error(value.id, 0);
-    else reset_stream(value);
+    if (!value.body_ended) {
+        stream_error(value.id, 0);
+    } else {
+        reset_stream(value);
+    }
 }
 
 auto session::set_release_hook(release_hook hook, void* context) noexcept -> void
@@ -1383,7 +1442,7 @@ auto session::stream_error(std::uint32_t id, std::uint32_t error) -> void
         fatal_ = true;
         return;
     }
-    if (auto* value = find_stream(id)) reset_stream(*value);
+    if (auto* value = find_stream(id)) reset_stream(*value, closed_reason::local_reset);
 }
 
 auto session::connection_error(std::uint32_t error) -> void
