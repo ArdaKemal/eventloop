@@ -472,6 +472,23 @@ every running connection has sent its close and retired.
   exceeding either returns 500 with a short plain-text body. HTTP/1.1 and
   HTTP/2 and HTTP/3 list when `server_options::directory_listing` is set. The
   component-by-component `O_NOFOLLOW` document-root walk is unchanged.
+- `server_options::open_file_cache_capacity` (default 0, off; at most 65536)
+  keeps up to that many regular files open per server, with their metadata,
+  so repeated static requests skip opening, `fstat`, and closing the file.
+  Entries are keyed by decoded path and are opened and checked only through
+  the component-by-component `O_NOFOLLOW` walk. A hit at least one second
+  after its last check walks the path again; a changed, replaced, or removed
+  file, or one replaced by a symbolic link, then drops out or is reopened.
+  Within that second the previous file and metadata are served: replace
+  files atomically (write a new file, then rename it) so that a cached
+  response stays consistent; an in-place edit can pair old metadata with new
+  bytes. Each entry holds one file descriptor; storage is allocated when the
+  server is constructed, and a hit makes no general-heap allocation. Entries
+  in use by responses stay open until those responses finish; when every
+  entry is in use, a request is served uncached. Directories, `index.html`
+  lookups, paths longer than 255 decoded bytes, and HTTP/1.1 bodies of
+  11 KiB or more (sent with `sendfile` from a private descriptor) are not
+  served from the cache. The cache belongs to the server's event loop.
 - Include `eventloop/http2/client.h` for one outbound HTTPS HTTP/2 request.
   `http2::async_request(loop, endpoint, context, hostname, request)` owns the
   TLS socket from connect through close. `hostname` is used for certificate

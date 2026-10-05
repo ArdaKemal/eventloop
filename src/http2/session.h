@@ -2,6 +2,7 @@
 
 #include "eventloop/unique_fd.h"
 #include "../http/exchange.h"
+#include "../http/open_file_cache.h"
 #include "hpack.h"
 
 #include <array>
@@ -55,7 +56,7 @@ public:
                      std::uint64_t max_request_body = 0);
 
     struct file_send {
-        unique_fd file;
+        http::detail::static_file file;
         std::uint64_t offset = 0;
         std::size_t size = 0;
         std::span<const std::byte> prefix {};
@@ -66,7 +67,7 @@ public:
     [[nodiscard]] auto take_file_send(bool include_prefix = false) noexcept
         -> std::optional<file_send>;
     // Return the descriptor after the borrowed transport send has completed.
-    auto complete_file_send(unique_fd file) -> void;
+    auto complete_file_send(http::detail::static_file file) -> void;
 
     session(const session&) = delete;
     auto operator=(const session&) -> session& = delete;
@@ -83,7 +84,8 @@ public:
     [[nodiscard]] auto respond(std::uint32_t stream_id, unsigned status,
         std::span<const http::header> headers, std::vector<std::byte> body) -> bool;
     [[nodiscard]] auto respond_file(std::uint32_t stream_id, unsigned status,
-        std::span<const http::header> headers, unique_fd file, std::uint64_t size,
+        std::span<const http::header> headers, http::detail::static_file file,
+        std::uint64_t size,
         bool send_body, std::uint64_t offset = 0) -> bool;
 
     [[nodiscard]] auto closed() const noexcept -> bool;
@@ -140,7 +142,7 @@ private:
         bool duplicate_range = false;
         std::uint64_t response_file_start = 0;
         std::vector<std::byte> response_body;
-        unique_fd response_file;
+        http::detail::static_file response_file;
         std::uint64_t response_size = 0;
         std::uint64_t response_offset = 0;
         std::size_t response_accounted = 0;

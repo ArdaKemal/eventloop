@@ -16,6 +16,7 @@
 namespace eventloop { class tls_context; }
 
 namespace eventloop::http {
+namespace detail { struct document_root; }
 
 // Cleartext HTTP/1.1 server. It owns its listening socket and document-root
 // descriptor; run() accepts until the listener closes.
@@ -28,10 +29,10 @@ public:
 
 private:
     static auto accept_loop(event_loop& loop, server& listener,
-                            std::shared_ptr<unique_fd> root,
+                            std::shared_ptr<detail::document_root> root,
                             server_options options) -> task<void>;
 
-    std::shared_ptr<unique_fd> root_descriptor_;
+    std::shared_ptr<detail::document_root> root_descriptor_;
     server_options options_;
 };
 
@@ -47,11 +48,11 @@ public:
 
 private:
     static auto accept_loop(event_loop& loop, https_server& listener,
-                            std::shared_ptr<unique_fd> root,
+                            std::shared_ptr<detail::document_root> root,
                             std::shared_ptr<tls_context> context,
                             server_options options) -> task<void>;
 
-    std::shared_ptr<unique_fd> root_descriptor_;
+    std::shared_ptr<detail::document_root> root_descriptor_;
     std::shared_ptr<tls_context> context_;
     server_options options_;
 };

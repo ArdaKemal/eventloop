@@ -1,6 +1,7 @@
 #pragma once
 
 #include "exchange.h"
+#include "open_file_cache.h"
 #include "parser.h"
 #include "eventloop/native_socket.h"
 #include "eventloop/unique_fd.h"
@@ -35,7 +36,8 @@ struct route_state {
 class session {
 public:
     session(native_socket root_descriptor, bool directory_listing = false,
-            route_state* routing = nullptr, bool static_files = true) noexcept;
+            route_state* routing = nullptr, bool static_files = true,
+            open_file_cache* files = nullptr) noexcept;
     ~session() = default;
 
     session(const session&) = delete;
@@ -67,7 +69,7 @@ private:
     [[nodiscard]] auto dispatch_route(std::size_t head_size) -> bool;
     auto handle_request(const parsed_request& parsed) -> void;
     auto serve_resource(const parsed_request& parsed, bool headers_only) -> void;
-    auto serve_file(const parsed_request& parsed, unique_fd descriptor, const file_info& info,
+    auto serve_file(const parsed_request& parsed, static_file descriptor, const file_info& info,
                     bool headers_only, std::string_view mime_path) -> void;
     auto serve_directory(unique_fd descriptor, bool headers_only) -> void;
     auto send_directory_redirect(std::string_view target) -> void;
@@ -82,6 +84,7 @@ private:
     [[nodiscard]] auto allocate_response(std::size_t size) -> std::span<char>;
 
     native_socket root_descriptor_;
+    open_file_cache* files_ {nullptr};
     route_state* routing_ {nullptr};
     std::array<char, 256> input_ {};
     std::unique_ptr<char[]> expanded_input_;

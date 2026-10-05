@@ -53,8 +53,8 @@ constexpr std::size_t sendfile_min_size = 11 * 1024;
 } // namespace
 
 session::session(native_socket root_descriptor, bool directory_listing,
-                 route_state* routing, bool static_files) noexcept
-    : root_descriptor_(root_descriptor), routing_(routing),
+                 route_state* routing, bool static_files, open_file_cache* files) noexcept
+    : root_descriptor_(root_descriptor), files_(files), routing_(routing),
       directory_listing_(directory_listing), static_files_(static_files)
 {
 }
@@ -250,7 +250,7 @@ auto session::handle_request(const parsed_request& parsed) -> void
 
 auto session::serve_resource(const parsed_request& parsed, bool headers_only) -> void
 {
-    auto opened = detail::open_resource(root_descriptor_, parsed.target);
+    auto opened = detail::open_static(root_descriptor_, files_, parsed.target);
     if (!opened && opened.error() == detail::resource_error::target_too_long) {
         send_error(parse_status::target_too_long);
         return;
@@ -259,21 +259,25 @@ auto session::serve_resource(const parsed_request& parsed, bool headers_only) ->
         send_error(parse_status::bad_request);
         return;
     }
-    auto descriptor = opened ? std::move(*opened) : unique_fd {};
-    if (!descriptor) {
+    if (!opened || (opened->info.kind != detail::file_info::type::regular &&
+                    opened->info.kind != detail::file_info::type::directory)) {
         send_static_response(not_found);
         return;
     }
-
-    auto info = detail::get_file_info(descriptor.get());
-    if (!info || (info->kind != detail::file_info::type::regular &&
-                  info->kind != detail::file_info::type::directory)) {
-        descriptor.reset();
-        send_static_response(not_found);
-        return;
+    if (opened->file.cached() && !headers_only && opened->info.size >= sendfile_min_size) {
+        // sendfile moves a file position that cached descriptors share, so a
+        // body sent with it comes from a private descriptor and its metadata.
+        opened->file.reset();
+        opened = detail::open_static(root_descriptor_, nullptr, parsed.target);
+        if (!opened || opened->info.kind != detail::file_info::type::regular) {
+            send_static_response(not_found);
+            return;
+        }
     }
-    if (info->kind == detail::file_info::type::regular) {
-        serve_file(parsed, std::move(descriptor), *info, headers_only, parsed.target);
+    auto descriptor = std::move(opened->file);
+    const auto info = opened->info;
+    if (info.kind == detail::file_info::type::regular) {
+        serve_file(parsed, std::move(descriptor), info, headers_only, parsed.target);
         return;
     }
 
@@ -299,10 +303,10 @@ auto session::serve_resource(const parsed_request& parsed, bool headers_only) ->
         send_static_response(forbidden);
         return;
     }
-    serve_directory(std::move(descriptor), headers_only);
+    serve_directory(descriptor.take_owned(), headers_only);
 }
 
-auto session::serve_file(const parsed_request& parsed, unique_fd descriptor, const file_info& info,
+auto session::serve_file(const parsed_request& parsed, static_file descriptor, const file_info& info,
                          bool headers_only, std::string_view mime_path) -> void
 {
     if (info.size > (std::numeric_limits<std::size_t>::max)()) {
@@ -360,8 +364,15 @@ auto session::serve_file(const parsed_request& parsed, unique_fd descriptor, con
 
     const auto response_size = header_length + body_size;
     if (!headers_only && body_size >= sendfile_min_size) {
+        if (descriptor.cached()) {
+            // Not reached: serve_resource() reopens cached files this large.
+            descriptor.reset();
+            close_after_response_ = true;
+            send_static_response(internal_error);
+            return;
+        }
         send_response(std::span {header}.first(header_length));
-        file_ = std::move(descriptor);
+        file_ = descriptor.take_owned();
         file_size_ = body_size;
         file_offset_ = selection.offset;
         return;

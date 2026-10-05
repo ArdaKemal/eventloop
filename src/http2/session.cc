@@ -366,7 +366,7 @@ auto session::take_file_send(bool include_prefix) noexcept -> std::optional<file
     return std::move(file_send_);
 }
 
-auto session::complete_file_send(unique_fd file) -> void
+auto session::complete_file_send(http::detail::static_file file) -> void
 {
     if (!file_send_active_ || file_send_prefix_ != 0 || file_send_.file || !file) {
         connection_error(internal_error);
@@ -424,7 +424,8 @@ auto session::respond(std::uint32_t stream_id, unsigned status,
 }
 
 auto session::respond_file(std::uint32_t stream_id, unsigned status,
-                           std::span<const http::header> headers, unique_fd file,
+                           std::span<const http::header> headers,
+                           http::detail::static_file file,
                            std::uint64_t size, bool send_body, std::uint64_t offset) -> bool
 {
     auto* value = find_stream(stream_id);

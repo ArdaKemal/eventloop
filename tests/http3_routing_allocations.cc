@@ -205,12 +205,14 @@ auto main() -> int
         encode("GET", "/static-asset-bundle.min.txt", {}),
     };
 
-    measurement result;
-    {
+    // Static requests are measured without and with the open-file cache.
+    auto run = [&](std::size_t cache_capacity) {
+        measurement result;
         event_loop loop;
         http::http3_server server(loop, ip_endpoint::loopback_v4(0),
             directory / "cert.pem", directory / "key.pem",
             http::server_options {.routes = routes, .document_root = directory / "www",
+                                  .open_file_cache_capacity = cache_capacity,
                                   .connection_capacity = 1});
         quic_client_options options;
         constexpr std::array<std::uint8_t, 2> alpn {'h', '3'};
@@ -224,16 +226,24 @@ auto main() -> int
         check(loop.spawn(watch(loop, server, endpoint, result)) == task_spawn_result::accepted,
               "spawn watch");
         (void)loop.run();
-    }
+        return result;
+    };
+    const auto uncached = run(0);
+    const auto cached = run(16);
     std::filesystem::remove_all(directory);
-    check(result.done, "requests did not complete");
     // Setup (keys, handshake, certificate) allocates, proving the hook counts.
     check(test::openssl_allocations.load() > 0, "OpenSSL allocation counter is not active");
     std::cout << "OpenSSL allocations in total, including setup: "
               << test::openssl_allocations.load() << '\n';
-    std::cout << "HTTP/3 allocations over " << result.requests << " requests: routed "
-              << result.routed << ", static " << result.static_files << "; OpenSSL routed "
-              << result.routed_openssl << ", static " << result.static_openssl << '\n';
-    if (result.routed != 0 || result.static_files != 0 || result.routed_openssl != 0 ||
-        result.static_openssl != 0) return 1;
+    bool steady = true;
+    for (const auto* result : {&uncached, &cached}) {
+        check(result->done, "requests did not complete");
+        std::cout << "HTTP/3 allocations over " << result->requests << " requests"
+                  << (result == &cached ? " with the open-file cache" : "") << ": routed "
+                  << result->routed << ", static " << result->static_files << "; OpenSSL routed "
+                  << result->routed_openssl << ", static " << result->static_openssl << '\n';
+        steady = steady && result->routed == 0 && result->static_files == 0 &&
+                 result->routed_openssl == 0 && result->static_openssl == 0;
+    }
+    if (!steady) return 1;
 }

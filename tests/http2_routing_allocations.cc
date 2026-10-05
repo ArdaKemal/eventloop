@@ -269,12 +269,14 @@ auto main() -> int
         encode("GET", "/static-asset-bundle.min.txt", {}),
     };
 
-    measurement result;
-    {
+    // Static requests are measured without and with the open-file cache.
+    auto run = [&](std::size_t cache_capacity) {
+        measurement result;
         event_loop loop;
         auto listener = std::make_unique<http::https_server>(loop, ip_endpoint::loopback_v4(0),
             tls_context::make_server(directory / "cert.pem", directory / "key.pem"),
-            http::server_options {.routes = routes, .document_root = directory / "www"});
+            http::server_options {.routes = routes, .document_root = directory / "www",
+                                  .open_file_cache_capacity = cache_capacity});
         sockaddr_in address {};
         socklen_t length = sizeof(address);
         check(::getsockname(listener->descriptor(), reinterpret_cast<sockaddr*>(&address),
@@ -294,17 +296,24 @@ auto main() -> int
         loop.shutdown(0ms);
         (void)loop.run();
         check(!timed_out, "timed out");
-    }
+        return result;
+    };
+    const auto uncached = run(0);
+    const auto cached = run(16);
     std::filesystem::remove_all(directory);
-    check(result.done, "requests did not complete");
     // Setup (keys, handshake, certificate) allocates, proving the hook counts.
     check(test::openssl_allocations.load() > 0, "OpenSSL allocation counter is not active");
     std::cout << "OpenSSL allocations in total, including setup: "
               << test::openssl_allocations.load() << '\n';
-    std::cout << "HTTP/2 allocations over " << result.requests << " requests: routed "
-              << result.routed << ", static " << result.static_files << "; OpenSSL routed "
-              << result.routed_openssl << ", static " << result.static_openssl << '\n';
-    check(result.routed == 0 && result.static_files == 0 &&
-          result.routed_openssl == 0 && result.static_openssl == 0,
-          "steady-state requests allocate");
+    for (const auto* result : {&uncached, &cached}) {
+        check(result->done, "requests did not complete");
+        std::cout << "HTTP/2 allocations over " << result->requests << " requests"
+                  << (result == &cached ? " with the open-file cache" : "") << ": routed "
+                  << result->routed << ", static " << result->static_files << "; OpenSSL routed "
+                  << result->routed_openssl << ", static " << result->static_openssl << '\n';
+    }
+    for (const auto* result : {&uncached, &cached})
+        check(result->routed == 0 && result->static_files == 0 &&
+              result->routed_openssl == 0 && result->static_openssl == 0,
+              "steady-state requests allocate");
 }

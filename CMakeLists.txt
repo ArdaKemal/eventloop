@@ -63,6 +63,7 @@ if(WIN32)
         src/http/routing.cc
         src/http/mime_types.cc
         src/http/resource.cc
+        src/http/open_file_cache.cc
         src/http/directory_listing.cc
         src/http/session.cc
         src/http/server.cc
@@ -795,6 +796,7 @@ add_library(eventloop
     src/http/session.h
     src/http/resource.h
     src/http/resource.cc
+    src/http/open_file_cache.cc
     src/http/server.cc
     src/http/session.cc
     src/http2/connection.h
@@ -1058,6 +1060,12 @@ if(BUILD_TESTING)
     add_test(NAME http2_priority COMMAND http2_priority_test)
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(http_open_file_cache_test tests/http_open_file_cache.cc)
+        target_include_directories(http_open_file_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(http_open_file_cache_test PRIVATE eventloop::eventloop)
+        target_compile_options(http_open_file_cache_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+        add_test(NAME http_open_file_cache COMMAND http_open_file_cache_test)
+
         add_executable(http2_file_send_test tests/http2_file_send.cc)
         target_include_directories(http2_file_send_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(http2_file_send_test PRIVATE eventloop::eventloop)

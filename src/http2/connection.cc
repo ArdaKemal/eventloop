@@ -50,7 +50,8 @@ auto respond_empty(session& state, std::uint32_t stream_id,
     }
 }
 
-auto respond_static_file(session& state, const request& incoming, unique_fd descriptor,
+auto respond_static_file(session& state, const request& incoming,
+                         http::detail::static_file descriptor,
                          const http::detail::file_info& info, std::string_view path) -> void
 {
     const auto selected = http::detail::choose_file_response(info, {
@@ -90,7 +91,8 @@ auto respond_static_file(session& state, const request& incoming, unique_fd desc
 }
 
 auto serve_request(session& state, const request& incoming, native_socket root,
-                   bool directory_listing, const http::router* routes) -> void
+                   http::detail::open_file_cache* files, bool directory_listing,
+                   const http::router* routes) -> void
 {
     // A routed path reaches here only without a handler for the method.
     if (routes != nullptr) {
@@ -119,7 +121,7 @@ auto serve_request(session& state, const request& incoming, native_socket root,
     }
 
     const bool headers_only = incoming.method == "HEAD";
-    auto opened = http::detail::open_resource(root, incoming.target);
+    auto opened = http::detail::open_static(root, files, incoming.target);
     if (!opened) {
         const auto status = opened.error() == http::detail::resource_error::invalid_target
             ? 400u : opened.error() == http::detail::resource_error::target_too_long
@@ -127,16 +129,16 @@ auto serve_request(session& state, const request& incoming, native_socket root,
         respond_empty(state, incoming.stream_id, status);
         return;
     }
-    auto descriptor = std::move(*opened);
-    auto info = http::detail::get_file_info(descriptor.get());
-    if (!info || (info->kind != http::detail::file_info::type::regular &&
-                  info->kind != http::detail::file_info::type::directory)) {
+    auto descriptor = std::move(opened->file);
+    const auto info = opened->info;
+    if (info.kind != http::detail::file_info::type::regular &&
+        info.kind != http::detail::file_info::type::directory) {
         respond_empty(state, incoming.stream_id, 404);
         return;
     }
 
-    if (info->kind == http::detail::file_info::type::regular) {
-        respond_static_file(state, incoming, std::move(descriptor), *info, incoming.target);
+    if (info.kind == http::detail::file_info::type::regular) {
+        respond_static_file(state, incoming, std::move(descriptor), info, incoming.target);
         return;
     }
 
@@ -161,7 +163,7 @@ auto serve_request(session& state, const request& incoming, native_socket root,
         return;
     }
     try {
-        auto listing = http::make_directory_listing(descriptor.release());
+        auto listing = http::make_directory_listing(descriptor.take_owned().release());
         if (!listing) {
             if (listing.error() == http::directory_listing_error::list_failed) {
                 respond_empty(state, incoming.stream_id, 500);
@@ -340,8 +342,9 @@ public:
 
 struct connection_state {
     connection_state(event_loop& loop, tls_stream& peer, session& state,
-                     const http::router& routes, native_socket root, bool directory_listing)
-        : loop(loop), peer(peer), state(state), routes(routes), root(root),
+                     const http::router& routes, native_socket root,
+                     http::detail::open_file_cache* files, bool directory_listing)
+        : loop(loop), peer(peer), state(state), routes(routes), root(root), files(files),
           directory_listing(directory_listing)
     {
         for (auto& exchange : exchanges) exchange.owner = this;
@@ -393,6 +396,7 @@ struct connection_state {
     session& state;
     const http::router& routes;
     native_socket root;
+    http::detail::open_file_cache* files;
     bool directory_listing;
     std::array<http2_exchange, max_concurrent_streams> exchanges {};
     std::array<std::optional<task_handle<void>>, max_concurrent_streams> handlers {};
@@ -718,7 +722,7 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
         // responses are written together once the batch is dispatched.
         connection.batching = true;
         while (state.pop_request(incoming))
-            serve_request(state, incoming, connection.root,
+            serve_request(state, incoming, connection.root, connection.files,
                           connection.directory_listing, &connection.routes);
         routed_request routed;
         while (state.pop_routed(routed)) dispatch_routed(connection, std::move(routed));
@@ -742,14 +746,15 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
 }
 
 auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
-                  bool directory_listing, const http::router& routes,
+                  http::detail::open_file_cache* files, bool directory_listing,
+                  const http::router& routes,
                   std::uint64_t max_request_body) -> task<bool>
 {
     // Session, task slots and exchanges are allocated once per connection.
     auto state = std::make_unique<session>(peer.kernel_sendfile_available(), &routes,
                                            max_request_body);
     auto connection = std::make_unique<connection_state>(loop, peer, *state, routes, root,
-                                                         directory_listing);
+                                                         files, directory_listing);
     state->set_release_hook(&connection_state::released, connection.get());
     task_handle<void> reader;
     if (loop.spawn(read_loop(loop, *connection), reader) != task_spawn_result::accepted)
@@ -801,13 +806,14 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
 } // namespace
 
 auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
-           std::shared_ptr<unique_fd> document_root,
+           std::shared_ptr<http::detail::document_root> document_root,
            bool directory_listing, std::shared_ptr<const http::router> routes,
            std::uint64_t max_request_body) -> task<bool>
 {
     if (routes) {
         try {
-            co_return (co_await serve_routed(loop, peer, document_root->get(), directory_listing,
+            co_return (co_await serve_routed(loop, peer, document_root->descriptor.get(),
+                                             document_root->cache.get(), directory_listing,
                                              *routes, max_request_body)).value_or(false);
         } catch (...) {
             co_return false;
@@ -818,8 +824,8 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
         request incoming;
         for (;;) {
             while (state->pop_request(incoming)) {
-                serve_request(*state, incoming, document_root->get(),
-                              directory_listing, nullptr);
+                serve_request(*state, incoming, document_root->descriptor.get(),
+                              document_root->cache.get(), directory_listing, nullptr);
             }
 
             for (;;) {
