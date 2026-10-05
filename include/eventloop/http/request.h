@@ -1,6 +1,7 @@
 #pragma once
 
 #include "eventloop/task.h"
+#include "eventloop/http/websocket_stream.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -53,6 +54,9 @@ public:
     // :authority, or Host on HTTP/1.1.
     [[nodiscard]] auto authority() const noexcept -> std::string_view { return authority_; }
     [[nodiscard]] auto protocol() const noexcept -> http::protocol { return protocol_; }
+    // Extended CONNECT :protocol, or empty on ordinary requests.
+    [[nodiscard]] auto connect_protocol() const noexcept -> std::string_view
+    { return connect_protocol_; }
     [[nodiscard]] auto headers() const noexcept -> std::span<const header> { return headers_; }
     // First field with this name, compared case-insensitively.
     [[nodiscard]] auto header_value(std::string_view name) const noexcept
@@ -71,6 +75,15 @@ public:
     [[nodiscard]] auto async_read_body(std::span<std::byte> buffer)
         -> task<std::expected<std::size_t, std::error_code>>;
 
+    // Accept RFC 8441/9220 WebSocket version 13 before reading the body or
+    // starting a response. A selected subprotocol must have been offered.
+    // No extensions are negotiated. The handler applies Origin/auth policy.
+    // Invalid handshakes return invalid_argument without a response; HTTP/1.1
+    // returns operation_not_supported. The returned stream cannot outlive
+    // this handler. Ordinary HTTP I/O is invalid after acceptance.
+    [[nodiscard]] auto async_accept_websocket(std::string_view subprotocol = {})
+        -> task<std::expected<websocket_stream, std::error_code>>;
+
 private:
     friend struct detail::request_access;
     request() = default;
@@ -81,6 +94,7 @@ private:
     std::string_view path_;
     std::string_view query_;
     std::string_view authority_;
+    std::string_view connect_protocol_;
     std::optional<std::uint64_t> content_length_;
     void* route_context_ {nullptr};
     method_type method_ {method_type::unknown};

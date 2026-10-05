@@ -76,6 +76,13 @@ protocol errors:
 Body framing, trailers, malformed-body errors, and unread-body cleanup are
 defined in each protocol contract.
 
+For HTTP/2 and HTTP/3, a CONNECT route can inspect
+`request::connect_protocol()` and call `async_accept_websocket()` to return a
+stream for `ws::web_socket`. Acceptance replaces ordinary response/body
+operations for that exchange. The [WebSocket contract](websocket.md#routed-http2-and-http3-websockets)
+specifies validation, bounded storage, ownership, and cancellation.
+Authentication and Origin policy remain in the route handler.
+
 ## Responses
 
 - `http::response` sends the status and fields with `async_start`, body

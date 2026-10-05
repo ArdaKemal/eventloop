@@ -165,6 +165,66 @@ auto skipped_stream_id_is_protocol_error() -> void
     check(error_of(state, 7, 0) == protocol_error, "lower unused stream id");
 }
 
+auto extended_handler(eventloop::event_loop&, eventloop::http::request&,
+                      eventloop::http::response&) -> eventloop::task<void> { co_return; }
+
+auto extended_connect() -> void
+{
+    eventloop::http::router routes;
+    check(routes.add(eventloop::http::method_type::connect, "/chat", extended_handler).has_value(),
+          "CONNECT route");
+    const std::vector<field> valid {{":method", "CONNECT"}, {":scheme", "https"},
+        {":path", "/chat"}, {":authority", "localhost"}, {":protocol", "websocket"}};
+    const auto send = [](session& state, std::uint32_t id, const std::vector<field>& fields) {
+        std::vector<std::byte> block, input;
+        check(hpack_encode(fields, block) == hpack_error::none, "encode CONNECT");
+        frame(input, 1, 4, id, block);
+        feed(state, input);
+    };
+    {
+        session state;
+        connect(state);
+        send(state, 1, valid);
+        check(error_of(state, 3, 1) == protocol_error, "Extended CONNECT without advertisement");
+    }
+    for (std::size_t i = 0; i < valid.size(); ++i) {
+        session state(false, &routes, 32);
+        connect(state);
+        auto missing = valid;
+        missing.erase(missing.begin() + static_cast<std::ptrdiff_t>(i));
+        send(state, 1, missing);
+        check(error_of(state, 3, 1) == protocol_error, "CONNECT missing required pseudo-header");
+    }
+    {
+        session state(false, &routes, 32);
+        connect(state);
+        auto duplicate = valid;
+        duplicate.push_back({":protocol", "websocket"});
+        send(state, 1, duplicate);
+        check(error_of(state, 3, 1) == protocol_error, "duplicate :protocol");
+    }
+    {
+        session state(false, &routes, 32);
+        connect(state);
+        const std::array<std::byte, 6> bad {std::byte{0}, std::byte{8}, std::byte{0},
+            std::byte{0}, std::byte{0}, std::byte{2}};
+        std::vector<std::byte> input;
+        frame(input, 4, 0, 0, bad);
+        feed(state, input);
+        check(error_of(state, 7, 0) == protocol_error, "invalid Extended CONNECT setting");
+    }
+    {
+        session state(false, &routes, 32);
+        connect(state);
+        for (std::uint32_t i = 0; i < 9; ++i) send(state, 2 * i + 1, valid);
+        check(error_of(state, 3, 17) == 7, "bounded tunnel slots refuse ninth stream");
+        eventloop::http2::detail::routed_request routed;
+        unsigned count = 0;
+        while (state.pop_routed(routed)) ++count;
+        check(count == 8 && !state.closed(), "eight live tunnels leave connection alive");
+    }
+}
+
 } // namespace
 
 int main()
@@ -173,4 +233,5 @@ int main()
     frames_after_peer_reset_are_stream_errors();
     frames_racing_local_reset_are_discarded();
     skipped_stream_id_is_protocol_error();
+    extended_connect();
 }

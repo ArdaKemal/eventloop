@@ -214,7 +214,12 @@ private:
             self.consume_output(*written);
         }
         if (self.ready_to_close()) {
-            if constexpr (requires(Stream& stream) { stream.async_close(); }) {
+            // A failed WebSocket must abort its transport after the diagnostic
+            // Close frame drains. Waiting for the peer's orderly close can
+            // otherwise leave an invalid HTTP tunnel alive indefinitely.
+            if (self.error()) {
+                self.close_transport();
+            } else if constexpr (requires(Stream& stream) { stream.async_close(); }) {
                 auto closed = normalize_close(co_await self.stream_.async_close());
                 if (!closed) {
                     self.retire_transport();

@@ -72,6 +72,14 @@ required for changes confined to this protocol.
 - A handler that returns after `async_start` but before `async_finish` resets
   the stream with `H3_INTERNAL_ERROR`.
 
+- With a router, the server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and
+  accepts routed WebSockets through Extended CONNECT (RFC 9220). See the
+  [WebSocket contract](websocket.md#routed-http2-and-http3-websockets) for
+  acceptance, scratch-slot lifetimes, and stream closure. Unsupported
+  Extended CONNECT protocols receive 501. Accepted tunnels carry DATA only
+  (plus permitted unknown extension frames); trailing HEADERS are
+  H3_FRAME_UNEXPECTED, a connection error.
+
 ## Control streams and QPACK
 
 Each peer unidirectional stream is parsed by type with about 300 bytes of
@@ -109,7 +117,7 @@ section that uses the dynamic table or does not decode is
 one request reset the response and send STOP_SENDING with the same code,
 and the connection continues. A malformed request is `H3_MESSAGE_ERROR`:
 missing, duplicate, unknown, or late pseudo-header fields (including
-`:protocol`), an empty `:path` or missing authority for `http`/`https`,
+`:protocol` when Extended CONNECT is disabled), an empty `:path` or missing authority for `http`/`https`,
 `:authority` and Host that disagree, uppercase or invalid field names,
 NUL, CR, LF, or DEL in values, connection-specific fields, TE other than
 `trailers`, a non-numeric or conflicting Content-Length, DATA whose total
@@ -118,7 +126,7 @@ ending before its request HEADERS is `H3_REQUEST_INCOMPLETE`. A field
 section above the 16 KiB header cap or the decode limits, or If-None-Match
 values that do not fit request storage, is `H3_EXCESSIVE_LOAD`. A file read
 failure is `H3_INTERNAL_ERROR`, and a response write that fails because the
-peer stopped or reset the stream is `H3_REQUEST_CANCELLED`. CONNECT is
+peer stopped or reset the stream is `H3_REQUEST_CANCELLED`. Ordinary CONNECT is
 answered 405 and a `:scheme` other than `https` 400.
 
 For static requests, the response is sent once the request HEADERS are valid. The server then reads the rest of the

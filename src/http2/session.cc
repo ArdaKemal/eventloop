@@ -283,7 +283,7 @@ session::session(bool file_sendfile, const http::router* routes,
     output_.resize(4096);
     decoded_fields_.reserve(16);
 
-    std::array<std::byte, 36> settings {};
+    std::array<std::byte, 42> settings {};
     auto setting = [&](std::size_t offset, std::uint16_t id,
                        std::uint32_t value) {
         settings[offset] = static_cast<std::byte>(id >> 8);
@@ -299,7 +299,8 @@ session::session(bool file_sendfile, const http::router* routes,
     std::size_t settings_size = 30;
     if (routes_ != nullptr) {
         setting(30, 4, static_cast<std::uint32_t>(route_body_slot_size));
-        settings_size = 36;
+        setting(36, 8, 1); // RFC 8441 Extended CONNECT, dispatched through routes.
+        settings_size = 42;
     }
     if (!append_frame(settings_frame, 0, 0, std::span {settings}.first(settings_size)))
         fatal_ = true;
@@ -856,7 +857,8 @@ auto session::dispatch_data() -> void
     }
     if (value->routed) {
         return_connection_credit();
-        if (value->request_body_size > max_routed_body_) value->too_large = true;
+        if (value->connect == connect_state::none && value->request_body_size > max_routed_body_)
+            value->too_large = true;
         // Buffered bytes return their stream credit when the handler reads
         // them; padding, and bodies past the limit, return it now.
         std::int64_t credit = flow_size;
@@ -919,7 +921,7 @@ auto session::dispatch_settings() -> void
             (byte_value(frame_data_[offset]) << 8) |
              byte_value(frame_data_[offset + 1]));
         const auto value = read_u32(frame_data_ + offset + 2);
-        if ((id == 2 || id == 9) && value > 1) {
+        if ((id == 2 || id == 8 || id == 9) && value > 1) {
             connection_error(protocol_error);
             return;
         }
@@ -1045,7 +1047,8 @@ auto session::finish_header_block() -> void
         return;
     }
     if (header_trailers_) {
-        if (!header_end_stream_ || !validate_trailers(decoded_fields_)) {
+        if (value->connect == connect_state::accepted || !header_end_stream_ ||
+            !validate_trailers(decoded_fields_)) {
             stream_error(header_stream_id_, protocol_error);
         } else {
             finish_request(*value);
@@ -1055,6 +1058,12 @@ auto session::finish_header_block() -> void
         stream_error(header_stream_id_, protocol_error);
     } else {
         value->initial_headers = true;
+        if (value->connect == connect_state::unsupported) {
+            (void)respond(value->id, 501, {}, {});
+            stream_error(value->id, 0);
+            header_block_.clear();
+            return;
+        }
         if (routes_ != nullptr) (void)route_stream(*value);
         // Routing may refuse the stream when no body buffer is free.
         if (header_end_stream_ && value->active) finish_request(*value);
@@ -1091,6 +1100,7 @@ auto session::validate_initial_headers(stream& value,
     std::string_view scheme;
     std::string_view target;
     std::string_view authority;
+    std::string_view connect_protocol;
     std::string_view host;
     std::optional<std::uint64_t> content_length;
     bool regular_field_seen = false;
@@ -1098,6 +1108,7 @@ auto session::validate_initial_headers(stream& value,
     bool scheme_seen = false;
     bool target_seen = false;
     bool authority_seen = false;
+    bool protocol_seen = false;
     bool host_seen = false;
     std::uint8_t urgency = 3;
     bool incremental = false;
@@ -1128,9 +1139,11 @@ auto session::validate_initial_headers(stream& value,
                 if (authority_seen) return false;
                 authority_seen = true;
                 authority = entry.value;
+            } else if (entry.name == ":protocol") {
+                if (routes_ == nullptr || protocol_seen || !valid_method(entry.value)) return false;
+                protocol_seen = true;
+                connect_protocol = entry.value;
             } else {
-                // :protocol needs extended CONNECT negotiation, which is not
-                // enabled by this server.
                 return false;
             }
             continue;
@@ -1165,7 +1178,9 @@ auto session::validate_initial_headers(stream& value,
 
     if (!method_seen || !valid_method(method)) return false;
     const bool connect = method == "CONNECT";
-    if (connect) {
+    if (protocol_seen && !connect) return false;
+    const bool extended = connect && protocol_seen;
+    if (connect && !extended) {
         if (!authority_seen || authority.empty() || scheme_seen || target_seen) {
             return false;
         }
@@ -1177,7 +1192,10 @@ auto session::validate_initial_headers(stream& value,
     } else if (target == "*" && method != "OPTIONS") {
         return false;
     }
-    if (!connect) {
+    if (extended && (!authority_seen || authority.empty())) return false;
+    if (connect_protocol == "websocket" && !ascii_equal(scheme, "http") &&
+        !ascii_equal(scheme, "https")) return false;
+    if (!connect || extended) {
         const auto alpha = [](unsigned char byte) {
             return (byte >= 'a' && byte <= 'z') ||
                    (byte >= 'A' && byte <= 'Z');
@@ -1199,6 +1217,8 @@ auto session::validate_initial_headers(stream& value,
     value.method.assign(method);
     value.target.assign(target);
     value.content_length = content_length;
+    value.connect = !extended ? connect_state::none : connect_protocol == "websocket"
+        ? connect_state::websocket : connect_state::unsupported;
     if (priority_valid) {
         value.urgency = urgency;
         value.incremental = incremental;
@@ -1282,9 +1302,19 @@ auto session::route_stream(stream& value) -> bool
     const std::string_view target = value.target;
     const auto match = http::detail::router_access::match(*routes_,
         http::detail::method_from_name(value.method), target.substr(0, target.find('?')));
-    if (match.function == nullptr) return false;
+    if (match.function == nullptr) {
+        if (value.connect == connect_state::none) return false;
+        std::array<char, 96> allow {};
+        const auto count = http::detail::format_allow(match.allowed, allow);
+        const std::array<http::header, 1> headers {{{"allow", {allow.data(), count}}}};
+        (void)respond(value.id, match.allowed == 0 ? 404 : 405,
+            match.allowed == 0 ? std::span<const http::header> {} : std::span<const http::header>(headers), {});
+        stream_error(value.id, 0);
+        return true;
+    }
     value.routed = true;
-    const bool too_large = value.content_length && *value.content_length > max_routed_body_;
+    const bool too_large = value.connect == connect_state::none && value.content_length &&
+                          *value.content_length > max_routed_body_;
     if (!header_end_stream_ && !too_large) {
         value.body_slot = acquire_body_slot();
         if (value.body_slot == no_slot) {
@@ -1381,15 +1411,18 @@ auto session::read_body(std::uint32_t stream_id, std::span<std::byte> output,
 
 auto session::start_streamed(std::uint32_t stream_id, unsigned status,
                              std::span<const http::header> headers,
-                             std::span<const http::header> extra) -> bool
+                             std::span<const http::header> extra, bool websocket) -> bool
 {
     auto* value = find_stream(stream_id);
     if (value == nullptr || !value->routed || value->response_started || fatal_) return false;
+    if (websocket && (value->connect != connect_state::websocket || value->content_length))
+        return false;
     value->streaming = true;
     if (!append_response_headers(*value, status, headers, extra, false)) {
         stream_error(stream_id, internal_error);
         return false;
     }
+    if (websocket) value->connect = connect_state::accepted;
     return true;
 }
 
@@ -1423,7 +1456,7 @@ auto session::finish_streamed(std::uint32_t stream_id, std::span<const http::hea
         return false;
     }
     value->stream_finished = true;
-    complete_stream(*value);
+    if (value->connect != connect_state::accepted || value->body_ended) complete_stream(*value);
     return true;
 }
 

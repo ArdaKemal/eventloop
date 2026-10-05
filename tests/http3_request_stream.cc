@@ -122,6 +122,22 @@ auto content_length() -> void
           "body without Content-Length");
 }
 
+auto connect_framing() -> void
+{
+    std::array<std::byte, 16> storage {};
+    request_frames parser(storage);
+    const std::array<std::byte, 4> head {std::byte{1}, std::byte{2}, std::byte{0}, std::byte{0}};
+    auto input = std::span<const std::byte>(head);
+    check(parser.receive(input).value() == request_frames::event::header_block, "CONNECT headers");
+    parser.accept_connect();
+    const std::array<std::byte, 3> data {std::byte{0}, std::byte{1}, std::byte{'x'}};
+    input = data;
+    check(parser.receive(input).value() == request_frames::event::data, "CONNECT DATA");
+    check(parser.finish().has_value(), "CONNECT FIN after DATA");
+    input = head;
+    check(parser.receive(input).error() == h3_error::frame_unexpected, "no trailers on CONNECT tunnel");
+}
+
 auto fields() -> void
 {
     using list = std::vector<field>;
@@ -147,6 +163,27 @@ auto fields() -> void
           "repeated identical Content-Length");
     const auto connect = validate({{":method", "CONNECT"}, {":authority", "example.com:443"}});
     check(connect && connect->method == "CONNECT", "plain CONNECT");
+
+    const list extended {{":method", "CONNECT"}, {":scheme", "https"},
+        {":authority", "example.com"}, {":path", "/chat"}, {":protocol", "websocket"}};
+    check(!validate_request(extended), "Extended CONNECT requires advertisement");
+    const auto accepted = validate_request(extended, true);
+    check(accepted && accepted->connect_protocol == "websocket" && accepted->path == "/chat",
+          "Extended CONNECT pseudo-headers");
+    for (std::size_t i = 1; i < extended.size(); ++i) {
+        auto missing = extended;
+        missing.erase(missing.begin() + static_cast<std::ptrdiff_t>(i));
+        check(!validate_request(missing, true), "Extended CONNECT missing field");
+    }
+    auto duplicate = extended;
+    duplicate.push_back({":protocol", "websocket"});
+    check(!validate_request(duplicate, true), "duplicate :protocol");
+    auto wrong_method = extended;
+    wrong_method[0].value = "GET";
+    check(!validate_request(wrong_method, true), ":protocol only on CONNECT");
+    auto unknown = extended;
+    unknown.back().value = "other";
+    check(validate_request(unknown, true).has_value(), "unknown token reaches application rejection");
 
     check(malformed({{":scheme", "https"}, {":authority", "a"}, {":path", "/"}}), "missing :method");
     check(malformed({{":method", "GET"}, {":authority", "a"}, {":path", "/"}}), "missing :scheme");
@@ -192,5 +229,6 @@ auto main() -> int
 {
     framing();
     content_length();
+    connect_framing();
     fields();
 }

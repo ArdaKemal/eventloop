@@ -97,6 +97,8 @@ public:
     auto set_content_length(std::optional<std::uint64_t> length) noexcept -> void
     { content_length_ = length; }
 
+    auto accept_connect() noexcept -> void { tunnel_ = true; content_length_.reset(); }
+
     [[nodiscard]] auto block() const noexcept -> std::span<const std::byte>
     { return std::span<const std::byte>(storage_).first(block_size_); }
     // The DATA payload bytes of the last data event.
@@ -128,7 +130,7 @@ private:
     auto begin_frame() noexcept -> std::expected<void, h3_error>
     {
         if (frame_type_ == headers_frame) {
-            if (phase_ == phase::complete) return std::unexpected(h3_error::frame_unexpected);
+            if (tunnel_ || phase_ == phase::complete) return std::unexpected(h3_error::frame_unexpected);
             if (remaining_ > storage_.size()) return std::unexpected(h3_error::excessive_load);
             block_size_ = 0;
             state_ = state::header_payload;
@@ -170,6 +172,7 @@ private:
     varint_accumulator varint_ {};
     state state_ {state::frame_type};
     phase phase_ {phase::request_headers};
+    bool tunnel_ {false};
 };
 
 // Field rules shared by request headers and trailers (RFC 9114 4.2 and
@@ -192,17 +195,20 @@ struct request_head {
     std::string_view scheme;
     std::string_view authority; // :authority, or Host when it is absent
     std::string_view path;
+    std::string_view connect_protocol;
     std::optional<std::uint64_t> content_length;
 };
 
 // Validates a decoded request field section. Any violation makes the request
 // malformed, which is a stream error of type H3_MESSAGE_ERROR (4.1.2).
-[[nodiscard]] constexpr auto validate_request(std::span<const field> fields) noexcept
+[[nodiscard]] constexpr auto validate_request(std::span<const field> fields,
+                                              bool enable_extended_connect = false) noexcept
     -> std::expected<request_head, h3_error>
 {
     const auto malformed = std::unexpected(h3_error::message_error);
     request_head head;
     bool have_method = false, have_scheme = false, have_path = false, have_authority = false;
+    bool have_protocol = false;
     bool regular = false;
     std::optional<std::string_view> host;
     for (const auto& f : fields) {
@@ -219,7 +225,8 @@ struct request_head {
             else if (f.name == ":scheme") ok = take(have_scheme, head.scheme);
             else if (f.name == ":path") ok = take(have_path, head.path);
             else if (f.name == ":authority") ok = take(have_authority, head.authority);
-            // :protocol is invalid without SETTINGS_ENABLE_CONNECT_PROTOCOL.
+            else if (f.name == ":protocol" && enable_extended_connect)
+                ok = take(have_protocol, head.connect_protocol);
             if (!ok) return malformed;
             for (unsigned char c : f.value)
                 if (c == 0 || c == '\r' || c == '\n' || c == 0x7f) return malformed;
@@ -242,7 +249,17 @@ struct request_head {
         }
     }
     if (!have_method || head.method.empty()) return malformed;
-    if (head.method == "CONNECT") {
+    if (have_protocol) {
+        if (head.method != "CONNECT" || head.connect_protocol.empty() ||
+            !have_scheme || head.scheme.empty() || !have_path || head.path.empty() ||
+            head.path.front() != '/' || head.path.find('#') != std::string_view::npos ||
+            !have_authority || head.authority.empty()) return malformed;
+        for (unsigned char c : head.connect_protocol)
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') ||
+                  std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) !=
+                      std::string_view::npos)) return malformed;
+    } else if (head.method == "CONNECT") {
         // Plain CONNECT names only an authority (4.4).
         if (have_scheme || have_path || !have_authority || head.authority.empty())
             return malformed;

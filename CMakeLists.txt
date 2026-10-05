@@ -644,6 +644,8 @@ if(WIN32)
     if(EVENTLOOP_WINDOWS_TLS)
         add_executable(websocket_echo_server examples/websocket_echo_server.cc)
         target_link_libraries(websocket_echo_server PRIVATE eventloop::eventloop OpenSSL::Crypto)
+        add_executable(websocket_routing_server examples/websocket_routing_server.cc)
+        target_link_libraries(websocket_routing_server PRIVATE eventloop::eventloop)
     endif()
 
     add_executable(quic_echo_server examples/quic_echo_server.cc)
@@ -880,6 +882,10 @@ target_compile_options(tcp_echo PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 add_executable(routing_server examples/routing_server.cc)
 target_link_libraries(routing_server PRIVATE eventloop::eventloop)
 target_compile_options(routing_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
+add_executable(websocket_routing_server examples/websocket_routing_server.cc)
+target_link_libraries(websocket_routing_server PRIVATE eventloop::eventloop)
+target_compile_options(websocket_routing_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
 add_executable(unix_echo examples/unix_echo.cc)
 target_link_libraries(unix_echo PRIVATE eventloop::eventloop)
@@ -1445,6 +1451,13 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME http3_routing COMMAND http3_routing_test)
     set_tests_properties(http3_routing PROPERTIES TIMEOUT 20)
+
+    add_executable(http_websocket_test tests/http_websocket.cc src/http3/qpack.cc)
+    target_include_directories(http_websocket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http_websocket_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(http_websocket_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http_websocket COMMAND http_websocket_test)
+    set_tests_properties(http_websocket PROPERTIES TIMEOUT 20)
 
     add_executable(http3_routing_allocations_test tests/http3_routing_allocations.cc
         src/http3/qpack.cc)

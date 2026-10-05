@@ -104,7 +104,8 @@ public:
     // during the call.
     [[nodiscard]] auto start_streamed(std::uint32_t stream_id, unsigned status,
                                       std::span<const http::header> headers,
-                                      std::span<const http::header> extra = {}) -> bool;
+                                      std::span<const http::header> extra = {},
+                                      bool websocket = false) -> bool;
     // Borrows data until chunk_pending() turns false.
     [[nodiscard]] auto queue_chunk(std::uint32_t stream_id, std::span<const std::byte> data)
         -> bool;
@@ -128,6 +129,8 @@ public:
     auto resume_input() -> void;
 
 private:
+    enum class connect_state : std::uint8_t { none, unsupported, websocket, accepted };
+
     struct stream {
         std::uint32_t id = 0;
         std::int64_t receive_window = 65535;
@@ -157,6 +160,7 @@ private:
         bool too_large = false;
         bool streaming = false;
         bool stream_finished = false;
+        connect_state connect = connect_state::none;
         std::uint8_t body_slot = no_slot;
         std::size_t body_begin = 0;
         std::size_t body_end = 0;

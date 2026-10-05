@@ -253,6 +253,15 @@ public:
         return send_file_task(loop_, *this, status, headers, std::move(file), offset, size);
     }
     [[nodiscard]] auto loop() noexcept -> event_loop& override { return loop_; }
+    auto accept_websocket(std::span<const header> headers) -> task<void_result> override
+    { return start_task(loop_, *this, 200, headers, std::nullopt, true); }
+    auto abort_websocket() noexcept -> void override
+    {
+        if (websocket_aborted || (finished_ && body_ended_)) return;
+        websocket_aborted = true;
+        broken_ = true;
+        fail(connection_, id_, h3::h3_error::request_cancelled);
+    }
 
     http::request request_ = detail::request_access::make_request();
     http::response response_ = detail::request_access::make_response();
@@ -263,14 +272,19 @@ public:
     bool too_large_ {false};
 
     static auto start_task(event_loop& loop, http3_exchange& self, unsigned status,
-                           std::span<const header> headers, std::optional<std::uint64_t> length)
+                           std::span<const header> headers, std::optional<std::uint64_t> length,
+                           bool websocket = false)
         -> task<void_result>
     {
         if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
         if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
-        if (self.started_) co_return std::unexpected(failure(std::errc::invalid_argument));
+        if (self.started_ || (websocket && self.reading_))
+            co_return std::unexpected(failure(std::errc::invalid_argument));
         const auto checked = detail::check_response_start(status, headers, length);
         if (!checked) co_return std::unexpected(checked.error());
+        if (self.request_.method() == method_type::connect && status < 300 &&
+            (length || checked->declared))
+            co_return std::unexpected(failure(std::errc::invalid_argument));
         if (headers.size() + 3 > response_fields)
             co_return std::unexpected(failure(std::errc::message_size));
         busy writing(self.writing_);
@@ -293,9 +307,12 @@ public:
         }
         if (!(co_await write_section(loop, self, fields.first(count), false)).value_or(false)) {
             self.broken_ = true;
+            if (websocket) self.abort_websocket();
             co_return std::unexpected(failure(std::errc::connection_reset));
         }
         self.started_ = true;
+        self.websocket_accepted = websocket;
+        if (websocket) self.frames_.accept_connect();
         self.bodyless_ = checked->bodyless;
         self.declared_ = checked->declared;
         co_return void_result {};
@@ -344,6 +361,9 @@ private:
         busy reading(self.reading_);
         const auto input_area = std::span(self.storage_.io).subspan(response_header_area);
         for (;;) {
+            if (self.websocket_aborted)
+                co_return std::unexpected(failure(std::errc::operation_canceled));
+            if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
             if (!self.data_.empty()) {
                 if (buffer.empty()) co_return std::unexpected(failure(std::errc::invalid_argument));
                 const auto count = std::min(buffer.size(), self.data_.size());
@@ -352,7 +372,6 @@ private:
                 co_return count;
             }
             if (self.body_ended_) co_return 0;
-            if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
             if (!self.pending_.empty()) {
                 const auto parsed = self.frames_.receive(self.pending_);
                 std::expected<void, h3::h3_error> valid {};
@@ -365,7 +384,8 @@ private:
                     co_return std::unexpected(failure(std::errc::bad_message));
                 }
                 if (*parsed == h3::request_frames::event::data) {
-                    if (self.frames_.data_received() > self.max_request_body_) {
+                    if (!self.websocket_accepted &&
+                        self.frames_.data_received() > self.max_request_body_) {
                         self.too_large_ = true;
                         co_return std::unexpected(failure(std::errc::message_size));
                     }
@@ -375,6 +395,10 @@ private:
             }
             const auto got = flatten_result(co_await self.connection_.async_read(self.id_, input_area));
             if (!got) {
+                if (self.websocket_aborted)
+                    co_return std::unexpected(failure(std::errc::operation_canceled));
+                if (self.websocket_accepted && got.error() == failure(std::errc::operation_canceled))
+                    co_return std::unexpected(got.error());
                 self.broken_ = true;
                 co_return std::unexpected(failure(std::errc::connection_reset));
             }
@@ -394,7 +418,10 @@ private:
     static auto write_task(event_loop& loop, http3_exchange& self, std::span<const std::byte> data)
         -> task<void_result>
     {
+        (void)loop;
         if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.websocket_aborted)
+            co_return std::unexpected(failure(std::errc::operation_canceled));
         if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
         if (!self.started_ || self.finished_ || (self.bodyless_ && !data.empty()) ||
             (self.declared_ && data.size() > *self.declared_ - self.sent_))
@@ -406,20 +433,26 @@ private:
         const auto header_size = h3::encode_frame_header(h3::data_frame, data.size(),
                                                          buffer.first(16));
         if (!header_size) co_return std::unexpected(failure(std::errc::message_size));
-        bool written = false;
+        std::expected<std::size_t, std::error_code> written;
         if (data.size() <= buffer.size() - *header_size) {
             // Small writes go out as one contiguous frame.
             std::memcpy(buffer.data() + *header_size, data.data(), data.size());
-            written = (co_await write_all(loop, self.connection_, self.id_,
-                buffer.first(*header_size + data.size()), false)).value_or(false);
+            written = flatten_result(co_await self.connection_.async_write(self.id_,
+                buffer.first(*header_size + data.size()), false));
         } else {
-            written = (co_await write_all(loop, self.connection_, self.id_,
-                          buffer.first(*header_size), false)).value_or(false) &&
-                      (co_await write_all(loop, self.connection_, self.id_, data, false))
-                          .value_or(false);
+            written = flatten_result(co_await self.connection_.async_write(self.id_,
+                          buffer.first(*header_size), false));
+            if (written) written = flatten_result(co_await self.connection_.async_write(self.id_, data, false));
         }
         if (!written) {
+            if (self.websocket_aborted)
+                co_return std::unexpected(failure(std::errc::operation_canceled));
             self.broken_ = true;
+            if (self.websocket_accepted) {
+                fail(self.connection_, self.id_, h3::h3_error::request_cancelled);
+                co_return std::unexpected(written.error() == failure(std::errc::operation_canceled)
+                    ? written.error() : failure(std::errc::connection_reset));
+            }
             co_return std::unexpected(failure(std::errc::connection_reset));
         }
         co_return void_result {};
@@ -429,6 +462,8 @@ private:
         -> task<void_result>
     {
         if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.websocket_aborted)
+            co_return std::unexpected(failure(std::errc::operation_canceled));
         if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
         if (!self.started_ || self.finished_)
             co_return std::unexpected(failure(std::errc::invalid_argument));
@@ -535,6 +570,7 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
         .method_name = head.method,
         .target = head.path,
         .authority = head.authority,
+        .connect_protocol = head.connect_protocol,
         .content_length = head.content_length,
         .method = detail::method_from_name(head.method),
         .protocol = http::protocol::http3,
@@ -577,24 +613,27 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
 {
     const auto match = detail::router_access::match(*settings.routes,
         detail::method_from_name(head.method), head.path.substr(0, head.path.find('?')));
-    if (match.allowed == 0) co_return false;
-    const bool too_large = match.function != nullptr && head.content_length &&
+    const bool extended = !head.connect_protocol.empty();
+    const bool unsupported = extended && head.connect_protocol != "websocket";
+    if (match.allowed == 0 && !extended) co_return false;
+    const bool too_large = match.function != nullptr && head.connect_protocol.empty() && head.content_length &&
                            *head.content_length > settings.max_request_body;
-    if (match.function != nullptr && !too_large) {
+    if (match.function != nullptr && !too_large && !unsupported) {
         (void)co_await serve_route(loop, connection, id, s, frames, pending, head, fields,
                                    match, settings.max_request_body);
         co_return true;
     }
     std::array<char, 96> allow {};
     const auto allow_size = detail::format_allow(match.allowed, allow);
-    const unsigned status = too_large ? 413 : head.method == "OPTIONS" ? 204 : 405;
+    const unsigned status = unsupported ? 501 : too_large ? 413 : match.allowed == 0 ? 404
+        : head.method == "OPTIONS" ? 204 : 405;
     if (!(co_await send_headers(loop, connection, id, status, 0, "text/plain", true,
             std::span(s.io).first(response_header_area), nullptr,
             {allow.data(), allow_size})).value_or(false)) {
         fail(connection, id, h3::h3_error::request_cancelled);
         co_return true;
     }
-    if (too_large)
+    if (too_large || !head.connect_protocol.empty())
         (void)connection.stop_sending(id, static_cast<std::uint64_t>(h3::h3_error::no_error));
     else
         (void)co_await finish_request(loop, connection, id, s, frames, pending);
@@ -629,7 +668,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         co_return;
     }
     const auto request_fields = std::span<const h3::field>(s.fields).first(*decoded);
-    const auto head = h3::validate_request(request_fields);
+    const auto head = h3::validate_request(request_fields, settings.routes != nullptr);
     if (!head) {
         fail(connection, id, head.error());
         co_return;
@@ -637,9 +676,13 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     frames.set_content_length(head->content_length);
     const auto method = head->method;
     const auto path = head->path;
+    if (head->connect_protocol == "websocket" && head->scheme != "https") {
+        fail(connection, id, h3::h3_error::message_error);
+        co_return;
+    }
     // Routes see https requests; others keep the static answers below. The
     // routed path runs in its own frame so this one stays in its size class.
-    if (settings.routes != nullptr && head->scheme == "https" &&
+    if (settings.routes != nullptr && (head->scheme == "https" || !head->connect_protocol.empty()) &&
         (co_await route_request(loop, connection, id, s, frames, pending, *head,
                                 request_fields, settings)).value_or(true))
         co_return;
@@ -819,11 +862,12 @@ auto serve_connection(event_loop& loop, quic_connection connection,
     const auto general = static_cast<std::uint64_t>(h3::h3_error::general_protocol_error);
     if (!control) { connection.close_application(general); co_return; }
     // Server control stream: stream type 0, SETTINGS with zero QPACK dynamic table.
-    const std::array<std::byte, 6> control_settings {std::byte{0}, std::byte{4}, std::byte{4},
-        std::byte{1}, std::byte{0}, std::byte{7}};
-    const std::array<std::byte, 1> last {std::byte{0}};
-    if (!(co_await write_all(loop, connection, *control, control_settings, false)).value_or(false) ||
-        !(co_await write_all(loop, connection, *control, last, false)).value_or(false)) {
+    const bool extended = settings.routes != nullptr;
+    const std::array<std::byte, 9> control_settings {std::byte{0}, std::byte{4},
+        extended ? std::byte{6} : std::byte{4}, std::byte{1}, std::byte{0}, std::byte{7},
+        std::byte{0}, std::byte{8}, std::byte{1}};
+    if (!(co_await write_all(loop, connection, *control,
+            std::span(control_settings).first(extended ? 9 : 7), false)).value_or(false)) {
         connection.close(); co_return;
     }
     // Required QPACK encoder and decoder streams. No dynamic entries are sent.

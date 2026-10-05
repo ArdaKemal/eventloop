@@ -296,6 +296,8 @@ public:
     auto send_file(unsigned status, std::span<const http::header> headers, unique_fd file,
                    std::uint64_t offset, std::uint64_t size) -> task<void_result> override;
     auto loop() noexcept -> event_loop& override;
+    auto accept_websocket(std::span<const http::header> headers) -> task<void_result> override;
+    auto abort_websocket() noexcept -> void override;
 
     // Read-side and write-side waits resume when these hold.
     [[nodiscard]] auto read_ready() const noexcept -> bool;
@@ -314,6 +316,7 @@ public:
         head_only = bodyless = reading = writing = false;
         started = finished = broken = released = completed = false;
         waiting_file = too_large = false;
+        websocket_accepted = websocket_aborted = body_read = false;
     }
 
     connection_state* owner {nullptr};
@@ -465,7 +468,9 @@ auto read_task(event_loop& loop, http2_exchange& self, std::span<std::byte> buff
     self.reading = true;
     struct done { bool& flag; ~done() { flag = false; } } guard {self.reading};
     for (;;) {
+        if (self.websocket_aborted) co_return std::unexpected(failure(std::errc::operation_canceled));
         if (self.owner->broken) co_return std::unexpected(failure(std::errc::connection_reset));
+        if (self.websocket_accepted && self.released && self.completed) co_return 0;
         std::size_t count = 0;
         switch (self.owner->state.read_body(self.id, buffer, count)) {
         case session::body_state::data:
@@ -486,22 +491,29 @@ auto read_task(event_loop& loop, http2_exchange& self, std::span<std::byte> buff
 }
 
 auto start_task(event_loop& loop, http2_exchange& self, unsigned status,
-                std::span<const http::header> headers, std::optional<std::uint64_t> length)
+                std::span<const http::header> headers, std::optional<std::uint64_t> length,
+                bool websocket = false)
     -> task<void_result>
 {
     (void)loop;
     if (self.writing) co_return std::unexpected(failure(std::errc::operation_in_progress));
     if (self.broken || self.owner->broken)
         co_return std::unexpected(failure(std::errc::connection_reset));
-    if (self.started) co_return std::unexpected(failure(std::errc::invalid_argument));
+    if (self.started || (websocket && self.reading))
+        co_return std::unexpected(failure(std::errc::invalid_argument));
     const auto checked = http::detail::check_response_start(status, headers, length);
     if (!checked) co_return std::unexpected(checked.error());
+    if (self.request_.method() == http::method_type::connect && status < 300 &&
+        (length || checked->declared))
+        co_return std::unexpected(failure(std::errc::invalid_argument));
     const generated_fields extra(checked->emit_length, length.value_or(0), !checked->has_date);
-    if (!self.owner->state.start_streamed(self.id, status, headers, extra.view())) {
+    if (!self.owner->state.start_streamed(self.id, status, headers, extra.view(), websocket)) {
         self.broken = true;
+        if (websocket) self.abort_websocket();
         co_return std::unexpected(failure(std::errc::connection_reset));
     }
     self.started = true;
+    self.websocket_accepted = websocket;
     self.bodyless = checked->bodyless;
     self.declared = checked->declared;
     self.owner->drain();
@@ -513,6 +525,7 @@ auto write_task(event_loop& loop, http2_exchange& self, std::span<const std::byt
 {
     (void)loop;
     if (self.writing) co_return std::unexpected(failure(std::errc::operation_in_progress));
+    if (self.websocket_aborted) co_return std::unexpected(failure(std::errc::operation_canceled));
     if (self.broken || self.owner->broken)
         co_return std::unexpected(failure(std::errc::connection_reset));
     if (!self.started || self.finished || (self.bodyless && !data.empty()) ||
@@ -537,6 +550,7 @@ auto write_task(event_loop& loop, http2_exchange& self, std::span<const std::byt
         }
     }
     // The chunk is accepted once it has left the borrowed span.
+    if (self.websocket_aborted) co_return std::unexpected(failure(std::errc::operation_canceled));
     if (self.owner->broken || !self.owner->state.stream_open(self.id)) {
         self.broken = true;
         co_return std::unexpected(failure(std::errc::connection_reset));
@@ -549,6 +563,7 @@ auto finish_task(event_loop& loop, http2_exchange& self, std::span<const http::h
 {
     (void)loop;
     if (self.writing) co_return std::unexpected(failure(std::errc::operation_in_progress));
+    if (self.websocket_aborted) co_return std::unexpected(failure(std::errc::operation_canceled));
     if (self.broken || self.owner->broken)
         co_return std::unexpected(failure(std::errc::connection_reset));
     if (!self.started || self.finished)
@@ -571,6 +586,20 @@ auto finish_task(event_loop& loop, http2_exchange& self, std::span<const http::h
     self.finished = true;
     self.owner->drain();
     co_return void_result {};
+}
+
+auto http2_exchange::accept_websocket(std::span<const http::header> headers) -> task<void_result>
+{
+    return start_task(owner->loop, *this, 200, headers, std::nullopt, true);
+}
+
+auto http2_exchange::abort_websocket() noexcept -> void
+{
+    if (released) return;
+    websocket_aborted = true;
+    broken = true;
+    owner->state.abandon(id, cancel_error);
+    owner->drain();
 }
 
 auto send_file_task(event_loop& loop, http2_exchange& self, unsigned status,
@@ -676,12 +705,13 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
         exchange.in_use = false;
         return;
     }
-    std::string_view method, target, authority, host;
+    std::string_view method, target, authority, host, connect_protocol;
     exchange.headers.reserve(hpack_max_fields);
     for (const auto& entry : exchange.routed.fields) {
         if (entry.name == ":method") method = entry.value;
         else if (entry.name == ":path") target = entry.value;
         else if (entry.name == ":authority") authority = entry.value;
+        else if (entry.name == ":protocol") connect_protocol = entry.value;
         else if (!entry.name.empty() && entry.name.front() != ':') {
             if (entry.name == "host") host = entry.value;
             exchange.headers.push_back({entry.name, entry.value});
@@ -693,6 +723,7 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
         .method_name = method,
         .target = target,
         .authority = authority.empty() ? host : authority,
+        .connect_protocol = connect_protocol,
         .content_length = exchange.routed.content_length,
         .method = http::detail::method_from_name(method),
         .protocol = http::protocol::http2,

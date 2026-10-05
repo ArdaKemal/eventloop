@@ -242,7 +242,10 @@ separately; Wayfarer and the WebSocket client do so on a bounded worker.
   [Wayfarer](examples/wayfarer/README.md) for a public-header caller.
 - WebSocket receive and send are awaitable and bounded by configured message
   and output limits. The [WebSocket client guide](examples/README-websocket-client.md)
-  covers its outbound echo example.
+  covers its outbound echo example. HTTP/2 and HTTP/3 CONNECT routes can accept
+  WebSockets using RFC 8441/9220; [websocket_routing_server](examples/websocket_routing_server.cc)
+  serves an echo route on both. See the [WebSocket contract](docs/websocket.md)
+  for handshake, capacity, and ownership rules.
 - The public QUIC API supports v1/v2 connections, streams, and DATAGRAMs.
   Wayfarer and Stonegate exercise the client and server sides of HTTP/3.
   QUIC transport release qualification is still active. See the

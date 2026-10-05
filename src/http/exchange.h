@@ -31,6 +31,11 @@ public:
                            std::uint64_t offset, std::uint64_t size) -> task<void_result> = 0;
     // Each implementation owns the loop its tasks run on.
     [[nodiscard]] virtual auto loop() noexcept -> event_loop& = 0;
+    virtual auto accept_websocket(std::span<const header> headers) -> task<void_result>;
+    virtual auto abort_websocket() noexcept -> void {}
+    bool websocket_accepted {false};
+    bool websocket_aborted {false};
+    bool body_read {false};
 
 protected:
     ~exchange() = default;
@@ -41,6 +46,7 @@ struct request_fields {
     std::string_view method_name;
     std::string_view target;
     std::string_view authority;
+    std::string_view connect_protocol {};
     std::optional<std::uint64_t> content_length;
     method_type method {method_type::unknown};
     http::protocol protocol {http::protocol::http1_1};
@@ -52,6 +58,8 @@ struct request_access {
     static auto bind(response& value, exchange& owner) noexcept -> void;
     [[nodiscard]] static auto make_request() noexcept -> request { return {}; }
     [[nodiscard]] static auto make_response() noexcept -> response { return {}; }
+    [[nodiscard]] static auto make_websocket(exchange& owner) noexcept -> websocket_stream
+    { return websocket_stream(owner); }
 };
 
 // Bitmask of method_type values.

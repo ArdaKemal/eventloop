@@ -28,8 +28,12 @@ required for changes confined to this protocol.
   DATA uses OpenSSL `SSL_sendfile()` when transmit kTLS is active, and otherwise
   uses the bounded buffered path. Directory-root traversal uses the shared HTTP contract's
   component-by-component `O_NOFOLLOW` checks. Cleartext
-  prior-knowledge HTTP/2, h2c upgrade, CONNECT tunnels, and extended CONNECT are
-  not supported. Plain `http::server` continues to serve HTTP/1.1.
+  prior-knowledge HTTP/2, h2c upgrade, and ordinary CONNECT proxy tunnels are
+  not supported. With a router, the server advertises
+  SETTINGS_ENABLE_CONNECT_PROTOCOL and supports routed WebSockets through
+  Extended CONNECT (RFC 8441). See the [WebSocket contract](websocket.md#routed-http2-and-http3-websockets)
+  for acceptance, storage capacity, and stream closure. Plain `http::server`
+  continues to serve HTTP/1.1.
 
 ## Routed handlers, flow control, and cancellation
 
