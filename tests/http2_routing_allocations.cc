@@ -256,16 +256,17 @@ auto main() -> int
         ("eventloop-h2-allocations-" + std::to_string(random()));
     std::filesystem::create_directories(directory / "www");
     test::make_localhost_certificate(directory / "cert.pem", directory / "key.pem");
-    std::ofstream(directory / "www" / "file.txt") << "static";
+    // Paths longer than std::string's inline buffer, as real assets are.
+    std::ofstream(directory / "www" / "static-asset-bundle.min.txt") << "static";
 
     auto routes = std::make_shared<http::router>();
-    check(routes->add(http::method_type::get, "/hello", hello).has_value() &&
+    check(routes->add(http::method_type::get, "/api/v1/catalog/items/hello", hello).has_value() &&
           routes->add(http::method_type::post, "/upload", upload).has_value(), "routes");
     const std::array<std::vector<std::byte>, 3> requests {
-        encode("GET", "/hello", {}),
+        encode("GET", "/api/v1/catalog/items/hello", {}),
         encode("POST", "/upload",
                "0123456789012345678901234567890123456789012345678901234567890123456789"),
-        encode("GET", "/file.txt", {}),
+        encode("GET", "/static-asset-bundle.min.txt", {}),
     };
 
     measurement result;

@@ -89,7 +89,7 @@ auto respond_static_file(session& state, const request& incoming, unique_fd desc
     return location;
 }
 
-auto serve_request(session& state, request incoming, native_socket root,
+auto serve_request(session& state, const request& incoming, native_socket root,
                    bool directory_listing, const http::router* routes) -> void
 {
     // A routed path reaches here only without a handler for the method.
@@ -711,13 +711,14 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
 {
     (void)loop;
     auto& state = connection.state;
+    // Reused so request strings keep their capacity across requests.
+    request incoming;
     for (;;) {
         // Handlers spawned here usually finish before they suspend; their
         // responses are written together once the batch is dispatched.
         connection.batching = true;
-        request incoming;
         while (state.pop_request(incoming))
-            serve_request(state, std::move(incoming), connection.root,
+            serve_request(state, incoming, connection.root,
                           connection.directory_listing, &connection.routes);
         routed_request routed;
         while (state.pop_routed(routed)) dispatch_routed(connection, std::move(routed));
@@ -814,10 +815,10 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
     }
     try {
         auto state = std::make_unique<session>(peer.kernel_sendfile_available());
+        request incoming;
         for (;;) {
-            request incoming;
             while (state->pop_request(incoming)) {
-                serve_request(*state, std::move(incoming), document_root->get(),
+                serve_request(*state, incoming, document_root->get(),
                               directory_listing, nullptr);
             }
 

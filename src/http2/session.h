@@ -75,6 +75,8 @@ public:
     auto commit_read(std::size_t size) -> void;
     [[nodiscard]] auto output() const noexcept -> std::span<const std::byte>;
     auto consume_output(std::size_t size) -> void;
+    // Assigns into value's existing strings, so a caller reusing one request
+    // keeps their capacity across requests.
     [[nodiscard]] auto pop_request(request& value) -> bool;
 
     // Header fields are borrowed only during the call.
@@ -282,7 +284,8 @@ private:
     std::uint32_t closed_floor_ = 0;
     bool header_closed_reply_ = false;
 
-    std::vector<request> requests_;
+    // Streams whose static request is complete, in arrival order.
+    std::vector<std::uint32_t> requests_;
     std::vector<routed_request> routed_;
     std::vector<std::byte> header_block_;
     std::vector<std::byte> output_;

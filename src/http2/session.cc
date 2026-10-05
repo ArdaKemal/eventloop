@@ -385,10 +385,21 @@ auto session::complete_file_send(unique_fd file) -> void
 
 auto session::pop_request(request& value) -> bool
 {
-    if (requests_.empty()) return false;
-    value = std::move(requests_.front());
-    requests_.erase(requests_.begin());
-    return true;
+    while (!requests_.empty()) {
+        const auto* source = find_stream(requests_.front());
+        requests_.erase(requests_.begin());
+        if (source == nullptr) continue;
+        value.stream_id = source->id;
+        value.method.assign(source->method);
+        value.target.assign(source->target);
+        value.if_none_match.assign(source->if_none_match);
+        value.if_modified_since.assign(source->if_modified_since);
+        if (source->duplicate_range) value.range.clear();
+        else value.range.assign(source->range);
+        value.body_size = source->request_body_size;
+        return true;
+    }
+    return false;
 }
 
 auto session::respond(std::uint32_t stream_id, unsigned status,
@@ -1068,15 +1079,8 @@ auto session::finish_request(stream& value) -> void
         return;
     }
     value.request_ready = true;
-    requests_.push_back(request {
-        .stream_id = value.id,
-        .method = std::move(value.method),
-        .target = std::move(value.target),
-        .if_none_match = std::move(value.if_none_match),
-        .if_modified_since = std::move(value.if_modified_since),
-        .range = value.duplicate_range ? std::string {} : std::move(value.range),
-        .body_size = value.request_body_size,
-    });
+    // The stream keeps its fields until pop_request() copies them out.
+    requests_.push_back(value.id);
 }
 
 auto session::validate_initial_headers(stream& value,
@@ -1258,9 +1262,7 @@ auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
     } else {
         inline_response_bytes_ = 0;
     }
-    std::erase_if(requests_, [&value](const request& pending) {
-        return pending.stream_id == value.id;
-    });
+    std::erase(requests_, value.id);
     if (value.body_slot != no_slot) slot_used_[value.body_slot] = false;
     if (value.routed) {
         std::erase_if(routed_, [&value](const routed_request& pending) {
