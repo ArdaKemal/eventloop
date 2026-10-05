@@ -19,6 +19,10 @@
 
 namespace eventloop {
 namespace {
+
+// One write is one full TLS record; its ciphertext fits the 64 KiB
+// encrypted output buffer.
+constexpr std::size_t max_record_plaintext = 16 * 1024;
 [[nodiscard]] auto system_code(int value) noexcept -> std::error_code
 {
     return {value, std::generic_category()};
@@ -152,7 +156,8 @@ public:
         // Keep record buffers for the connection, avoiding release/reallocate on each read.
         SSL_CTX_clear_mode(context.get(), SSL_MODE_RELEASE_BUFFERS);
         SSL_CTX_set_mode(context.get(), SSL_MODE_AUTO_RETRY);
-        require_ssl(SSL_CTX_set_max_send_fragment(context.get(), 16 * 1024), "TLS send fragment limit");
+        require_ssl(SSL_CTX_set_max_send_fragment(context.get(),
+                        max_record_plaintext), "TLS send fragment limit");
         SSL_CTX_set_session_cache_mode(context.get(), SSL_SESS_CACHE_OFF);
         SSL_CTX_set_num_tickets(context.get(), 0);
         if (role == context_role::client)
@@ -727,7 +732,8 @@ auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const 
     if (buffer.empty()) co_return std::size_t {0};
     bool completed = false;
     struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
-    const auto size = std::min<std::size_t>(buffer.size(), 4096);
+    // Smaller writes would each pay a record and a transport write.
+    const auto size = std::min(buffer.size(), max_record_plaintext);
 #ifndef __linux__
     // Flush before writing, so this record always has bounded output space.
     auto flushed = co_await flush_task(loop, self);
