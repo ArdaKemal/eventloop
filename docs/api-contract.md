@@ -404,7 +404,11 @@ every running connection has sent its close and retired.
   - Steady-state routed requests make no general-heap allocation on a
     kept-alive HTTP/1.1 connection, on an HTTP/2 connection (TLS included),
     or on an HTTP/3 connection (QUIC included). Static HTTP/2 and HTTP/3 file
-    requests make none either. HTTP/2 decodes request fields into the
+    requests make none either. An HTTP/1.1 connection reads request heads
+    into 256 bytes of session storage; a longer head allocates one 4 KiB
+    input buffer, released once the remaining input fits again, so idle
+    connections stay small. A browser request head is usually longer, so
+    expect one allocation per such request. HTTP/2 decodes request fields into the
     connection's existing strings, keeps its HPACK dynamic table in one
     4 KiB ring allocated with the first entry, and encodes response fields
     from views into one reused buffer, so only a header value longer than
