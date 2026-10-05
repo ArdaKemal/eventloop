@@ -1,8 +1,10 @@
 # Public API conventions
 
 Use this guide when adding or changing a public header. The behavioral contract
-is in [api-contract.md](api-contract.md); preserve its ownership, cancellation,
-and result rules when changing a signature.
+is indexed in [api-contract.md](api-contract.md). Read the relevant topic
+contract and, for asynchronous changes, [coroutines.md](coroutines.md); preserve
+their ownership, cancellation, and result rules when changing a signature. For
+HTTP changes, also read [http.md](http.md) and the relevant protocol contract.
 
 ## Names and layout
 
@@ -87,4 +89,5 @@ bounded per-loop pool and preserve the nested task and operation results.
   operation pattern.
 - Check both error layers where a task wraps an I/O result. Keep readiness and
   cancellation machinery inside `eventloop::detail` and update
-  [api-contract.md](api-contract.md) when the behavior changes.
+  the relevant contract linked from [api-contract.md](api-contract.md) when
+  the behavior changes.

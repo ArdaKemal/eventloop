@@ -192,15 +192,17 @@ For configuration files, `eventloop::util::parse_toml` parses
 [TOML 1.1.0](https://toml.io/en/v1.1.0) into caller-provided node and decoded
 string buffers. The document borrows those buffers and the input; exhaustion
 returns an error. Parsing is synchronous and portable. See the
-[TOML API contract](docs/api-contract.md#toml-configuration-parsing) for
+[TOML API contract](docs/toml.md) for
 storage lifetimes, limits, and error behavior.
 
 The library also provides `task<T>`, observed `task_handle<T>` roots,
 `when_all`, `race`, and `with_timeout` for composing loop-owned work.
-The [coroutine API contract](docs/api-contract.md) explains task results,
+The [coroutine and event-loop contract](docs/coroutines.md) explains task results,
 cancellation, buffer lifetimes, and capacity errors. The
+[shared HTTP contract](docs/http.md) links to focused HTTP/1.1, HTTP/2, and
+HTTP/3 contracts. The
 [API conventions](docs/api-conventions.md) describe how public operations fit
-together.
+together. The [API contract index](docs/api-contract.md) links to each topic.
 
 ## Designed for bounded services
 
@@ -236,16 +238,15 @@ separately; Wayfarer and the WebSocket client do so on a bounded worker.
 - The outbound HTTP/2 client performs one HTTPS request per connection using
   ALPN `h2`. It supports general methods, bounded owned request bodies,
   streamed uploads, and streamed response bodies and headers. See
-  [the API contract](docs/api-contract.md) for its limits and
+  [HTTP/2 contract](docs/http2.md#outbound-client) for its limits and
   [Wayfarer](examples/wayfarer/README.md) for a public-header caller.
 - WebSocket receive and send are awaitable and bounded by configured message
   and output limits. The [WebSocket client guide](examples/README-websocket-client.md)
   covers its outbound echo example.
 - The public QUIC API supports v1/v2 connections, streams, and DATAGRAMs.
   Wayfarer and Stonegate exercise the client and server sides of HTTP/3.
-  QUIC transport release qualification is still active; see the
-  [milestone and remaining gates](docs/quic-milestone.md). The root test suite
-  retains a separate [HTTP/3 fixture guide](docs/http3-outbound-tests.md).
+  QUIC transport release qualification is still active. See the
+  [QUIC contract](docs/quic.md) for stream limits and lifecycle rules.
 - The HTTP server cancels active connection tasks on shutdown; its grace
   timeout does not drain unfinished responses.
 

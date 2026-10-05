@@ -3,9 +3,16 @@
 This file records constraints that are easy to break while changing the
 library. Check the current code, CMake configuration, Git status, and relevant
 documentation before relying on an old status claim. The user-facing entry
-point is [README.md](README.md); API behavior is specified in
-[docs/api-contract.md](docs/api-contract.md) and
-[docs/api-conventions.md](docs/api-conventions.md).
+point is [README.md](README.md); API contracts are indexed in
+[docs/api-contract.md](docs/api-contract.md); load only the relevant topic
+contracts. For asynchronous changes, also read
+[docs/coroutines.md](docs/coroutines.md) for shared ownership, results, and
+cancellation rules. Public API conventions are in
+[docs/api-conventions.md](docs/api-conventions.md). For HTTP work, read
+[docs/http.md](docs/http.md) and only the relevant protocol contract:
+[HTTP/1.1](docs/http1.1.md), [HTTP/2](docs/http2.md), or
+[HTTP/3](docs/http3.md). Load the other protocol documents only when a change
+crosses protocol boundaries.
 
 ## Design intent
 
@@ -110,11 +117,9 @@ ownership, and error visibility.
   because `sendfile` there moves the file position.
 - QUIC v1/v2 public endpoints, streams, and DATAGRAMs are implemented. The
   Wayfarer and Stonegate examples exercise HTTP/1.1, HTTP/2, and HTTP/3 through
-  public APIs. Root HTTP/3 test fixtures and optional aioquic v1/v2 tests are
-  documented in [docs/http3-outbound-tests.md](docs/http3-outbound-tests.md).
-  Transport release gates and remaining endpoint work are in
-  [docs/quic-milestone.md](docs/quic-milestone.md). Keep public claims scoped to
-  verified behavior.
+  public APIs. Stream limits and lifecycle rules are specified in
+  [docs/quic.md](docs/quic.md); HTTP/3 application behavior is in
+  [docs/http3.md](docs/http3.md). Keep public claims scoped to verified behavior.
 
 ## Working in this repository
 
@@ -138,6 +143,10 @@ ownership, and error visibility.
   staging, and stage only intended files.
 - After changing code, check warnings, `git diff --check`, and the relevant
   CTest subset; run the full suite when a cross-cutting change warrants it.
+- Save tokens by redirecting full benchmark output to a log file, then using
+  `rg` or `grep` to return only the relevant result lines in tool output. Filter
+  before the output enters the agent context or cache; summarizing it afterward
+  does not save those tokens. For failed runs, return only targeted diagnostics.
 - Historical benchmark numbers from old worktrees are not current performance
   claims. `benchmark/file_io_benchmark.cc` uses a cached /tmp workload and
   measures runtime overhead, not storage throughput.
