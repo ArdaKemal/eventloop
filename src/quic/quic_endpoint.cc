@@ -310,7 +310,7 @@ public:
     {
         closing_ = true;
         for (auto& entry : slots_)
-            if (entry.driver && !entry.driver_finished) entry.driver->stop();
+            if (entry.driver && !entry.driver_finished) entry.driver->stop(false);
         close_socket_when_idle();
         wake_all();
     }
@@ -596,6 +596,15 @@ private:
         auto& entry = *static_cast<slot*>(argument);
         auto& self = *entry.owner;
         const auto index = self.slot_of(entry);
+        const auto state = entry.connection->core().state();
+        if (const auto error = entry.driver->failure()) {
+            entry.closing = true;
+            entry.terminal_error = driver_error_code(*error);
+        } else if (state == connection_state::closing || state == connection_state::draining ||
+                   state == connection_state::closed) {
+            entry.closing = true;
+            if (!entry.terminal_error) entry.terminal_error = make_error_code(quic_errc::peer_closed);
+        }
         // The pumping driver is still running. Retired slots are reaped by
         // drive(), connection acceptance, and endpoint close instead.
         self.wake_connection(index);

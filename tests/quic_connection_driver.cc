@@ -1,9 +1,11 @@
 #include "quic/connection_driver.h"
+#include "eventloop/task_composition.h"
 #include <openssl/evp.h>
 #include <openssl/x509v3.h>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <vector>
 using namespace eventloop::quic::detail;
 static auto checked(bool value, int line) -> void
 { if (!value) { std::fprintf(stderr, "connection core check failed at line %d\n", line); std::abort(); } }
@@ -122,8 +124,89 @@ static auto notification_scenario() -> void
     (void)cancelled.take_result();
     check(loop.coroutine_statistics().live==0);
 }
+
+static auto receive_packet(event_loop&,udp_socket& peer,std::span<std::byte> buffer)
+    -> task<std::expected<udp_datagram,std::error_code>>
+{ co_return co_await peer.async_receive_from(buffer); }
+
+// The raw peer intentionally ignores the first close and sends another packet.
+// It must receive the cached close while the driver retains its route (10.2).
+static auto lost_close(event_loop& loop,connection_driver& driver,bounded_connection& server,
+    bounded_connection& client,udp_endpoint& endpoint,udp_socket& peer,buffers& storage,bool& done)
+    -> task<void>
+{
+    driver.stop_with_application_error(0x123);
+    auto input=std::as_writable_bytes(std::span(storage.plaintext));
+    auto first=co_await peer.async_receive_from(input);
+    check(first && first->size>=1200);
+    const std::vector<std::byte> cached(input.begin(),input.begin()+static_cast<std::ptrdiff_t>(first->size));
+    check(driver.run_active() && !driver.retired());
+    const auto pto=server.application_pto().value_or(1s);
+    const auto deadline=server.core().next_deadline(pto);
+    check(deadline && *deadline>lifecycle_time_point::clock::now());
+    // Initial packets must be padded to at least 1200 bytes even in closing.
+    std::fill(storage.frame.begin(),storage.frame.end(),0);
+    storage.frame[0]=1; // PING.
+    protected_packet_fields fields;
+    fields.kind=packet_kind::initial;
+    fields.destination_cid=dcid; fields.source_cid=dcid;
+    const auto size=client.core().build(fields,std::span(storage.frame).first(1200),
+                                      storage.encoded,storage.build_scratch);
+    check(size.has_value());
+    check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*size)),
+                                      endpoint.local_endpoint())).has_value());
+    auto second=co_await peer.async_receive_from(input);
+    check(second && std::ranges::equal(input.first(second->size),cached));
+    check(server.core().next_deadline(pto)==deadline);
+    // A full-sized retry earns credit, but cannot trigger a second immediate
+    // response. It is answered at the next PTO without extending retention.
+    check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*size)),
+                                      endpoint.local_endpoint())).has_value());
+    auto throttled=co_await with_timeout(loop,receive_packet(loop,peer,input),10ms);
+    check((throttled && throttled->state==timeout_result<
+        std::expected<udp_datagram,std::error_code>>::outcome::timed_out));
+    auto third=co_await peer.async_receive_from(input);
+    check(third && std::ranges::equal(input.first(third->size),cached));
+    check(server.core().next_deadline(pto)==deadline);
+    // Even a validated address cannot amplify unauthenticated closing traffic.
+    std::array<std::byte,32> tiny {};
+    tiny[0]=std::byte{0x40};
+    std::memcpy(tiny.data()+1,dcid.data(),dcid.size());
+    check((co_await peer.async_send_to(tiny,endpoint.local_endpoint())).has_value());
+    auto withheld=co_await with_timeout(loop,receive_packet(loop,peer,input),10ms);
+    check((withheld && withheld->state==timeout_result<
+        std::expected<udp_datagram,std::error_code>>::outcome::timed_out));
+    while (!driver.retired()) check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
+    check(server.core().state()==connection_state::closed);
+    check(lifecycle_time_point::clock::now()>=*deadline);
+    done=true;
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+static auto lost_close_scenario(contexts& context,std::uint32_t version) -> void
+{
+    event_loop loop;
+    auto owned=std::make_unique<udp_socket>(loop,ip_endpoint::loopback_v4());
+    auto* peer=owned.get();
+    const auto address=peer->local_endpoint();
+    loop.add(std::move(owned));
+    udp_endpoint endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    connection_callbacks callbacks{nullptr,valid_parameters,nullptr};
+    auto server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks,lifecycle_time_point::clock::now());
+    auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks,lifecycle_time_point::clock::now());
+    check(server->initialize(context.server.get(),{true,{},protocol,parameters},version,dcid).has_value());
+    check(client->initialize(context.client.get(),{false,"localhost",protocol,parameters},version,dcid).has_value());
+    auto driver=std::make_unique<connection_driver>(loop,endpoint,*server,dcid,dcid,address,true);
+    auto storage=std::make_unique<buffers>();
+    bool done=false,clean=false;
+    check(loop.spawn(receiver(loop,endpoint))==task_spawn_result::accepted);
+    check(loop.spawn(drive(loop,*driver,clean))==task_spawn_result::accepted);
+    check(loop.spawn(lost_close(loop,*driver,*server,*client,endpoint,*peer,*storage,done))==task_spawn_result::accepted);
+    (void)loop.run();
+    check(done && clean && loop.coroutine_statistics().live==0);
+}
 static auto queue_peer_close(bounded_connection& server,udp_endpoint& client_endpoint,
-                             ip_endpoint server_peer) -> void
+    ip_endpoint server_peer,bool trailing_ping=true) -> void
 {
     // Queue a close and another authenticated packet before the client
     // pump runs. The second packet must not turn peer closure into an
@@ -132,6 +215,7 @@ static auto queue_peer_close(bounded_connection& server,udp_endpoint& client_end
     protected_packet_fields fields; fields.kind=packet_kind::short_header;
     fields.destination_cid=dcid;
     for (const auto type : {0x1cU,0x01U}) {
+        if (type==0x01U && !trailing_ping) break;
         decoded_frame frame; frame.type=type;
         const auto encoded=encode_frame(frame,std::as_writable_bytes(std::span(buffer.frame)));
         check(encoded.has_value());
@@ -258,12 +342,19 @@ static auto observe(event_loop& loop,bounded_connection& client,bounded_connecti
     }
     else client_driver.stop();
     server_driver.stop();
-    // Drivers must retire their pending sends before endpoint shutdown.
+    // Draining retains the route through its deadline and sends no data.
     (void)co_await sleep_for(loop,10ms);
     if (delivered) {
-        check(client_driver.retired());
+        check(!client_driver.retired());
         check(client.core().state()==connection_state::draining);
+        const auto before=client.core().next_packet_number(tls_level::application);
+        queue_peer_close(server,client_endpoint,server_peer,false);
+        check(co_await sleep_for(loop,5ms)==timer_wait_result::expired);
+        check(client.core().next_packet_number(tls_level::application)==before);
     }
+    for (int attempt=0;attempt<4000 && (!client_driver.retired() || !server_driver.retired());++attempt)
+        (void)co_await sleep_for(loop,1ms);
+    check(client_driver.retired() && server_driver.retired());
     loop.shutdown(event_loop::clock::duration::zero());
 }
 int main()
@@ -273,6 +364,7 @@ int main()
 #endif
     contexts context;
     notification_scenario();
+    for (auto version : {version_1,version_2}) lost_close_scenario(context,version);
     for (auto version : {version_1,version_2}) {
         event_loop loop;
         udp_endpoint client_endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);

@@ -116,8 +116,9 @@ public:
     [[nodiscard]] auto async_read(std::uint64_t stream_id,
                                   std::span<std::byte> buffer)
         -> task<std::expected<std::size_t, std::error_code>>;
-    // Writes a full buffer; fin closes the send side. Returns the accepted
-    // byte count unless cancelled.
+    // Returns the accepted byte count, which can be smaller than the buffer.
+    // Retry the remainder; fin closes the send side only when all supplied
+    // bytes are accepted. The buffer remains borrowed through completion.
     [[nodiscard]] auto async_write(std::uint64_t stream_id,
                                    std::span<const std::byte> buffer, bool fin)
         -> task<std::expected<std::size_t, std::error_code>>;

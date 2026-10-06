@@ -175,14 +175,26 @@ private:
     bool tunnel_ {false};
 };
 
+// HTTP field names, methods, and Extended CONNECT protocol values are tokens.
+[[nodiscard]] constexpr auto valid_token(std::string_view text) noexcept -> bool
+{
+    if (text.empty()) return false;
+    for (unsigned char c : text)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') ||
+              std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) !=
+                  std::string_view::npos)) return false;
+    return true;
+}
+
 // Field rules shared by request headers and trailers (RFC 9114 4.2 and
 // 4.1.2): lowercase token names, no NUL/CR/LF in values, no connection-
 // specific fields, and TE limited to "trailers".
 [[nodiscard]] constexpr auto valid_regular_field(const field& f) noexcept -> bool
 {
-    if (f.name.empty()) return false;
+    if (!valid_token(f.name)) return false;
     for (unsigned char c : f.name)
-        if (c <= 0x20 || c >= 0x7f || (c >= 'A' && c <= 'Z') || c == ':') return false;
+        if (c >= 'A' && c <= 'Z') return false;
     for (unsigned char c : f.value)
         if (c == 0 || c == '\r' || c == '\n' || c == 0x7f) return false;
     if (f.name == "connection" || f.name == "keep-alive" || f.name == "proxy-connection" ||
@@ -248,17 +260,12 @@ struct request_head {
             head.content_length = value;
         }
     }
-    if (!have_method || head.method.empty()) return malformed;
+    if (!have_method || !valid_token(head.method)) return malformed;
     if (have_protocol) {
-        if (head.method != "CONNECT" || head.connect_protocol.empty() ||
+        if (head.method != "CONNECT" || !valid_token(head.connect_protocol) ||
             !have_scheme || head.scheme.empty() || !have_path || head.path.empty() ||
             head.path.front() != '/' || head.path.find('#') != std::string_view::npos ||
             !have_authority || head.authority.empty()) return malformed;
-        for (unsigned char c : head.connect_protocol)
-            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                  (c >= '0' && c <= '9') ||
-                  std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) !=
-                      std::string_view::npos)) return malformed;
     } else if (head.method == "CONNECT") {
         // Plain CONNECT names only an authority (4.4).
         if (have_scheme || have_path || !have_authority || head.authority.empty())

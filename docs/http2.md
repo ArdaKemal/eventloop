@@ -37,6 +37,10 @@ required for changes confined to this protocol.
 
 ## Routed handlers, flow control, and cancellation
 
+A SETTINGS_INITIAL_WINDOW_SIZE change that overflows any stream's send window
+ends the connection with FLOW_CONTROL_ERROR (RFC 9113 6.9.2). A stream's
+WINDOW_UPDATE that overflows only that stream remains a stream error.
+
 - HTTP/2 runs one handler task per stream, up to 32 per connection, next to
   a reader task and the connection task, which writes. A handler's
   `async_write` completes once its bytes enter the connection's 256 KiB

@@ -37,11 +37,10 @@ public:
     }
     connection_driver(const connection_driver&)=delete;
     auto operator=(const connection_driver&)-> connection_driver& = delete;
-    // A local close: stop after sending one transport CONNECTION_CLOSE with
-    // NO_ERROR (RFC 9000 10.2). The closing period is not retained; late peer
-    // packets are dropped.
-    auto stop() noexcept -> void
-    { check_owner(); if (!close_frame_) close_frame_={0x1c,0x00}; stopped_=true; notify(); }
+    // Endpoint shutdown may end retention early because it closes the socket
+    // (RFC 9000 10.2). Otherwise retain the route through three current PTOs.
+    auto stop(bool retain = true) noexcept -> void
+    { check_owner(); if (!retain) retain_close_=false; if (!close_frame_) close_frame_={0x1c,0x00}; stopped_=true; notify(); }
     // As stop(), with an application CONNECTION_CLOSE (RFC 9000 19.19). Before
     // 1-RTT keys exist it is sent as APPLICATION_ERROR in a transport close
     // (10.2.3). The first close requested wins.
@@ -64,6 +63,7 @@ public:
     { check_owner(); initial_token_=token; }
     [[nodiscard]] auto retired() const noexcept -> bool { return started_ && !running_; }
     [[nodiscard]] auto run_active() const noexcept -> bool { return running_; }
+    [[nodiscard]] auto failure() const noexcept -> std::optional<connection_error> { return failure_; }
     [[nodiscard]] auto initiate_key_update() -> std::expected<void, key_update_error>
     {
         check_owner();
@@ -153,7 +153,18 @@ private:
     static auto enqueue(void* argument,std::span<const std::byte>,const packet_header& header,ip_endpoint peer) noexcept -> bool
     {
         auto& self=*static_cast<connection_driver*>(argument);
-        if (self.stopped_ || self.count_==queue_capacity || header.packet.size()>packet_capacity) {
+        if (self.stopped_) {
+            // Closing does not decrypt/dispatch new frames. Credit limits
+            // cached responses even when the routed peer address is validated.
+            if (self.connection_.core().state()==connection_state::closing && self.close_size_) {
+                const bool ready=self.close_credit_>=self.close_size_;
+                self.close_credit_=std::min(self.close_size_,self.close_credit_+
+                    3*std::min(self.close_size_,header.packet.size()));
+                if (!ready && self.close_credit_>=self.close_size_) self.notify();
+            }
+            ++self.dropped_; return true;
+        }
+        if (self.count_==queue_capacity || header.packet.size()>packet_capacity) {
             ++self.dropped_; return true;
         }
         auto& slot=self.queue_[(self.head_+self.count_)%queue_capacity];
@@ -186,7 +197,7 @@ private:
                 }
                 const auto received=connection_.receive(std::span(packet.bytes).first(packet.size),0,
                     local_size_,packet_scratch_,plaintext_,auth_scratch_,
-                    now,std::chrono::seconds(1));
+                    now,connection_.application_pto().value_or(std::chrono::seconds(1)));
                 head_=(head_+1)%queue_capacity; --count_;
                 if (!received) {
                     if (received.error()==connection_error::authentication_failed ||
@@ -194,8 +205,8 @@ private:
                         received.error()==connection_error::malformed_packet) continue;
                     return std::unexpected(received.error());
                 }
-                // A peer close enters draining during receive(). Retire before
-                // processing queued/coalesced packets or preparing another send.
+                // A peer close enters draining during receive(). Stop data
+                // processing now; pump() retains the route without sending.
                 const auto state=connection_.core().state();
                 if (state==connection_state::closing || state==connection_state::draining ||
                     state==connection_state::closed) {
@@ -387,9 +398,7 @@ private:
         if (*sent) ++self.candidate_attempts_;
         co_return std::expected<void,connection_error>{};
     }
-    // Runs the packet loop, then sends at most one CONNECTION_CLOSE before
-    // retiring: a transport close after a local failure, or the requested
-    // application close. running_ stays set until that send completes.
+    // Application work ends before the route's closing/draining retention.
     static auto pump(event_loop& loop,connection_driver& self) -> task<std::expected<void,connection_error>>
     {
         self.check_owner();
@@ -401,6 +410,8 @@ private:
         // Event-loop shutdown cancels this task too, so its sends would fail.
         const bool cancelled=!outcome && outcome.error()==task_result::cancelled;
         const auto result=unwrap_task(std::move(outcome));
+        self.stopped_=true;
+        if (!result) self.failure_=result.error();
         if (cancelled) {
         } else if (!result) {
             if (const auto code=transport_close_code(self,result.error()))
@@ -408,7 +419,36 @@ private:
         } else if (self.close_frame_) {
             (void)co_await send_close(loop,self,self.close_frame_->first,self.close_frame_->second);
         }
+        if (self.progress_) self.progress_(self.progress_argument_);
+        if (!cancelled && self.retain_close_ &&
+            (self.connection_.core().state()==connection_state::closing ||
+             self.connection_.core().state()==connection_state::draining))
+            (void)co_await retain_close(loop,self);
         co_return result;
+    }
+
+    static auto retain_close(event_loop& loop,connection_driver& self) -> task<void>
+    {
+        (void)loop;
+        const auto pto=self.connection_.application_pto().value_or(std::chrono::seconds(1));
+        auto& core=self.connection_.core();
+        while (self.retain_close_) {
+            const auto now=lifecycle_time_point::clock::now();
+            if (!core.poll(now,pto) || core.state()==connection_state::closed) break;
+            if (core.state()==connection_state::closing && self.close_size_ &&
+                self.close_credit_>=self.close_size_ && now>=self.close_reply_due_) {
+                const auto sent=flatten_result(co_await self.endpoint_.async_send(self.route_,
+                    std::as_bytes(std::span(self.output_).first(self.close_size_))));
+                if (!sent && sent.error().value()!=EAGAIN &&
+                    sent.error().value()!=EWOULDBLOCK && sent.error().value()!=EBUSY) break;
+                if (sent) self.close_credit_=0;
+                self.close_reply_due_=lifecycle_deadline(now,pto);
+            }
+            auto deadline=core.next_deadline(pto).value_or(lifecycle_time_point::max());
+            if (self.close_size_ && self.close_credit_>=self.close_size_)
+                deadline=std::min(deadline,self.close_reply_due_);
+            if (!co_await idle_wait(self,deadline)) break;
+        }
     }
     // RFC 9000 20.1 codes for local failures. Stream and flow violations in
     // peer frames are reported as PROTOCOL_VIOLATION, which 20.1 permits when
@@ -546,11 +586,12 @@ private:
         const auto built=core.build(fields,
             {self.packet_scratch_.data(),size},self.output_,self.build_scratch_);
         if (!built) co_return;
-        // Best effort: a lost close leaves the peer to its idle timeout.
-        (void)co_await self.endpoint_.async_send(self.route_,
-            std::as_bytes(std::span(self.output_).first(*built)));
+        const auto sent=flatten_result(co_await self.endpoint_.async_send(self.route_,
+            std::as_bytes(std::span(self.output_).first(*built))));
+        if (!sent) co_return;
         const auto now=lifecycle_time_point::clock::now();
-        (void)core.close_sent(now,self.connection_.application_pto().value_or(std::chrono::seconds(1)));
+        if (core.close_sent(now,self.connection_.application_pto().value_or(std::chrono::seconds(1))))
+            self.close_size_=*built;
     }
     event_loop& loop_;
     udp_endpoint& endpoint_;
@@ -572,6 +613,10 @@ private:
     std::uint8_t probes_{};
     // Requested CONNECTION_CLOSE frame type and error code.
     std::optional<std::pair<std::uint64_t,std::uint64_t>> close_frame_{};
+    std::optional<connection_error> failure_{};
+    std::size_t close_size_{},close_credit_{};
+    lifecycle_time_point close_reply_due_{};
+    bool retain_close_{true};
     void* progress_argument_{};
     idle_wait* idle_ {};
     void (*progress_)(void*) noexcept {};

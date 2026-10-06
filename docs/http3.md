@@ -118,7 +118,8 @@ one request reset the response and send STOP_SENDING with the same code,
 and the connection continues. A malformed request is `H3_MESSAGE_ERROR`:
 missing, duplicate, unknown, or late pseudo-header fields (including
 `:protocol` when Extended CONNECT is disabled), an empty `:path` or missing authority for `http`/`https`,
-`:authority` and Host that disagree, uppercase or invalid field names,
+`:authority` and Host that disagree, uppercase or non-token field names,
+an empty or non-token method,
 NUL, CR, LF, or DEL in values, connection-specific fields, TE other than
 `trailers`, a non-numeric or conflicting Content-Length, DATA whose total
 differs from Content-Length, or a pseudo-header in trailers. A stream

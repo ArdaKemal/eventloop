@@ -433,16 +433,27 @@ private:
         const auto header_size = h3::encode_frame_header(h3::data_frame, data.size(),
                                                          buffer.first(16));
         if (!header_size) co_return std::unexpected(failure(std::errc::message_size));
-        std::expected<std::size_t, std::error_code> written;
-        if (data.size() <= buffer.size() - *header_size) {
+        const bool contiguous = data.size() <= buffer.size() - *header_size;
+        if (contiguous) {
             // Small writes go out as one contiguous frame.
             std::memcpy(buffer.data() + *header_size, data.data(), data.size());
-            written = flatten_result(co_await self.connection_.async_write(self.id_,
-                buffer.first(*header_size + data.size()), false));
-        } else {
-            written = flatten_result(co_await self.connection_.async_write(self.id_,
-                          buffer.first(*header_size), false));
-            if (written) written = flatten_result(co_await self.connection_.async_write(self.id_, data, false));
+        }
+        std::span<const std::byte> pending = buffer.first(
+            *header_size + (contiguous ? data.size() : 0));
+        bool payload_pending = !contiguous;
+        std::expected<std::size_t, std::error_code> written;
+        for (;;) {
+            written = flatten_result(co_await self.connection_.async_write(self.id_, pending, false));
+            if (!written) break;
+            if (*written == 0 || *written > pending.size()) {
+                written = std::unexpected(failure(std::errc::connection_reset));
+                break;
+            }
+            pending = pending.subspan(*written);
+            if (!pending.empty()) continue;
+            if (!payload_pending) break;
+            pending = data;
+            payload_pending = false;
         }
         if (!written) {
             if (self.websocket_aborted)

@@ -73,3 +73,10 @@ Extended CONNECT-capable peer is required; the example does not implement an
 HTTP/1.1 WebSocket handshake. Session setup and framing storage may allocate.
 As with other HTTP/3 handlers, size the loop's 2048-byte coroutine-frame class
 for simultaneous long-lived requests.
+
+`tests/run_http_websocket_interop.py` exercises that public example with
+independent hyper-h2, wsproto, and aioquic 1.3.0 peers. If those optional Python
+packages are installed in `Python3_EXECUTABLE`, CMake registers
+`http_websocket_interop`. It checks negotiation, concurrent HTTP and WebSocket
+streams, fragmentation and Ping/Pong, flow control, Close/FIN ordering, and
+reset isolation over HTTP/2 and HTTP/3 with QUIC v1 and v2.

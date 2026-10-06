@@ -165,6 +165,40 @@ auto skipped_stream_id_is_protocol_error() -> void
     check(error_of(state, 7, 0) == protocol_error, "lower unused stream id");
 }
 
+auto window_overflow_error_scope() -> void
+{
+    // WINDOW_UPDATE overflow is confined to its stream; a SETTINGS change
+    // that overflows any stream window is a connection error (RFC 9113 6.9).
+    for (bool settings : {false, true}) {
+        session state;
+        connect(state);
+        get(state, 1, 4);
+        const std::array<std::byte, 4> to_maximum {
+            std::byte{0x7f}, std::byte{0xff}, std::byte{0}, std::byte{0}};
+        std::vector<std::byte> input;
+        frame(input, 8, 0, 1, to_maximum);
+        feed(state, input);
+        check(!state.closed() && error_of(state, 3, 1) == ~0u, "maximum stream window is valid");
+        drain(state);
+        input.clear();
+        if (settings) {
+            const std::array<std::byte, 6> increase_initial {
+                std::byte{0}, std::byte{4}, std::byte{0}, std::byte{1}, std::byte{0}, std::byte{0}};
+            frame(input, 4, 0, 0, increase_initial);
+        } else {
+            const std::array<std::byte, 4> increment {
+                std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}};
+            frame(input, 8, 0, 1, increment);
+        }
+        feed(state, input);
+        check(error_of(state, settings ? 7 : 3, settings ? 0 : 1) == 3,
+              settings ? "SETTINGS window overflow sends GOAWAY FLOW_CONTROL_ERROR"
+                       : "WINDOW_UPDATE overflow sends RST_STREAM FLOW_CONTROL_ERROR");
+        drain(state);
+        check(state.closed() == settings, "only SETTINGS overflow ends the connection");
+    }
+}
+
 auto extended_handler(eventloop::event_loop&, eventloop::http::request&,
                       eventloop::http::response&) -> eventloop::task<void> { co_return; }
 
@@ -233,5 +267,6 @@ int main()
     frames_after_peer_reset_are_stream_errors();
     frames_racing_local_reset_are_discarded();
     skipped_stream_id_is_protocol_error();
+    window_overflow_error_scope();
     extended_connect();
 }

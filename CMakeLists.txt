@@ -1717,6 +1717,17 @@ if(BUILD_TESTING)
 
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        execute_process(COMMAND "${Python3_EXECUTABLE}" -c
+            "import h2, wsproto, aioquic; assert aioquic.__version__ == '1.3.0'"
+            RESULT_VARIABLE http_websocket_interop_available
+            OUTPUT_QUIET ERROR_QUIET)
+        if(http_websocket_interop_available EQUAL 0)
+            add_test(NAME http_websocket_interop
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http_websocket_interop.py"
+                    $<TARGET_FILE:websocket_routing_server> ${OPENSSL_EXECUTABLE})
+            set_tests_properties(http_websocket_interop PROPERTIES TIMEOUT 50)
+        endif()
         add_test(NAME http2_file_transfer
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http2_file_transfer.py"

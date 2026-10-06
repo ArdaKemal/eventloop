@@ -197,6 +197,19 @@ auto fields() -> void
     check(malformed(request({{":protocol", "websocket"}})), ":protocol without extended CONNECT");
     check(malformed(request({{":status", "200"}})), "response pseudo-header");
     check(malformed(request({{"Accept", "*/*"}})), "uppercase field name");
+    for (auto name : {"x(foo", "x)foo", "x/foo", "x[foo", "x\\foo", "x=foo", "x,foo", "x\"foo"}) {
+        check(malformed(request({{name, "value"}})), "field name must be a token");
+        const auto trailer = validate_trailers(list {{name, "value"}});
+        check(!trailer && trailer.error() == h3_error::message_error, "trailer name must be a token");
+    }
+    check(validate(request({{"x!#$%&'*+-.^_`|~", "value"}})).has_value(),
+          "all permitted field-name punctuation remains valid");
+    for (auto method : {"BAD METHOD", "GET/", "GET\t", "(GET)", "GET\x80"})
+        check(malformed({{":method", method}, {":scheme", "https"}, {":authority", "example.com"},
+                         {":path", "/"}}), "method must be a token");
+    check(validate({{":method", "CUSTOM-METHOD"}, {":scheme", "https"},
+                    {":authority", "example.com"}, {":path", "/"}}).has_value(),
+          "extension methods remain valid");
     check(malformed(request({{"x-bad", "a\r\nb"}})), "CR LF in value");
     for (auto name : {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"})
         check(malformed(request({{name, "x"}})), "connection-specific field");

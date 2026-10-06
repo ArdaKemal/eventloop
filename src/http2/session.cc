@@ -937,7 +937,8 @@ auto session::dispatch_settings() -> void
                 if (!stream_value.active) continue;
                 stream_value.send_window += delta;
                 if (stream_value.send_window > max_window_size) {
-                    stream_error(stream_value.id, flow_control_error);
+                    connection_error(flow_control_error);
+                    return;
                 }
             }
         } else if (id == 5 &&
