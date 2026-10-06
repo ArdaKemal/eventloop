@@ -1,5 +1,6 @@
 #include "eventloop/task.h"
 
+#include <array>
 #include <atomic>
 #include <pthread.h>
 #include <cerrno>
@@ -59,6 +60,15 @@ auto wait_until(event_loop& loop, event_loop::clock::time_point deadline,
     if (stop) loop.stop();
 }
 
+auto post_after_blocking(event_loop& loop, bool& ran) -> task<void>
+{
+    (void)co_await run_blocking(loop, []() noexcept {});
+    if (!loop.post(execution_task([&]() noexcept {
+            ran = true;
+            loop.stop();
+        }))) loop.stop();
+}
+
 auto post_tests() -> bool
 {
     {
@@ -93,6 +103,21 @@ auto post_tests() -> bool
             !on_loop.load()) return false;
     }
     {
+        // A worker completion resumes a coroutine that posts on the owner
+        // thread; that post relies on the owner's local hint, not a wakeup.
+        event_loop loop(event_loop_options {.worker_count = 1});
+        bool ran = false;
+        if (loop.spawn(post_after_blocking(loop, ran)) !=
+            task_spawn_result::accepted) return false;
+        std::thread stopper([&] {
+            std::this_thread::sleep_for(2s);
+            loop.stop();
+        });
+        const auto result = loop.run();
+        stopper.join();
+        if (result != event_loop_result::stopped || !ran) return false;
+    }
+    {
         event_loop loop(event_loop_options {.post_capacity = 2});
         int count = 0;
         execution_task empty;
@@ -111,6 +136,169 @@ auto post_tests() -> bool
         }
     }
     return true;
+}
+
+auto blocking_completions(event_loop& loop, std::size_t count,
+                          std::size_t& completed) -> task<void>
+{
+    for (std::size_t index = 0; index < count; ++index) {
+        auto result = co_await run_blocking(loop, []() noexcept {});
+        if (result) ++completed;
+    }
+}
+
+auto blocking_ping_pong(event_loop& loop, std::size_t count,
+                        bool& passed) -> task<void>
+{
+    std::size_t completed = 0;
+    co_await blocking_completions(loop, count, completed);
+    passed = completed == count;
+    loop.stop();
+}
+
+// One publisher in lockstep with the owner: each publication races the
+// owner's return to its poll with no other publisher to mask a lost wakeup.
+auto wakeup_ping_pong_test() -> bool
+{
+    constexpr std::size_t iterations = 100'000;
+    std::atomic<bool> timed_out {false};
+    std::atomic<bool> finished {false};
+    const auto watch = [&](event_loop& loop) {
+        return std::thread([&] {
+            const auto deadline = std::chrono::steady_clock::now() + 20s;
+            while (!finished.load()) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    timed_out.store(true);
+                    loop.stop();
+                    return;
+                }
+                std::this_thread::sleep_for(1ms);
+            }
+        });
+    };
+    {
+        event_loop loop;
+        std::atomic<std::size_t> executed {0};
+        std::thread watchdog = watch(loop);
+        std::thread producer([&] {
+            for (std::size_t index = 0; index < iterations; ++index) {
+                if (!loop.post(execution_task([&]() noexcept {
+                        executed.fetch_add(1, std::memory_order_release);
+                    }))) break;
+                while (executed.load(std::memory_order_acquire) == index) {
+                    if (timed_out.load()) return;
+                }
+            }
+            loop.stop();
+        });
+        const auto result = loop.run();
+        producer.join();
+        finished.store(true);
+        watchdog.join();
+        if (result != event_loop_result::stopped || timed_out.load() ||
+            executed.load() != iterations) return false;
+    }
+    finished.store(false);
+    {
+        event_loop loop(event_loop_options {.worker_count = 1});
+        bool passed = false;
+        std::thread watchdog = watch(loop);
+        if (loop.spawn(blocking_ping_pong(loop, iterations, passed)) !=
+            task_spawn_result::accepted) return false;
+        const auto result = loop.run();
+        finished.store(true);
+        watchdog.join();
+        if (result != event_loop_result::stopped || timed_out.load() ||
+            !passed) return false;
+    }
+    return true;
+}
+
+// Producers alternate pressure bursts with waits that let the owner block in
+// its poll, while worker completions publish to the second queue. A lost
+// wakeup leaves a producer or root waiting until the watchdog stops the loop.
+auto cross_thread_wakeup_stress_test() -> bool
+{
+    constexpr std::size_t producer_count = 4;
+    constexpr std::size_t rounds = 2'000;
+    constexpr std::size_t root_count = 16;
+    constexpr std::size_t completions_per_root = 500;
+
+    event_loop loop(event_loop_options {.worker_count = 4});
+    std::array<std::atomic<std::size_t>, producer_count> executed {};
+    std::array<std::size_t, producer_count> posted {};
+    std::atomic<bool> timed_out {false};
+    std::atomic<bool> finished {false};
+    std::size_t completions = 0;
+    for (std::size_t root = 0; root < root_count; ++root) {
+        if (loop.spawn(blocking_completions(loop, completions_per_root,
+                                            completions)) !=
+            task_spawn_result::accepted) return false;
+    }
+
+    std::array<std::thread, producer_count> producers;
+    for (std::size_t id = 0; id < producer_count; ++id) {
+        producers[id] = std::thread([&, id] {
+            for (std::size_t round = 0; round < rounds; ++round) {
+                const std::size_t burst = (round * 7 + id * 13) % 100 + 1;
+                for (std::size_t index = 0; index < burst; ++index) {
+                    execution_task task([&, id]() noexcept {
+                        executed[id].fetch_add(1, std::memory_order_release);
+                    });
+                    while (!loop.post(std::move(task))) {
+                        if (timed_out.load()) return;
+                        std::this_thread::yield();
+                    }
+                    ++posted[id];
+                }
+                if (round % 2 != 0) continue;
+                while (executed[id].load(std::memory_order_acquire) !=
+                       posted[id]) {
+                    if (timed_out.load()) return;
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+    std::thread watchdog([&] {
+        const auto deadline = std::chrono::steady_clock::now() + 20s;
+        while (!finished.load()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                timed_out.store(true);
+                loop.stop();
+                return;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+    std::thread joiner([&] {
+        for (auto& producer : producers) producer.join();
+        // Producer counts are final; the owner checks them from a task.
+        for (;;) {
+            execution_task check([&]() noexcept {
+                bool all = completions == root_count * completions_per_root;
+                for (std::size_t id = 0; id < producer_count; ++id) {
+                    all = all && executed[id].load() == posted[id];
+                }
+                if (all) {
+                    finished.store(true);
+                    loop.stop();
+                }
+            });
+            while (!loop.post(std::move(check))) std::this_thread::yield();
+            for (int wait = 0; wait < 100 && !finished.load() &&
+                               !timed_out.load(); ++wait) {
+                std::this_thread::sleep_for(1ms);
+            }
+            if (finished.load() || timed_out.load()) return;
+        }
+    });
+
+    const auto result = loop.run();
+    joiner.join();
+    finished.store(true);
+    watchdog.join();
+    return result == event_loop_result::stopped && !timed_out.load();
 }
 
 auto executor_integration_test() -> bool
@@ -306,6 +494,8 @@ auto main() -> int
     if (!sigpipe_test()) return 1;
 #endif
     if (!post_tests()) return 1;
+    if (!wakeup_ping_pong_test()) return 1;
+    if (!cross_thread_wakeup_stress_test()) return 1;
     if (!executor_integration_test()) return 1;
     if (!timer_tests()) return 1;
     if (!timer_arm_failure_test()) return 1;

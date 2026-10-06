@@ -2,11 +2,14 @@
 // HTTP/2, and HTTP/3, so a load generator can compare the two paths.
 //
 //   routing_benchmark_server <document-root> <certificate> <key> <base-port>
-//                            [open-file-cache-capacity]
+//                            [open-file-cache-capacity [blocking-workers
+//                            [blocking-microseconds]]]
 //
 // HTTP/1.1 listens on base-port, HTTPS on base-port + 1, and HTTP/3 on UDP
 // base-port + 2. GET /routed answers from memory with as many bytes as
 // <document-root>/payload.bin, which static requests fetch as /payload.bin.
+// GET /blocking first sleeps on a worker through run_blocking(), standing in
+// for a database query (default 16 workers, 100 us), then sends the payload.
 #include "eventloop/event_loop.h"
 #include "eventloop/http/http3_server.h"
 #include "eventloop/http/router.h"
@@ -16,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -27,6 +31,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace eventloop;
@@ -34,12 +39,34 @@ using namespace eventloop;
 namespace {
 
 std::vector<std::byte> payload;
+std::chrono::microseconds query_time {100};
+
+constexpr std::array<http::header, 1> fields {{
+    {"content-type", "application/octet-stream"}}};
 
 auto routed(event_loop&, http::request&, http::response& response) -> task<void>
 {
-    static constexpr std::array<http::header, 1> fields {{
-        {"content-type", "application/octet-stream"}}};
     (void)co_await response.async_send(200, fields, payload);
+}
+
+auto blocking(event_loop& loop, http::request&, http::response& response) -> task<void>
+{
+    const auto queried = co_await run_blocking(loop, []() noexcept {
+        std::this_thread::sleep_for(query_time);
+    });
+    if (!queried) {
+        (void)co_await response.async_send(503, {}, {});
+        co_return;
+    }
+    (void)co_await response.async_send(200, fields, payload);
+}
+
+[[nodiscard]] auto parse_count(std::string_view text, const char* name) -> std::size_t
+{
+    std::size_t value = 0;
+    if (std::from_chars(text.data(), text.data() + text.size(), value).ec != std::errc {})
+        throw std::invalid_argument(std::string(name) + " must be a number");
+    return value;
 }
 
 template<typename Listener>
@@ -55,9 +82,10 @@ event_loop* running = nullptr;
 
 auto main(int argc, char** argv) -> int
 {
-    if (argc != 5 && argc != 6) {
+    if (argc < 5 || argc > 8) {
         std::cerr << "usage: routing_benchmark_server <document-root> <certificate> <key> "
-                     "<base-port> [open-file-cache-capacity]\n";
+                     "<base-port> [open-file-cache-capacity [blocking-workers "
+                     "[blocking-microseconds]]]\n";
         return 1;
     }
     try {
@@ -74,20 +102,24 @@ auto main(int argc, char** argv) -> int
             throw std::invalid_argument("base port must be 1..65533");
 
         auto routes = std::make_shared<http::router>();
-        if (!routes->add(http::method_type::get, "/routed", routed))
-            throw std::runtime_error("register /routed");
-        std::size_t cache_capacity = 0;
-        if (argc == 6) {
-            const std::string_view text = argv[5];
-            if (std::from_chars(text.data(), text.data() + text.size(), cache_capacity).ec !=
-                    std::errc {})
-                throw std::invalid_argument("open file cache capacity must be a number");
+        if (!routes->add(http::method_type::get, "/routed", routed) ||
+            !routes->add(http::method_type::get, "/blocking", blocking))
+            throw std::runtime_error("register routes");
+        const std::size_t cache_capacity =
+            argc > 5 ? parse_count(argv[5], "open file cache capacity") : 0;
+        const std::size_t workers = argc > 6 ? parse_count(argv[6], "blocking workers") : 16;
+        if (workers == 0) throw std::invalid_argument("blocking workers must be positive");
+        if (argc > 7) {
+            query_time = std::chrono::microseconds(
+                parse_count(argv[7], "blocking microseconds"));
         }
         const http::server_options options {.routes = routes, .document_root = root,
                                             .open_file_cache_capacity = cache_capacity};
 
         // Size the coroutine pools for many concurrent HTTP/3 requests.
-        event_loop_options loop_options;
+        // Admit one blocking query per concurrent request.
+        event_loop_options loop_options {.worker_count = workers,
+                                         .coroutine_completion_capacity = 4096};
         for (auto& capacity : loop_options.coroutine_frame_capacities)
             capacity = std::max<std::size_t>(capacity, 1024);
         event_loop loop(loop_options);

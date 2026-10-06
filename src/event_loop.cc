@@ -561,7 +561,30 @@ public:
         if (!coroutine_completions.try_push(std::move(completion))) {
             std::terminate();
         }
-        poller.wake();
+        notify();
+    }
+
+    // Called after a cross-thread push. Only the first publisher since the
+    // owner's last claim writes the backend wake notifier.
+    auto notify() noexcept -> void
+    {
+        if (!wake_pending.exchange(true, std::memory_order_release)) {
+            poller.wake();
+        }
+    }
+
+    // The owner claims all notifications published so far before draining.
+    // Both sides use read-modify-writes on one atomic: a publisher that set
+    // the flag before this exchange is synchronized with, so its push is
+    // visible to the drain; one that sets it after observes false and wakes.
+    auto drain_queues() -> void
+    {
+        local_post_pending = false;
+        (void)wake_pending.exchange(false, std::memory_order_acquire);
+        const bool more_posted = drain_posted();
+        const bool more_completions = drain_coroutine_completions();
+        // Drained tasks may also have set the hint with same-thread posts.
+        if (more_posted || more_completions) local_post_pending = true;
     }
 
     [[nodiscard]] auto submit_blocking(execution_task&& work) noexcept
@@ -871,6 +894,9 @@ public:
     // continuations and same-thread posts use posted_tasks without writing
     // to the backend wake notifier.
     bool local_post_pending {false};
+    // Set by the first cross-thread publisher after the owner's last drain;
+    // while set, a backend wakeup or owner drain is already due.
+    std::atomic<bool> wake_pending {false};
     bounded_task_queue coroutine_completions;
     const std::size_t coroutine_completion_capacity;
     std::atomic<std::size_t> reserved_coroutine_completions {0};
@@ -965,6 +991,11 @@ auto event_loop::run() -> event_loop_result
             }
         } catch (...) {
             if (result.event_count != 0) implementation_->finish_dispatch();
+            // wake_pending stays set until a drain claims it, so the
+            // consumed wakeup must still lead to one.
+            if (result.wake_requested) {
+                implementation_->local_post_pending = true;
+            }
             throw;
         }
 
@@ -972,13 +1003,7 @@ auto event_loop::run() -> event_loop_result
         implementation_->drain_completed_roots();
 
         if (result.wake_requested || implementation_->local_post_pending) {
-            implementation_->local_post_pending = false;
-            const bool more_posted = implementation_->drain_posted();
-            const bool more_completions =
-                implementation_->drain_coroutine_completions();
-            if (more_posted || more_completions) {
-                implementation_->local_post_pending = true;
-            }
+            implementation_->drain_queues();
             implementation_->drain_completed_roots();
         }
         if (result.timer_requested) {
@@ -1145,7 +1170,7 @@ auto event_loop::post(execution_task&& task) noexcept -> bool
     if (!implementation_->posted_tasks.try_push(std::move(task))) {
         return false;
     }
-    implementation_->poller.wake();
+    implementation_->notify();
     return true;
 }
 
