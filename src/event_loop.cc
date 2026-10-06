@@ -573,19 +573,6 @@ public:
         }
     }
 
-    // The owner claims all notifications published so far before draining.
-    // Both sides use read-modify-writes on one atomic: a publisher that set
-    // the flag before this exchange is synchronized with, so its push is
-    // visible to the drain; one that sets it after observes false and wakes.
-    auto drain_queues() -> void
-    {
-        local_post_pending = false;
-        (void)wake_pending.exchange(false, std::memory_order_acquire);
-        const bool more_posted = drain_posted();
-        const bool more_completions = drain_coroutine_completions();
-        // Drained tasks may also have set the hint with same-thread posts.
-        if (more_posted || more_completions) local_post_pending = true;
-    }
 
     [[nodiscard]] auto submit_blocking(execution_task&& work) noexcept
         -> detail::blocking_submission_result
@@ -640,14 +627,6 @@ public:
         if (!deadline) poller.arm_timer(std::nullopt);
         else poller.arm_timer(*deadline - event_loop::clock::now());
         armed_deadline = deadline;
-    }
-
-    // Checked after each dispatch, so a deadline that passes while a batch
-    // runs is serviced before the next poll, however many descriptors are
-    // ready.
-    [[nodiscard]] auto timer_due() const noexcept -> bool
-    {
-        return armed_deadline && event_loop::clock::now() >= *armed_deadline;
     }
 
     auto add_timer(event_loop::clock::time_point deadline,
@@ -943,7 +922,8 @@ auto event_loop::run() -> event_loop_result
             return event_loop_result::stopped;
         }
         const auto result = implementation_->poller.poll(
-            events, implementation_->local_post_pending);
+            events, implementation_->local_post_pending ||
+                        implementation_->wake_pending.load(std::memory_order_relaxed));
         if (result.event_count != 0) ++implementation_->dispatch_depth;
 
         try {
@@ -979,22 +959,32 @@ auto event_loop::run() -> event_loop_result
             }
         } catch (...) {
             if (result.event_count != 0) implementation_->finish_dispatch();
-            // wake_pending stays set until a drain claims it, so the
-            // consumed wakeup must still lead to one.
-            if (result.wake_requested) {
-                implementation_->local_post_pending = true;
-            }
             throw;
         }
 
         if (result.event_count != 0) implementation_->finish_dispatch();
         implementation_->drain_completed_roots();
 
-        if (result.wake_requested || implementation_->local_post_pending) {
-            implementation_->drain_queues();
+        // Queues and timers are checked after every batch: their poller
+        // notifications can wait behind every ready socket under load.
+        if (implementation_->local_post_pending ||
+            implementation_->wake_pending.load(std::memory_order_relaxed)) {
+            implementation_->local_post_pending = false;
+            // Claims every notification published so far. A publisher whose
+            // exchange came first is synchronized with, so its push is
+            // visible below; a later one sees false and wakes the poller.
+            (void)implementation_->wake_pending.exchange(
+                false, std::memory_order_acquire);
+            const bool more_posted = implementation_->drain_posted();
+            const bool more_completions =
+                implementation_->drain_coroutine_completions();
+            if (more_posted || more_completions) {
+                implementation_->local_post_pending = true;
+            }
             implementation_->drain_completed_roots();
         }
-        if (result.timer_requested || implementation_->timer_due()) {
+        const auto& deadline = implementation_->armed_deadline;
+        if (deadline && clock::now() >= *deadline) {
             implementation_->run_due_timers();
             implementation_->drain_completed_roots();
         }

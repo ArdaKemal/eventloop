@@ -8,6 +8,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstddef>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -392,54 +393,52 @@ auto interrupted_wait_test() -> bool
            finished >= deadline && finished - deadline < 2s;
 }
 
-// About 200 descriptors stay ready, more than one poll batch returns. A
-// timer that becomes due while a batch is dispatched must run before the
-// next batch instead of waiting for the poller to report it.
+// About 200 descriptors stay ready, more than one poll batch returns. Work
+// that becomes due or is posted while a batch is dispatched must run within
+// a batch or two instead of waiting for the poller to return its descriptor
+// behind every ready socket.
 struct ready_ring {
-    std::size_t completions {0};
-    std::size_t timer_delay {0};
-    bool timer_fired {false};
+    std::atomic<std::size_t> completions {0};
+    std::size_t delay {0};
+    bool fired {false};
     bool stopping {false};
+    // Runs once, inside a completion, when the ring is in steady state.
+    std::function<void()> trigger;
 };
 
 constexpr std::size_t ring_pairs = 200;
 constexpr std::size_t batch_capacity = 64;
 
-auto timer_after_batch(event_loop& loop, ready_ring& ring) -> task<void>
+auto finish_ring(event_loop& loop, ready_ring& ring, std::size_t since) -> void
 {
-    const auto registered = ring.completions;
-    (void)co_await sleep_until(loop, event_loop::clock::now() + 1us);
-    ring.timer_delay = ring.completions - registered;
-    ring.timer_fired = true;
+    const auto now = ring.completions.load(std::memory_order_relaxed);
+    ring.delay = now > since ? now - since : 0;
+    ring.fired = true;
     ring.stopping = true;
     loop.stop();
 }
 
-auto ring_peer(event_loop& loop, tcp_stream& stream, bool first,
-               ready_ring& ring) -> task<void>
+auto ring_peer(event_loop&, tcp_stream& stream, bool first, ready_ring& ring)
+    -> task<void>
 {
     std::array<std::byte, 1> byte {};
     if (first && !co_await stream.async_write_some(byte)) co_return;
     while (!ring.stopping) {
         if (!co_await stream.async_read_some(byte)) co_return;
-        if (++ring.completions == 10 * ring_pairs) {
-            if (loop.spawn(timer_after_batch(loop, ring)) !=
-                task_spawn_result::accepted) co_return;
-            // Make sure the deadline passes before this batch ends.
-            const auto due = event_loop::clock::now() + 5us;
-            while (event_loop::clock::now() < due) {}
-        }
+        if (ring.completions.fetch_add(1, std::memory_order_relaxed) + 1 ==
+            10 * ring_pairs) ring.trigger();
         if (!co_await stream.async_write_some(byte)) co_return;
     }
 }
 
-auto ready_ring_timer_test() -> bool
+// Builds the ring, then lets drive() run the loop with any helpers it needs.
+template<typename Drive>
+auto run_ready_ring(ready_ring& ring, Drive&& drive) -> bool
 {
     event_loop_options options;
     options.coroutine_frame_capacities.fill(1024);
     event_loop loop(options);
     std::vector<tcp_stream*> streams;
-    ready_ring ring;
     for (std::size_t pair = 0; pair < ring_pairs; ++pair) {
         int sockets[2] {};
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == -1)
@@ -452,13 +451,60 @@ auto ready_ring_timer_test() -> bool
                 task_spawn_result::accepted) return false;
         }
     }
-    (void)loop.run();
+    drive(loop);
     for (auto* stream : streams) stream->close();
     loop.stop();
     (void)loop.run();
-    if (!ring.timer_fired || ring.timer_delay >= batch_capacity)
-        std::cerr << "ready ring timer delay " << ring.timer_delay << '\n';
-    return ring.timer_fired && ring.timer_delay < batch_capacity;
+    return ring.fired;
+}
+
+auto timer_after_batch(event_loop& loop, ready_ring& ring) -> task<void>
+{
+    const auto registered = ring.completions.load(std::memory_order_relaxed);
+    (void)co_await sleep_until(loop, event_loop::clock::now() + 1us);
+    finish_ring(loop, ring, registered);
+}
+
+// A timer that becomes due during a batch runs before the next one.
+auto ready_ring_timer_test() -> bool
+{
+    ready_ring ring;
+    const bool ran = run_ready_ring(ring, [&](event_loop& loop) {
+        ring.trigger = [&] {
+            if (loop.spawn(timer_after_batch(loop, ring)) !=
+                task_spawn_result::accepted) return;
+            // Make sure the deadline passes before this batch ends.
+            const auto due = event_loop::clock::now() + 5us;
+            while (event_loop::clock::now() < due) {}
+        };
+        (void)loop.run();
+    });
+    if (!ran || ring.delay >= batch_capacity)
+        std::cerr << "ready ring timer delay " << ring.delay << '\n';
+    return ran && ring.delay < batch_capacity;
+}
+
+// Work posted from another thread is drained within two batches: the one
+// running when it was published and, if the owner had already checked for
+// cross-thread work, the next.
+auto ready_ring_post_test() -> bool
+{
+    ready_ring ring;
+    const bool ran = run_ready_ring(ring, [&](event_loop& loop) {
+        std::atomic<bool> requested {false};
+        std::jthread poster([&] {
+            while (!requested.load(std::memory_order_acquire)) {}
+            const auto published = ring.completions.load(std::memory_order_relaxed);
+            if (!loop.post(execution_task([&loop, &ring, published]() noexcept {
+                    finish_ring(loop, ring, published);
+                }))) loop.stop();
+        });
+        ring.trigger = [&] { requested.store(true, std::memory_order_release); };
+        (void)loop.run();
+    });
+    if (!ran || ring.delay >= 2 * batch_capacity)
+        std::cerr << "ready ring post delay " << ring.delay << '\n';
+    return ran && ring.delay < 2 * batch_capacity;
 }
 #endif
 
@@ -585,6 +631,7 @@ auto main() -> int
 #ifndef _WIN32
     if (!interrupted_wait_test()) return 1;
     if (!ready_ring_timer_test()) return 1;
+    if (!ready_ring_post_test()) return 1;
 #endif
     if (!shutdown_tests()) return 1;
 #ifndef _WIN32

@@ -24,8 +24,6 @@ struct poll_result {
     std::size_t event_count;
     bool stop_requested;
     bool signal_requested;
-    bool wake_requested;
-    bool timer_requested;
 };
 
 class epoll_loop {
@@ -77,8 +75,7 @@ private:
     unique_fd stop_descriptor_;
     unique_fd wake_descriptor_;
     unique_fd epoll_descriptor_;
-    // The earliest timer deadline. Waits time out at it, and every poll
-    // compares it with the clock, so busy descriptors cannot delay timers.
+    // The earliest timer deadline, which bounds each wait.
     std::optional<std::chrono::steady_clock::time_point> deadline_;
     // Cleared when the kernel lacks epoll_pwait2 (Linux < 5.11); epoll_wait
     // then rounds timeouts up to whole milliseconds.

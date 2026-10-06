@@ -191,11 +191,6 @@ auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
     std::size_t output_count = 0;
     bool stop_requested = false;
     bool signal_requested = false;
-    bool wake_requested = false;
-    // The deadline stays set until the loop arms the next one, so a due
-    // timer is reported again if dispatch throws before timers run.
-    const bool timer_requested =
-        deadline_ && std::chrono::steady_clock::now() >= *deadline_;
     for (int index = 0; index < count; ++index) {
         const auto& native = native_events[static_cast<std::size_t>(index)];
         if (native.data.fd == signal_descriptor_.get()) {
@@ -213,7 +208,6 @@ auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
         if (native.data.fd == wake_descriptor_.get()) {
             std::uint64_t value;
             (void)read(wake_descriptor_.get(), &value, sizeof(value));
-            wake_requested = true;
             continue;
         }
 
@@ -230,9 +224,7 @@ auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
     }
     return {.event_count = output_count,
             .stop_requested = stop_requested,
-            .signal_requested = signal_requested,
-            .wake_requested = wake_requested,
-            .timer_requested = timer_requested};
+            .signal_requested = signal_requested};
 }
 
 auto epoll_loop::update_descriptor(int descriptor, bool read_enabled,

@@ -22,8 +22,8 @@ struct poll_result {
     std::size_t event_count {0};
     bool stop_requested {false};
     bool signal_requested {false};
+    // Ends the dequeue early; the loop checks its queues on every pass.
     bool wake_requested {false};
-    bool timer_requested {false};
 };
 
 class iocp_loop {

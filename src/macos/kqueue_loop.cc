@@ -185,10 +185,6 @@ auto kqueue_loop::poll(std::span<ready_event> events, bool nonblocking)
     }
 
     poll_result result {};
-    if (deadline_ && std::chrono::steady_clock::now() >= *deadline_) {
-        result.timer_requested = true;
-        deadline_.reset();
-    }
     for (int index = 0; index < count; ++index) {
         const auto& native = native_events[static_cast<std::size_t>(index)];
         if ((native.flags & EV_ERROR) != 0 && native.data != 0)
@@ -196,7 +192,6 @@ auto kqueue_loop::poll(std::span<ready_event> events, bool nonblocking)
                                     std::system_category(), "kevent event");
         if (native.filter == EVFILT_USER) {
             if (native.ident == stop_identifier) result.stop_requested = true;
-            if (native.ident == wake_identifier) result.wake_requested = true;
             continue;
         }
         if (native.filter == EVFILT_SIGNAL) {
