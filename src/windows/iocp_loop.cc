@@ -116,7 +116,7 @@ auto iocp_loop::wake() noexcept -> void
 }
 
 auto iocp_loop::arm_timer(
-    std::optional<std::chrono::steady_clock::duration> delay) -> void
+    std::optional<std::chrono::steady_clock::duration> delay) noexcept -> void
 {
     if (!delay) {
         deadline_.reset();

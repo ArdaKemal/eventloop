@@ -1,4 +1,5 @@
 #include "eventloop/task.h"
+#include "eventloop/tcp_stream.h"
 
 #include <array>
 #include <atomic>
@@ -6,42 +7,20 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
+#include <iostream>
 #include <memory>
+#include <vector>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
 
 #ifndef _WIN32
-#if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
-#include <sys/timerfd.h>
-#endif
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
 
 using namespace eventloop;
-
-#if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
-namespace {
-int injected_timer_arm_errors = 0;
-}
-
-extern "C" auto __real_timerfd_settime(int descriptor, int flags,
-                                         const itimerspec* value,
-                                         itimerspec* old_value) -> int;
-
-extern "C" auto __wrap_timerfd_settime(int descriptor, int flags,
-                                         const itimerspec* value,
-                                         itimerspec* old_value) -> int
-{
-    if (injected_timer_arm_errors != 0) {
-        --injected_timer_arm_errors;
-        errno = EIO;
-        return -1;
-    }
-    return __real_timerfd_settime(descriptor, flags, value, old_value);
-}
-#endif
 
 namespace {
 using namespace std::chrono_literals;
@@ -349,35 +328,139 @@ auto timer_tests() -> bool
                event_loop::clock::time_point::max();
 }
 
-#if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
-auto failed_timer_registration(event_loop& loop, bool& caught) -> task<void>
+auto stop_after_post(event_loop& loop, timer_wait_result& result) -> void
 {
-    try {
-        (void)co_await sleep_for(loop, 1ms);
-    } catch (const std::system_error& error) {
-        caught = error.code().value() == EIO;
+    if (!loop.post(execution_task([&]() noexcept {
+            if (loop.spawn(wait_then_stop(loop, 5ms, result)) !=
+                task_spawn_result::accepted) loop.stop();
+        }))) loop.stop();
+}
+
+// Posted work that registers an earlier timer must shorten a wait that
+// started with a later deadline.
+auto posted_deadline_test() -> bool
+{
+    event_loop loop;
+    timer_wait_result distant = timer_wait_result::expired;
+    timer_wait_result near = timer_wait_result::cancelled;
+    task_handle<void> waiting;
+    if (loop.spawn(wait_until(loop, event_loop::clock::now() + 1h, distant, false),
+                   waiting) != task_spawn_result::accepted) return false;
+    std::jthread poster([&] {
+        std::this_thread::sleep_for(20ms);
+        stop_after_post(loop, near);
+    });
+    const auto started = event_loop::clock::now();
+    const bool stopped = loop.run() == event_loop_result::stopped;
+    const auto elapsed = event_loop::clock::now() - started;
+    poster.join();
+    (void)waiting.cancel();
+    loop.stop();
+    (void)loop.run();
+    return stopped && near == timer_wait_result::expired && elapsed < 5s &&
+           distant == timer_wait_result::cancelled;
+}
+
+#ifndef _WIN32
+// Signals interrupting the wait must not restart its full timeout.
+auto interrupted_wait_test() -> bool
+{
+    struct sigaction action {};
+    struct sigaction previous {};
+    action.sa_handler = [](int) {};
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGUSR1, &action, &previous) == -1) return false;
+    event_loop loop;
+    timer_wait_result result = timer_wait_result::cancelled;
+    const auto deadline = event_loop::clock::now() + 50ms;
+    if (loop.spawn(wait_until(loop, deadline, result, true)) !=
+        task_spawn_result::accepted) return false;
+    std::atomic<bool> done {false};
+    const auto target = pthread_self();
+    std::jthread interrupter([&] {
+        while (!done.load()) {
+            (void)pthread_kill(target, SIGUSR1);
+            std::this_thread::sleep_for(2ms);
+        }
+    });
+    const bool stopped = loop.run() == event_loop_result::stopped;
+    const auto finished = event_loop::clock::now();
+    done = true;
+    interrupter.join();
+    (void)sigaction(SIGUSR1, &previous, nullptr);
+    return stopped && result == timer_wait_result::expired &&
+           finished >= deadline && finished - deadline < 2s;
+}
+
+// About 200 descriptors stay ready, more than one poll batch returns. A
+// timer that becomes due while a batch is dispatched must run before the
+// next batch instead of waiting for the poller to report it.
+struct ready_ring {
+    std::size_t completions {0};
+    std::size_t timer_delay {0};
+    bool timer_fired {false};
+    bool stopping {false};
+};
+
+constexpr std::size_t ring_pairs = 200;
+constexpr std::size_t batch_capacity = 64;
+
+auto timer_after_batch(event_loop& loop, ready_ring& ring) -> task<void>
+{
+    const auto registered = ring.completions;
+    (void)co_await sleep_until(loop, event_loop::clock::now() + 1us);
+    ring.timer_delay = ring.completions - registered;
+    ring.timer_fired = true;
+    ring.stopping = true;
+    loop.stop();
+}
+
+auto ring_peer(event_loop& loop, tcp_stream& stream, bool first,
+               ready_ring& ring) -> task<void>
+{
+    std::array<std::byte, 1> byte {};
+    if (first && !co_await stream.async_write_some(byte)) co_return;
+    while (!ring.stopping) {
+        if (!co_await stream.async_read_some(byte)) co_return;
+        if (++ring.completions == 10 * ring_pairs) {
+            if (loop.spawn(timer_after_batch(loop, ring)) !=
+                task_spawn_result::accepted) co_return;
+            // Make sure the deadline passes before this batch ends.
+            const auto due = event_loop::clock::now() + 5us;
+            while (event_loop::clock::now() < due) {}
+        }
+        if (!co_await stream.async_write_some(byte)) co_return;
     }
 }
-#endif
 
-auto timer_arm_failure_test() -> bool
+auto ready_ring_timer_test() -> bool
 {
-#if defined(EVENTLOOP_TEST_WRAP_TIMERFD)
-    event_loop loop;
-    bool caught = false;
-    timer_wait_result accepted = timer_wait_result::cancelled;
-    if (loop.spawn(wait_then_stop(loop, 5ms, accepted)) !=
-        task_spawn_result::accepted) return false;
-    injected_timer_arm_errors = 1;
-    if (loop.spawn(failed_timer_registration(loop, caught)) !=
-        task_spawn_result::accepted) return false;
-    return injected_timer_arm_errors == 0 && caught &&
-           loop.run() == event_loop_result::stopped &&
-           accepted == timer_wait_result::expired;
-#else
-    return true;
-#endif
+    event_loop_options options;
+    options.coroutine_frame_capacities.fill(1024);
+    event_loop loop(options);
+    std::vector<tcp_stream*> streams;
+    ready_ring ring;
+    for (std::size_t pair = 0; pair < ring_pairs; ++pair) {
+        int sockets[2] {};
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == -1)
+            return false;
+        for (int side = 0; side < 2; ++side) {
+            auto stream = std::make_unique<tcp_stream>(loop, unique_fd(sockets[side]));
+            streams.push_back(stream.get());
+            loop.add(std::move(stream));
+            if (loop.spawn(ring_peer(loop, *streams.back(), side == 0, ring)) !=
+                task_spawn_result::accepted) return false;
+        }
+    }
+    (void)loop.run();
+    for (auto* stream : streams) stream->close();
+    loop.stop();
+    (void)loop.run();
+    if (!ring.timer_fired || ring.timer_delay >= batch_capacity)
+        std::cerr << "ready ring timer delay " << ring.timer_delay << '\n';
+    return ring.timer_fired && ring.timer_delay < batch_capacity;
 }
+#endif
 
 auto shutdown_tests() -> bool
 {
@@ -498,7 +581,11 @@ auto main() -> int
     if (!cross_thread_wakeup_stress_test()) return 1;
     if (!executor_integration_test()) return 1;
     if (!timer_tests()) return 1;
-    if (!timer_arm_failure_test()) return 1;
+    if (!posted_deadline_test()) return 1;
+#ifndef _WIN32
+    if (!interrupted_wait_test()) return 1;
+    if (!ready_ring_timer_test()) return 1;
+#endif
     if (!shutdown_tests()) return 1;
 #ifndef _WIN32
     if (!signal_test()) return 1;

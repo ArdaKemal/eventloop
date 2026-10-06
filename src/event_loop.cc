@@ -629,7 +629,7 @@ public:
         }
     }
 
-    auto arm_next_timer() -> void
+    auto arm_next_timer() noexcept -> void
     {
         std::optional<event_loop::clock::time_point> deadline;
         if (!timers.empty()) deadline = timers.begin()->first.first;
@@ -637,14 +637,17 @@ public:
             (!deadline || coroutine_timers->deadline < *deadline)) {
             deadline = coroutine_timers->deadline;
         }
-        // Registering or cancelling a later timer leaves the earliest
-        // deadline unchanged; skip the poller syscall unless that deadline
-        // is due, since an expired poller timer must be armed again.
-        const auto now = event_loop::clock::now();
-        if (deadline == armed_deadline && (!deadline || *deadline > now)) return;
         if (!deadline) poller.arm_timer(std::nullopt);
-        else poller.arm_timer(*deadline - now);
+        else poller.arm_timer(*deadline - event_loop::clock::now());
         armed_deadline = deadline;
+    }
+
+    // Checked after each dispatch, so a deadline that passes while a batch
+    // runs is serviced before the next poll, however many descriptors are
+    // ready.
+    [[nodiscard]] auto timer_due() const noexcept -> bool
+    {
+        return armed_deadline && event_loop::clock::now() >= *armed_deadline;
     }
 
     auto add_timer(event_loop::clock::time_point deadline,
@@ -655,14 +658,8 @@ public:
         }
 
         const auto id = next_timer++;
-        auto timer = timers.emplace(timer_key {deadline, id},
-                                    std::move(task)).first;
-        try {
-            arm_next_timer();
-        } catch (...) {
-            timers.erase(timer);
-            throw;
-        }
+        timers.emplace(timer_key {deadline, id}, std::move(task));
+        arm_next_timer();
     }
 
     auto run_due_timers() -> void
@@ -701,12 +698,7 @@ public:
         // of timeout lengths.
         timer.sequence = next_timer_sequence++;
         coroutine_timers = meld_timers(coroutine_timers, &timer);
-        try {
-            arm_next_timer();
-        } catch (...) {
-            unlink_coroutine_timer(timer);
-            throw;
-        }
+        arm_next_timer();
     }
 
     auto cancel_coroutine_timer(
@@ -716,11 +708,7 @@ public:
         unlink_coroutine_timer(timer);
         detail::coroutine_frame_access::detach_cancellation(
             timer.cancellation);
-        try {
-            arm_next_timer();
-        } catch (...) {
-            std::terminate();
-        }
+        arm_next_timer();
     }
 
     auto force_shutdown() noexcept -> void
@@ -1006,7 +994,7 @@ auto event_loop::run() -> event_loop_result
             implementation_->drain_queues();
             implementation_->drain_completed_roots();
         }
-        if (result.timer_requested) {
+        if (result.timer_requested || implementation_->timer_due()) {
             implementation_->run_due_timers();
             implementation_->drain_completed_roots();
         }

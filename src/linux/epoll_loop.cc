@@ -6,13 +6,14 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <ctime>
 #include <exception>
+#include <limits>
 #include <system_error>
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
-#include <sys/timerfd.h>
 #include <unistd.h>
 
 namespace eventloop {
@@ -72,14 +73,9 @@ epoll_loop::epoll_loop()
     wake_descriptor_.reset(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
     if (!wake_descriptor_) throw system_error("eventfd");
 
-    timer_descriptor_.reset(timerfd_create(
-        CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
-    if (!timer_descriptor_) throw system_error("timerfd_create");
-
     update_descriptor(signal_descriptor_.get(), true, false, EPOLL_CTL_ADD);
     update_descriptor(stop_descriptor_.get(), true, false, EPOLL_CTL_ADD);
     update_descriptor(wake_descriptor_.get(), true, false, EPOLL_CTL_ADD);
-    update_descriptor(timer_descriptor_.get(), true, false, EPOLL_CTL_ADD);
 }
 
 epoll_loop::~epoll_loop() = default;
@@ -131,23 +127,51 @@ auto epoll_loop::wake() noexcept -> void
 }
 
 auto epoll_loop::arm_timer(
-    std::optional<std::chrono::steady_clock::duration> delay) -> void
+    std::optional<std::chrono::steady_clock::duration> delay) noexcept -> void
 {
-    itimerspec value {};
-    if (delay) {
-        auto nanoseconds = std::chrono::ceil<std::chrono::nanoseconds>(*delay);
-        if (nanoseconds <= std::chrono::nanoseconds::zero()) {
-            nanoseconds = std::chrono::nanoseconds {1};
+    if (!delay) {
+        deadline_.reset();
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    // Deadlines saturate, so a long delay must not overflow the time point.
+    deadline_ = *delay <= std::chrono::steady_clock::duration::zero() ? now
+        : *delay >= std::chrono::steady_clock::time_point::max() - now
+            ? std::chrono::steady_clock::time_point::max() : now + *delay;
+}
+
+// The timeout is recomputed from the deadline on every call, so a retry
+// after EINTR waits only for the remainder.
+auto epoll_loop::wait(epoll_event* events, int capacity, bool nonblocking)
+    -> int
+{
+    using namespace std::chrono;
+    std::optional<steady_clock::duration> remaining;
+    if (nonblocking) remaining = steady_clock::duration::zero();
+    else if (deadline_)
+        remaining = std::max(*deadline_ - steady_clock::now(),
+                             steady_clock::duration::zero());
+    if (nanosecond_timeouts_) {
+        timespec timeout {};
+        if (remaining) {
+            const auto seconds = duration_cast<std::chrono::seconds>(*remaining);
+            timeout.tv_sec = static_cast<time_t>(seconds.count());
+            timeout.tv_nsec = static_cast<long>(
+                duration_cast<nanoseconds>(*remaining - seconds).count());
         }
-        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
-            nanoseconds);
-        const auto remainder = nanoseconds - seconds;
-        value.it_value.tv_sec = static_cast<time_t>(seconds.count());
-        value.it_value.tv_nsec = static_cast<long>(remainder.count());
+        const int count = epoll_pwait2(epoll_descriptor_.get(), events, capacity,
+                                       remaining ? &timeout : nullptr, nullptr);
+        // Seccomp filters that predate the syscall may report EPERM.
+        if (count != -1 || (errno != ENOSYS && errno != EPERM)) return count;
+        nanosecond_timeouts_ = false;
     }
-    if (timerfd_settime(timer_descriptor_.get(), 0, &value, nullptr) == -1) {
-        throw system_error("timerfd_settime");
+    int milliseconds = -1;
+    if (remaining) {
+        milliseconds = static_cast<int>(std::min<steady_clock::rep>(
+            ceil<std::chrono::milliseconds>(*remaining).count(),
+            std::numeric_limits<int>::max()));
     }
+    return epoll_wait(epoll_descriptor_.get(), events, capacity, milliseconds);
 }
 
 auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
@@ -158,8 +182,7 @@ auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
 
     int count;
     do {
-        count = epoll_wait(epoll_descriptor_.get(), native_events.data(), capacity,
-                           nonblocking ? 0 : -1);
+        count = wait(native_events.data(), capacity, nonblocking);
     } while (count == -1 && errno == EINTR);
     if (count == -1) {
         throw system_error("epoll_wait");
@@ -169,7 +192,10 @@ auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
     bool stop_requested = false;
     bool signal_requested = false;
     bool wake_requested = false;
-    bool timer_requested = false;
+    // The deadline stays set until the loop arms the next one, so a due
+    // timer is reported again if dispatch throws before timers run.
+    const bool timer_requested =
+        deadline_ && std::chrono::steady_clock::now() >= *deadline_;
     for (int index = 0; index < count; ++index) {
         const auto& native = native_events[static_cast<std::size_t>(index)];
         if (native.data.fd == signal_descriptor_.get()) {
@@ -188,12 +214,6 @@ auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
             std::uint64_t value;
             (void)read(wake_descriptor_.get(), &value, sizeof(value));
             wake_requested = true;
-            continue;
-        }
-        if (native.data.fd == timer_descriptor_.get()) {
-            std::uint64_t value;
-            (void)read(timer_descriptor_.get(), &value, sizeof(value));
-            timer_requested = true;
             continue;
         }
 

@@ -24,6 +24,8 @@ constexpr std::size_t burst_size = 64;
 constexpr std::size_t burst_count = 10'000;
 constexpr std::size_t completion_roots = 64;
 constexpr std::size_t completions_per_root = 2'000;
+constexpr std::size_t timer_roots = 256;
+constexpr std::size_t timers_per_root = 200;
 
 // Write syscalls made by this process, including exited threads. The
 // benchmarked producers and workers make no other writes, so the delta
@@ -224,6 +226,46 @@ auto worker_completions() -> void
               << " ns\n";
 }
 
+// Staggered ~1 ms sleeps, so each expiry usually moves the earliest
+// deadline. Run it alone under strace to count the poller's timer syscalls.
+auto timer_root(event_loop& loop, std::size_t index,
+                std::vector<std::int64_t>& lateness, std::size_t& remaining)
+    -> task<void>
+{
+    const auto delay = std::chrono::microseconds(1000 + index);
+    for (std::size_t round = 0; round < timers_per_root; ++round) {
+        const auto due = event_loop::clock::now() + delay;
+        if (co_await sleep_until(loop, due) != timer_wait_result::expired) break;
+        lateness.push_back(std::chrono::duration_cast<std::chrono::microseconds>(
+            event_loop::clock::now() - due).count());
+    }
+    if (--remaining == 0) loop.stop();
+}
+
+auto timer_expirations() -> void
+{
+    event_loop loop;
+    std::vector<std::int64_t> lateness;
+    lateness.reserve(timer_roots * timers_per_root);
+    std::size_t remaining = timer_roots;
+    measure("timer expirations", timer_roots * timers_per_root, [&] {
+        for (std::size_t index = 0; index < timer_roots; ++index) {
+            if (loop.spawn(timer_root(loop, index, lateness, remaining)) !=
+                task_spawn_result::accepted) {
+                std::terminate();
+            }
+        }
+        (void)loop.run();
+    });
+    std::sort(lateness.begin(), lateness.end());
+    const auto at = [&](double quantile) {
+        return lateness[static_cast<std::size_t>(
+            quantile * static_cast<double>(lateness.size() - 1))];
+    };
+    std::cout << "timer lateness: p50 " << at(0.5) << " us, p99 " << at(0.99)
+              << " us, max " << lateness.back() << " us\n";
+}
+
 auto clock_observations() -> void
 {
     using clock = std::chrono::steady_clock;
@@ -261,13 +303,18 @@ auto clock_observations() -> void
 
 } // namespace
 
-auto main() -> int
+auto main(int argc, char* argv[]) -> int
 {
+    if (argc > 1 && std::string(argv[1]) == "timers") {
+        timer_expirations();
+        return 0;
+    }
     construction();
     post_round_trip();
     cross_thread_post();
     cross_thread_burst();
     worker_completions();
+    timer_expirations();
     clock_observations();
     return 0;
 }

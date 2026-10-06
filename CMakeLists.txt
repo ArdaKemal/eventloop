@@ -1008,11 +1008,6 @@ if(BUILD_TESTING)
     add_executable(event_loop_test tests/event_loop.cc)
     target_link_libraries(event_loop_test PRIVATE eventloop::eventloop)
     target_compile_options(event_loop_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-       CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_link_options(event_loop_test PRIVATE -Wl,--wrap=timerfd_settime)
-        target_compile_definitions(event_loop_test PRIVATE EVENTLOOP_TEST_WRAP_TIMERFD=1)
-    endif()
     add_test(NAME event_loop COMMAND event_loop_test)
 
     add_executable(http_routing_test tests/http_routing.cc)

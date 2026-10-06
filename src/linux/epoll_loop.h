@@ -9,6 +9,8 @@
 #include <span>
 #include <thread>
 
+struct epoll_event;
+
 namespace eventloop {
 
 struct ready_event {
@@ -42,7 +44,7 @@ public:
     auto request_stop() -> void;
     auto wake() noexcept -> void;
     auto arm_timer(std::optional<std::chrono::steady_clock::duration> delay)
-        -> void;
+        noexcept -> void;
     [[nodiscard]] auto poll(std::span<ready_event> events,
                             bool nonblocking = false) -> poll_result;
 
@@ -67,13 +69,20 @@ private:
 
     auto update_descriptor(int descriptor, bool read_enabled,
                            bool write_enabled, int operation) -> void;
+    [[nodiscard]] auto wait(epoll_event* events, int capacity,
+                            bool nonblocking) -> int;
 
     signal_mask_guard signal_mask_;
     unique_fd signal_descriptor_;
     unique_fd stop_descriptor_;
     unique_fd wake_descriptor_;
-    unique_fd timer_descriptor_;
     unique_fd epoll_descriptor_;
+    // The earliest timer deadline. Waits time out at it, and every poll
+    // compares it with the clock, so busy descriptors cannot delay timers.
+    std::optional<std::chrono::steady_clock::time_point> deadline_;
+    // Cleared when the kernel lacks epoll_pwait2 (Linux < 5.11); epoll_wait
+    // then rounds timeouts up to whole milliseconds.
+    bool nanosecond_timeouts_ {true};
 };
 
 } // namespace eventloop

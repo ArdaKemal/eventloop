@@ -26,7 +26,7 @@ public:
     auto request_stop() -> void;
     auto wake() noexcept -> void;
     auto arm_timer(std::optional<std::chrono::steady_clock::duration> delay)
-        -> void;
+        noexcept -> void;
     [[nodiscard]] auto poll(std::span<ready_event> events,
                             bool nonblocking = false) -> poll_result;
 
