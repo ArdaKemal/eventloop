@@ -116,7 +116,7 @@ auto iocp_loop::wake() noexcept -> void
 }
 
 auto iocp_loop::arm_timer(
-    std::optional<std::chrono::steady_clock::duration> delay) -> void
+    std::optional<std::chrono::steady_clock::duration> delay) noexcept -> void
 {
     if (!delay) {
         deadline_.reset();
@@ -164,9 +164,6 @@ auto iocp_loop::poll(std::span<ready_event> events, bool nonblocking)
         }
         if (result.event_count == events.size() || result.stop_requested ||
             result.wake_requested) break;
-    }
-    if (deadline_ && std::chrono::steady_clock::now() >= *deadline_) {
-        result.timer_requested = true;
     }
     return result;
 }

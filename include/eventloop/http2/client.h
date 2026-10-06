@@ -25,8 +25,9 @@ struct header {
 // Called on the owning loop thread with a writable borrowed chunk of at most
 // 16 KiB. Return 0 for EOF, a byte count within the span, or an error. Any
 // captured descriptor or buffer must remain valid until task completion.
+// Sources are move-only and may own captured resources exclusively.
 using request_body_source =
-    std::function<std::expected<std::size_t, std::error_code>(std::span<std::byte>)>;
+    std::move_only_function<std::expected<std::size_t, std::error_code>(std::span<std::byte>)>;
 
 struct client_request {
     std::string method {"GET"};
@@ -46,17 +47,20 @@ struct client_response {
 
 // Called on the owning loop thread. The borrowed chunk is valid only during
 // the call. A nonzero error aborts the request and is returned to the caller.
-using response_sink = std::function<std::error_code(std::span<const std::byte>)>;
+using response_sink = std::move_only_function<std::error_code(std::span<const std::byte>)>;
 // Called once for each complete header block before subsequent DATA. Status
 // is 1xx for informational headers, the final status for final headers, and
 // zero for trailers. The fields span is valid only during the call.
 using response_header_sink =
-    std::function<std::error_code(unsigned, std::span<const header>)>;
+    std::move_only_function<std::error_code(unsigned, std::span<const header>)>;
 
 // Performs one request on one owned TLS connection. The numeric endpoint
 // is caller supplied; hostname selects certificate verification, SNI and the
 // default :authority. All request strings are owned by the task. Response
-// strings and body bytes are owned by the caller after completion. Limits:
+// strings and body bytes are owned by the caller after completion. Requests
+// and callbacks are move-only; move named values into this operation. Owned
+// callback captures live with the task through completion, including cancellation.
+// Limits:
 // 64 KiB and 128 fields per header block, 16 KiB frame, 4 MiB owned request
 // and buffered response bodies. A source or sink streams up to 1 TiB; a sink
 // leaves response.body empty. Callbacks run synchronously on the loop thread.

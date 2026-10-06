@@ -561,8 +561,18 @@ public:
         if (!coroutine_completions.try_push(std::move(completion))) {
             std::terminate();
         }
-        poller.wake();
+        notify();
     }
+
+    // Called after a cross-thread push. Only the first publisher since the
+    // owner's last claim writes the backend wake notifier.
+    auto notify() noexcept -> void
+    {
+        if (!wake_pending.exchange(true, std::memory_order_release)) {
+            poller.wake();
+        }
+    }
+
 
     [[nodiscard]] auto submit_blocking(execution_task&& work) noexcept
         -> detail::blocking_submission_result
@@ -606,7 +616,7 @@ public:
         }
     }
 
-    auto arm_next_timer() -> void
+    auto arm_next_timer() noexcept -> void
     {
         std::optional<event_loop::clock::time_point> deadline;
         if (!timers.empty()) deadline = timers.begin()->first.first;
@@ -614,13 +624,8 @@ public:
             (!deadline || coroutine_timers->deadline < *deadline)) {
             deadline = coroutine_timers->deadline;
         }
-        // Registering or cancelling a later timer leaves the earliest
-        // deadline unchanged; skip the poller syscall unless that deadline
-        // is due, since an expired poller timer must be armed again.
-        const auto now = event_loop::clock::now();
-        if (deadline == armed_deadline && (!deadline || *deadline > now)) return;
         if (!deadline) poller.arm_timer(std::nullopt);
-        else poller.arm_timer(*deadline - now);
+        else poller.arm_timer(*deadline - event_loop::clock::now());
         armed_deadline = deadline;
     }
 
@@ -632,14 +637,8 @@ public:
         }
 
         const auto id = next_timer++;
-        auto timer = timers.emplace(timer_key {deadline, id},
-                                    std::move(task)).first;
-        try {
-            arm_next_timer();
-        } catch (...) {
-            timers.erase(timer);
-            throw;
-        }
+        timers.emplace(timer_key {deadline, id}, std::move(task));
+        arm_next_timer();
     }
 
     auto run_due_timers() -> void
@@ -678,12 +677,7 @@ public:
         // of timeout lengths.
         timer.sequence = next_timer_sequence++;
         coroutine_timers = meld_timers(coroutine_timers, &timer);
-        try {
-            arm_next_timer();
-        } catch (...) {
-            unlink_coroutine_timer(timer);
-            throw;
-        }
+        arm_next_timer();
     }
 
     auto cancel_coroutine_timer(
@@ -693,11 +687,7 @@ public:
         unlink_coroutine_timer(timer);
         detail::coroutine_frame_access::detach_cancellation(
             timer.cancellation);
-        try {
-            arm_next_timer();
-        } catch (...) {
-            std::terminate();
-        }
+        arm_next_timer();
     }
 
     auto force_shutdown() noexcept -> void
@@ -871,6 +861,9 @@ public:
     // continuations and same-thread posts use posted_tasks without writing
     // to the backend wake notifier.
     bool local_post_pending {false};
+    // Set by the first cross-thread publisher after the owner's last drain;
+    // while set, a backend wakeup or owner drain is already due.
+    std::atomic<bool> wake_pending {false};
     bounded_task_queue coroutine_completions;
     const std::size_t coroutine_completion_capacity;
     std::atomic<std::size_t> reserved_coroutine_completions {0};
@@ -929,7 +922,8 @@ auto event_loop::run() -> event_loop_result
             return event_loop_result::stopped;
         }
         const auto result = implementation_->poller.poll(
-            events, implementation_->local_post_pending);
+            events, implementation_->local_post_pending ||
+                        implementation_->wake_pending.load(std::memory_order_relaxed));
         if (result.event_count != 0) ++implementation_->dispatch_depth;
 
         try {
@@ -971,8 +965,16 @@ auto event_loop::run() -> event_loop_result
         if (result.event_count != 0) implementation_->finish_dispatch();
         implementation_->drain_completed_roots();
 
-        if (result.wake_requested || implementation_->local_post_pending) {
+        // Queues and timers are checked after every batch: their poller
+        // notifications can wait behind every ready socket under load.
+        if (implementation_->local_post_pending ||
+            implementation_->wake_pending.load(std::memory_order_relaxed)) {
             implementation_->local_post_pending = false;
+            // Claims every notification published so far. A publisher whose
+            // exchange came first is synchronized with, so its push is
+            // visible below; a later one sees false and wakes the poller.
+            (void)implementation_->wake_pending.exchange(
+                false, std::memory_order_acquire);
             const bool more_posted = implementation_->drain_posted();
             const bool more_completions =
                 implementation_->drain_coroutine_completions();
@@ -981,7 +983,8 @@ auto event_loop::run() -> event_loop_result
             }
             implementation_->drain_completed_roots();
         }
-        if (result.timer_requested) {
+        const auto& deadline = implementation_->armed_deadline;
+        if (deadline && clock::now() >= *deadline) {
             implementation_->run_due_timers();
             implementation_->drain_completed_roots();
         }
@@ -1145,7 +1148,7 @@ auto event_loop::post(execution_task&& task) noexcept -> bool
     if (!implementation_->posted_tasks.try_push(std::move(task))) {
         return false;
     }
-    implementation_->poller.wake();
+    implementation_->notify();
     return true;
 }
 

@@ -98,6 +98,7 @@ private:
     accept_awaiter* waiter_ {nullptr};
     bool read_interest_enabled_ {false};
     bool closed_ {false};
+    unsigned immediate_accepts_ {0};
     bool unix_socket_ {false};
     [[no_unique_address]] detail::socket_accept_state backend_state_ {};
 };

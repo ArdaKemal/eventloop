@@ -367,6 +367,47 @@ auto duplicate_accept_and_close() -> bool
            loop.coroutine_statistics().live == 0;
 }
 
+constexpr std::size_t backlog_connections = 32;
+
+auto accept_backlog(event_loop& loop, tcp_acceptor& listener,
+                    std::size_t& accepted) -> task<void>
+{
+    while (accepted < backlog_connections) {
+        if (!co_await listener.async_accept()) break;
+        ++accepted;
+    }
+    loop.stop();
+}
+
+// A connection backlog is accepted in bounded runs, returning to the loop
+// between them, instead of all at once inside one dispatch.
+auto bounded_backlog_accept() -> bool
+{
+    event_loop loop;
+    auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4());
+    auto* accepting = listener.get();
+    const auto port = local_port(accepting->descriptor());
+    if (port == 0) return false;
+    loop.add(std::move(listener));
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    std::array<unique_fd, backlog_connections> clients;
+    for (auto& client : clients) {
+        client.reset(raw_socket(AF_INET));
+        if (!client || ::connect(client.get(), reinterpret_cast<sockaddr*>(&address),
+                                 sizeof(address)) == -1) return false;
+    }
+    std::size_t accepted = 0;
+    if (loop.spawn(accept_backlog(loop, *accepting, accepted)) !=
+        task_spawn_result::accepted) return false;
+    const auto first_run = accepted;
+    (void)loop.run();
+    accepting->close();
+    return first_run < backlog_connections && accepted == backlog_connections;
+}
+
 auto fill_send_queue(native_socket descriptor) -> bool
 {
     std::array<std::byte, 4096> buffer {};
@@ -643,6 +684,7 @@ int main()
         (ipv6_loopback_available() &&
          !check(roundtrip(ip_endpoint::loopback_v6()), "IPv6 roundtrip")) ||
         !check(duplicate_accept_and_close(), "duplicate accept and close") ||
+        !check(bounded_backlog_accept(), "bounded backlog accept") ||
         !check(duplicate_io_and_close(), "duplicate I/O and close") ||
         !check(immediate_error_cases(), "immediate errors") ||
         !check(refused_connect(), "refused connect") ||

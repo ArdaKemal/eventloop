@@ -15,8 +15,6 @@ struct poll_result {
     std::size_t event_count;
     bool stop_requested;
     bool signal_requested;
-    bool wake_requested;
-    bool timer_requested;
 };
 
 } // namespace eventloop

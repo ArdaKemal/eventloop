@@ -1008,11 +1008,6 @@ if(BUILD_TESTING)
     add_executable(event_loop_test tests/event_loop.cc)
     target_link_libraries(event_loop_test PRIVATE eventloop::eventloop)
     target_compile_options(event_loop_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-       CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_link_options(event_loop_test PRIVATE -Wl,--wrap=timerfd_settime)
-        target_compile_definitions(event_loop_test PRIVATE EVENTLOOP_TEST_WRAP_TIMERFD=1)
-    endif()
     add_test(NAME event_loop COMMAND event_loop_test)
 
     add_executable(http_routing_test tests/http_routing.cc)
@@ -1668,6 +1663,17 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME coroutine_udp COMMAND coroutine_udp_test)
     set_tests_properties(coroutine_udp PROPERTIES TIMEOUT 10)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(interest_churn_test tests/interest_churn.cc)
+        target_link_libraries(interest_churn_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+        target_compile_options(interest_churn_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            target_compile_options(interest_churn_test PRIVATE -Wno-mismatched-new-delete)
+        endif()
+        add_test(NAME interest_churn COMMAND interest_churn_test)
+        set_tests_properties(interest_churn PROPERTIES TIMEOUT 10)
+    endif()
 
     add_test(
         NAME http_server

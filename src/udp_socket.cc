@@ -293,8 +293,25 @@ auto udp_socket::send_awaiter::cancel(
 
 auto udp_socket::update_interest() -> void
 {
-    loop_.set_io_interest(descriptor_.get(), receive_ != nullptr,
-                          send_ != nullptr);
+    const bool receive = receive_ != nullptr;
+    const bool send = send_ != nullptr;
+    if (receive_interest_ == receive && send_interest_ == send) return;
+    loop_.set_io_interest(descriptor_.get(), receive, send);
+    receive_interest_ = receive;
+    send_interest_ = send;
+}
+
+// Completions call this after resuming, as tcp_stream does, so a continuation
+// that starts the next receive or send keeps its interest armed. The loop
+// defers handler removal while a completion runs; closing removes the socket.
+auto udp_socket::refresh_interest() noexcept -> void
+{
+    if (closing_) return;
+    try {
+        update_interest();
+    } catch (...) {
+        std::terminate();
+    }
 }
 
 auto udp_socket::complete_receive(int result, ip_endpoint source,
@@ -310,13 +327,9 @@ auto udp_socket::complete_receive(int result, ip_endpoint source,
     operation->result_ = result;
     operation->source_ = source;
     receive_segment_ = segment;
-    try {
-        update_interest();
-    } catch (...) {
-        std::terminate();
-    }
     const auto continuation = operation->continuation_;
     continuation.resume();
+    refresh_interest();
 }
 
 auto udp_socket::complete_send(int result) noexcept -> void
@@ -328,13 +341,9 @@ auto udp_socket::complete_send(int result) noexcept -> void
     detail::coroutine_frame_access::detach_cancellation(
         operation->cancellation_);
     operation->result_ = result;
-    try {
-        update_interest();
-    } catch (...) {
-        std::terminate();
-    }
     const auto continuation = operation->continuation_;
     continuation.resume();
+    refresh_interest();
 }
 
 auto udp_socket::complete_pending(int result) noexcept -> void
@@ -357,13 +366,9 @@ auto udp_socket::complete_pending(int result) noexcept -> void
         sending->result_ = result;
         send_continuation = sending->continuation_;
     }
-    try {
-        update_interest();
-    } catch (...) {
-        std::terminate();
-    }
     if (receive_continuation) receive_continuation.resume();
     if (send_continuation) send_continuation.resume();
+    refresh_interest();
 }
 
 auto udp_socket::on_read() -> void

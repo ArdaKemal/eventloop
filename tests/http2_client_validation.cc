@@ -115,10 +115,12 @@ auto scripted_server(event_loop& loop, tcp_acceptor& listener,
 using outcome = std::expected<http2::client_response, std::error_code>;
 
 auto client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
-            http2::client_request request, std::optional<outcome>& result) -> task<void>
+            http2::client_request request, std::optional<outcome>& result,
+            http2::response_sink sink, http2::response_header_sink header_sink) -> task<void>
 {
     result = flatten(co_await http2::async_request(loop, ip_endpoint::loopback_v4(port),
-        std::move(context), "localhost", std::move(request)));
+        std::move(context), "localhost", std::move(request), std::move(sink),
+        std::move(header_sink)));
     loop.stop();
 }
 
@@ -138,7 +140,9 @@ struct certificate_files {
 // Runs one request against a peer that replies with script. Without a script,
 // no peer is accepted, for requests rejected before connecting.
 [[nodiscard]] auto exchange(const certificate_files& files, http2::client_request request,
-                            std::optional<std::string> script) -> outcome
+                            std::optional<std::string> script,
+                            http2::response_sink sink = {},
+                            http2::response_header_sink header_sink = {}) -> outcome
 {
     event_loop loop;
     auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4(0));
@@ -154,7 +158,8 @@ struct certificate_files {
               task_spawn_result::accepted, "spawn server");
     std::optional<outcome> result;
     check(loop.spawn(client(loop, ntohs(address.sin_port),
-              tls_context::make_client(files.certificate), std::move(request), result)) ==
+              tls_context::make_client(files.certificate), std::move(request), result,
+              std::move(sink), std::move(header_sink))) ==
           task_spawn_result::accepted, "spawn client");
     bool timed_out = false;
     task_handle<void> timer;
@@ -194,6 +199,26 @@ auto responses(const certificate_files& files) -> void
     const auto accepted = exchange(files, get(), ok);
     check(accepted && accepted->status == 200 && accepted->body == bytes("abcde"),
           "DATA matching Content-Length");
+
+    // Each sink exclusively owns its state across suspension and task moves.
+    std::string streamed;
+    unsigned streamed_status = 0;
+    const auto streamed_response = exchange(files, get(), ok,
+        [state = std::make_unique<std::string>(), &streamed](
+            std::span<const std::byte> chunk) -> std::error_code {
+            state->append(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+            streamed = *state;
+            return {};
+        },
+        [state = std::make_unique<unsigned>(), &streamed_status](
+            unsigned status, std::span<const http2::header>) -> std::error_code {
+            *state = status;
+            streamed_status = *state;
+            return {};
+        });
+    check(streamed_response && streamed_response->body.empty() &&
+          streamed == "abcde" && streamed_status == 200,
+          "move-only response sinks");
 
     for (auto field : {std::pair {"connection", "close"}, {"keep-alive", "1"},
                        {"proxy-connection", "close"}, {"transfer-encoding", "chunked"},
@@ -314,11 +339,12 @@ auto requests(const certificate_files& files) -> void
 
     const auto sourced = [&](std::string_view value, std::size_t produce) {
         auto request = declared(value);
-        request.body_source = [remaining = produce](std::span<std::byte> chunk) mutable
+        request.body_source = [remaining = std::make_unique<std::size_t>(produce)](
+            std::span<std::byte> chunk)
             -> std::expected<std::size_t, std::error_code> {
-            const auto count = std::min(remaining, chunk.size());
+            const auto count = std::min(*remaining, chunk.size());
             std::fill_n(chunk.begin(), count, std::byte {'a'});
-            remaining -= count;
+            *remaining -= count;
             return count;
         };
         return exchange(files, std::move(request), response("200", {}, true));

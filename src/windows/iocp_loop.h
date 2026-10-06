@@ -22,8 +22,8 @@ struct poll_result {
     std::size_t event_count {0};
     bool stop_requested {false};
     bool signal_requested {false};
+    // Ends the dequeue early; the loop checks its queues on every pass.
     bool wake_requested {false};
-    bool timer_requested {false};
 };
 
 class iocp_loop {
@@ -40,7 +40,7 @@ public:
     auto request_stop() -> void;
     auto wake() noexcept -> void;
     auto arm_timer(std::optional<std::chrono::steady_clock::duration> delay)
-        -> void;
+        noexcept -> void;
     [[nodiscard]] auto poll(std::span<ready_event> events, bool nonblocking = false)
         -> poll_result;
     [[nodiscard]] auto native_handle() const noexcept -> HANDLE { return port_; }

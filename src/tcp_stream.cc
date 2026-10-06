@@ -186,6 +186,10 @@ auto tcp_stream::set_async_interest(bool read_enabled,
     write_interest_enabled_ = write_enabled;
 }
 
+// Completions call this after resuming their continuation, which often starts
+// the next operation of the same kind. Updating afterward keeps that interest
+// armed instead of issuing a disable/re-enable pair. The loop defers handler
+// removal while a completion runs, so the stream outlives the continuation.
 auto tcp_stream::update_async_interest() noexcept -> void
 {
     if (!closed_) {
@@ -216,8 +220,8 @@ auto tcp_stream::complete_connect(std::error_code error) noexcept
     detail::socket_operations::stream_retire(*this, waiter->operation_);
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
-    update_async_interest();
     waiter->finish(error);
+    update_async_interest();
 }
 
 auto tcp_stream::complete_read(std::size_t size,
@@ -230,8 +234,6 @@ auto tcp_stream::complete_read(std::size_t size,
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
     waiter->finish(size, error);
-    // The continuation often starts another read before returning. Keep the
-    // existing read interest if it did, avoiding a disable/re-enable pair.
     update_async_interest();
 }
 
@@ -244,8 +246,8 @@ auto tcp_stream::complete_write(std::size_t size,
     detail::socket_operations::stream_retire(*this, waiter->operation_);
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
-    update_async_interest();
     waiter->finish(size, error);
+    update_async_interest();
 }
 
 auto tcp_stream::complete_file(std::error_code error) noexcept -> void
@@ -257,8 +259,8 @@ auto tcp_stream::complete_file(std::error_code error) noexcept -> void
         std::terminate();
     detail::coroutine_frame_access::detach_cancellation(
         waiter->cancellation_);
-    update_async_interest();
     waiter->finish(error);
+    update_async_interest();
 }
 
 tcp_stream::connect_awaiter::connect_awaiter(
@@ -731,9 +733,9 @@ auto tcp_stream::complete_ready(std::error_code error) noexcept -> void
     }
     if (first) detail::coroutine_frame_access::detach_cancellation(first->cancellation_);
     if (second) detail::coroutine_frame_access::detach_cancellation(second->cancellation_);
-    update_async_interest();
     if (first) first->finish(error);
     if (second) second->finish(error);
+    update_async_interest();
 }
 
 template class tcp_stream::readiness_awaiter<true>;
