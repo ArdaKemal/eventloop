@@ -1669,6 +1669,17 @@ if(BUILD_TESTING)
     add_test(NAME coroutine_udp COMMAND coroutine_udp_test)
     set_tests_properties(coroutine_udp PROPERTIES TIMEOUT 10)
 
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(interest_churn_test tests/interest_churn.cc)
+        target_link_libraries(interest_churn_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+        target_compile_options(interest_churn_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            target_compile_options(interest_churn_test PRIVATE -Wno-mismatched-new-delete)
+        endif()
+        add_test(NAME interest_churn COMMAND interest_churn_test)
+        set_tests_properties(interest_churn PROPERTIES TIMEOUT 10)
+    endif()
+
     add_test(
         NAME http_server
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_http_server.sh

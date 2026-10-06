@@ -161,6 +161,7 @@ private:
     auto on_error() -> void override;
     auto on_shutdown() -> void override;
     auto update_interest() -> void;
+    auto refresh_interest() noexcept -> void;
     auto complete_receive(int result, ip_endpoint source = {},
                           std::size_t segment = 0) noexcept -> void;
     auto complete_send(int result) noexcept -> void;
@@ -173,6 +174,8 @@ private:
     std::size_t receive_segment_ {0};
     bool closing_ {false};
     bool gso_disabled_ {false};
+    bool receive_interest_ {false};
+    bool send_interest_ {false};
     void* lifetime_observer_context_ {nullptr};
     void (*lifetime_observer_)(void*) noexcept {nullptr};
     [[no_unique_address]] detail::socket_datagram_state backend_state_ {};
