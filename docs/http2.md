@@ -98,8 +98,13 @@ the key schedule on every new connection.
   verification, SNI, and the default `:authority`; `endpoint` is a numeric
   address, so name resolution belongs to the caller. ALPN must select `h2`.
   Requests own their method, target, authority override, header strings, and
-  body bytes or a `request_body_source` callback. Any valid HTTP method token
-  is accepted, including GET, HEAD, POST, PUT, PATCH, DELETE, and OPTIONS.
+  body bytes or a `request_body_source` callback.
+  Requests and all three callback types are move-only; pass named requests
+  and callbacks with `std::move`. Callbacks may exclusively own resources
+  through move-only captures, which remain task-owned through task completion,
+  including cancellation. Callback construction may allocate.
+  Any valid HTTP method token is accepted, including GET, HEAD, POST, PUT,
+  PATCH, DELETE, and OPTIONS.
   CONNECT returns `operation_not_supported` because a tunnel does not fit one
   buffered exchange.
   The owned body is limited to 4 MiB; a source can produce up to 1 TiB in

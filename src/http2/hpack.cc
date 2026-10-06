@@ -459,8 +459,8 @@ struct huffman_tree {
     const auto data = input.subspan(offset, length);
     offset += length;
     if (huffman) return decode_huffman(data, output);
-    output.reserve(length);
-    for (const auto octet : data) output.push_back(static_cast<char>(byte(octet)));
+    if (!data.empty())
+        output.assign(reinterpret_cast<const char*>(data.data()), data.size());
     return hpack_error::none;
 }
 

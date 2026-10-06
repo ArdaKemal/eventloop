@@ -24,9 +24,13 @@ namespace {
     const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
         value.data(), static_cast<int>(value.size()), nullptr, 0);
     if (length == 0) return {};
-    std::wstring result(static_cast<std::size_t>(length), L'\0');
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-            static_cast<int>(value.size()), result.data(), length) == 0) return {};
+    std::wstring result;
+    result.resize_and_overwrite(static_cast<std::size_t>(length),
+        [&](wchar_t* output, std::size_t) noexcept -> std::size_t {
+            return static_cast<std::size_t>(MultiByteToWideChar(
+                CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                static_cast<int>(value.size()), output, length));
+        });
     return result;
 }
 
@@ -36,10 +40,13 @@ namespace {
     const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
         value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
     if (length == 0) return {};
-    std::string result(static_cast<std::size_t>(length), '\0');
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
-        static_cast<int>(value.size()), result.data(), length, nullptr, nullptr) == 0)
-        return {};
+    std::string result;
+    result.resize_and_overwrite(static_cast<std::size_t>(length),
+        [&](char* output, std::size_t) noexcept -> std::size_t {
+            return static_cast<std::size_t>(WideCharToMultiByte(
+                CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                static_cast<int>(value.size()), output, length, nullptr, nullptr));
+        });
     return result;
 }
 
@@ -48,11 +55,13 @@ namespace {
     const DWORD size = GetFinalPathNameByHandleW(handle, nullptr, 0,
                                                  FILE_NAME_NORMALIZED);
     if (size == 0 || size > 32767) return {};
-    std::wstring path(size, L'\0');
-    const DWORD written = GetFinalPathNameByHandleW(handle, path.data(), size,
-                                                    FILE_NAME_NORMALIZED);
-    if (written == 0 || written >= size) return {};
-    path.resize(written);
+    std::wstring path;
+    path.resize_and_overwrite(size,
+        [&](wchar_t* output, std::size_t) noexcept -> std::size_t {
+            const DWORD written = GetFinalPathNameByHandleW(
+                handle, output, size, FILE_NAME_NORMALIZED);
+            return written < size ? written : 0;
+        });
     return path;
 }
 

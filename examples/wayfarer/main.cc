@@ -543,9 +543,9 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
             const auto body_bytes = std::as_bytes(std::span(body.data(), body.size()));
             request.body.assign(body_bytes.begin(), body_bytes.end());
             if (!body_file.empty()) {
-                auto file = std::make_shared<std::ifstream>(body_file, std::ios::binary);
+                auto file = std::make_unique<std::ifstream>(body_file, std::ios::binary);
                 if (!file->is_open()) { fail("cannot open request body file"); co_return; }
-                request.body_source = [file](std::span<std::byte> buffer)
+                request.body_source = [file = std::move(file)](std::span<std::byte> buffer)
                     -> std::expected<std::size_t, std::error_code> {
                     file->read(reinterpret_cast<char*>(buffer.data()),
                         static_cast<std::streamsize>(buffer.size()));
@@ -587,7 +587,8 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
                 return {};
             };
             auto response = io_result(co_await http2::async_request(
-                loop, addresses->endpoints[i], tls, current.hostname, std::move(request), sink, headers_sink));
+                loop, addresses->endpoints[i], tls, current.hostname, std::move(request),
+                std::move(sink), std::move(headers_sink)));
             if (!response) {
                 if (!state.expired) fail("HTTP/2 request failed: " + response.error().message());
                 if (wrote_output) co_return;
