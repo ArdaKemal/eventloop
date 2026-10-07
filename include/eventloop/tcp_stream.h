@@ -120,7 +120,7 @@ public:
 private:
     class file_awaiter {
     public:
-        file_awaiter(tcp_stream& owner, unique_fd file,
+        file_awaiter(tcp_stream& owner, unique_fd file, std::uint64_t offset,
                      std::size_t size) noexcept;
         ~file_awaiter();
         file_awaiter(const file_awaiter&) = delete;
@@ -146,6 +146,7 @@ private:
         auto finish(std::error_code error) noexcept -> void;
         tcp_stream& owner_;
         unique_fd file_;
+        std::uint64_t offset_;
         std::size_t remaining_;
         detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
@@ -154,13 +155,16 @@ private:
     };
     [[nodiscard]] static auto send_file_task(
         event_loop& loop, tcp_stream& socket, std::span<const std::byte> header,
-        unique_fd file, std::size_t size)
+        unique_fd file, std::uint64_t offset, std::size_t size)
         -> task<std::expected<void, std::error_code>>;
 public:
-    // Owns file through completion, including cancellation. This task wraps
-    // the internal sendfile awaiter and requires a coroutine frame.
+    // Sends header, then size bytes of file starting at offset. Reads at the
+    // offset without moving the file position. Owns file through completion,
+    // including cancellation. This task wraps the internal sendfile awaiter
+    // and requires a coroutine frame.
     [[nodiscard]] auto async_send_file(std::span<const std::byte> header,
-                                       unique_fd file, std::size_t size)
+                                       unique_fd file, std::uint64_t offset,
+                                       std::size_t size)
         -> task<std::expected<void, std::error_code>>;
     virtual auto close() -> void;
 

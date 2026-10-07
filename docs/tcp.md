@@ -21,9 +21,10 @@ together with the rules below.
   close it. A pending connect failure or cancellation removes the stream.
   Check saved descriptors or task results before retaining
   a pointer after failure.
-- `eventloop::tcp_stream::async_send_file()` takes ownership of its file
-  descriptor and sends the optional header followed by the requested file
-  range. Plain HTTP uses it for larger files; preserve the component-by-component `O_NOFOLLOW` path walk that protects document-root access.
+- `eventloop::tcp_stream::async_send_file(header, file, offset, size)` takes
+  ownership of its file descriptor and sends the optional header followed by
+  `size` bytes from `offset`. It reads at that offset and leaves the file
+  position unchanged. Plain HTTP uses it for larger files and byte ranges; preserve the component-by-component `O_NOFOLLOW` path walk that protects document-root access.
 
 TLS operations are specified in the [TLS contract](tls.md). Unix domain
 streams use these result and cancellation rules; see the

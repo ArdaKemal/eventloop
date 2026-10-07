@@ -231,7 +231,7 @@ auto socket_operations::stream_bind(tcp_stream&, socket_operation& operation,
                 return;
             }
             self.remaining_ -= bytes;
-            op.file_offset += bytes;
+            self.offset_ += bytes;
             const auto next = self.advance();
             if (next.value() != EAGAIN) self.owner_.complete_file(next);
         };
@@ -277,7 +277,8 @@ auto socket_operations::stream_close(tcp_stream& stream) -> void
 }
 
 auto socket_operations::stream_send_file(tcp_stream& stream,
-                                         const unique_fd& file, std::size_t size,
+                                         const unique_fd& file, std::uint64_t offset,
+                                         std::size_t size,
                                          socket_operation& operation) noexcept
     -> socket_result
 {
@@ -289,16 +290,8 @@ auto socket_operations::stream_send_file(tcp_stream& stream,
         native_file = static_cast<native_socket>(handle);
     }
     operation.file_requested = size;
-    const auto offset = static_cast<std::uint64_t>(operation.file_offset);
-    operation.overlapped = {};
-    operation.overlapped.Offset = static_cast<DWORD>(offset);
-    operation.overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
-    return start_send_file(stream.descriptor_.get(), native_file, size, operation);
+    return start_send_file(stream.descriptor_.get(), native_file, offset, size, operation);
 }
-
-auto socket_operations::stream_file_advanced(socket_operation& operation,
-                                             std::size_t bytes) noexcept -> void
-{ operation.file_offset += bytes; }
 
 namespace {
 [[nodiscard]] auto last_error() noexcept -> std::error_code
@@ -570,13 +563,18 @@ auto socket_operations::start_write(native_socket socket, const void* buffer,
 }
 
 auto socket_operations::start_send_file(native_socket socket,
-                                        native_socket file, std::size_t size,
+                                        native_socket file, std::uint64_t offset,
+                                        std::size_t size,
                                         socket_operation& operation) noexcept
     -> socket_result
 {
     if (size == 0) return {};
     if (size > std::numeric_limits<DWORD>::max())
         return {.error = std::make_error_code(std::errc::invalid_argument)};
+    // TransmitFile reads at the overlapped offset.
+    operation.overlapped = {};
+    operation.overlapped.Offset = static_cast<DWORD>(offset);
+    operation.overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
     const BOOL started = ::TransmitFile(
         static_cast<SOCKET>(socket), reinterpret_cast<HANDLE>(file),
         static_cast<DWORD>(size), 0, &operation.overlapped, nullptr, 0);

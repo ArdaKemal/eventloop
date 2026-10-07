@@ -234,16 +234,14 @@ template<typename Stream>
             auto file = state->take_file();
             if (file) {
                 if constexpr (std::is_same_v<Stream, tcp_stream>) {
-                    if (file_offset == 0) {
-                        auto sent = co_await peer->async_send_file({}, std::move(file),
-                                                                   file_size);
-                        if (!operation_succeeded(sent)) {
-                            peer->close();
-                            co_return;
-                        }
-                        state->finish_response();
-                        continue;
+                    auto sent = co_await peer->async_send_file({}, std::move(file),
+                                                               file_offset, file_size);
+                    if (!operation_succeeded(sent)) {
+                        peer->close();
+                        co_return;
                     }
+                    state->finish_response();
+                    continue;
                 }
                 if constexpr (std::is_same_v<Stream, tls_stream>) {
                     if (peer->kernel_sendfile_available()) {

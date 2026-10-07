@@ -514,15 +514,13 @@ private:
             busy writing(self.writing_);
             bool sent = false;
             if constexpr (std::is_same_v<Stream, tcp_stream>) {
-                if (offset == 0) {
-                    auto result = io_value(co_await self.peer_.async_send_file(
-                        {}, std::move(file), static_cast<std::size_t>(size)));
-                    if (!result) {
-                        self.broken_ = true;
-                        co_return std::unexpected(result.error());
-                    }
-                    sent = true;
+                auto result = io_value(co_await self.peer_.async_send_file(
+                    {}, std::move(file), offset, static_cast<std::size_t>(size)));
+                if (!result) {
+                    self.broken_ = true;
+                    co_return std::unexpected(result.error());
                 }
+                sent = true;
             }
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
             if constexpr (std::is_same_v<Stream, tls_stream>) {

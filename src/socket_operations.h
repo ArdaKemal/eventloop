@@ -77,11 +77,10 @@ public:
     { static_cast<notifiable&>(stream).unpin(); }
     [[nodiscard]] static auto stream_send_file(tcp_stream& stream,
                                                const unique_fd& file,
+                                               std::uint64_t offset,
                                                std::size_t size,
                                                socket_operation& operation) noexcept
         -> socket_result;
-    static auto stream_file_advanced(socket_operation& operation,
-                                     std::size_t bytes) noexcept -> void;
     [[nodiscard]] static auto create(int family, int type, int protocol)
         -> native_socket;
     [[nodiscard]] static auto create_listener(ip_endpoint endpoint)
@@ -136,8 +135,10 @@ public:
                                           std::size_t size,
                                           socket_operation& operation) noexcept
         -> socket_result;
+    // Reads at offset; the file position does not move.
     [[nodiscard]] static auto start_send_file(native_socket socket,
                                               native_socket file,
+                                              std::uint64_t offset,
                                               std::size_t size,
                                               socket_operation& operation) noexcept
         -> socket_result;
@@ -228,12 +229,11 @@ inline auto socket_operations::stream_cancel(tcp_stream&,
 inline auto socket_operations::stream_close(tcp_stream& stream) -> void
 { stream.loop_.remove(stream.descriptor_.get()); }
 inline auto socket_operations::stream_send_file(tcp_stream& stream,
-                                         const unique_fd& file, std::size_t size,
+                                         const unique_fd& file, std::uint64_t offset,
+                                         std::size_t size,
                                          socket_operation& operation) noexcept
     -> socket_result
-{ return start_send_file(stream.descriptor_.get(), file.get(), size, operation); }
-inline auto socket_operations::stream_file_advanced(socket_operation&,
-                                             std::size_t) noexcept -> void {}
+{ return start_send_file(stream.descriptor_.get(), file.get(), offset, size, operation); }
 
 inline auto socket_operations::received_source(const socket_operation&) noexcept
     -> ip_endpoint { return {}; }

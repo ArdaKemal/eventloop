@@ -590,10 +590,12 @@ auto send_opened_file(event_loop& loop, tcp_stream& socket,
 {
     auto opened = co_await async_openat(loop, AT_FDCWD, path, O_RDONLY);
     if (opened) {
+        // A duplicate shares the file position, which the send leaves alone.
+        const unique_fd position(::dup(opened->get()));
         constexpr std::array<std::byte, 1> header {std::byte {'#'}};
         const auto sent = co_await socket.async_send_file(
-            header, std::move(*opened), sizeof("file payload") - 1);
-        passed = sent.has_value();
+            header, std::move(*opened), 5, sizeof("payload") - 1);
+        passed = sent.has_value() && ::lseek(position.get(), 0, SEEK_CUR) == 0;
     }
     socket.close();
     stop_after_two(loop, completed);
@@ -602,7 +604,7 @@ auto send_opened_file(event_loop& loop, tcp_stream& socket,
 auto receive_opened_file(event_loop& loop, tcp_stream& socket,
                          int& completed, bool& passed) -> task<void>
 {
-    constexpr std::string_view expected = "#file payload";
+    constexpr std::string_view expected = "#payload";
     std::array<std::byte, expected.size()> buffer {};
     std::size_t received = 0;
     while (received < buffer.size()) {

@@ -265,8 +265,9 @@ auto session::serve_resource(const parsed_request& parsed, bool headers_only) ->
         return;
     }
     if (opened->file.cached() && !headers_only && opened->info.size >= sendfile_min_size) {
-        // sendfile moves a file position that cached descriptors share, so a
-        // body sent with it comes from a private descriptor and its metadata.
+        // sendfile takes ownership of its descriptor and cached descriptors
+        // are shared, so a body sent with it comes from a private descriptor
+        // and its metadata.
         opened->file.reset();
         opened = detail::open_static(root_descriptor_, nullptr, parsed.target);
         if (!opened || opened->info.kind != detail::file_info::type::regular) {

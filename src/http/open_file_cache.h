@@ -35,7 +35,7 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] auto cached() const noexcept -> bool { return cache_ != nullptr; }
     auto reset() noexcept -> void;
-    // An owned descriptor, for an operation that needs its own file position.
+    // An owned descriptor, for an operation that takes ownership of it.
     [[nodiscard]] auto take_owned() noexcept -> unique_fd { return std::move(owned_); }
 
 private:

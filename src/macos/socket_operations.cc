@@ -278,27 +278,22 @@ auto socket_operations::start_write(native_socket socket, const void* buffer,
 }
 
 auto socket_operations::start_send_file(native_socket socket,
-                                        native_socket file, std::size_t size,
+                                        native_socket file, std::uint64_t offset,
+                                        std::size_t size,
                                         socket_operation&) noexcept -> socket_result
 {
     // Darwin interprets a zero sendfile length as "through EOF".
     if (size == 0) return {};
+    const auto limit = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+    if (size > limit || offset > limit - size) return {.error = code(EOVERFLOW)};
     for (;;) {
 #ifdef __APPLE__
-        // Darwin sendfile does not advance the input file's offset. Preserve
-        // the Linux API's current-offset contract, including partial progress
-        // returned alongside EAGAIN/EINTR.
-        const off_t offset = ::lseek(file, 0, SEEK_CUR);
-        if (offset == -1) return {.error = code(errno)};
-        if (size > static_cast<std::size_t>(std::numeric_limits<off_t>::max()) ||
-            offset > std::numeric_limits<off_t>::max() - static_cast<off_t>(size))
-            return {.error = code(EOVERFLOW)};
+        // Report partial progress returned alongside EAGAIN/EINTR.
         off_t transferred = static_cast<off_t>(size);
-        const int result = ::sendfile(file, socket, offset, &transferred, nullptr, 0);
+        const int result = ::sendfile(file, socket, static_cast<off_t>(offset),
+                                      &transferred, nullptr, 0);
         const int error = result == -1 ? errno : 0;
         if (transferred > 0) {
-            if (::lseek(file, offset + transferred, SEEK_SET) == -1)
-                return {.error = code(errno)};
             if (error != 0 && error != EINTR && error != EAGAIN && error != EWOULDBLOCK)
                 return {.error = code(error)};
             return {.transferred = static_cast<std::size_t>(transferred)};
@@ -308,7 +303,8 @@ auto socket_operations::start_send_file(native_socket socket,
         if (error == EAGAIN || error == EWOULDBLOCK) return {.pending = true};
         return {.error = code(error)};
 #else
-        const auto result = ::sendfile(socket, file, nullptr, size);
+        auto position = static_cast<off_t>(offset);
+        const auto result = ::sendfile(socket, file, &position, size);
         if (result >= 0)
             return {.transferred = static_cast<std::size_t>(result)};
         if (errno == EINTR) continue;

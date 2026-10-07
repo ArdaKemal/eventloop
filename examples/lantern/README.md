@@ -56,7 +56,7 @@ configure with `-DEVENTLOOP_SOURCE_DIR=`.
 | Pages, scripts, styles | Static files from `--web` with the open-file cache |
 | JSON API | `http::router` handlers (`api.cc`) |
 | Upload chunks | `request::async_read_body` into a 256 KiB buffer, then `async_write_at` |
-| Playback | `response::async_send_file` with single ranges. TLS uses kTLS `sendfile` when the connection has it, cleartext HTTP/1.1 uses `sendfile` for ranges from byte 0, and other cases use bounded buffered reads |
+| Playback | `response::async_send_file` with single ranges. Cleartext HTTP/1.1 uses `sendfile` and TLS uses kTLS `sendfile` when the connection has it; other cases use bounded buffered reads |
 | Journal | `async_write_at` at offsets reserved per record, so concurrent changes need no queue |
 | HTTP/3 | `http3_server` sharing the same router |
 
