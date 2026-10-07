@@ -34,6 +34,9 @@ struct directory_entry {
 [[nodiscard]] auto open_root(std::string_view path) -> unique_fd;
 [[nodiscard]] auto open_child(native_socket parent, std::string_view name,
                               bool directory_required) noexcept -> unique_fd;
+// A second owned descriptor for the same open file, or an empty one on
+// failure. Reads through it at explicit offsets do not disturb the original.
+[[nodiscard]] auto duplicate_file(native_socket file) noexcept -> unique_fd;
 [[nodiscard]] auto get_file_info(native_socket file) noexcept
     -> std::optional<file_info>;
 [[nodiscard]] auto read_file(native_socket file, std::span<std::byte> output) noexcept

@@ -23,8 +23,8 @@ struct server_options {
     // the document root at most once per second, so for up to a second a
     // changed, replaced, or deleted file can still be served as it was;
     // replace files atomically. Each entry holds a file descriptor.
-    // HTTP/1.1 bodies of 11 KiB or more, sent with sendfile, open the file
-    // themselves. See docs/api-contract.md.
+    // HTTP/1.1 bodies of 11 KiB or more are sent with sendfile from a
+    // duplicate descriptor. See docs/api-contract.md.
     std::size_t open_file_cache_capacity {0};
     // TCP servers only.
     bool reuse_port {false};
