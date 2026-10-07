@@ -78,6 +78,12 @@ struct coroutine_timer_node {
     coroutine_cancellation_node cancellation;
 };
 
+// A waiter that eventloop::wakeup::notify() queued for resumption.
+struct wakeup_node {
+    wakeup_node* next {nullptr};
+    std::coroutine_handle<> handle {};
+};
+
 struct coroutine_frame_access {
     [[nodiscard]] static auto allocate(event_loop& loop,
                                        std::size_t size) noexcept -> void*;
@@ -86,6 +92,8 @@ struct coroutine_frame_access {
     static auto register_timer(event_loop& loop, coroutine_timer_node& timer)
         -> void;
     static auto cancel_timer(coroutine_timer_node& timer) noexcept -> void;
+    static auto schedule_wakeup(event_loop& loop, wakeup_node& node) noexcept
+        -> void;
     static auto attach_cancellation(coroutine_cancellation_state& state,
                                     coroutine_cancellation_node& node) noexcept
         -> bool;

@@ -11,7 +11,8 @@ implementation conventions.
 ## Core and utilities
 
 - [Coroutines and event loop](coroutines.md): task and handle lifetimes,
-  frame capacity, results, executors, cancellation, timers, and composition.
+  frame capacity, results, executors, cancellation, timers, wakeups, and
+  composition.
 - [File I/O](file-io.md): descriptor and buffer ownership, worker completion,
   and bounded operation capacity.
 - [TOML configuration](toml.md): caller storage, view lifetimes, parser limits,

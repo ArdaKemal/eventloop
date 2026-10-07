@@ -602,6 +602,29 @@ public:
         handlers.clear();
     }
 
+    auto schedule_wakeup(detail::wakeup_node& node) noexcept -> void
+    {
+        node.next = nullptr;
+        *ready_wakeups_tail = &node;
+        ready_wakeups_tail = &node.next;
+        local_post_pending = true;
+    }
+
+    // Resumes queued waiters in order, including ones notified meanwhile, up
+    // to the same per-iteration budget as posted work. A node is unlinked
+    // before its resumption, which may destroy it.
+    auto drain_wakeups() noexcept -> bool
+    {
+        for (std::size_t count = 0; count < max_posted_tasks_per_iteration; ++count) {
+            auto* const node = ready_wakeups;
+            if (node == nullptr) return false;
+            ready_wakeups = node->next;
+            if (ready_wakeups == nullptr) ready_wakeups_tail = &ready_wakeups;
+            node->handle.resume();
+        }
+        return ready_wakeups != nullptr;
+    }
+
     auto erase_pending() -> void
     {
         for (const native_socket descriptor : pending_removals) {
@@ -878,7 +901,9 @@ public:
     // continuations and same-thread posts use posted_tasks without writing
     // to the backend wake notifier.
     bool local_post_pending {false};
-
+    // Notified wakeup waiters, resumed in order with posted work.
+    detail::wakeup_node* ready_wakeups {nullptr};
+    detail::wakeup_node** ready_wakeups_tail {&ready_wakeups};
     // Set by the first cross-thread publisher after the owner's last drain;
     // while set, a backend wakeup or owner drain is already due.
     std::atomic<bool> wake_pending {false};
@@ -1001,7 +1026,8 @@ auto event_loop::run() -> event_loop_result
                 const bool more_posted = implementation_->drain_posted();
                 const bool more_completions =
                     implementation_->drain_coroutine_completions();
-                more = more_posted || more_completions;
+                const bool more_wakeups = implementation_->drain_wakeups();
+                more = more_posted || more_completions || more_wakeups;
             }
             if (more) implementation_->local_post_pending = true;
             implementation_->drain_completed_roots();
@@ -1263,6 +1289,12 @@ auto detail::coroutine_frame_access::register_timer(
     event_loop& loop, coroutine_timer_node& timer) -> void
 {
     loop.implementation_->register_coroutine_timer(timer);
+}
+
+auto detail::coroutine_frame_access::schedule_wakeup(
+    event_loop& loop, wakeup_node& node) noexcept -> void
+{
+    loop.implementation_->schedule_wakeup(node);
 }
 
 auto detail::coroutine_frame_access::cancel_timer(
