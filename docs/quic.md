@@ -16,6 +16,11 @@ The aggregate receive-data window remains at most 128 KiB, independently
 of stream count, with at most 4 KiB buffered per stream. No stream storage falls
 back to an unbounded allocation.
 
+`quic_endpoint::async_accept()` reports a connection that failed, or that its
+peer closed, before acceptance as that connection's error; accept again to
+continue. After `close()`, or when the accepting task is cancelled, it reports
+`operation_canceled`.
+
 `quic_connection::async_write()` returns the bytes accepted into bounded send
 storage, which can be fewer than supplied. Retry the remaining span; `fin`
 closes the send side only when the entire supplied span is accepted. The

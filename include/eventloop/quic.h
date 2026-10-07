@@ -177,7 +177,10 @@ public:
     auto operator=(const quic_endpoint&) -> quic_endpoint& = delete;
 
     [[nodiscard]] auto local_endpoint() const noexcept -> ip_endpoint;
-    // Resolves when a new accepted connection completes its handshake.
+    // Resolves when a new accepted connection completes its handshake. A
+    // connection that fails or is closed by its peer before acceptance
+    // reports its own error instead, and acceptance continues; after close(),
+    // or when cancelled, it reports operation_canceled.
     [[nodiscard]] auto async_accept()
         -> task<std::expected<quic_connection, std::error_code>>;
     // Starts a client connection to server and resolves once the handshake

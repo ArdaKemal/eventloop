@@ -930,8 +930,10 @@ auto accept_connection(event_loop&, quic_endpoint::implementation& impl)
                 co_return quic_connection {impl.owner_, i, slot.generation};
             }
         }
+        // peer_closed above belongs to one connection; closing the endpoint
+        // ends acceptance itself.
         if (impl.closing_)
-            co_return std::unexpected(make_error_code(quic_errc::peer_closed));
+            co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
         co_await notify(impl);
     }
 }
