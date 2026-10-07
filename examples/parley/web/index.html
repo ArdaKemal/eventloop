@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#00a884">
+<title>Parley</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M1.1 21.8 23 12 1.1 2.2 1 9.8l15.7 2.2L1 14.2z"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-6a3.5 3.5 0 0 0-7 0v6A3.5 3.5 0 0 0 12 15zm6.1-3.6a.9.9 0 0 0-1.8 0 4.3 4.3 0 0 1-8.6 0 .9.9 0 0 0-1.8 0 6.1 6.1 0 0 0 5.2 6v2.9h1.8v-2.9a6.1 6.1 0 0 0 5.2-6z"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 24 24"><path d="M16.5 6.5v10.6a4.5 4.5 0 0 1-9 0V5.6a3 3 0 0 1 6 0v10.2a1.5 1.5 0 0 1-3 0V6.5H9v9.3a3 3 0 0 0 6 0V5.6a4.5 4.5 0 0 0-9 0v11.5a6 6 0 0 0 12 0V6.5z"/></symbol>
+  <symbol id="i-smile" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 18.2a8.2 8.2 0 1 1 0-16.4 8.2 8.2 0 0 1 0 16.4zM8.6 10.8a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8zm6.8 0a1.4 1.4 0 1 0 0-2.8 1.4 1.4 0 0 0 0 2.8zM12 17.3a5.3 5.3 0 0 0 4.9-3.3H7.1a5.3 5.3 0 0 0 4.9 3.3z"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M19 3H5a2 2 0 0 0-2 2v15.6l3.6-3.6H19a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm-5 9H7v-2h7zm3-4H7V6h10z"/></symbol>
+  <symbol id="i-group" viewBox="0 0 24 24"><path d="M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm-8 0a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 2c-2.3 0-7 1.2-7 3.5V19h14v-2.5C15 14.2 10.3 13 8 13zm8 0h-1c1.2.9 2 2 2 3.5V19h6v-2.5c0-2.3-4.7-3.5-7-3.5z"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M10 17l1.4-1.4L8.8 13H20v-2H8.8l2.6-2.6L10 7l-5 5zM4 5h7V3H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h7v-2H4z"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4l5.6 5.6L5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6z"/></symbol>
+  <symbol id="i-reply" viewBox="0 0 24 24"><path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z"/></symbol>
+  <symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zm2 16H8v-2h8zm0-4H8v-2h8zm-3-5V3.5L18.5 9z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><path d="M21 19V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2zM8.5 13.5l2.5 3 3.5-4.5 4.5 6H5z"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M6 19h4V5H6zm8-14v14h4V5z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6zM19 4h-3.5l-1-1h-5l-1 1H5v2h14z"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M5 20h14v-2H5zM19 9h-4V3H9v6H5l7 7z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 14 15.5l.3.3v.8l5 5 1.5-1.5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 11"><path d="M11.1.6 4.6 7.2 1.9 4.5.6 5.8l4 4L12.4 1.9z"/></symbol>
+  <symbol id="i-checks" viewBox="0 0 16 11"><path d="M11.1.6 4.6 7.2 1.9 4.5.6 5.8l4 4L12.4 1.9zM15.4.6 8.9 7.2l-.8-.8-1.3 1.3 2.1 2.1L16.7 1.9z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 16 16"><path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zm0 11.7a5.2 5.2 0 1 1 0-10.4 5.2 5.2 0 0 1 0 10.4zM8.6 4.5H7.4v4l3.3 2 .6-1-2.7-1.6z"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-2h2zm0-4h-2V7h2z"/></symbol>
+</svg>
+
+<!-- Sign in / register -->
+<main id="auth" class="auth" hidden>
+  <div class="auth-card">
+    <div class="brand"><svg><use href="#i-chat"/></svg><span>Parley</span></div>
+    <p class="auth-tagline">Private chat over HTTP/2, HTTP/3, and WebSockets.</p>
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-mode="login" role="tab">Sign in</button>
+      <button class="tab" data-mode="register" role="tab">Create account</button>
+    </div>
+    <form id="auth-form" autocomplete="on">
+      <label>Username<input name="username" autocomplete="username" required minlength="3" maxlength="24" pattern="[A-Za-z0-9._]+" autocapitalize="off" spellcheck="false"></label>
+      <label class="register-only" hidden>Display name<input name="name" maxlength="64" autocomplete="nickname"></label>
+      <label>Password<input name="password" type="password" required minlength="8" maxlength="128" autocomplete="current-password"></label>
+      <p id="auth-error" class="error" role="alert"></p>
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+  </div>
+</main>
+
+<!-- Application -->
+<div id="app" class="app" hidden>
+  <aside class="sidebar">
+    <header class="bar">
+      <button id="me-button" class="avatar-button" title="Profile"></button>
+      <div class="bar-actions">
+        <button class="icon" id="new-chat" title="New chat"><svg><use href="#i-chat"/></svg></button>
+        <button class="icon" id="new-group" title="New group"><svg><use href="#i-group"/></svg></button>
+        <button class="icon" id="logout" title="Sign out"><svg><use href="#i-logout"/></svg></button>
+      </div>
+    </header>
+    <div id="connection" class="connection" hidden></div>
+    <div class="search"><svg><use href="#i-search"/></svg><input id="search" placeholder="Search or start a new chat" autocomplete="off"></div>
+    <ul id="chat-list" class="chat-list"></ul>
+    <div id="contact-results" class="contact-results" hidden>
+      <h3>Contacts</h3>
+      <ul id="contact-list" class="chat-list"></ul>
+    </div>
+  </aside>
+
+  <section id="conversation" class="conversation">
+    <div id="empty" class="empty">
+      <svg><use href="#i-chat"/></svg>
+      <h2>Parley</h2>
+      <p>Send and receive messages, photos, voice notes, and documents.<br>Pick a chat or start a new one.</p>
+      <p class="transport" id="transport"></p>
+    </div>
+    <div id="chat" class="chat" hidden>
+      <header class="bar chat-header">
+        <button class="icon back" id="back" title="Back"><svg><use href="#i-back"/></svg></button>
+        <div id="chat-avatar"></div>
+        <div class="chat-title">
+          <strong id="chat-name"></strong>
+          <span id="chat-status"></span>
+        </div>
+      </header>
+      <div id="messages" class="messages" tabindex="0" aria-live="polite">
+        <div id="history-loader" class="history-loader" hidden>Loading…</div>
+        <div id="message-list"></div>
+      </div>
+      <div id="drop-hint" class="drop-hint" hidden>Drop files to send</div>
+      <div id="reply-bar" class="reply-bar" hidden>
+        <div class="reply-quote"><strong id="reply-name"></strong><span id="reply-text"></span></div>
+        <button class="icon" id="reply-cancel" title="Cancel reply"><svg><use href="#i-close"/></svg></button>
+      </div>
+      <div id="emoji-panel" class="emoji-panel" hidden></div>
+      <footer class="composer" id="composer">
+        <button class="icon" id="emoji-button" title="Emoji"><svg><use href="#i-smile"/></svg></button>
+        <div class="attach-wrap">
+          <button class="icon" id="attach-button" title="Attach"><svg><use href="#i-clip"/></svg></button>
+          <div id="attach-menu" class="attach-menu" hidden>
+            <button data-accept="image/*"><span class="dot photo"><svg><use href="#i-image"/></svg></span>Photos</button>
+            <button data-accept=""><span class="dot document"><svg><use href="#i-doc"/></svg></span>Document</button>
+            <button data-accept="audio/*"><span class="dot audio"><svg><use href="#i-mic"/></svg></span>Audio file</button>
+          </div>
+        </div>
+        <input id="file-input" type="file" multiple hidden>
+        <textarea id="input" rows="1" placeholder="Type a message" maxlength="4096"></textarea>
+        <button class="icon send" id="send-button" title="Send"><svg><use href="#i-mic"/></svg></button>
+      </footer>
+      <footer class="composer recording" id="recorder" hidden>
+        <button class="icon" id="record-cancel" title="Discard"><svg><use href="#i-trash"/></svg></button>
+        <span class="record-dot"></span>
+        <span id="record-time">0:00</span>
+        <span class="record-hint">Recording voice note…</span>
+        <button class="icon send" id="record-send" title="Send voice note"><svg><use href="#i-send"/></svg></button>
+      </footer>
+    </div>
+  </section>
+</div>
+
+<!-- Dialogs -->
+<dialog id="picker" class="sheet">
+  <form method="dialog">
+    <header><button class="icon" value="cancel"><svg><use href="#i-close"/></svg></button><h2 id="picker-title">New chat</h2></header>
+    <label id="group-name-row" hidden>Group name<input id="group-name" maxlength="64"></label>
+    <input id="picker-search" placeholder="Search contacts" autocomplete="off">
+    <ul id="picker-list" class="chat-list"></ul>
+    <p id="picker-error" class="error"></p>
+    <menu id="picker-actions" hidden><button class="primary" id="create-group" value="create">Create group</button></menu>
+  </form>
+</dialog>
+
+<dialog id="profile" class="sheet">
+  <form method="dialog" id="profile-form">
+    <header><button class="icon" value="cancel"><svg><use href="#i-close"/></svg></button><h2>Profile</h2></header>
+    <div id="profile-avatar" class="profile-avatar"></div>
+    <p class="muted" id="profile-username"></p>
+    <label>Name<input id="profile-name" maxlength="64" required></label>
+    <label>About<input id="profile-about" maxlength="140" placeholder="Hey there! I am using Parley."></label>
+    <p id="profile-error" class="error"></p>
+    <menu><button class="primary" value="save">Save</button></menu>
+  </form>
+</dialog>
+
+<dialog id="preview" class="sheet preview">
+  <form method="dialog">
+    <header><button class="icon" value="cancel"><svg><use href="#i-close"/></svg></button><h2 id="preview-title">Send</h2></header>
+    <div id="preview-body" class="preview-body"></div>
+    <div class="preview-caption">
+      <input id="preview-caption" placeholder="Add a caption" maxlength="4096">
+      <button class="icon send" value="send" title="Send"><svg><use href="#i-send"/></svg></button>
+    </div>
+  </form>
+</dialog>
+
+<div id="lightbox" class="lightbox" hidden>
+  <button class="icon" id="lightbox-close" title="Close"><svg><use href="#i-close"/></svg></button>
+  <a class="icon" id="lightbox-download" title="Download" download><svg><use href="#i-down"/></svg></a>
+  <img id="lightbox-image" alt="">
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js" type="module"></script>
+</body>
+</html>

@@ -21,11 +21,13 @@ For a local stream service, use `unix_acceptor` and `unix_stream` from
 server. The listener removes its socket path on close if that path still names
 its socket; it never removes an existing path before bind.
 
-Two applications show how these pieces work together using public headers:
+Three applications show how these pieces work together using public headers:
 [Wayfarer](examples/wayfarer/README.md) fetches over HTTP/1.1, HTTP/2, or
 HTTP/3, while [Stonegate](examples/stonegate/README.md) serves a document root
-over the same protocol generations. They build as separate example projects,
-keeping the core library's examples small.
+over the same protocol generations. [Parley](examples/parley/README.md) is a
+browser chat application with routed APIs, uploads, and realtime messages over
+WebSockets on HTTP/2. They build as separate example projects, keeping the core
+library's examples small.
 
 ## A complete echo server
 
