@@ -33,16 +33,60 @@ def request(stream, path, byte_range=None, head=False):
     return frame(1, 5, stream, block)
 
 
+FALLBACK_SUITE = "ECDHE-RSA-AES256-SHA384"
+
+
+def client_context(fallback):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.set_alpn_protocols(["h2"])
+    if fallback:
+        # CBC is unsupported by Linux kTLS, even on hosts with TLS offload.
+        context.maximum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers(FALLBACK_SUITE)
+    return context
+
+
+def free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def system_server_accepts_fallback(openssl, root):
+    """Whether a server with this host's default OpenSSL cipher settings,
+    which the library leaves unchanged, negotiates the CBC suite. Some
+    distribution builds (Fedora 44 with OpenSSL 3.5) leave TLS 1.2 CBC suites
+    out of server defaults."""
+    port = free_port()
+    server = subprocess.Popen([openssl, "s_server", "-accept", str(port), "-naccept", "1", "-quiet",
+                               "-cert", str(root / "cert.pem"), "-key", str(root / "key.pem")],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(100):
+            try:
+                connection = socket.create_connection(("127.0.0.1", port), timeout=3)
+                break
+            except OSError:
+                time.sleep(0.02)
+        else:
+            raise AssertionError("openssl s_server did not start")
+        context = client_context(True)
+        context.set_alpn_protocols([])
+        try:
+            with context.wrap_socket(connection, server_hostname="localhost") as tls:
+                return tls.cipher()[0] == FALLBACK_SUITE
+        except ssl.SSLError:
+            return False
+    finally:
+        server.kill()
+        server.wait()
+
+
 class Peer:
     def __init__(self, port, fallback):
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        context.set_alpn_protocols(["h2"])
-        if fallback:
-            # CBC is unsupported by Linux kTLS, even on hosts with TLS offload.
-            context.maximum_version = ssl.TLSVersion.TLSv1_2
-            context.set_ciphers("ECDHE-RSA-AES256-SHA384")
+        context = client_context(fallback)
         self.socket = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=3), server_hostname="localhost")
         assert self.socket.selected_alpn_protocol() == "h2"
         if fallback:
@@ -181,12 +225,8 @@ def main():
         (root / "file.bin").write_bytes(payload)
         (root / "tiny.bin").write_bytes(payload[:97])
         subprocess.run([args.openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-keyout", str(root / "key.pem"), "-out", str(root / "cert.pem")], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            https_port = probe.getsockname()[1]
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            http_port = probe.getsockname()[1]
+        https_port = free_port()
+        http_port = free_port()
         with (root / "server.log").open("w+") as log:
             server = subprocess.Popen([args.server, "--root", str(root), "--certificate", str(root / "cert.pem"), "--private-key", str(root / "key.pem"), "--hostname", "localhost", "--http-port", str(http_port), "--https-port", str(https_port)], stdout=log, stderr=log)
             try:
@@ -200,7 +240,11 @@ def main():
                 else:
                     raise AssertionError("server did not start")
                 exercise(https_port, payload, False)
-                exercise(https_port, payload, True)
+                if system_server_accepts_fallback(args.openssl, root):
+                    exercise(https_port, payload, True)
+                else:
+                    print(f"skipped the userspace TLS fallback: this host's OpenSSL server "
+                          f"defaults refuse {FALLBACK_SUITE}")
             except Exception:
                 log.flush()
                 log.seek(0)
