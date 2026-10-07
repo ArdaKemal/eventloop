@@ -264,16 +264,6 @@ auto session::serve_resource(const parsed_request& parsed, bool headers_only) ->
         send_static_response(not_found);
         return;
     }
-    if (opened->file.cached() && !headers_only && opened->info.size >= sendfile_min_size) {
-        // sendfile moves a file position that cached descriptors share, so a
-        // body sent with it comes from a private descriptor and its metadata.
-        opened->file.reset();
-        opened = detail::open_static(root_descriptor_, nullptr, parsed.target);
-        if (!opened || opened->info.kind != detail::file_info::type::regular) {
-            send_static_response(not_found);
-            return;
-        }
-    }
     auto descriptor = std::move(opened->file);
     const auto info = opened->info;
     if (info.kind == detail::file_info::type::regular) {
@@ -364,15 +354,17 @@ auto session::serve_file(const parsed_request& parsed, static_file descriptor, c
 
     const auto response_size = header_length + body_size;
     if (!headers_only && body_size >= sendfile_min_size) {
-        if (descriptor.cached()) {
-            // Not reached: serve_resource() reopens cached files this large.
-            descriptor.reset();
+        // sendfile owns its descriptor; a cached one is shared, so it goes
+        // out as a duplicate read at the range offset.
+        file_ = descriptor.cached() ? detail::duplicate_file(descriptor.get())
+                                    : descriptor.take_owned();
+        descriptor.reset();
+        if (!file_) {
             close_after_response_ = true;
             send_static_response(internal_error);
             return;
         }
         send_response(std::span {header}.first(header_length));
-        file_ = descriptor.take_owned();
         file_size_ = body_size;
         file_offset_ = selection.offset;
         return;

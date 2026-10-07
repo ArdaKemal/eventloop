@@ -248,11 +248,15 @@ auto socket_operations::start_write(native_socket socket, const void* buffer,
 }
 
 auto socket_operations::start_send_file(native_socket socket,
-                                        native_socket file, std::size_t size,
+                                        native_socket file, std::uint64_t offset,
+                                        std::size_t size,
                                         socket_operation&) noexcept -> socket_result
 {
+    if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
+        return {.error = code(EOVERFLOW)};
     for (;;) {
-        const auto result = ::sendfile(socket, file, nullptr, size);
+        auto position = static_cast<off_t>(offset);
+        const auto result = ::sendfile(socket, file, &position, size);
         if (result >= 0)
             return {.transferred = static_cast<std::size_t>(result)};
         if (errno == EINTR) continue;

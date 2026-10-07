@@ -41,6 +41,11 @@ auto open_child(native_socket parent, std::string_view name,
                            (directory_required ? O_DIRECTORY : 0)));
 }
 
+auto duplicate_file(native_socket file) noexcept -> unique_fd
+{
+    return unique_fd(fcntl(file, F_DUPFD_CLOEXEC, 0));
+}
+
 auto get_file_info(native_socket file) noexcept -> std::optional<file_info>
 {
     struct stat info {};

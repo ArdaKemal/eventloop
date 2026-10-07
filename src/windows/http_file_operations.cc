@@ -108,13 +108,7 @@ auto open_child(native_socket parent, std::string_view name,
                 bool directory_required) noexcept -> unique_fd
 {
     try {
-        if (name == ".") {
-            HANDLE duplicate = INVALID_HANDLE_VALUE;
-            if (DuplicateHandle(GetCurrentProcess(), as_handle(parent),
-                    GetCurrentProcess(), &duplicate, 0, FALSE,
-                    DUPLICATE_SAME_ACCESS)) return native_file(duplicate);
-            return {};
-        }
+        if (name == ".") return duplicate_file(parent);
         if (name.empty() || name == ".." || name.size() >= 4096 ||
             name.find_first_of("/\\:\0", 0, 3) != std::string_view::npos ||
             name.back() == '.' || name.back() == ' ') return {};
@@ -142,6 +136,14 @@ auto open_child(native_socket parent, std::string_view name,
     } catch (...) {
         return {};
     }
+}
+
+auto duplicate_file(native_socket file) noexcept -> unique_fd
+{
+    HANDLE duplicate = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(GetCurrentProcess(), as_handle(file), GetCurrentProcess(),
+            &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) return {};
+    return native_file(duplicate);
 }
 
 auto get_file_info(native_socket file) noexcept -> std::optional<file_info>

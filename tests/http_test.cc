@@ -68,7 +68,7 @@ auto stop_after(event_loop& loop, std::chrono::milliseconds delay) -> task<void>
 }
 
 struct capture {
-    std::array<char, 128 * 1024> output {};
+    std::array<char, 256 * 1024> output {};
     std::size_t size {0};
     bool open {true};
 };
@@ -91,19 +91,23 @@ auto collect(http::detail::session& session, capture& stream) -> void
                     response.size());
         stream.size += response.size();
         const auto file_size = session.file_size();
+        auto offset = static_cast<off_t>(session.file_offset());
         auto file = session.take_file();
         if (file) {
+            // Like the server's sendfile, read at the offset: a cached file's
+            // duplicate shares its position.
             std::size_t remaining = file_size;
             while (remaining != 0) {
-                const auto read_size = ::read(file.get(),
+                const auto read_size = ::pread(file.get(),
                     stream.output.data() + stream.size,
-                    std::min(remaining, stream.output.size() - stream.size));
+                    std::min(remaining, stream.output.size() - stream.size), offset);
                 if (read_size <= 0) {
                     stream.open = false;
                     return;
                 }
                 stream.size += static_cast<std::size_t>(read_size);
                 remaining -= static_cast<std::size_t>(read_size);
+                offset += read_size;
             }
         }
         session.finish_response();
@@ -207,31 +211,38 @@ auto session_input_growth_tests() -> bool
             .find("431 Request Header Fields Too Large") != std::string_view::npos;
 }
 
-// With the open-file cache, a small file is served from its cached
-// descriptor, so it survives removal within the revalidation window, and a
-// large file is sent from a private descriptor whose position starts at 0.
+// With the open-file cache, small and large files are served from their
+// cached descriptors, so both survive removal within the revalidation
+// window; a large body goes out through a duplicate read at its offset.
 auto session_cache_tests() -> bool
 {
     char directory_name[] = "/tmp/eventloop-http-cache-XXXXXX";
     if (mkdtemp(directory_name) == nullptr) return false;
     const int directory = open(directory_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (directory == -1) return false;
-    const std::string large(70 * 1024, 'y');
+    std::string large(70 * 1024, '\0');
+    for (std::size_t i = 0; i < large.size(); ++i) large[i] = static_cast<char>('a' + i % 23);
     bool valid = write_file(directory, "site.css", "body{}") &&
                  write_file(directory, "large.bin", large);
     constexpr std::string_view requests =
         "GET /site.css HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        "GET /large.bin HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        "GET /large.bin HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        "GET /large.bin HTTP/1.1\r\nHost: localhost\r\nRange: bytes=1000-59999\r\n\r\n";
     {
         http::detail::open_file_cache cache(8);
         http::detail::session session(directory, false, nullptr, true, &cache);
         for (int round = 0; valid && round < 2; ++round) {
-            if (round == 1) valid = unlinkat(directory, "site.css", 0) == 0;
+            if (round == 1)
+                valid = unlinkat(directory, "site.css", 0) == 0 &&
+                        unlinkat(directory, "large.bin", 0) == 0;
             auto stream = std::make_unique<capture>();
             session.receive(std::as_bytes(std::span {requests}));
             collect(session, *stream);
             valid = valid && stream->open && contains(*stream, "body{}") &&
-                    contains(*stream, "Content-Length: 71680") && contains(*stream, large);
+                    contains(*stream, "Content-Length: 71680") && contains(*stream, large) &&
+                    contains(*stream, "Content-Range: bytes 1000-59999/71680") &&
+                    std::string_view(stream->output.data(), stream->size)
+                        .ends_with(std::string_view(large).substr(1000, 59000));
         }
     }
     (void)unlinkat(directory, "site.css", 0);

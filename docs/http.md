@@ -140,10 +140,10 @@ Authentication and Origin policy remain in the route handler.
   bytes. Each entry holds one file descriptor; storage is allocated when the
   server is constructed, and a hit makes no general-heap allocation. Entries
   in use by responses stay open until those responses finish; when every
-  entry is in use, a request is served uncached. Directories, `index.html`
-  lookups, paths longer than 255 decoded bytes, and HTTP/1.1 bodies of
-  11 KiB or more (sent with `sendfile` from a private descriptor) are not
-  served from the cache. The cache belongs to the server's event loop.
+  entry is in use, a request is served uncached. HTTP/1.1 bodies of 11 KiB or
+  more are sent with `sendfile` from a duplicate of the cached descriptor.
+  Directories, `index.html` lookups, and paths longer than 255 decoded bytes
+  are not served from the cache. The cache belongs to the server's event loop.
 
 ## Allocation scope
 

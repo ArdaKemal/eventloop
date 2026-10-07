@@ -997,9 +997,9 @@ auto http3_server::run_loop(event_loop& loop, http3_server& server) -> task<void
     while (true) {
         auto accepted = flatten_result(co_await impl.endpoint_.async_accept());
         if (!accepted) {
-            if (accepted.error() == make_error_code(quic_errc::peer_closed) ||
-                accepted.error() == std::make_error_code(std::errc::operation_canceled))
-                break;
+            // Other errors, such as a peer that closed before acceptance,
+            // fail only that connection.
+            if (accepted.error() == std::make_error_code(std::errc::operation_canceled)) break;
             continue;
         }
         auto slot = std::find_if(impl.connections_.begin(), impl.connections_.end(),

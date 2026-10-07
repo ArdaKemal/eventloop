@@ -501,8 +501,8 @@ template class tcp_stream::io_awaiter<true>;
 template class tcp_stream::io_awaiter<false>;
 
 tcp_stream::file_awaiter::file_awaiter(tcp_stream& owner, unique_fd file,
-                                       std::size_t size) noexcept
-    : owner_(owner), file_(std::move(file)), remaining_(size)
+                                       std::uint64_t offset, std::size_t size) noexcept
+    : owner_(owner), file_(std::move(file)), offset_(offset), remaining_(size)
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
@@ -520,7 +520,7 @@ auto tcp_stream::file_awaiter::advance() noexcept -> std::error_code
     while (remaining_ != 0) {
         const auto requested = std::min(remaining_, std::size_t {0x7ffff000});
         const auto result = detail::socket_operations::stream_send_file(
-            owner_, file_, requested, operation_);
+            owner_, file_, offset_, requested, operation_);
         if (result.pending) {
             detail::socket_operations::stream_submitted(owner_, operation_);
             return code(EAGAIN);
@@ -528,8 +528,7 @@ auto tcp_stream::file_awaiter::advance() noexcept -> std::error_code
         if (result.error) return result.error;
         if (result.transferred > 0) {
             remaining_ -= result.transferred;
-            detail::socket_operations::stream_file_advanced(
-                operation_, result.transferred);
+            offset_ += result.transferred;
             continue;
         }
         return code(EIO);
@@ -615,7 +614,7 @@ auto tcp_stream::file_awaiter::await_resume() const noexcept
 
 auto tcp_stream::send_file_task(event_loop& loop, tcp_stream& socket,
                                 std::span<const std::byte> header,
-                                unique_fd file, std::size_t size)
+                                unique_fd file, std::uint64_t offset, std::size_t size)
     -> task<std::expected<void, std::error_code>>
 {
     (void)loop;
@@ -625,13 +624,13 @@ auto tcp_stream::send_file_task(event_loop& loop, tcp_stream& socket,
         if (*sent == 0) co_return std::unexpected(code(EIO));
         header = header.subspan(*sent);
     }
-    co_return co_await tcp_stream::file_awaiter(socket, std::move(file), size);
+    co_return co_await tcp_stream::file_awaiter(socket, std::move(file), offset, size);
 }
 auto tcp_stream::async_send_file(std::span<const std::byte> header,
-                                  unique_fd file, std::size_t size)
+                                  unique_fd file, std::uint64_t offset, std::size_t size)
     -> task<std::expected<void, std::error_code>>
 {
-    return send_file_task(loop_, *this, header, std::move(file), size);
+    return send_file_task(loop_, *this, header, std::move(file), offset, size);
 }
 
 #ifdef __linux__

@@ -113,8 +113,8 @@ ownership, and error visibility.
 - The opt-in open-file cache (`server_options::open_file_cache_capacity`,
   `src/http/open_file_cache.h`) opens and revalidates only through
   `open_decoded()`, the `O_NOFOLLOW` walk. Cached descriptors are shared, so
-  read them at explicit offsets; HTTP/1.1 `sendfile` bodies reopen privately
-  because `sendfile` there moves the file position.
+  read them at explicit offsets; HTTP/1.1 `sendfile` bodies send a duplicate
+  descriptor because `tcp_stream::async_send_file()` takes ownership of it.
 - QUIC v1/v2 public endpoints, streams, and DATAGRAMs are implemented. The
   Wayfarer and Stonegate examples exercise HTTP/1.1, HTTP/2, and HTTP/3 through
   public APIs. Stream limits and lifecycle rules are specified in
