@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <span>
@@ -53,6 +54,18 @@ auto hello(event_loop&, http::request& request, http::response& response) -> tas
     (void)co_await response.async_send(200, fields, text("hello"));
 }
 
+auto cookies(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    ++*static_cast<std::size_t*>(request.route_context());
+    const auto value = request.header_value("cookie");
+    std::size_t count = 0;
+    for (const auto& field : request.headers())
+        if (field.name == "cookie") ++count;
+    check(count == (value ? 1u : 0u), "handler sees one normalized Cookie field");
+    check(request.header_value("x-test") == "seen", "Cookie joining preserves other fields");
+    (void)co_await response.async_send(200, {}, text(value.value_or("<none>")));
+}
+
 auto info(event_loop&, http::request& request, http::response& response) -> task<void>
 {
     std::array<char, 256> body {};
@@ -68,6 +81,7 @@ auto info(event_loop&, http::request& request, http::response& response) -> task
 
 auto upload(event_loop&, http::request& request, http::response& response) -> task<void>
 {
+    ++*static_cast<std::size_t*>(request.route_context());
     std::array<std::byte, 700> chunk {};
     std::uint64_t count = 0;
     std::uint64_t sum = 0;
@@ -134,7 +148,7 @@ auto file(event_loop&, http::request& request, http::response& response) -> task
 
 auto headers_frame(std::vector<h3::field> fields) -> std::vector<std::byte>
 {
-    std::vector<std::byte> block(4096);
+    std::vector<std::byte> block(16 * 1024);
     const auto size = h3::qpack_encode(fields, block);
     check(size.has_value(), "encode field section");
     block.resize(*size);
@@ -159,15 +173,17 @@ struct request_spec {
     std::string path {"/"};
     std::vector<std::pair<std::string, std::string>> fields {};
     std::vector<std::string> body {};  // One DATA frame per entry.
+    std::string scheme {"https"};
+    bool wait_continue {false};
 };
 
 auto encode(const request_spec& spec) -> std::vector<std::byte>
 {
-    std::vector<h3::field> fields {{":method", spec.method}, {":scheme", "https"},
+    std::vector<h3::field> fields {{":method", spec.method}, {":scheme", spec.scheme},
                                    {":authority", "example.test"}, {":path", spec.path}};
     for (const auto& [name, value] : spec.fields) fields.push_back({name, value});
     auto bytes = headers_frame(fields);
-    for (const auto& part : spec.body) {
+    if (!spec.wait_continue) for (const auto& part : spec.body) {
         auto frame = data_frame(part);
         bytes.insert(bytes.end(), frame.begin(), frame.end());
     }
@@ -229,14 +245,47 @@ auto send_all(event_loop&, quic_connection& connection, std::uint64_t id,
 }
 
 auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::byte> request,
-              response_view& view) -> task<void>
+              const request_spec& spec, response_view& view) -> task<void>
 {
     const auto id = flatten_result(co_await connection.async_open_stream(
         quic_stream_direction::bidirectional));
     check(id.has_value(), "open request stream");
-    (void)co_await send_all(loop, connection, *id, request, true);
+    check((co_await send_all(loop, connection, *id, request, !spec.wait_continue))
+              .value_or(false), "send request");
     std::vector<std::byte> bytes;
     std::array<std::byte, 1024> buffer {};
+    if (spec.wait_continue) {
+        // Send HEADERS only and leave the request stream open. DATA cannot
+        // reach the handler until its interim response has been verified.
+        for (;;) {
+            const auto got = flatten_result(co_await connection.async_read(*id, buffer));
+            check(got && *got != 0, "Continue arrives before response FIN");
+            bytes.insert(bytes.end(), buffer.begin(),
+                         buffer.begin() + static_cast<std::ptrdiff_t>(*got));
+            const auto frame = h3::decode_frame(bytes, 1024);
+            if (!frame) {
+                check(frame.error() == h3::frame_error::incomplete_input,
+                      "incremental Continue frame");
+                continue;
+            }
+            check(frame->type == h3::headers_frame && frame->encoded_size == bytes.size(),
+                  "Continue is a single HEADERS frame");
+            std::array<h3::field, 4> fields {};
+            std::array<char, 64> strings {};
+            const auto count = h3::qpack_decode(frame->payload, fields, strings);
+            check(count && *count == 1 && fields[0].name == ":status" &&
+                  fields[0].value == "100", "Continue contains only :status 100");
+            bytes.clear();
+            break;
+        }
+        for (const auto& part : spec.body) {
+            const auto frame = data_frame(part);
+            check((co_await send_all(loop, connection, *id, frame, false)).value_or(false),
+                  "send body after Continue");
+        }
+        check((co_await send_all(loop, connection, *id, {}, true)).value_or(false),
+              "finish request after Continue");
+    }
     for (;;) {
         const auto got = flatten_result(co_await connection.async_read(*id, buffer));
         if (!got) { view.error = got.error(); break; }
@@ -247,7 +296,8 @@ auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::by
 }
 
 auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
-            std::vector<std::vector<std::byte>>& requests, std::vector<response_view>& responses,
+            std::vector<std::vector<std::byte>>& requests, const std::vector<request_spec>& specs,
+            std::vector<response_view>& responses,
             bool& done) -> task<void>
 {
     auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
@@ -259,7 +309,8 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
     check(control && (co_await send_all(loop, connection, *control, settings, false))
               .value_or(false), "client control stream");
     for (std::size_t index = 0; index < requests.size(); ++index)
-        (void)co_await exchange(loop, connection, std::move(requests[index]), responses[index]);
+        (void)co_await exchange(loop, connection, std::move(requests[index]), specs[index],
+                               responses[index]);
     done = true;
 }
 
@@ -290,7 +341,7 @@ auto serve(const std::filesystem::path& directory, http::server_options options,
         quic_endpoint endpoint(loop, ip_endpoint::loopback_v4(0), std::move(client_options));
         task_handle<void> serving;
         check(loop.spawn(server.run(), serving) == task_spawn_result::accepted, "spawn server");
-        check(loop.spawn(client(loop, endpoint, server.local_endpoint(), requests, responses,
+        check(loop.spawn(client(loop, endpoint, server.local_endpoint(), requests, specs, responses,
                                 done)) == task_spawn_result::accepted, "spawn client");
         check(loop.spawn(watch(loop, server, endpoint, done)) == task_spawn_result::accepted,
               "spawn watch");
@@ -332,10 +383,13 @@ auto main() -> int
     std::ofstream(directory.path() / "www" / "data.txt") << "0123456789";
     const auto file_path = (directory.path() / "www" / "data.txt").string();
 
+    std::size_t cookie_calls = 0;
+    std::size_t upload_calls = 0;
     auto routes = std::make_shared<http::router>();
     check(routes->add(http::method_type::get, "/hello", hello).has_value() &&
+          routes->add(http::method_type::get, "/cookies", cookies, &cookie_calls).has_value() &&
           routes->add_prefix(http::method_type::get, "/api/", info).has_value() &&
-          routes->add(http::method_type::post, "/upload", upload).has_value() &&
+          routes->add(http::method_type::post, "/upload", upload, &upload_calls).has_value() &&
           routes->add(http::method_type::post, "/partial", partial).has_value() &&
           routes->add(http::method_type::get, "/stream", stream).has_value() &&
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
@@ -376,6 +430,10 @@ auto main() -> int
             {.method = "POST", .path = "/partial", .fields = {length(5000)},
              .body = {std::string(5000, 'p')}},
             {.path = "/hello"},
+            {.path = "/cookies", .fields = {{"cookie", "a=1"}, {"x-test", "seen"},
+                                           {"cookie", "b=2; c=3"}, {"cookie", "d=4"}}},
+            {.path = "/cookies", .fields = {{"cookie", "single=1"}, {"x-test", "seen"}}},
+            {.path = "/cookies", .fields = {{"x-test", "seen"}}},
         });
 
     const auto& hello_response = responses[0];
@@ -408,10 +466,123 @@ auto main() -> int
           "streamed body above max_request_body");
     check(responses[14].body == "partial", "unread body stopped");
     check(responses[15].body == "hello", "connection survives");
+    check(responses[16].body == "a=1; b=2; c=3; d=4", "split Cookies joined in wire order");
+    check(responses[17].body == "single=1", "single Cookie preserved");
+    check(responses[18].body == "<none>", "absent Cookie preserved");
+
+    const auto uploads_before = upload_calls;
+    const auto large_lengths = serve(directory.path(),
+        {.routes = routes, .max_request_body = std::numeric_limits<std::uint64_t>::max()},
+        {
+            {.method = "POST", .path = "/upload",
+             .fields = {{"content-length", "4611686018427387904"}}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"content-length", "18446744073709551615"}}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"content-length", "18446744073709551616"},
+                        {"content-length", "00018446744073709551616"}}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"content-length", std::string(100, '9')}}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"content-length", "18446744073709551616"},
+                        {"content-length", "18446744073709551617"}}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"content-length", "18446744073709551616x"}}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"content-length", "000000000000000000000003"},
+                        {"content-length", "3"}}, .body = {"abc"}},
+            {.path = "/hello"},
+        });
+    for (std::size_t i = 0; i < 4; ++i)
+        check(large_lengths[i].status == 413,
+              "unmatchable declared length answers 413 even with unlimited body option");
+    for (std::size_t i = 4; i < 6; ++i)
+        check(large_lengths[i].status == 0 &&
+              large_lengths[i].error == make_error_code(quic_errc::stream_reset),
+              "invalid large Content-Length remains a malformed request");
+    check(large_lengths[6].status == 200 && large_lengths[6].body == "3 294",
+          "long zero-padded length retains exact body framing");
+    check(upload_calls == uploads_before + 1, "unmatchable length never reaches a handler");
+    check(large_lengths[7].status == 200 && large_lengths[7].body == "hello",
+          "connection survives unmatchable and malformed lengths");
+
+    const request_spec exhausted_cookie {.path = "/cookies",
+        .fields = {{"cookie", std::string(5000, 'a')}, {"x-test", "seen"},
+                   {"cookie", std::string(5000, 'b')}}};
+    // This request fits both decode buffers; only Cookie joining exhausts
+    // their unused string tail. Distinguish that path from header rejection.
+    const auto encoded_cookie = encode(exhausted_cookie);
+    const auto cookie_frame = h3::decode_frame(encoded_cookie, 16 * 1024);
+    std::array<h3::field, h3::qpack_max_fields> decoded_fields {};
+    std::array<char, 16 * 1024> decoded_strings {};
+    check(cookie_frame && h3::qpack_decode(cookie_frame->payload, decoded_fields,
+                                         decoded_strings).has_value(),
+          "Cookie boundary request fits the existing decode limits");
+    const auto calls_before = cookie_calls;
+    const auto cookie_boundary = serve(directory.path(), {.routes = routes},
+        {exhausted_cookie,
+         {.path = "/cookies", .fields = {{"cookie", "ok=1"}, {"x-test", "seen"}}}});
+    check(cookie_boundary[0].error == make_error_code(quic_errc::stream_reset) &&
+          cookie_boundary[0].status == 0, "Cookie join exhaustion resets the request stream");
+    check(cookie_boundary[1].status == 200 && cookie_boundary[1].body == "ok=1",
+          "connection survives Cookie join exhaustion");
+    check(cookie_calls == calls_before + 1, "exhausted Cookie request never invokes the handler");
+
+    const auto cached = serve(directory.path(),
+        {.document_root = directory.path() / "www"},
+        {
+            {.path = "/index.html", .fields = {{"if-none-match", responses[11].field("etag")}}},
+            {.path = "/", .fields = {{"if-modified-since", responses[11].field("last-modified")}}},
+            {.method = "HEAD", .path = "/index.html", .fields = {{"if-none-match", "*"}}},
+        });
+    for (const auto& response : cached)
+        check(response.status == 304 && response.body.empty() &&
+              response.field("content-length") == "6",
+              "304 keeps representation length without a body");
 
     // Routes only: unmatched paths answer 404.
     const auto routed_only = serve(directory.path(), {.routes = routes},
-                                   {{.path = "/index.html"}, {.path = "/hello"}});
+                                   {{.path = "/index.html"}, {.path = "/hello", .scheme = "HtTpS"}});
     check(routed_only[0].status == 404 && routed_only[1].body == "hello",
-          "routes without document root");
+          "routes without document root accept mixed-case HTTPS");
+
+    const auto continued = serve(directory.path(), {.routes = routes},
+        {
+            {.method = "POST", .path = "/upload",
+             .fields = {{"expect", "100-CoNtInUe"}, length(3)}, .body = {"a", "bc"},
+             .wait_continue = true},
+            {.method = "POST", .path = "/upload", .fields = {{"expect", "100-continue"}},
+             .body = {"abc"}, .wait_continue = true},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"expect", "100-continue \t, 100-CoNtInUe"}, length(3)},
+             .body = {"abc"}, .wait_continue = true},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"expect", "custom=\"wait,100-continue,still\""},
+                        {"expect", "100-continue"}, length(3)},
+             .body = {"abc"}, .wait_continue = true},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"expect", "custom=\"wait\\\",100-continue,still\",\t100-continue"}},
+             .body = {"abc"}, .wait_continue = true},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"expect", "100-continue"}, length(0)}},
+            {.path = "/hello", .fields = {{"expect", "100-continue"}, length(3)}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"expect", "100-continue"}, length(3)}, .body = {"abc"}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"expect", "custom=\"wait,100-continue,still\", other"}}},
+            {.method = "POST", .path = "/upload",
+             .fields = {{"expect", "100-continue=other"}}},
+        });
+    for (std::size_t i = 0; i < 5; ++i)
+        check(continued[i].status == 200 && continued[i].body == "3 294" &&
+              continued[i].trailers.empty(), "final response follows exactly one Continue");
+    check(continued[5].status == 200 && continued[5].body == "0 0" &&
+          continued[5].trailers.empty(), "zero-length body needs no Continue");
+    check(continued[6].status == 200 && continued[6].body == "hello" &&
+          continued[6].trailers.empty(), "header-only decision sends a final response");
+    check(continued[7].status == 200 && continued[7].body == "3 294" &&
+          continued[7].trailers.empty(), "buffered content needs no Continue");
+    for (std::size_t i = 8; i < 10; ++i)
+        check(continued[i].status == 200 && continued[i].body == "0 0" &&
+              continued[i].trailers.empty(), "only an exact expectation member sends Continue");
 }

@@ -17,6 +17,7 @@
 #include <array>
 #include <charconv>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -215,6 +216,32 @@ using size_result = detail::size_result;
 constexpr std::size_t response_fields = h3::qpack_max_fields / 2;
 constexpr std::size_t trailer_block = header_limit / 2;
 
+[[nodiscard]] auto expects_continue(std::span<const header> headers) noexcept -> bool
+{
+    for (const auto& field : headers) {
+        if (field.name != "expect") continue;
+        auto value = field.value;
+        while (!value.empty()) {
+            std::size_t end = 0;
+            bool quoted = false;
+            for (; end < value.size(); ++end) {
+                const char c = value[end];
+                if (quoted && c == '\\' && end + 1 < value.size()) ++end;
+                else if (c == '"') quoted = !quoted;
+                else if (!quoted && c == ',') break;
+            }
+            auto member = value.substr(0, end);
+            while (!member.empty() && (member.front() == ' ' || member.front() == '\t'))
+                member.remove_prefix(1);
+            while (!member.empty() && (member.back() == ' ' || member.back() == '\t'))
+                member.remove_suffix(1);
+            if (h3::ascii_equal(member, "100-continue")) return true;
+            value.remove_prefix(end + (end < value.size()));
+        }
+    }
+    return false;
+}
+
 // One routed request on a request stream. Lives in serve_route's frame; the
 // connection, storage and parser outlive it.
 class http3_exchange final : public detail::exchange {
@@ -366,6 +393,7 @@ private:
             if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
             if (!self.data_.empty()) {
                 if (buffer.empty()) co_return std::unexpected(failure(std::errc::invalid_argument));
+                self.continue_checked_ = true;
                 const auto count = std::min(buffer.size(), self.data_.size());
                 std::memcpy(buffer.data(), self.data_.data(), count);
                 self.data_ = self.data_.subspan(count);
@@ -392,6 +420,20 @@ private:
                     self.data_ = self.frames_.data();
                 }
                 continue;
+            }
+            // RFC 9110 10.1.1: send Continue before waiting for content,
+            // unless content or a final response has already started.
+            if (!self.continue_checked_) {
+                self.continue_checked_ = true;
+                if (!self.started_ && !self.writing_ && self.request_.content_length() != 0 &&
+                    expects_continue(self.request_.headers())) {
+                    busy writing(self.writing_);
+                    const std::array<h3::field, 1> fields {{{":status", "100"}}};
+                    if (!(co_await write_section(loop, self, fields, false)).value_or(false)) {
+                        self.broken_ = true;
+                        co_return std::unexpected(failure(std::errc::connection_reset));
+                    }
+                }
             }
             const auto got = flatten_result(co_await self.connection_.async_read(self.id_, input_area));
             if (!got) {
@@ -559,9 +601,58 @@ private:
     std::optional<std::uint64_t> declared_;
     bool head_only_;
     bool bodyless_ {false};
+    bool continue_checked_ {false};
     bool reading_ {false};
     bool writing_ {false};
 };
+
+// Join split Cookie lines for the generic HTTP application (RFC 9114 4.2.1).
+// The unused decoded-string tail keeps the joined view alive through body
+// reads and response writes without using either operation's scratch area.
+auto prepare_request_headers(stream_storage& s, std::span<const h3::field> fields,
+                             std::size_t& count) -> bool
+{
+    std::size_t cookies = 0, cookie_size = 0;
+    for (const auto& field : fields)
+        if (field.name == "cookie") { ++cookies; cookie_size += field.value.size(); }
+    std::string_view joined;
+    if (cookies > 1) {
+        std::size_t used = 0;
+        const std::less<const char*> less;
+        for (const auto& field : fields)
+            for (const auto value : {field.name, field.value})
+                if (!less(value.data(), s.strings.data()) &&
+                    less(value.data(), s.strings.data() + s.strings.size()))
+                    used = std::max(used, static_cast<std::size_t>(value.data() - s.strings.data()) +
+                                         value.size());
+        cookie_size += 2 * (cookies - 1);
+        if (cookie_size > s.strings.size() - used)
+            return false;
+        char* output = s.strings.data() + used;
+        std::size_t written = 0;
+        bool first = true;
+        for (const auto& field : fields) {
+            if (field.name != "cookie") continue;
+            if (!first) { output[written++] = ';'; output[written++] = ' '; }
+            if (!field.value.empty())
+                std::memcpy(output + written, field.value.data(), field.value.size());
+            written += field.value.size();
+            first = false;
+        }
+        joined = {output, written};
+    }
+    count = 0;
+    bool copied_cookie = false;
+    for (const auto& field : fields) {
+        if (!field.name.empty() && field.name.front() == ':') continue;
+        if (field.name == "cookie" && cookies > 1) {
+            if (copied_cookie) continue;
+            copied_cookie = true;
+            s.request_headers[count++] = {field.name, joined};
+        } else s.request_headers[count++] = {field.name, field.value};
+    }
+    return true;
+}
 
 // Runs a route handler for a decoded, validated request.
 auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id,
@@ -571,9 +662,10 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
                  std::uint64_t max_request_body) -> task<void>
 {
     std::size_t count = 0;
-    for (const auto& field : fields)
-        if (field.name.empty() || field.name.front() != ':')
-            s.request_headers[count++] = {field.name, field.value};
+    if (!prepare_request_headers(s, fields, count)) {
+        fail(connection, id, h3::h3_error::excessive_load);
+        co_return;
+    }
     http3_exchange exchange(loop, connection, id, s, frames, pending, max_request_body,
                             head.method == "HEAD");
     const detail::request_fields request {
@@ -627,8 +719,9 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     const bool extended = !head.connect_protocol.empty();
     const bool unsupported = extended && head.connect_protocol != "websocket";
     if (match.allowed == 0 && !extended) co_return false;
-    const bool too_large = match.function != nullptr && head.connect_protocol.empty() && head.content_length &&
-                           *head.content_length > settings.max_request_body;
+    const bool too_large = match.function != nullptr && (head.content_length_too_large ||
+        (head.connect_protocol.empty() && head.content_length &&
+         *head.content_length > settings.max_request_body));
     if (match.function != nullptr && !too_large && !unsupported) {
         (void)co_await serve_route(loop, connection, id, s, frames, pending, head, fields,
                                    match, settings.max_request_body);
@@ -636,7 +729,7 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     }
     std::array<char, 96> allow {};
     const auto allow_size = detail::format_allow(match.allowed, allow);
-    const unsigned status = unsupported ? 501 : too_large ? 413 : match.allowed == 0 ? 404
+    const unsigned status = too_large ? 413 : unsupported ? 501 : match.allowed == 0 ? 404
         : head.method == "OPTIONS" ? 204 : 405;
     if (!(co_await send_headers(loop, connection, id, status, 0, "text/plain", true,
             std::span(s.io).first(response_header_area), nullptr,
@@ -684,16 +777,17 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         fail(connection, id, head.error());
         co_return;
     }
-    frames.set_content_length(head->content_length);
+    frames.set_content_length(head->content_length, head->content_length_too_large);
     const auto method = head->method;
     const auto path = head->path;
-    if (head->connect_protocol == "websocket" && head->scheme != "https") {
+    const bool https = h3::ascii_equal(head->scheme, "https");
+    if (head->connect_protocol == "websocket" && !https) {
         fail(connection, id, h3::h3_error::message_error);
         co_return;
     }
     // Routes see https requests; others keep the static answers below. The
     // routed path runs in its own frame so this one stays in its size class.
-    if (settings.routes != nullptr && (head->scheme == "https" || !head->connect_protocol.empty()) &&
+    if (settings.routes != nullptr && (https || !head->connect_protocol.empty()) &&
         (co_await route_request(loop, connection, id, s, frames, pending, *head,
                                 request_fields, settings)).value_or(true))
         co_return;
@@ -731,7 +825,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     std::vector<char> listing;
     std::string_view mime = "text/plain";
     // Plain CONNECT has no :scheme and is answered 405 below.
-    if (method != "CONNECT" && head->scheme != "https") status = 400;
+    if (method != "CONNECT" && !https) status = 400;
     else if (method == "OPTIONS") status = 204;
     else if (method != "GET" && method != "HEAD") status = 405;
     else {

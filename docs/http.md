@@ -106,7 +106,8 @@ Authentication and Origin policy remain in the route handler.
 - Built-in static-file GET and HEAD responses over HTTP/1.1, HTTP/2, and
   HTTP/3 include a weak metadata ETag, Last-Modified, and
   `Accept-Ranges: bytes`. `If-None-Match` takes precedence over
-  `If-Modified-Since`; a matching validator returns 304 with no body.
+  `If-Modified-Since`; a matching validator returns 304 with no body and
+  Content-Length equal to the full representation size.
   `If-Modified-Since` accepts the emitted IMF-fixdate form. A single valid
   `bytes` range (closed, open-ended, or suffix) returns 206 with
   `Content-Range`; an unsatisfiable single range returns 416 with

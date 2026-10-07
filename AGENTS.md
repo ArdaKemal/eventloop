@@ -129,7 +129,15 @@ ownership, and error visibility.
   measured bottleneck it fixes, and measure the result afterward. If it fails
   that test, drop it (or leave it uncommitted and report why) instead of
   polishing it. Feature volume, speculative hardening, and completeness alone
-  are not reasons to commit.
+  are not reasons to commit. Drop a change when its added complexity outweighs
+  a demonstrated correctness benefit or significant measured performance gain.
+- Prefer lean, minimal, clean code that fully solves the demonstrated problem.
+  Keep the solution maintainable; remove superseded code and avoid temporary
+  workarounds, redundant helpers, and speculative abstractions that clutter
+  the codebase.
+- Group related small changes into a coherent commit for the same problem or
+  topic. Consolidate related local commits before publishing when that makes
+  the change easier to review.
 - Before implementation, write down the intended public caller, ownership of
   every descriptor and buffer, capacity and exhaustion behavior, cancellation
   behavior, and affected platforms. Resolve unclear boundaries in the API

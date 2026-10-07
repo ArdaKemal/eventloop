@@ -504,6 +504,17 @@ auto main() -> int
           responses[23].find("Connection: close") != std::string::npos,
           "chunked body on a path without a handler for the method");
 
+    const auto cached = serve({.document_root = directory.path()},
+        {
+            request("GET / HTTP/1.1\r\nIf-None-Match: *\r\n"),
+            request("HEAD /index.html HTTP/1.1\r\nIf-None-Match: *\r\n"),
+        });
+    for (const auto& response : cached)
+        check(response.starts_with("HTTP/1.1 304 Not Modified\r\n") &&
+              response.find("Content-Length: 6\r\n") != std::string::npos &&
+              response.ends_with("\r\n\r\n"),
+              "304 keeps representation length without a body");
+
     // Expect: 100-continue is answered when the handler reads the body.
     {
         event_loop loop;

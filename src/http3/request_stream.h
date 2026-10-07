@@ -14,6 +14,8 @@
 
 namespace eventloop::http3::detail {
 
+constexpr std::uint64_t max_stream_data = (std::uint64_t {1} << 62) - 1;
+
 // Incremental parser for a client request stream (RFC 9114 4.1 and 7.1):
 // HEADERS, then DATA frames, then at most one trailing HEADERS. Unknown and
 // reserved extension frames may appear anywhere and are skipped by length.
@@ -88,16 +90,18 @@ public:
             return std::unexpected(h3_error::frame_error);
         if (phase_ == phase::request_headers)
             return std::unexpected(h3_error::request_incomplete);
-        if (content_length_ && data_received_ != *content_length_)
+        if (content_length_too_large_ || (content_length_ && data_received_ != *content_length_))
             return std::unexpected(h3_error::message_error);
         return {};
     }
 
     // Declared request content length; DATA must sum to it exactly (4.1.2).
-    auto set_content_length(std::optional<std::uint64_t> length) noexcept -> void
-    { content_length_ = length; }
+    // A decimal above the QUIC stream limit cannot match even at FIN.
+    auto set_content_length(std::optional<std::uint64_t> length, bool too_large = false) noexcept -> void
+    { content_length_ = length; content_length_too_large_ = too_large; }
 
-    auto accept_connect() noexcept -> void { tunnel_ = true; content_length_.reset(); }
+    auto accept_connect() noexcept -> void
+    { tunnel_ = true; content_length_.reset(); content_length_too_large_ = false; }
 
     [[nodiscard]] auto block() const noexcept -> std::span<const std::byte>
     { return std::span<const std::byte>(storage_).first(block_size_); }
@@ -138,7 +142,7 @@ private:
         }
         if (frame_type_ == data_frame) {
             if (phase_ != phase::body) return std::unexpected(h3_error::frame_unexpected);
-            if (remaining_ > max_varint - data_received_)
+            if (remaining_ > max_stream_data - data_received_)
                 return std::unexpected(h3_error::message_error);
             data_received_ += remaining_;
             if (content_length_ && data_received_ > *content_length_)
@@ -161,7 +165,6 @@ private:
         return event::header_block;
     }
 
-    static constexpr std::uint64_t max_varint = (std::uint64_t {1} << 62) - 1;
     std::span<std::byte> storage_;
     std::span<const std::byte> data_;
     std::optional<std::uint64_t> content_length_;
@@ -173,6 +176,7 @@ private:
     state state_ {state::frame_type};
     phase phase_ {phase::request_headers};
     bool tunnel_ {false};
+    bool content_length_too_large_ {false};
 };
 
 // HTTP field names, methods, and Extended CONNECT protocol values are tokens.
@@ -187,19 +191,179 @@ private:
     return true;
 }
 
+// RFC 9110 5.5: field-vchar at either end, with SP/HTAB allowed internally.
+[[nodiscard]] constexpr auto valid_field_value(std::string_view value) noexcept -> bool
+{
+    if (!value.empty() && (value.front() == ' ' || value.front() == '\t' ||
+                           value.back() == ' ' || value.back() == '\t')) return false;
+    for (unsigned char c : value)
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
+    return true;
+}
+
+// ASCII case-insensitive matching against a lowercase comparison string.
+[[nodiscard]] constexpr auto ascii_equal(std::string_view text,
+                                       std::string_view name) noexcept -> bool
+{
+    if (text.size() != name.size()) return false;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const auto c = static_cast<unsigned char>(text[i]);
+        if ((c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c) != name[i]) return false;
+    }
+    return true;
+}
+
 // Field rules shared by request headers and trailers (RFC 9114 4.2 and
-// 4.1.2): lowercase token names, no NUL/CR/LF in values, no connection-
+// 4.1.2): lowercase token names, valid field values, no connection-
 // specific fields, and TE limited to "trailers".
 [[nodiscard]] constexpr auto valid_regular_field(const field& f) noexcept -> bool
 {
     if (!valid_token(f.name)) return false;
     for (unsigned char c : f.name)
         if (c >= 'A' && c <= 'Z') return false;
-    for (unsigned char c : f.value)
-        if (c == 0 || c == '\r' || c == '\n' || c == 0x7f) return false;
+    if (!valid_field_value(f.value)) return false;
     if (f.name == "connection" || f.name == "keep-alive" || f.name == "proxy-connection" ||
         f.name == "transfer-encoding" || f.name == "upgrade") return false;
-    return f.name != "te" || f.value == "trailers";
+    return f.name != "te" || ascii_equal(f.value, "trailers");
+}
+
+// URI schemes are an ASCII letter followed by letters, digits, '+', '-', or '.'.
+[[nodiscard]] constexpr auto valid_scheme(std::string_view scheme) noexcept -> bool
+{
+    const auto alpha = [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    };
+    if (scheme.empty() || !alpha(scheme.front())) return false;
+    for (unsigned char c : scheme)
+        if (!alpha(c) && !(c >= '0' && c <= '9') && c != '+' && c != '-' && c != '.')
+            return false;
+    return true;
+}
+
+[[nodiscard]] constexpr auto uri_hex_digit(unsigned char c) noexcept -> bool
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+// RFC 3986 unreserved / sub-delims, shared by reg-name and IPvFuture.
+[[nodiscard]] constexpr auto uri_name_char(unsigned char c) noexcept -> bool
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           std::string_view("-._~!$&'()*+,;=").find(static_cast<char>(c)) != std::string_view::npos;
+}
+
+[[nodiscard]] constexpr auto valid_ipv4_tail(std::string_view address) noexcept -> bool
+{
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto dot = address.find('.');
+        const auto octet = address.substr(0, dot);
+        if (octet.empty() || octet.size() > 3 || (octet.size() > 1 && octet.front() == '0'))
+            return false;
+        unsigned value = 0;
+        for (unsigned char c : octet) {
+            if (c < '0' || c > '9') return false;
+            value = value * 10 + static_cast<unsigned>(c - '0');
+        }
+        if (value > 255) return false;
+        if (i == 3) return dot == std::string_view::npos;
+        if (dot == std::string_view::npos) return false;
+        address.remove_prefix(dot + 1);
+    }
+    return false;
+}
+
+// RFC 3986 3.2.2: IPv6address or IPvFuture, without constructing an address.
+[[nodiscard]] constexpr auto valid_ip_literal(std::string_view address) noexcept -> bool
+{
+    if (address.empty()) return false;
+    if (address.front() == 'v' || address.front() == 'V') {
+        address.remove_prefix(1);
+        const auto dot = address.find('.');
+        if (dot == 0 || dot == std::string_view::npos) return false;
+        for (unsigned char c : address.substr(0, dot))
+            if (!uri_hex_digit(c)) return false;
+        address.remove_prefix(dot + 1);
+        if (address.empty()) return false;
+        for (unsigned char c : address)
+            if (!uri_name_char(c) && c != ':') return false;
+        return true;
+    }
+    unsigned groups = 0;
+    bool compressed = address.starts_with("::");
+    if (compressed) address.remove_prefix(2);
+    while (!address.empty()) {
+        const auto colon = address.find(':');
+        const auto group = address.substr(0, colon);
+        if (group.empty()) return false;
+        if (group.find('.') != std::string_view::npos) {
+            if (colon != std::string_view::npos || !valid_ipv4_tail(group)) return false;
+            groups += 2;
+            break;
+        }
+        if (group.size() > 4) return false;
+        for (unsigned char c : group)
+            if (!uri_hex_digit(c)) return false;
+        if (++groups > 8) return false;
+        if (colon == std::string_view::npos) break;
+        address.remove_prefix(colon + 1);
+        if (address.starts_with(':')) {
+            if (compressed) return false;
+            compressed = true;
+            address.remove_prefix(1);
+        } else if (address.empty()) return false;
+    }
+    return compressed ? groups < 8 : groups == 8;
+}
+
+// CONNECT requires a nonempty numeric port; HTTP(S) permits no or empty port.
+[[nodiscard]] constexpr auto valid_authority(std::string_view authority,
+                                            bool require_port = false) noexcept -> bool
+{
+    if (authority.empty()) return false;
+    const bool bracketed = authority.front() == '[';
+    auto end = authority.find(bracketed ? ']' : ':');
+    if (bracketed && end == std::string_view::npos) return false;
+    if (end == std::string_view::npos) end = authority.size();
+    const auto host = authority.substr(bracketed ? 1 : 0, end - (bracketed ? 1 : 0));
+    if (host.empty()) return false;
+    if (bracketed && !valid_ip_literal(host)) return false;
+    for (std::size_t i = 0; !bracketed && i < host.size(); ++i) {
+        const auto c = static_cast<unsigned char>(host[i]);
+        if (c == '%') {
+            if (host.size() - i < 3 || !uri_hex_digit(host[i + 1]) ||
+                !uri_hex_digit(host[i + 2])) return false;
+            i += 2;
+        } else if (!uri_name_char(c)) return false;
+    }
+    if (bracketed) ++end;
+    if (end == authority.size()) return !require_port;
+    if (authority[end] != ':') return false;
+    const auto port = authority.substr(end + 1);
+    if (require_port && port.empty()) return false;
+    for (unsigned char c : port)
+        if (c < '0' || c > '9') return false;
+    return true;
+}
+
+// RFC 9114 4.3.1 (erratum 7014): absolute-path (RFC 9110 4.1) and optional
+// query (RFC 3986 3.4), or '*' for OPTIONS. Check escapes without decoding.
+[[nodiscard]] constexpr auto valid_request_path(std::string_view path,
+                                               std::string_view method) noexcept -> bool
+{
+    if (path == "*") return method == "OPTIONS";
+    if (path.empty() || path.front() != '/') return false;
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        const auto c = static_cast<unsigned char>(path[i]);
+        if (c == '%') {
+            if (path.size() - i < 3 || !uri_hex_digit(path[i + 1]) ||
+                !uri_hex_digit(path[i + 2])) return false;
+            i += 2;
+        } else if (!uri_name_char(c) && c != ':' && c != '@' && c != '/' && c != '?')
+            return false;
+    }
+    return true;
 }
 
 struct request_head {
@@ -209,6 +373,7 @@ struct request_head {
     std::string_view path;
     std::string_view connect_protocol;
     std::optional<std::uint64_t> content_length;
+    bool content_length_too_large {false}; // Declared length cannot fit a QUIC stream.
 };
 
 // Validates a decoded request field section. Any violation makes the request
@@ -223,6 +388,7 @@ struct request_head {
     bool have_protocol = false;
     bool regular = false;
     std::optional<std::string_view> host;
+    std::optional<std::string_view> declared_length;
     for (const auto& f : fields) {
         if (!f.name.empty() && f.name.front() == ':') {
             if (regular) return malformed;
@@ -240,8 +406,7 @@ struct request_head {
             else if (f.name == ":protocol" && enable_extended_connect)
                 ok = take(have_protocol, head.connect_protocol);
             if (!ok) return malformed;
-            for (unsigned char c : f.value)
-                if (c == 0 || c == '\r' || c == '\n' || c == 0x7f) return malformed;
+            if (!valid_field_value(f.value)) return malformed;
             continue;
         }
         regular = true;
@@ -250,37 +415,45 @@ struct request_head {
             if (host) return malformed;
             host = f.value;
         } else if (f.name == "content-length") {
-            if (f.value.empty() || f.value.size() > 19) return malformed;
-            std::uint64_t value = 0;
-            for (char c : f.value) {
+            if (f.value.empty()) return malformed;
+            for (char c : f.value)
                 if (c < '0' || c > '9') return malformed;
-                value = value * 10 + static_cast<std::uint64_t>(c - '0');
+            const auto first = f.value.find_first_not_of('0');
+            const auto normalized = first == std::string_view::npos ? std::string_view {}
+                                                                    : f.value.substr(first);
+            if (declared_length && *declared_length != normalized) return malformed;
+            declared_length = normalized;
+            constexpr std::string_view limit = "4611686018427387903"; // max_stream_data
+            head.content_length_too_large = normalized.size() > limit.size() ||
+                (normalized.size() == limit.size() && normalized > limit);
+            if (!head.content_length_too_large) {
+                std::uint64_t value = 0;
+                for (char c : normalized) value = value * 10 + static_cast<unsigned>(c - '0');
+                head.content_length = value;
             }
-            if (head.content_length && *head.content_length != value) return malformed;
-            head.content_length = value;
         }
     }
     if (!have_method || !valid_token(head.method)) return malformed;
+    if (host && !valid_authority(*host)) return malformed;
     if (have_protocol) {
         if (head.method != "CONNECT" || !valid_token(head.connect_protocol) ||
-            !have_scheme || head.scheme.empty() || !have_path || head.path.empty() ||
-            head.path.front() != '/' || head.path.find('#') != std::string_view::npos ||
+            !have_scheme || head.scheme.empty() || !have_path ||
             !have_authority || head.authority.empty()) return malformed;
     } else if (head.method == "CONNECT") {
         // Plain CONNECT names only an authority (4.4).
-        if (have_scheme || have_path || !have_authority || head.authority.empty())
+        if (have_scheme || have_path || !have_authority || !valid_authority(head.authority, true))
             return malformed;
         return head;
     }
-    if (!have_scheme || !have_path) return malformed;
-    if (head.scheme == "http" || head.scheme == "https") {
-        if (head.path.empty()) return malformed;
+    if (!have_scheme || !valid_scheme(head.scheme) || !have_path ||
+        !valid_request_path(head.path, head.method)) return malformed;
+    if (ascii_equal(head.scheme, "http") || ascii_equal(head.scheme, "https")) {
         if (have_authority && host && *host != head.authority) return malformed;
         if (!have_authority) {
             if (!host) return malformed;
             head.authority = *host;
         }
-        if (head.authority.empty()) return malformed;
+        if (!valid_authority(head.authority)) return malformed;
     }
     return head;
 }

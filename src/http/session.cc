@@ -342,7 +342,7 @@ auto session::serve_file(const parsed_request& parsed, static_file descriptor, c
         return;
     }
 
-    const auto body_size = headers_only ? std::size_t {0}
+    const auto body_size = headers_only || selection.status == 304 ? std::size_t {0}
                                         : static_cast<std::size_t>(selection.length);
     const auto header_length = static_cast<std::size_t>(header_size);
     if (body_size > (std::numeric_limits<std::size_t>::max)() - header_length) {

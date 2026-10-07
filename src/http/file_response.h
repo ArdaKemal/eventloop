@@ -106,7 +106,6 @@ struct file_response {
         (conditions.if_none_match.empty() && !conditions.if_modified_since.empty() &&
          modified_since(conditions.if_modified_since, info.modified))) {
         result.status = 304;
-        result.length = 0;
         return result;
     }
     auto range = trim_http(conditions.range);

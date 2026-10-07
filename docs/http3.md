@@ -54,12 +54,27 @@ required for changes confined to this protocol.
 - HTTP/3 runs a handler inside each request's existing coroutine, using
   that request's scratch buffer. Request concurrency and refusal follow the
   server capacity above.
+- Split Cookie field lines are joined with `; ` in their original order before
+  reaching a handler. Joining uses the unused portion of the request's 16 KiB
+  decoded-string storage; exhaustion resets the stream with `H3_EXCESSIVE_LOAD`.
 - HTTP/3 bodies may omit Content-Length. A read past
   `max_request_body` returns `message_size`, and the server answers 413
   if the handler then returns without a response. A malformed body
   (DATA beyond Content-Length, a truncated frame, invalid trailers)
   returns `bad_message` and resets the stream with the RFC 9114 code.
   Request trailers are validated but not exposed.
+- For a case-insensitive `100-continue` member in any `Expect` field's
+  comma-separated list, a handler's body read sends
+  an interim HEADERS section containing only `:status: 100` before waiting
+  for content. It is omitted when content is already available, Content-Length
+  is zero, or a final response has started. The interim section does not
+  start the final response or end the stream.
+- Decimal Content-Length values above QUIC's `2^62 - 1` stream-data limit
+  are valid declarations but cannot be satisfied. Matched routed requests
+  answer 413 without running the handler, even when `max_request_body` is
+  larger. Smaller values remain exact; duplicate declarations compare
+  numerically, including leading zeros. Static requests retain the unread-body
+  policy below; a FIN that cannot match the declaration is `H3_MESSAGE_ERROR`.
 
 - An unread request body is ended with STOP_SENDING `H3_NO_ERROR` after the
   response (RFC 9114 4.1).
@@ -117,18 +132,26 @@ section that uses the dynamic table or does not decode is
 one request reset the response and send STOP_SENDING with the same code,
 and the connection continues. A malformed request is `H3_MESSAGE_ERROR`:
 missing, duplicate, unknown, or late pseudo-header fields (including
-`:protocol` when Extended CONNECT is disabled), an empty `:path` or missing authority for `http`/`https`,
-`:authority` and Host that disagree, uppercase or non-token field names,
+`:protocol` when Extended CONNECT is disabled), an invalid URI scheme, path,
+or query (including relative paths, fragments, or invalid percent escapes),
+`*` for a method other than OPTIONS, missing
+authority or malformed host/port syntax (including userinfo, whitespace, or
+invalid bracketed IPv6/IPvFuture literals)
+in authority for `http`/`https` or Host, an ordinary CONNECT authority without
+a host and nonempty numeric port, `:authority` and Host
+that disagree, uppercase or non-token field names,
 an empty or non-token method,
-NUL, CR, LF, or DEL in values, connection-specific fields, TE other than
-`trailers`, a non-numeric or conflicting Content-Length, DATA whose total
-differs from Content-Length, or a pseudo-header in trailers. A stream
-ending before its request HEADERS is `H3_REQUEST_INCOMPLETE`. A field
+control bytes other than internal HTAB or leading/trailing SP/HTAB in values,
+connection-specific fields, TE other than
+`trailers`, a Content-Length that is non-numeric or conflicting,
+DATA whose total differs from Content-Length, or a pseudo-header
+in trailers. A stream ending before its request HEADERS is
+`H3_REQUEST_INCOMPLETE`. A field
 section above the 16 KiB header cap or the decode limits, or If-None-Match
 values that do not fit request storage, is `H3_EXCESSIVE_LOAD`. A file read
 failure is `H3_INTERNAL_ERROR`, and a response write that fails because the
 peer stopped or reset the stream is `H3_REQUEST_CANCELLED`. Ordinary CONNECT is
-answered 405 and a `:scheme` other than `https` 400.
+answered 405 and a `:scheme` other than `https` (case-insensitively) 400.
 
 For static requests, the response is sent once the request HEADERS are valid. The server then reads the rest of the
 request: DATA is counted and dropped, and trailers are decoded into the

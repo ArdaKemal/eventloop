@@ -138,6 +138,141 @@ auto connect_framing() -> void
     check(parser.receive(input).error() == h3_error::frame_unexpected, "no trailers on CONNECT tunnel");
 }
 
+auto request_uri() -> void
+{
+    std::array<field, 4> fields {{{":method", "GET"}, {":scheme", "https"},
+                                {":authority", "example.com"}, {":path", "/"}}};
+    for (const auto path : {"/", "/?", "//a", "/a//b/", "/a:@!$&'()*+,;=-._~",
+                           "/%2f%AF%00?q=%23&url=/a?b??"}) {
+        fields[3].value = path;
+        check(validate_request(fields).has_value(), "valid path and query syntax");
+    }
+    for (const auto scheme : {"https", "HTTPS", "custom"}) {
+        fields[1].value = scheme;
+        for (const auto path : {"", "relative", "?query", "https://example.com/a",
+                               "/#fragment", "/?q=#fragment", "/a b", "/a\tb", "/a\\b",
+                               "/[a]", "/\x80", "/%", "/%0", "/%GG", "/?q=%0G", "*"}) {
+            fields[3].value = path;
+            const auto rejected = validate_request(fields);
+            check(!rejected && rejected.error() == h3_error::message_error,
+                  "invalid path is H3_MESSAGE_ERROR for every scheme");
+        }
+    }
+    fields[0].value = "OPTIONS";
+    fields[3].value = "*";
+    check(validate_request(fields).has_value(), "OPTIONS asterisk form");
+    fields[3].value = "*?query";
+    check(!validate_request(fields), "asterisk form has no query");
+    fields[3].value = "/";
+    for (const auto scheme : {"http", "https", "HtTp", "HTTPS"}) {
+        fields[1].value = scheme;
+        fields[2].value = "user@example.com";
+        check(!validate_request(fields), "userinfo in :authority");
+        const std::array<field, 4> host {{{":method", "GET"}, {":scheme", scheme},
+                                        {":path", "/"}, {"host", "user@example.com"}}};
+        check(!validate_request(host), "userinfo in Host authority fallback");
+        fields[2] = {":authority", "example.com:443"};
+        check(validate_request(fields).has_value(), "authority with port");
+    }
+    for (const auto scheme : {"", "1https", "https:", "ht_tps", "ht tps", "https\x80"}) {
+        fields[1].value = scheme;
+        const auto rejected = validate_request(fields);
+        check(!rejected && rejected.error() == h3_error::message_error, "invalid URI scheme");
+    }
+    fields[1].value = "custom+v1.0-transport";
+    check(validate_request(fields).has_value(), "valid extension URI scheme");
+
+    std::array<field, 5> extended {{{":method", "CONNECT"}, {":scheme", "HTTPS"},
+        {":authority", "example.com"}, {":path", "/chat?room=%23a"}, {":protocol", "websocket"}}};
+    check(validate_request(extended, true).has_value(), "Extended CONNECT path and query");
+    for (const auto path : {"*", "relative", "/chat#fragment", "/chat%GG"}) {
+        extended[3].value = path;
+        check(!validate_request(extended, true), "Extended CONNECT uses the same URI path rules");
+    }
+    extended[3].value = "/chat";
+    extended[2].value = "user@example.com";
+    check(!validate_request(extended, true), "Extended CONNECT authority excludes userinfo");
+}
+
+auto field_values() -> void
+{
+    std::array<field, 5> fields {{{":method", "GET"}, {":scheme", "https"},
+        {":authority", "example.com"}, {":path", "/"}, {"x-value", ""}}};
+    const auto malformed = [](const auto& result) {
+        return !result && result.error() == h3_error::message_error;
+    };
+    for (const auto value : {"", "a b", "a\tb", "\x80\xff"}) {
+        fields.back().value = value;
+        check(validate_request(fields).has_value(), "valid request field value");
+        check(validate_trailers(std::span(fields).last(1)).has_value(),
+              "valid trailer field value");
+    }
+    for (const unsigned c : {0x00u, 0x01u, 0x08u, 0x0bu, 0x0cu, 0x1fu, 0x7fu}) {
+        const std::array<char, 3> value {'a', static_cast<char>(c), 'b'};
+        fields.back().value = std::string_view(value.data(), value.size());
+        check(malformed(validate_request(fields)), "control byte in request field value");
+        check(malformed(validate_trailers(std::span(fields).last(1))),
+              "control byte in trailer field value");
+        fields[2].value = fields.back().value;
+        check(malformed(validate_request(std::span(fields).first(4))),
+              "control byte in :authority");
+        fields[2].value = "example.com";
+    }
+    for (const auto value : {" ", "\t", " value", "value ", "\tvalue", "value\t"}) {
+        fields.back().value = value;
+        check(malformed(validate_request(fields)), "surrounding whitespace in request value");
+        check(malformed(validate_trailers(std::span(fields).last(1))),
+              "surrounding whitespace in trailer value");
+        fields[2].value = value;
+        check(malformed(validate_request(std::span(fields).first(4))),
+              "surrounding whitespace in :authority");
+        fields[2].value = "example.com";
+    }
+}
+
+auto request_authority() -> void
+{
+    std::array<field, 4> fields {{{":method", "GET"}, {":scheme", "https"},
+                                {":path", "/"}, {":authority", "example.com"}}};
+    for (const auto name : {":authority", "host"}) {
+        fields.back().name = name;
+        for (const auto authority : {"example.com", "EXAMPLE.com:443", "example.com:",
+                                     "127.0.0.1:80", "[::]", "[::1]", "[::1]:443", "[1::]",
+                                     "[1:2:3:4:5:6:7:8]", "[1:2:3:4:5:6:192.0.2.1]",
+                                     "[::ffff:192.0.2.1]:443", "[v1.a:b]:443", "[VF.a!$&]",
+                                     "ex%61mple.com"}) {
+            fields.back().value = authority;
+            check(validate_request(fields).has_value(), "valid host and optional port");
+        }
+        for (const auto authority : {"a b", "a\tb", ":443", "example.com:port", "a:1:2",
+                                     "user@example.com", "a/path", "a?query", "a#fragment",
+                                     "[::1", "[::1]extra", "[]:443", "::1", "a]", "a%GG",
+                                     "[example.com]", "[::gg]", "[vG.a]", "[a%20b]:443",
+                                     "[v.a]", "[v1.]", "[v1.a%20b]", "[1:2:3:4:5:6:7]",
+                                     "[1:2:3:4:5:6:7:8:9]", "[1:2:3:4:5:6:7:8::]",
+                                     "[1::2::3]", "[:::1]", "[::1:]", "[::12345]",
+                                     "[::ffff:192.0.2.256]", "[::ffff:192.0.02.1]",
+                                     "[::ffff:192.0.2]", "[::192.0.2.1:3]"}) {
+            fields.back().value = authority;
+            const auto rejected = validate_request(fields);
+            check(!rejected && rejected.error() == h3_error::message_error,
+                  "malformed host or authority is H3_MESSAGE_ERROR");
+        }
+    }
+    std::array<field, 2> connect {{{":method", "CONNECT"}, {":authority", "example.com:443"}}};
+    for (const auto authority : {"example.com:443", "127.0.0.1:80", "[::1]:443", "[v1.a:b]:443"}) {
+        connect.back().value = authority;
+        check(validate_request(connect).has_value(), "CONNECT with host and numeric port");
+    }
+    for (const auto authority : {"example.com", "example.com:", "[::1]", "[::1]:", ":443", "a:port",
+                                 "a b:443", "a\tb:443", "user@a:443"}) {
+        connect.back().value = authority;
+        const auto rejected = validate_request(connect);
+        check(!rejected && rejected.error() == h3_error::message_error,
+              "CONNECT requires host and nonempty numeric port");
+    }
+}
+
 auto fields() -> void
 {
     using list = std::vector<field>;
@@ -156,11 +291,20 @@ auto fields() -> void
     const auto ok = validate(request({{"content-length", "12"}, {"te", "trailers"}}));
     check(ok && ok->method == "GET" && ok->path == "/" && ok->authority == "example.com" &&
           ok->content_length == 12, "valid request");
+    for (const auto value : {"Trailers", "TRAILERS", "tRaIlErS"})
+        check(validate(request({{"te", value}})).has_value(), "case-insensitive TE trailers");
     const auto host = validate({{":method", "GET"}, {":scheme", "https"}, {":path", "/"},
                                 {"host", "example.com"}});
     check(host && host->authority == "example.com", "Host supplies the authority");
     check(validate(request({{"content-length", "4"}, {"content-length", "4"}})).has_value(),
           "repeated identical Content-Length");
+    const auto maximum = validate(request({{"content-length", "4611686018427387903"}}));
+    check(maximum && maximum->content_length == max_stream_data &&
+          !maximum->content_length_too_large, "maximum QUIC Content-Length stays exact");
+    const auto padded = validate(request({{"content-length", "000000000000000000000000004"},
+                                          {"content-length", "4"}}));
+    check(padded && padded->content_length == 4,
+          "long zero-padded Content-Length and numerically equal duplicate");
     const auto connect = validate({{":method", "CONNECT"}, {":authority", "example.com:443"}});
     check(connect && connect->method == "CONNECT", "plain CONNECT");
 
@@ -213,12 +357,44 @@ auto fields() -> void
     check(malformed(request({{"x-bad", "a\r\nb"}})), "CR LF in value");
     for (auto name : {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"})
         check(malformed(request({{name, "x"}})), "connection-specific field");
-    check(malformed(request({{"te", "gzip"}})), "TE other than trailers");
+    for (const auto value : {"", "gzip", "trailers ", " trailers", "trailers\t", "\ttrailers",
+                             "trai lers", "trailers,gzip", "trailers,trailers", "trailers;q=1"})
+        check(malformed(request({{"te", value}})), "TE must contain only trailers");
     check(malformed(request({{"content-length", "4"}, {"content-length", "5"}})),
           "conflicting Content-Length");
     check(malformed(request({{"content-length", "-1"}})), "non-numeric Content-Length");
-    check(malformed(request({{"content-length", "12345678901234567890"}})),
-          "Content-Length beyond 19 digits");
+    check(malformed(request({{"content-length", ""}})), "empty Content-Length");
+    for (const auto length : {"4611686018427387904", "18446744073709551615",
+                              "18446744073709551616", "100000000000000000000",
+                              "00018446744073709551616"}) {
+        const auto large = validate(request({{"content-length", length}}));
+        check(large && large->content_length_too_large && !large->content_length,
+              "large decimal Content-Length has no false exact value");
+        std::array<std::byte, 16> storage {};
+        request_frames parser(storage);
+        const auto input_bytes = bytes({0x01, 0x02, 0x00, 0x00});
+        auto input = std::span<const std::byte>(input_bytes);
+        check(parser.receive(input) == request_frames::event::header_block, "initial HEADERS");
+        parser.set_content_length(large->content_length, large->content_length_too_large);
+        check(parser.finish().error() == h3_error::message_error,
+              "FIN cannot satisfy an unmatchable Content-Length");
+    }
+    const auto large_duplicate = validate(request({{"content-length", "18446744073709551616"},
+        {"content-length", "00018446744073709551616"}}));
+    check(large_duplicate && large_duplicate->content_length_too_large,
+          "large decimal duplicates compare numerically");
+    check(malformed(request({{"content-length", "18446744073709551616"},
+        {"content-length", "18446744073709551617"}})), "conflicting large Content-Length");
+    check(malformed(request({{"content-length", "18446744073709551616x"}})),
+          "large length does not bypass non-digit validation");
+    const std::string many_digits(100, '9');
+    const auto huge = validate(request({{"content-length", many_digits}}));
+    check(huge && huge->content_length_too_large && !huge->content_length,
+          "arbitrary decimal length stays within existing header storage");
+    const auto zeros = validate(request({{"content-length", "000000000000000000000000"},
+        {"content-length", "0"}}));
+    check(zeros && zeros->content_length == 0 && !zeros->content_length_too_large,
+          "all-zero duplicates remain an exact zero length");
     check(malformed(request({{"host", "other.example"}})), "Host disagrees with :authority");
     check(malformed({{":method", "CONNECT"}, {":authority", "a"}, {":path", "/"}}),
           "CONNECT with :path");
@@ -243,5 +419,8 @@ auto main() -> int
     framing();
     content_length();
     connect_framing();
+    request_uri();
+    field_values();
+    request_authority();
     fields();
 }
