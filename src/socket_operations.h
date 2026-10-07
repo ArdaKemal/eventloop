@@ -69,6 +69,12 @@ public:
     [[nodiscard]] static auto stream_cancel(tcp_stream& stream,
                                             socket_operation& operation) noexcept -> bool;
     static auto stream_close(tcp_stream& stream) -> void;
+    // See notifiable::pin(): keeps a loop-owned stream valid for an internal
+    // owner after a reset, failed TLS operation, or cancellation removes it.
+    static auto stream_pin(tcp_stream& stream) noexcept -> void
+    { static_cast<notifiable&>(stream).pin(); }
+    static auto stream_unpin(tcp_stream& stream) noexcept -> void
+    { static_cast<notifiable&>(stream).unpin(); }
     [[nodiscard]] static auto stream_send_file(tcp_stream& stream,
                                                const unique_fd& file,
                                                std::size_t size,

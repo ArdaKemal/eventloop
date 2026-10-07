@@ -1016,6 +1016,12 @@ if(BUILD_TESTING)
     add_test(NAME http_routing COMMAND http_routing_test)
     set_tests_properties(http_routing PROPERTIES TIMEOUT 15)
 
+    add_executable(http_connection_lifetime_test tests/http_connection_lifetime.cc)
+    target_link_libraries(http_connection_lifetime_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(http_connection_lifetime_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http_connection_lifetime COMMAND http_connection_lifetime_test)
+    set_tests_properties(http_connection_lifetime PROPERTIES TIMEOUT 15)
+
     add_executable(http2_routing_test tests/http2_routing.cc)
     target_include_directories(http2_routing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(http2_routing_test PRIVATE eventloop::eventloop OpenSSL::Crypto)

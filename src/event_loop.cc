@@ -585,10 +585,27 @@ public:
                    : detail::blocking_submission_result::queue_full;
     }
 
+    // Removed handlers are retired: an internal owner may have pinned one
+    // that it still calls, and then the last unpin destroys it.
+    auto erase_handler(native_socket descriptor) -> void
+    {
+        const auto found = handlers.find(descriptor);
+        if (found == handlers.end()) return;
+        auto handler = std::move(found->second);
+        handlers.erase(found);
+        detail::notifiable::retire(std::move(handler));
+    }
+
+    auto erase_all_handlers() -> void
+    {
+        for (auto& entry : handlers) detail::notifiable::retire(std::move(entry.second));
+        handlers.clear();
+    }
+
     auto erase_pending() -> void
     {
         for (const native_socket descriptor : pending_removals) {
-            handlers.erase(descriptor);
+            erase_handler(descriptor);
         }
         pending_removals.clear();
     }
@@ -609,7 +626,7 @@ public:
             erase_pending();
 #else
             pending_removals.clear();
-            handlers.clear();
+            erase_all_handlers();
 #endif
         } else {
             erase_pending();
@@ -708,7 +725,7 @@ public:
             return;
         }
         pending_removals.clear();
-        handlers.clear();
+        erase_all_handlers();
 #endif
     }
 
@@ -861,6 +878,7 @@ public:
     // continuations and same-thread posts use posted_tasks without writing
     // to the backend wake notifier.
     bool local_post_pending {false};
+
     // Set by the first cross-thread publisher after the owner's last drain;
     // while set, a backend wakeup or owner drain is already due.
     std::atomic<bool> wake_pending {false};
@@ -975,17 +993,25 @@ auto event_loop::run() -> event_loop_result
             // visible below; a later one sees false and wakes the poller.
             (void)implementation_->wake_pending.exchange(
                 false, std::memory_order_acquire);
-            const bool more_posted = implementation_->drain_posted();
-            const bool more_completions =
-                implementation_->drain_coroutine_completions();
-            if (more_posted || more_completions) {
-                implementation_->local_post_pending = true;
+            bool more = false;
+            {
+                // Coroutines resumed here can close a stream from inside its
+                // own failed operation; defer removal as socket dispatch does.
+                handler_call_scope scope(*this);
+                const bool more_posted = implementation_->drain_posted();
+                const bool more_completions =
+                    implementation_->drain_coroutine_completions();
+                more = more_posted || more_completions;
             }
+            if (more) implementation_->local_post_pending = true;
             implementation_->drain_completed_roots();
         }
         const auto& deadline = implementation_->armed_deadline;
         if (deadline && clock::now() >= *deadline) {
-            implementation_->run_due_timers();
+            {
+                handler_call_scope scope(*this);
+                implementation_->run_due_timers();
+            }
             implementation_->drain_completed_roots();
         }
         if (implementation_->shutdown_complete()) {
@@ -1115,7 +1141,7 @@ auto event_loop::remove(native_socket descriptor) -> void
         }
     } else {
         implementation_->poller.remove_descriptor(descriptor);
-        implementation_->handlers.erase(descriptor);
+        implementation_->erase_handler(descriptor);
     }
 }
 
