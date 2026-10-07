@@ -95,6 +95,9 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
     auto status_end = std::to_chars(status_text.data(), status_text.data() + status_text.size(), status);
     auto length_end = std::to_chars(length_text.data(), length_text.data() + length_text.size(), length);
     if (status_end.ec != std::errc{} || length_end.ec != std::errc{}) co_return false;
+    if (buffer.size() < 80) co_return false;
+    const auto date_buffer = buffer.last(64);
+    const auto date_text = reinterpret_cast<char*>(date_buffer.data());
     std::array<h3::field, 8> fields {};
     std::size_t field_count = 0;
     fields[field_count++] = {":status", {status_text.data(), status_end.ptr}};
@@ -111,8 +114,11 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
         if (selected->content_range_size != 0)
             fields[field_count++] = {"content-range", {selected->content_range.data(), selected->content_range_size}};
     }
+    const auto date_size = detail::format_http_time(std::time(nullptr),
+                                                     {date_text, date_buffer.size()});
+    fields[field_count++] = {"date", {date_text, date_size}};
     auto encoded = h3::qpack_encode(std::span(fields).first(field_count),
-                                    buffer.subspan(16));
+                                    buffer.subspan(16, buffer.size() - 80));
     if (!encoded) co_return false;
     auto framed = h3::encode_frame(h3::headers_frame,
         buffer.subspan(16, *encoded), buffer);
@@ -880,7 +886,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         fail(connection, id, cancelled);
         co_return;
     }
-    if (have_listing) {
+    if (have_listing && method != "HEAD") {
         std::array<std::byte, 16> frame_header {};
         const auto header_size = h3::encode_frame_header(h3::data_frame, listing.size(), frame_header);
         if (!header_size ||

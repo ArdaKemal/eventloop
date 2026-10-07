@@ -381,6 +381,8 @@ auto main() -> int
     test::make_localhost_certificate(directory.path() / "cert.pem", directory.path() / "key.pem");
     std::ofstream(directory.path() / "www" / "index.html") << "static";
     std::ofstream(directory.path() / "www" / "data.txt") << "0123456789";
+    std::filesystem::create_directories(directory.path() / "www" / "listing");
+    std::ofstream(directory.path() / "www" / "listing" / "entry.txt") << "listed";
     const auto file_path = (directory.path() / "www" / "data.txt").string();
 
     std::size_t cookie_calls = 0;
@@ -442,10 +444,13 @@ auto main() -> int
           hello_response.field("content-length") == "5" &&
           hello_response.field("date") != "<none>", "exact route");
     check(responses[1].status == 200 && responses[1].body.empty() &&
-          responses[1].field("content-length") == "5", "HEAD runs GET without body");
-    check(responses[2].status == 204 && responses[2].field("allow") == "GET, HEAD, OPTIONS",
+          responses[1].field("content-length") == "5" &&
+          responses[1].field("date") != "<none>", "HEAD runs GET without body");
+    check(responses[2].status == 204 && responses[2].field("allow") == "GET, HEAD, OPTIONS" &&
+          responses[2].field("date") != "<none>",
           "OPTIONS lists methods");
-    check(responses[3].status == 405 && responses[3].field("allow") == "GET, HEAD, OPTIONS",
+    check(responses[3].status == 405 && responses[3].field("allow") == "GET, HEAD, OPTIONS" &&
+          responses[3].field("date") != "<none>",
           "wrong method");
     check(responses[4].body == "/api/items|id=7|seen|example.test", "prefix route");
     check(responses[5].body == "10000 " + std::to_string(large_sum), "streamed request body");
@@ -460,8 +465,10 @@ auto main() -> int
     check(responses[9].error == make_error_code(quic_errc::stream_reset),
           "short body resets the stream");
     check(responses[10].status == 200 && responses[10].body == "23456", "file range");
-    check(responses[11].status == 200 && responses[11].body == "static", "static fallback");
-    check(responses[12].status == 413, "declared body above max_request_body");
+    check(responses[11].status == 200 && responses[11].body == "static" &&
+          responses[11].field("date") != "<none>", "static fallback");
+    check(responses[12].status == 413 && responses[12].field("date") != "<none>",
+          "declared body above max_request_body");
     check(responses[13].status == 400 && responses[13].body == "too large",
           "streamed body above max_request_body");
     check(responses[14].body == "partial", "unread body stopped");
@@ -494,7 +501,7 @@ auto main() -> int
             {.path = "/hello"},
         });
     for (std::size_t i = 0; i < 4; ++i)
-        check(large_lengths[i].status == 413,
+        check(large_lengths[i].status == 413 && large_lengths[i].field("date") != "<none>",
               "unmatchable declared length answers 413 even with unlimited body option");
     for (std::size_t i = 4; i < 6; ++i)
         check(large_lengths[i].status == 0 &&
@@ -537,13 +544,25 @@ auto main() -> int
         });
     for (const auto& response : cached)
         check(response.status == 304 && response.body.empty() &&
-              response.field("content-length") == "6",
+              response.field("content-length") == "6" && response.field("date") != "<none>",
               "304 keeps representation length without a body");
+
+    const auto listings = serve(directory.path(),
+        {.document_root = directory.path() / "www", .directory_listing = true},
+        {{.path = "/listing/"}, {.method = "HEAD", .path = "/listing/"}});
+    check(listings[0].status == 200 &&
+          listings[0].body.find("entry.txt") != std::string::npos &&
+          listings[0].field("date") != "<none>", "static directory listing");
+    check(listings[1].status == 200 && listings[1].body.empty() &&
+          listings[1].field("content-length") == std::to_string(listings[0].body.size()) &&
+          listings[1].field("date") != "<none>",
+          "HEAD directory listing preserves GET metadata without DATA");
 
     // Routes only: unmatched paths answer 404.
     const auto routed_only = serve(directory.path(), {.routes = routes},
                                    {{.path = "/index.html"}, {.path = "/hello", .scheme = "HtTpS"}});
-    check(routed_only[0].status == 404 && routed_only[1].body == "hello",
+    check(routed_only[0].status == 404 && routed_only[0].field("date") != "<none>" &&
+          routed_only[1].body == "hello",
           "routes without document root accept mixed-case HTTPS");
 
     const auto continued = serve(directory.path(), {.routes = routes},

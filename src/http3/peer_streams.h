@@ -246,9 +246,9 @@ private:
             max_push_id_ = id;
             max_push_id_received_ = true;
         } else if (frame_type_ == cancel_push_frame) {
-            // A client may only cancel push IDs it has allowed (RFC 9114 7.2.3).
-            if (!max_push_id_received_ || id > max_push_id_)
-                return std::unexpected(h3_error::id_error);
+            // This server never sends PUSH_PROMISE, so every peer cancellation
+            // refers to an unpromised ID (RFC 9114 7.2.3).
+            return std::unexpected(h3_error::id_error);
         } else {
             // A client GOAWAY carries a push ID and must not increase (5.2).
             if (goaway_received_ && id > goaway_id_)

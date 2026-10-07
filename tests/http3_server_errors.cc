@@ -126,6 +126,7 @@ struct outcome {
     bool valid_trailers {false};
     bool survived {false};
     bool connection_closed {false};
+    bool cancel_push_closed {false};
     bool done {false};
 };
 
@@ -260,6 +261,29 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outco
     status = (co_await response_status(loop, connection, id, error)).value_or(0);
     result.connection_closed = status == 0 && error && error != reset_error &&
         event_loop::clock::now() - started < 2s;
+
+    // 8. CANCEL_PUSH names an ID the server never promised: H3_ID_ERROR closes
+    // this second connection, even though the ID is within MAX_PUSH_ID.
+    auto push_connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
+    if (!push_connected) { result.done = true; co_return; }
+    auto push_connection = std::move(*push_connected);
+    const auto push_control = flatten_result(co_await push_connection.async_open_stream(
+        quic_stream_direction::unidirectional));
+    if (!push_control) { result.done = true; co_return; }
+    if (!(co_await send(loop, push_connection, *push_control, settings, false)).value_or(false)) {
+        result.done = true;
+        co_return;
+    }
+    auto push_frames = frame(0x0d, "\x05"); // MAX_PUSH_ID 5
+    const auto cancel = frame(0x03, "\x05"); // CANCEL_PUSH 5
+    push_frames.insert(push_frames.end(), cancel.begin(), cancel.end());
+    const auto probe = (co_await open_request(loop, push_connection)).value_or(0);
+    const auto control_sent =
+        (co_await send(loop, push_connection, *push_control, push_frames, false)).value_or(false);
+    error = {};
+    (void)co_await send(loop, push_connection, probe, get("/hello.txt"), true);
+    status = (co_await response_status(loop, push_connection, probe, error)).value_or(0);
+    result.cancel_push_closed = control_sent && status == 0 && error && error != reset_error;
     result.done = true;
 }
 
@@ -289,7 +313,7 @@ auto main() -> int
         http::http3_server server(loop, ip_endpoint::loopback_v4(0),
             directory / "cert.pem", directory / "key.pem",
             http::server_options {.document_root = directory / "www",
-                                  .connection_capacity = 1, .request_capacity = 1});
+                                  .connection_capacity = 2, .request_capacity = 1});
         quic_client_options options;
         options.alpn = alpn;
         options.trusted_ca = directory / "cert.pem";
@@ -310,5 +334,6 @@ auto main() -> int
     check(result.valid_trailers, "valid body and trailers");
     check(result.survived, "connection survives stream errors");
     check(result.connection_closed, "frame-sequence error closes the connection");
+    check(result.cancel_push_closed, "unpromised CANCEL_PUSH closes the connection");
     std::puts("HTTP/3 server error scoping tests passed");
 }

@@ -110,8 +110,9 @@ and rejects duplicate or HTTP/2-only identifiers, and
 (`H3_SETTINGS_ERROR`).
 GOAWAY, MAX_PUSH_ID, and CANCEL_PUSH must hold exactly one push ID
 (`H3_FRAME_ERROR`); an increasing GOAWAY, decreasing MAX_PUSH_ID, or
-CANCEL_PUSH above the client's MAX_PUSH_ID is `H3_ID_ERROR`. Unknown frames
-are skipped by length. Because the server advertises a zero-capacity
+CANCEL_PUSH for an ID not previously sent in PUSH_PROMISE is `H3_ID_ERROR`.
+The server does not support push, so every peer CANCEL_PUSH is unpromised.
+Unknown frames are skipped by length. Because the server advertises a zero-capacity
 dynamic table, the encoder stream accepts only Set Dynamic Table Capacity 0
 (`QPACK_ENCODER_STREAM_ERROR`), and the decoder stream accepts only Stream
 Cancellation (`QPACK_DECODER_STREAM_ERROR`). Unknown stream types are
@@ -161,7 +162,9 @@ server stops reading with STOP_SENDING `H3_NO_ERROR` (RFC 9114 4.1), so
 Content-Length is not checked past that point. These static request bodies
 are discarded; routed request bodies follow the handler rules above. Directory listings are available when the server is
 constructed with `directory_listing` and follow the shared bounded
-renderer. HTTP/3 server push and WebTransport are not supported.
+renderer. Their HEAD responses preserve the GET representation length without
+sending DATA. Generated static and automatic responses include Date.
+HTTP/3 server push and WebTransport are not supported.
 
 ## Allocation measurements and transport references
 
