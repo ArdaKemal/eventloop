@@ -5,6 +5,7 @@
 #include "eventloop/event_loop.h"
 #include "eventloop/quic.h"
 #include "eventloop/task.h"
+#include "eventloop/task_composition.h"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -89,7 +90,25 @@ auto fetch(event_loop& loop, http_client_example::url_parts url,
                 request_state& state;
                 ~active_endpoint_guard() { state.endpoint = nullptr; }
             } active {state};
-            auto connected = co_await endpoint.async_connect(remote, url.hostname);
+            // A silent address (nothing listening, so UDP goes unanswered)
+            // holds a handshake until the QUIC idle timeout. Bound every
+            // attempt but the last, so localhost's ::1 cannot starve 127.0.0.1.
+            constexpr auto attempt_limit = std::chrono::seconds {3};
+            auto connected = std::expected<std::expected<quic_connection, std::error_code>,
+                                           task_result>(std::unexpected(task_result::cancelled));
+            if (index + 1 == addresses->count) {
+                connected = co_await endpoint.async_connect(remote, url.hostname);
+            } else {
+                auto attempt = co_await with_timeout(
+                    loop, endpoint.async_connect(remote, url.hostname), attempt_limit);
+                if (attempt && attempt->result) {
+                    connected = std::move(*attempt->result);
+                } else if (attempt && attempt->state ==
+                           timeout_result<std::expected<quic_connection, std::error_code>>::outcome::timed_out) {
+                    connected = std::expected<quic_connection, std::error_code>(
+                        std::unexpected(std::make_error_code(std::errc::timed_out)));
+                }
+            }
             if (!connected || !*connected) {
                 std::cerr << "QUIC connect/TLS handshake failed (address "
                           << index + 1 << "): "

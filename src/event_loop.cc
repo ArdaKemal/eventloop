@@ -585,10 +585,50 @@ public:
                    : detail::blocking_submission_result::queue_full;
     }
 
+    // Removed handlers are retired: an internal owner may have pinned one
+    // that it still calls, and then the last unpin destroys it.
+    auto erase_handler(native_socket descriptor) -> void
+    {
+        const auto found = handlers.find(descriptor);
+        if (found == handlers.end()) return;
+        auto handler = std::move(found->second);
+        handlers.erase(found);
+        detail::notifiable::retire(std::move(handler));
+    }
+
+    auto erase_all_handlers() -> void
+    {
+        for (auto& entry : handlers) detail::notifiable::retire(std::move(entry.second));
+        handlers.clear();
+    }
+
+    auto schedule_wakeup(detail::wakeup_node& node) noexcept -> void
+    {
+        node.next = nullptr;
+        *ready_wakeups_tail = &node;
+        ready_wakeups_tail = &node.next;
+        local_post_pending = true;
+    }
+
+    // Resumes queued waiters in order, including ones notified meanwhile, up
+    // to the same per-iteration budget as posted work. A node is unlinked
+    // before its resumption, which may destroy it.
+    auto drain_wakeups() noexcept -> bool
+    {
+        for (std::size_t count = 0; count < max_posted_tasks_per_iteration; ++count) {
+            auto* const node = ready_wakeups;
+            if (node == nullptr) return false;
+            ready_wakeups = node->next;
+            if (ready_wakeups == nullptr) ready_wakeups_tail = &ready_wakeups;
+            node->handle.resume();
+        }
+        return ready_wakeups != nullptr;
+    }
+
     auto erase_pending() -> void
     {
         for (const native_socket descriptor : pending_removals) {
-            handlers.erase(descriptor);
+            erase_handler(descriptor);
         }
         pending_removals.clear();
     }
@@ -609,7 +649,7 @@ public:
             erase_pending();
 #else
             pending_removals.clear();
-            handlers.clear();
+            erase_all_handlers();
 #endif
         } else {
             erase_pending();
@@ -708,7 +748,7 @@ public:
             return;
         }
         pending_removals.clear();
-        handlers.clear();
+        erase_all_handlers();
 #endif
     }
 
@@ -861,6 +901,9 @@ public:
     // continuations and same-thread posts use posted_tasks without writing
     // to the backend wake notifier.
     bool local_post_pending {false};
+    // Notified wakeup waiters, resumed in order with posted work.
+    detail::wakeup_node* ready_wakeups {nullptr};
+    detail::wakeup_node** ready_wakeups_tail {&ready_wakeups};
     // Set by the first cross-thread publisher after the owner's last drain;
     // while set, a backend wakeup or owner drain is already due.
     std::atomic<bool> wake_pending {false};
@@ -975,17 +1018,26 @@ auto event_loop::run() -> event_loop_result
             // visible below; a later one sees false and wakes the poller.
             (void)implementation_->wake_pending.exchange(
                 false, std::memory_order_acquire);
-            const bool more_posted = implementation_->drain_posted();
-            const bool more_completions =
-                implementation_->drain_coroutine_completions();
-            if (more_posted || more_completions) {
-                implementation_->local_post_pending = true;
+            bool more = false;
+            {
+                // Coroutines resumed here can close a stream from inside its
+                // own failed operation; defer removal as socket dispatch does.
+                handler_call_scope scope(*this);
+                const bool more_posted = implementation_->drain_posted();
+                const bool more_completions =
+                    implementation_->drain_coroutine_completions();
+                const bool more_wakeups = implementation_->drain_wakeups();
+                more = more_posted || more_completions || more_wakeups;
             }
+            if (more) implementation_->local_post_pending = true;
             implementation_->drain_completed_roots();
         }
         const auto& deadline = implementation_->armed_deadline;
         if (deadline && clock::now() >= *deadline) {
-            implementation_->run_due_timers();
+            {
+                handler_call_scope scope(*this);
+                implementation_->run_due_timers();
+            }
             implementation_->drain_completed_roots();
         }
         if (implementation_->shutdown_complete()) {
@@ -1115,7 +1167,7 @@ auto event_loop::remove(native_socket descriptor) -> void
         }
     } else {
         implementation_->poller.remove_descriptor(descriptor);
-        implementation_->handlers.erase(descriptor);
+        implementation_->erase_handler(descriptor);
     }
 }
 
@@ -1237,6 +1289,12 @@ auto detail::coroutine_frame_access::register_timer(
     event_loop& loop, coroutine_timer_node& timer) -> void
 {
     loop.implementation_->register_coroutine_timer(timer);
+}
+
+auto detail::coroutine_frame_access::schedule_wakeup(
+    event_loop& loop, wakeup_node& node) noexcept -> void
+{
+    loop.implementation_->schedule_wakeup(node);
 }
 
 auto detail::coroutine_frame_access::cancel_timer(

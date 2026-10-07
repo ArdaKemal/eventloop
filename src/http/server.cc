@@ -8,6 +8,7 @@
 #include "parser.h"
 #include "open_file_cache.h"
 #include "session.h"
+#include "../socket_operations.h"
 #include "eventloop/tcp_stream.h"
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 #include "eventloop/tls_stream.h"
@@ -103,6 +104,28 @@ template<typename T>
     return result && *result;
 }
 
+// A peer reset, failed TLS operation, or cancellation removes a stream from
+// the loop, possibly while a routed handler waits on something else. The
+// connection task keeps using it afterwards, so it pins the stream.
+class stream_pin {
+public:
+    stream_pin() = default;
+    stream_pin(const stream_pin&) = delete;
+    auto operator=(const stream_pin&) -> stream_pin& = delete;
+    ~stream_pin()
+    {
+        if (stream_ != nullptr) eventloop::detail::socket_operations::stream_unpin(*stream_);
+    }
+    auto hold(tcp_stream& stream) noexcept -> void
+    {
+        eventloop::detail::socket_operations::stream_pin(stream);
+        stream_ = &stream;
+    }
+
+private:
+    tcp_stream* stream_ {nullptr};
+};
+
 template<typename Stream>
 [[nodiscard]] auto serve_connection(event_loop& loop, unique_fd descriptor,
                                     std::shared_ptr<detail::document_root> root,
@@ -110,6 +133,7 @@ template<typename Stream>
                                     std::shared_ptr<tls_context> context)
     -> task<void>
 {
+    stream_pin pin;
     std::unique_ptr<Stream> socket;
     Stream* peer = nullptr;
     bool registered = false;
@@ -132,6 +156,7 @@ template<typename Stream>
         peer = socket.get();
         loop.add(std::move(socket));
         registered = true;
+        pin.hold(*peer);
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         if constexpr (std::is_same_v<Stream, tls_stream>) {
             const auto handshake = co_await peer->async_handshake();

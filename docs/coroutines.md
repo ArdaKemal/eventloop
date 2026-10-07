@@ -95,6 +95,24 @@ submissions remain bounded command and background-work APIs.
   does not provide a response-draining period for built-in HTTP connections.
   A second call forces removal of any remaining handlers immediately.
 
+## Wakeups
+
+- Include `eventloop/wakeup.h` for `eventloop::wakeup`, which wakes one
+  coroutine when another has work for it, such as a writer draining a queue.
+  `async_wait()` is a direct awaiter: the wait lives in the awaiting frame,
+  with no allocation, coroutine frame, or capacity limit. It yields
+  `std::expected<void, std::error_code>`.
+- `notify()` with a coroutine waiting queues it on the loop. The loop resumes
+  it after the notifier returns, in notification order, with posted work and
+  within the same per-iteration budget. With none waiting, the next
+  `async_wait()` completes without suspending. Notifications before the
+  waiter runs count once.
+- A second waiter reports `EBUSY`. Cancelling the waiting task before a
+  notification reports `ECANCELED`, including at shutdown; a waiter already
+  queued by `notify()` completes normally. `notify()` and `async_wait()` are
+  loop-thread operations. Destroying a `wakeup` while a coroutine waits on it,
+  or using it from another loop, is a programming error.
+
 ## Task composition
 
 - Include `eventloop/task_composition.h` for fixed-arity `eventloop::when_all`,
