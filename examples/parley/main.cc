@@ -239,7 +239,13 @@ auto main(int argc, char** argv) -> int
                   << ':' << settings.port << "/ (HTTP/2" << (settings.http3 ? ", HTTP/3" : "")
                   << ")\n" << std::flush;
         // Shutdown cancels every handler, the journal writer, and the ticker.
-        while (loop.run() == event_loop_result::interrupted) loop.shutdown(std::chrono::seconds {2});
+        // HTTP/3 does not stop with the loop: close it, and its run() task
+        // retires the endpoint.
+        while (loop.run() == event_loop_result::interrupted) {
+            if (quic) quic->close();
+            loop.shutdown(std::chrono::seconds {2});
+        }
+        while (quic && !serving_quic.done()) (void)loop.run();
 
         // Lines the cancelled writer did not reach.
         const auto& rest = data.journal_backlog();
