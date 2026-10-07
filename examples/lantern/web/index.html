@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Lantern</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/" aria-label="Lantern home">
+    <img src="favicon.svg" alt="" width="28" height="28"><span>Lantern</span>
+  </a>
+  <form class="search" role="search" id="search">
+    <input type="search" name="q" placeholder="Search" aria-label="Search videos" autocomplete="off">
+    <button type="submit" aria-label="Search">
+      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M10 4a6 6 0 1 0 3.5 10.9l4.8 4.8 1.4-1.4-4.8-4.8A6 6 0 0 0 10 4Zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z"/></svg>
+    </button>
+  </form>
+  <a class="upload-button" href="#/upload">
+    <svg viewBox="0 0 24 24" width="20" height="20"><path d="M11 16V7.8l-3.3 3.3-1.4-1.4L12 4l5.7 5.7-1.4 1.4L13 7.8V16h-2Zm-6 4v-6h2v4h10v-4h2v6H5Z"/></svg>
+    <span>Upload</span>
+  </a>
+</header>
+<main id="view" tabindex="-1"></main>
+<script src="app.js"></script>
+</body>
+</html>
