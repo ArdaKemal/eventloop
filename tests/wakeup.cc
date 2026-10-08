@@ -1,5 +1,6 @@
 // eventloop::wakeup: deferred resumption, stored and collapsed
-// notifications, EBUSY for a second waiter, cancellation, and shutdown.
+// notifications, EBUSY for a second waiter, cancellation, shutdown, and
+// wrong-loop waits (run as `wakeup_test wrong_loop`).
 #include "eventloop/event_loop.h"
 #include "eventloop/task.h"
 #include "eventloop/wakeup.h"
@@ -53,10 +54,32 @@ auto run(event_loop& loop) -> void
     while (loop.run() == event_loop_result::interrupted) {}
 }
 
+// A stored notification must not bypass the loop check.
+auto wrong_loop(event_loop&, wakeup& ready) -> task<void>
+{
+    (void)co_await ready.async_wait();
+    std::_Exit(1);
+}
+
+[[noreturn]] auto programming_error(std::string_view mode) -> void
+{
+    std::set_terminate([] { std::_Exit(0); });
+    if (mode == "wrong_loop") {
+        event_loop owner;
+        event_loop other;
+        wakeup ready(owner);
+        ready.notify();
+        (void)other.spawn(wrong_loop(other, ready));
+    }
+    std::_Exit(2);
+}
+
 } // namespace
 
-auto main() -> int
+auto main(int argc, char** argv) -> int
 {
+    if (argc == 2) programming_error(argv[1]);
+
     // The waiter runs after the notifier returns, once per batch of notifies.
     {
         event_loop loop;
@@ -112,6 +135,42 @@ auto main() -> int
         check(loop.spawn(probe::run(loop, ready, log)) == task_spawn_result::accepted, "spawn");
         run(loop);
         check(log == std::vector<std::string> {"immediate", "woken"}, "stored notification");
+    }
+
+    // A stored notification completes a wait even after the task was
+    // cancelled, and is consumed: the next cancelled wait reports ECANCELED.
+    {
+        event_loop loop;
+        wakeup ready(loop);
+        std::expected<void, std::error_code> first = std::unexpected(std::error_code {});
+        std::expected<void, std::error_code> second;
+        struct cancelled {
+            static auto run(event_loop& loop, wakeup& ready,
+                            std::expected<void, std::error_code>& first,
+                            std::expected<void, std::error_code>& second) -> task<void>
+            {
+                (void)co_await sleep_for(loop, 1h);
+                ready.notify();
+                first = co_await ready.async_wait();
+                second = co_await ready.async_wait();
+            }
+            static auto drive(event_loop& loop, wakeup& ready,
+                              std::expected<void, std::error_code>& first,
+                              std::expected<void, std::error_code>& second) -> task<void>
+            {
+                task_handle<void> waiting;
+                check(loop.spawn(run(loop, ready, first, second), waiting) ==
+                          task_spawn_result::accepted, "spawn");
+                (void)waiting.cancel();
+                (void)co_await waiting;
+                loop.stop();
+            }
+        };
+        check(loop.spawn(cancelled::drive(loop, ready, first, second)) ==
+                  task_spawn_result::accepted, "spawn");
+        run(loop);
+        check(first.has_value(), "stored notification wins over cancellation");
+        check(is(second, std::errc::operation_canceled), "stored notification consumed");
     }
 
     // A second waiter reports EBUSY; cancelling the first reports ECANCELED.

@@ -91,9 +91,11 @@ without allocation, another frame, or a capacity limit.
 notification order with posted work and the same per-iteration budget. With no
 waiter, the next wait completes immediately. Notifications coalesce until the
 waiter runs. A second waiter returns `EBUSY`; cancellation before notification
-returns `ECANCELED` (including shutdown); an already queued waiter completes
-normally. Notify/wait are loop-thread operations. Destruction with a pending
-waiter or use from another loop is a programming error.
+returns `ECANCELED` (including shutdown); an already queued waiter, or a wait
+that consumes a stored notification, completes normally even if its task was
+cancelled. Notify/wait are loop-thread operations. Destruction with a pending
+waiter or a wait from another loop, even with a stored notification, is a
+programming error.
 
 For bounded value transfer between multiple senders/receivers, include
 `eventloop/channel.h`; see the [channel contract](channel.md) for storage,

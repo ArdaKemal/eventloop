@@ -34,9 +34,10 @@ public:
 
     auto notify() noexcept -> void;
 
-    // Completes after notify(). Reports ECANCELED when the waiting task is
-    // cancelled before a notification, and EBUSY while another coroutine
-    // waits. Wrong-loop use is a programming error.
+    // Completes after notify(); a stored notification wins even for a task
+    // already cancelled. Reports ECANCELED when the waiting task is cancelled
+    // before a notification, and EBUSY while another coroutine waits.
+    // Wrong-loop use is a programming error.
     [[nodiscard]] auto async_wait() noexcept -> wait_awaiter;
 
 private:
@@ -55,15 +56,15 @@ public:
     wait_awaiter(const wait_awaiter&) = delete;
     auto operator=(const wait_awaiter&) -> wait_awaiter& = delete;
 
-    [[nodiscard]] auto await_ready() const noexcept -> bool
-    {
-        return std::exchange(owner_.notified_, false);
-    }
+    // A stored notification is consumed only after the loop check.
+    [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
 
     template<typename Promise>
     auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
     {
         if (handle.promise().owner_loop() != &owner_.loop_) std::terminate();
+        // Notified before this wait: completes even for a cancelled task.
+        if (std::exchange(owner_.notified_, false)) return false;
         if (owner_.waiter_ != nullptr) {
             error_ = EBUSY;
             return false;
