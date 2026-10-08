@@ -23,6 +23,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -445,6 +446,43 @@ struct stream_pair {
     }
     return result.server_ok && result.client_ok;
 }
+[[nodiscard]] auto plaintext_handshake(event_loop& loop, tls_stream& stream,
+                                       bool& failed) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    // The failed handshake closed and released the loop-owned stream.
+    failed = handshake && !*handshake;
+}
+
+// A handshake that fails before suspending closes a loop-owned stream outside
+// any handler call, which removes it at once; the operation must not touch or
+// destroy it while still marked active.
+[[nodiscard]] auto run_plaintext_peer_case(const std::filesystem::path& trusted_ca)
+    -> bool
+{
+    auto sockets = connect_loopback();
+    constexpr std::string_view plaintext = "HTTP/1.1 200 OK\r\n\r\n";
+    if (send(sockets.server.get(), plaintext.data(), plaintext.size(),
+             MSG_NOSIGNAL) != static_cast<ssize_t>(plaintext.size())) {
+        throw system_error("send");
+    }
+    pollfd readable {.fd = sockets.client.get(), .events = POLLIN, .revents = 0};
+    if (poll(&readable, 1, 5000) != 1) throw system_error("poll");
+    event_loop loop;
+    auto client = std::make_unique<tls_stream>(
+        loop, std::move(sockets.client), tls_context::make_client(trusted_ca),
+        tls_client_options {.hostname = "localhost", .application_protocols = {}});
+    auto* stream = client.get();
+    loop.add(std::move(client));
+    bool failed = false;
+    if (loop.spawn(plaintext_handshake(loop, *stream, failed)) !=
+        task_spawn_result::accepted) {
+        throw std::runtime_error("cannot start plaintext peer task");
+    }
+    if (!failed) std::cerr << "TLS plaintext peer handshake did not fail\n";
+    return failed;
+}
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
@@ -463,6 +501,7 @@ auto main(int argc, char* argv[]) -> int
                             run_case(certificate, key, trusted_ca, 3) &&
                             run_case(certificate, key, trusted_ca, 4) &&
                             run_case(certificate, key, trusted_ca, 6) &&
+                            run_plaintext_peer_case(trusted_ca) &&
                             run_outbound_case(certificate, key, trusted_ca,
                                               false, false) &&
                             run_outbound_case(certificate, key, trusted_ca,

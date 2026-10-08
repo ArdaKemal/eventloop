@@ -33,9 +33,31 @@ constexpr std::size_t max_record_plaintext = 16 * 1024;
     return system_code(result == task_result::frame_allocation_failure ? ENOMEM : ECANCELED);
 }
 #endif
-struct active_operation_guard {
-    bool& active;
-    ~active_operation_guard() { active = false; }
+// Marks one TLS operation active and pins the stream for its duration. Once
+// armed, an unsuccessful exit closes the stream; closing removes a loop-owned
+// stream, which then lives until its last operation releases the pin.
+class operation_guard {
+public:
+    operation_guard(tls_stream& stream, bool& active) noexcept
+        : stream_(stream), active_(active)
+    {
+        active_ = true;
+        detail::socket_operations::stream_pin(stream_);
+    }
+    operation_guard(const operation_guard&) = delete;
+    auto operator=(const operation_guard&) -> operation_guard& = delete;
+    ~operation_guard()
+    {
+        active_ = false;
+        if (close_on_exit) stream_.close();
+        detail::socket_operations::stream_unpin(stream_);
+    }
+
+    bool close_on_exit {false};
+
+private:
+    tls_stream& stream_;
+    bool& active_;
 };
 // SSL_get_error() requires an empty queue before its matching I/O call.
 // Clearing an already empty queue still scans all OpenSSL error slots; the
@@ -619,14 +641,12 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
 #endif
     if (self.exclusive_operation_active_ || self.read_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    self.exclusive_operation_active_ = true;
-    active_operation_guard guard {self.exclusive_operation_active_};
+    operation_guard guard {self, self.exclusive_operation_active_};
     if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
     if (auto peer = detail::socket_operations::peer_endpoint(self.descriptor()); !peer)
         co_return std::unexpected(peer.error());
     if (auto activated = self.activate_async_tls(); !activated) co_return std::unexpected(activated.error());
-    bool completed = false;
-    struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
+    guard.close_on_exit = true;
     auto& state = *self.implementation_;
     for (;;) {
         ERR_clear_error();
@@ -638,7 +658,7 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
         if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
             co_return std::unexpected(state.failure());
 #ifdef __linux__
-        if (result == 1) { completed = true; co_return std::expected<void, std::error_code> {}; }
+        if (result == 1) { guard.close_on_exit = false; co_return std::expected<void, std::error_code> {}; }
         auto ready = error == SSL_ERROR_WANT_READ
             ? co_await self.await_readable() : co_await self.await_writable();
         if (!ready) co_return std::unexpected(ready.error());
@@ -648,7 +668,7 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
         auto flushed = co_await flush_task(loop, self);
         if (!flushed) co_return std::unexpected(task_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
-        if (result == 1) { completed = true; co_return std::expected<void, std::error_code> {}; }
+        if (result == 1) { guard.close_on_exit = false; co_return std::expected<void, std::error_code> {}; }
         if (error == SSL_ERROR_WANT_WRITE || state.input_size_ != 0) continue;
         auto received = co_await self.tcp_stream::async_read_some(state.input_);
         if (!received) co_return std::unexpected(received.error());
@@ -667,16 +687,14 @@ auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::by
 #endif
     if (self.exclusive_operation_active_ || self.read_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    self.read_operation_active_ = true;
-    active_operation_guard guard {self.read_operation_active_};
+    operation_guard guard {self, self.read_operation_active_};
     if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
     if (!self.async_tls_mode_) co_return std::unexpected(system_code(ENOTCONN));
     if (buffer.empty()) co_return std::size_t {0};
     auto& state = *self.implementation_;
     if (state.peer_closed_) co_return std::size_t {0};
     if (!state.active()) co_return std::unexpected(system_code(ENOTCONN));
-    bool completed = false;
-    struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
+    guard.close_on_exit = true;
     for (;;) {
         std::size_t size = 0;
         clear_io_errors();
@@ -687,13 +705,13 @@ auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::by
         const int error = result == 1 ? SSL_ERROR_NONE : state.error(result);
         if (error == SSL_ERROR_ZERO_RETURN) {
             state.peer_closed_ = true;
-            completed = true;
+            guard.close_on_exit = false;
             co_return std::size_t {0};
         }
         if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
             co_return std::unexpected(state.failure());
 #ifdef __linux__
-        if (result == 1) { completed = true; co_return size; }
+        if (result == 1) { guard.close_on_exit = false; co_return size; }
         auto ready = error == SSL_ERROR_WANT_READ
             ? co_await self.await_readable() : co_await self.await_writable();
         if (!ready) co_return std::unexpected(ready.error());
@@ -703,7 +721,7 @@ auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::by
         auto flushed = co_await flush_task(loop, self);
         if (!flushed) co_return std::unexpected(task_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
-        if (result == 1) { completed = true; co_return size; }
+        if (result == 1) { guard.close_on_exit = false; co_return size; }
         if (error == SSL_ERROR_WANT_WRITE || state.input_size_ != 0) continue;
         auto received = co_await self.tcp_stream::async_read_some(state.input_);
         if (!received) co_return std::unexpected(received.error());
@@ -722,16 +740,14 @@ auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const 
 #endif
     if (self.exclusive_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    self.write_operation_active_ = true;
-    active_operation_guard guard {self.write_operation_active_};
+    operation_guard guard {self, self.write_operation_active_};
     if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
     auto& state = *self.implementation_;
     if (!self.async_tls_mode_ || !state.active() || self.transport_closed() ||
         (SSL_get_shutdown(state.ssl_.get()) & SSL_SENT_SHUTDOWN))
         co_return std::unexpected(system_code(ENOTCONN));
     if (buffer.empty()) co_return std::size_t {0};
-    bool completed = false;
-    struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
+    guard.close_on_exit = true;
     // Smaller writes would each pay a record and a transport write.
     const auto size = std::min(buffer.size(), max_record_plaintext);
 #ifndef __linux__
@@ -757,7 +773,7 @@ auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const 
             )
             co_return std::unexpected(state.failure());
 #ifdef __linux__
-        if (result == 1) { completed = true; co_return written; }
+        if (result == 1) { guard.close_on_exit = false; co_return written; }
         auto ready = error == SSL_ERROR_WANT_READ
             ? co_await self.await_readable() : co_await self.await_writable();
         if (!ready) co_return std::unexpected(ready.error());
@@ -767,7 +783,7 @@ auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const 
         auto sent = co_await flush_task(loop, self);
         if (!sent) co_return std::unexpected(task_code(sent.error()));
         if (!*sent) co_return std::unexpected(sent->error());
-        if (result == 1) { completed = true; co_return written; }
+        if (result == 1) { guard.close_on_exit = false; co_return written; }
 #endif
     }
 }
@@ -780,12 +796,10 @@ auto tls_stream::close_task(event_loop& loop, tls_stream& self)
 #endif
     if (self.exclusive_operation_active_ || self.read_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    self.exclusive_operation_active_ = true;
-    active_operation_guard guard {self.exclusive_operation_active_};
+    operation_guard guard {self, self.exclusive_operation_active_};
     if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
     if (!self.async_tls_mode_) co_return std::unexpected(system_code(ENOTCONN));
-    bool completed = false;
-    struct failure_guard { tls_stream& stream; bool& completed; ~failure_guard() { if (!completed) stream.close(); } } failure {self, completed};
+    guard.close_on_exit = true;
     auto& state = *self.implementation_;
     for (;;) {
         ERR_clear_error();
@@ -798,7 +812,7 @@ auto tls_stream::close_task(event_loop& loop, tls_stream& self)
             co_return std::unexpected(state.failure());
 #ifdef __linux__
         if (SSL_get_shutdown(state.ssl_.get()) & SSL_SENT_SHUTDOWN) {
-            completed = true;
+            guard.close_on_exit = false;
             co_return std::expected<void, std::error_code> {};
         }
         if (error != SSL_ERROR_WANT_WRITE && error != SSL_ERROR_WANT_READ)
@@ -814,7 +828,7 @@ auto tls_stream::close_task(event_loop& loop, tls_stream& self)
         if (!*flushed) co_return std::unexpected(flushed->error());
         // API sends close_notify without waiting for the peer's reply.
         if (SSL_get_shutdown(state.ssl_.get()) & SSL_SENT_SHUTDOWN) {
-            completed = true;
+            guard.close_on_exit = false;
             co_return std::expected<void, std::error_code> {};
         }
         if (error != SSL_ERROR_WANT_WRITE) co_return std::unexpected(state.failure());
@@ -832,8 +846,7 @@ auto tls_stream::send_file_task(event_loop& loop, tls_stream& self,
 #ifdef __linux__
     if (self.exclusive_operation_active_ || self.write_operation_active_)
         co_return std::unexpected(system_code(EBUSY));
-    self.write_operation_active_ = true;
-    active_operation_guard guard {self.write_operation_active_};
+    operation_guard guard {self, self.write_operation_active_};
     if (co_await cancellation_requested())
         co_return std::unexpected(system_code(ECANCELED));
     if (file == static_cast<native_socket>(-1)) co_return std::unexpected(system_code(EBADF));
@@ -842,12 +855,7 @@ auto tls_stream::send_file_task(event_loop& loop, tls_stream& self,
     if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
         size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) - offset)
         co_return std::unexpected(system_code(EOVERFLOW));
-    bool completed = false;
-    struct failure_guard {
-        tls_stream& stream;
-        bool& completed;
-        ~failure_guard() { if (!completed) stream.close(); }
-    } failure {self, completed};
+    guard.close_on_exit = true;
     auto& state = *self.implementation_;
     // Keep the H2 DATA header and file payload under one write guard and task.
     // The prefix is borrowed from the caller's bounded queue; it is never copied
@@ -896,7 +904,7 @@ auto tls_stream::send_file_task(event_loop& loop, tls_stream& self,
         if (self.transport_closed()) co_return std::unexpected(system_code(ECANCELED));
         if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
     }
-    completed = true;
+    guard.close_on_exit = false;
     co_return std::expected<void, std::error_code> {};
 #else
     (void)self; (void)file; (void)offset; (void)size; (void)prefix;

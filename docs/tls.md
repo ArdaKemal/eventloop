@@ -7,6 +7,8 @@ Setup/inherited operations: [TCP](tcp.md). Names below are in `eventloop`.
   `async_write_some`, and `async_close`. Await `async_close()` to flush
   `close_notify`, then `close()` to retire the transport. `close()` immediately
   cancels/closes it; a loop-owned stream pointer is invalid after removal.
+  A failed TLS operation closes the stream; a loop-owned stream removed that
+  way is destroyed when its last pending TLS operation completes.
 - One TLS read and write may coexist; duplicate directions return `EBUSY`.
   Handshake/async-close require other TLS operations idle. For outbound TLS,
   construct with an `ip_endpoint`, client context, and `tls_client_options`
