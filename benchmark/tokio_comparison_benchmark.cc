@@ -9,7 +9,9 @@
 // Each result is also printed as a tab-separated RESULT line (nanoseconds
 // per iteration: slope, median, mean, min, max).
 
+#include "eventloop/channel.h"
 #include "eventloop/file_io.h"
+#include "eventloop/semaphore.h"
 #include "eventloop/task.h"
 #include "eventloop/task_composition.h"
 #include "eventloop/tcp_acceptor.h"
@@ -659,6 +661,55 @@ auto bench_run(const std::string& name, event_loop& loop, Body body) -> void
     });
 }
 
+// ping_pong: each ping spawns a pong; two 1-slot channels in the ping's frame
+// stand in for tokio's oneshots, and the last ping signals completion.
+constexpr std::size_t ping_count = 1'000;
+
+auto pong(event_loop&, channel<char>& ping, channel<char>& reply) -> task<void>
+{
+    auto value = co_await ping.async_receive();
+    if (!value || !reply.try_send(std::move(*value))) std::terminate();
+}
+
+auto ping(event_loop& loop, std::size_t& remaining, channel<char>& done)
+    -> task<void>
+{
+    std::array<std::optional<char>, 1> first_slot;
+    std::array<std::optional<char>, 1> second_slot;
+    channel<char> first(loop, first_slot);
+    channel<char> second(loop, second_slot);
+    if (loop.spawn(pong(loop, first, second)) != task_spawn_result::accepted ||
+        !first.try_send('p')) {
+        std::terminate();
+    }
+    if (!co_await second.async_receive()) std::terminate();
+    if (--remaining == 0 && !done.try_send('d')) std::terminate();
+}
+
+auto spawn_pings(event_loop& loop, std::size_t& remaining, channel<char>& done)
+    -> task<void>
+{
+    for (std::size_t index = 0; index < ping_count; ++index) {
+        if (loop.spawn(ping(loop, remaining, done)) !=
+            task_spawn_result::accepted) {
+            std::terminate();
+        }
+    }
+    co_return;
+}
+
+auto ping_pong(event_loop& loop) -> task<void>
+{
+    std::array<std::optional<char>, 1> slot;
+    channel<char> done(loop, slot);
+    std::size_t remaining = ping_count;
+    if (loop.spawn(spawn_pings(loop, remaining, done)) !=
+        task_spawn_result::accepted) {
+        std::terminate();
+    }
+    if (!co_await done.async_receive()) std::terminate();
+}
+
 auto rt_multi_threaded_group() -> void
 {
     if (!group_enabled("rt_multi_threaded")) return;
@@ -670,6 +721,9 @@ auto rt_multi_threaded_group() -> void
               });
     bench_run("rt_multi_threaded/yield_many", loop, multi_yield_many);
     bench_run("rt_multi_threaded/chained_spawn", loop, multi_chained_spawn);
+    bench_run("rt_multi_threaded/ping_pong", loop, [](event_loop& owner) {
+        block_on(owner, ping_pong(owner));
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1226,220 @@ auto fs_group() -> void
     });
 }
 
+// ---------------------------------------------------------------------------
+// sync_mpsc, sync_mpsc_oneshot, sync_semaphore. Channels and semaphores are
+// loop-thread objects; tokio's run on multi_thread(6) (mpsc, semaphore
+// "multi") or (1) (request_reply), plus current_thread variants.
+
+struct medium {
+    std::array<std::size_t, 64> words {};
+};
+struct large {
+    std::array<medium, 64> items {};
+};
+
+template<typename T>
+auto send_one(event_loop&, channel<T>& messages) -> task<void>
+{
+    if (!co_await messages.async_send(T {})) std::terminate();
+}
+
+template<typename T>
+auto receive_one(event_loop&, channel<T>& messages) -> task<void>
+{
+    if (!co_await messages.async_receive()) std::terminate();
+}
+
+constexpr std::size_t mpsc_producers = 5;
+constexpr std::size_t mpsc_sends = 1'000;
+
+auto mpsc_producer(event_loop&, channel<std::size_t>& messages) -> task<void>
+{
+    for (std::size_t index = 0; index < mpsc_sends; ++index) {
+        if (!co_await messages.async_send(index)) std::terminate();
+    }
+}
+
+// The channel is built per iteration as tokio's is; its slots are not.
+// Producers are awaited because the channel must outlive their sends.
+auto mpsc_contention(event_loop& loop,
+                     std::span<std::optional<std::size_t>> storage)
+    -> task<void>
+{
+    channel<std::size_t> messages(loop, storage);
+    std::array<void_slot, mpsc_producers> producers;
+    for (auto& producer : producers) {
+        producer.emplace();
+        if (loop.spawn(mpsc_producer(loop, messages), *producer) !=
+            task_spawn_result::accepted) {
+            std::terminate();
+        }
+    }
+    for (std::size_t index = 0; index < mpsc_producers * mpsc_sends; ++index) {
+        if (!co_await messages.async_receive()) std::terminate();
+    }
+    for (auto& producer : producers) (void)co_await *producer;
+}
+
+auto mpsc_uncontended(event_loop& loop,
+                      std::span<std::optional<std::size_t>> storage)
+    -> task<void>
+{
+    channel<std::size_t> messages(loop, storage);
+    constexpr std::size_t count = mpsc_producers * mpsc_sends;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!co_await messages.async_send(index)) std::terminate();
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!co_await messages.async_receive()) std::terminate();
+    }
+}
+
+// request_reply: the reply path is a 1-slot channel in the requester's frame.
+using reply_channel = channel<char>;
+
+auto reply_server(event_loop&, channel<reply_channel*>& requests) -> task<void>
+{
+    for (;;) {
+        auto request = co_await requests.async_receive();
+        if (!request) co_return;
+        if (!(*request)->try_send('r')) std::terminate();
+    }
+}
+
+auto request_replies(event_loop& loop, channel<reply_channel*>& requests)
+    -> task<void>
+{
+    for (std::size_t index = 0; index < 1'000; ++index) {
+        std::array<std::optional<char>, 1> slot;
+        reply_channel reply(loop, slot);
+        if (!co_await requests.async_send(&reply)) std::terminate();
+        if (!co_await reply.async_receive()) std::terminate();
+    }
+}
+
+auto await_handle(event_loop&, task_handle<void>& handle) -> task<void>
+{
+    (void)co_await handle;
+}
+
+auto acquire_once(event_loop&, semaphore& permits) -> task<void>
+{
+    if (!co_await permits.async_acquire()) std::terminate();
+}
+
+auto acquire_sequential(event_loop&, semaphore& permits) -> task<void>
+{
+    for (int index = 0; index < 6; ++index) {
+        if (!co_await permits.async_acquire()) std::terminate();
+    }
+}
+
+// tokio::join! of six acquire futures: one task, no spawns.
+auto acquire_joined(event_loop& loop, semaphore& permits) -> task<void>
+{
+    (void)co_await when_all(
+        acquire_once(loop, permits), acquire_once(loop, permits),
+        acquire_once(loop, permits), acquire_once(loop, permits),
+        acquire_once(loop, permits), acquire_once(loop, permits));
+}
+
+template<typename Body>
+auto bench_iterations(const std::string& name, Body body) -> void
+{
+    bench(name, [&](std::uint64_t iterations) {
+        const auto start = steady::now();
+        for (std::uint64_t index = 0; index < iterations; ++index) body();
+        return steady::now() - start;
+    });
+}
+
+auto sync_mpsc_group() -> void
+{
+    if (!group_enabled("sync_mpsc/")) return;
+    event_loop loop(bench_options());
+
+    // tokio allocates the channel here; eventloop's caller provides slots, so
+    // these rows include allocating and initializing them.
+    for (const std::size_t size : {1UZ, 100UZ, 100'000UZ}) {
+        bench_iterations("sync_mpsc/create_medium/" + std::to_string(size),
+                         [&loop, size] {
+            auto storage = std::make_unique<std::optional<medium>[]>(size);
+            channel<medium> messages(loop, std::span(storage.get(), size));
+            keep(messages);
+        });
+    }
+
+    // Slots are allocated once; each iteration builds the channel on them.
+    {
+        std::vector<std::optional<medium>> storage(1'000);
+        bench_iterations("sync_mpsc/send/medium_1000", [&] {
+            channel<medium> messages(loop, storage);
+            block_on(loop, send_one(loop, messages));
+            block_on(loop, receive_one(loop, messages));
+        });
+    }
+    {
+        // A 32 KiB value exceeds the largest coroutine frame class, so this
+        // row uses try_send/try_receive outside any coroutine.
+        std::vector<std::optional<large>> storage(1'000);
+        bench_iterations("sync_mpsc/send/large_1000", [&] {
+            channel<large> messages(loop, storage);
+            if (!messages.try_send(large {})) std::terminate();
+            auto received = messages.try_receive();
+            if (!received) std::terminate();
+            keep(received);
+        });
+    }
+
+    std::vector<std::optional<std::size_t>> unbounded_like(1'000'000);
+    std::vector<std::optional<std::size_t>> full(100);
+    bench_iterations("sync_mpsc/contention/bounded", [&] {
+        block_on(loop, mpsc_contention(loop, unbounded_like));
+    });
+    bench_iterations("sync_mpsc/contention/bounded_full", [&] {
+        block_on(loop, mpsc_contention(loop, full));
+    });
+    bench_iterations("sync_mpsc/uncontented/bounded", [&] {
+        block_on(loop, mpsc_uncontended(loop, unbounded_like));
+    });
+}
+
+auto sync_mpsc_oneshot_group() -> void
+{
+    if (!group_enabled("sync_mpsc_oneshot/")) return;
+    event_loop loop(bench_options());
+    std::array<std::optional<reply_channel*>, 10> storage;
+    channel<reply_channel*> requests(loop, storage);
+    task_handle<void> server;
+    if (loop.spawn(reply_server(loop, requests), server) !=
+        task_spawn_result::accepted) {
+        std::terminate();
+    }
+    bench_iterations("sync_mpsc_oneshot/request_reply", [&] {
+        block_on(loop, request_replies(loop, requests));
+    });
+    requests.close();
+    block_on(loop, await_handle(loop, server));
+}
+
+auto sync_semaphore_group() -> void
+{
+    if (!group_enabled("sync_semaphore/")) return;
+    event_loop loop(bench_options());
+    semaphore ten(loop, 10);
+    semaphore five(loop, 5);
+    bench_iterations("sync_semaphore/uncontented/sequential", [&] {
+        block_on(loop, acquire_sequential(loop, ten));
+    });
+    bench_iterations("sync_semaphore/uncontented/concurrent_single", [&] {
+        block_on(loop, acquire_joined(loop, ten));
+    });
+    bench_iterations("sync_semaphore/contention/concurrent_single", [&] {
+        block_on(loop, acquire_joined(loop, five));
+    });
+}
+
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
@@ -1198,5 +1466,8 @@ auto main(int argc, char* argv[]) -> int
     rt_multi_threaded_group();
     net_accept_group();
     fs_group();
+    sync_mpsc_group();
+    sync_mpsc_oneshot_group();
+    sync_semaphore_group();
     return 0;
 }
