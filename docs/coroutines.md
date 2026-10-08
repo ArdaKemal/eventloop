@@ -95,6 +95,10 @@ returns `ECANCELED` (including shutdown); an already queued waiter completes
 normally. Notify/wait are loop-thread operations. Destruction with a pending
 waiter or use from another loop is a programming error.
 
+For bounded value transfer between multiple senders/receivers, include
+`eventloop/channel.h`; see the [channel contract](channel.md) for storage,
+backpressure, close, and cancellation semantics.
+
 ## Composition
 
 Include `eventloop/task_composition.h` for fixed-arity `when_all`, `race`, and

@@ -8,6 +8,7 @@ changes. Contracts describe behavior; current test runs establish status.
 | Topic | Defines |
 | --- | --- |
 | [Coroutines and event loop](coroutines.md) | Tasks/handles, results, frames, workers, cancellation, timers, wakeups, composition |
+| [Bounded channel](channel.md) | Caller-owned slots, FIFO transfer, backpressure, close, cancellation |
 | [File I/O](file-io.md) | Borrowed descriptors/buffers, path limits, worker capacity/completion |
 | [TOML](toml.md) | Synchronous caller storage, views, parser limits/errors, traversal |
 | [TCP](tcp.md) | Numeric endpoints, owned sockets, partial I/O, connect failures, file sending |
