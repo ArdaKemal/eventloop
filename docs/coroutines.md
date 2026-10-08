@@ -99,6 +99,10 @@ For bounded value transfer between multiple senders/receivers, include
 `eventloop/channel.h`; see the [channel contract](channel.md) for storage,
 backpressure, close, and cancellation semantics.
 
+For bounded concurrency, include `eventloop/semaphore.h`; the
+[semaphore contract](semaphore.md) defines scoped permits, FIFO acquisition,
+and cancellation before or after reservation.
+
 ## Composition
 
 Include `eventloop/task_composition.h` for fixed-arity `when_all`, `race`, and

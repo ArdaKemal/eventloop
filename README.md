@@ -45,6 +45,7 @@ Public headers are under `include/eventloop/`; readiness APIs remain private.
 | --- | --- | --- |
 | Tasks, timers, composition, workers | `event_loop.h`, `task.h`, `task_composition.h`, `wakeup.h` | [Coroutines](docs/coroutines.md) |
 | Bounded coroutine channel | `channel.h` | [Channel](docs/channel.md) |
+| Scoped concurrency permits | `semaphore.h` | [Semaphore](docs/semaphore.md) |
 | TCP | `tcp_acceptor.h`, `tcp_stream.h`, `ip_endpoint.h` | [TCP](docs/tcp.md), [echo](examples/tcp_echo.cc) |
 | TLS | `tls_stream.h`, `tls_context.h` | [TLS](docs/tls.md), [echo](examples/tls_echo.cc) |
 | Unix streams (Linux/macOS) | `unix_socket.h` | [Unix sockets](docs/unix-sockets.md), [echo](examples/unix_echo.cc) |
