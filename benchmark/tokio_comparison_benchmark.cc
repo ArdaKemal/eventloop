@@ -372,11 +372,31 @@ auto read_clock(event_loop&) -> task<void>
     co_return;
 }
 
+auto read_clocks(event_loop&, std::uint64_t iterations) -> task<void>
+{
+    for (std::uint64_t index = 0; index < iterations; ++index) {
+        keep(event_loop::clock::now());
+    }
+    co_return;
+}
+
 auto time_now_group() -> void
 {
     if (!group_enabled("time_now")) return;
     event_loop loop(bench_options());
-    bench_task("time_now/time_now_current_thread", loop, read_clock);
+    bench("time_now/time_now_current_thread", [&](std::uint64_t iterations) {
+        const auto start = steady::now();
+        for (std::uint64_t index = 0; index < iterations; ++index) {
+            block_on(loop, read_clock(loop));
+        }
+        return steady::now() - start;
+    });
+    // Like Tokio's in-loop body: clock reads inside one run(), no task each.
+    bench("time_now/time_now_current_thread [in-loop]", [&](std::uint64_t iterations) {
+        const auto start = steady::now();
+        block_on(loop, read_clocks(loop, iterations));
+        return steady::now() - start;
+    });
 }
 
 auto quick_job(event_loop&) -> task<int> { co_return 1; }

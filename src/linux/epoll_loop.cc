@@ -177,7 +177,7 @@ auto epoll_loop::wait(epoll_event* events, int capacity, bool nonblocking)
 auto epoll_loop::poll(std::span<ready_event> events, bool nonblocking)
     -> poll_result
 {
-    std::array<epoll_event, 64> native_events {};
+    std::array<epoll_event, 64> native_events;
     const auto capacity = static_cast<int>(std::min(events.size(), native_events.size()));
 
     int count;

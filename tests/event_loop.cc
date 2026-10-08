@@ -604,6 +604,56 @@ auto nested_signal_mask_test() -> bool
     return valid;
 }
 
+auto yield_then_stop(event_loop& loop) -> task<void>
+{
+    (void)co_await yield(loop);
+    loop.stop();
+}
+
+auto read_one(event_loop&, tcp_stream& stream, bool& done) -> task<void>
+{
+    std::array<std::byte, 1> byte {};
+    done = static_cast<bool>(co_await stream.async_read_some(byte));
+}
+
+// Each run() here enters with queued work and ends on an owner stop, so its
+// zero-timeout polls may be skipped; only a bounded number in a row are.
+auto skipped_poll_tests() -> bool
+{
+    constexpr int calls = 16;
+    {
+        event_loop loop;
+        if (::raise(SIGTERM) != 0) return false;
+        bool interrupted = false;
+        for (int call = 0; call < calls && !interrupted; ++call) {
+            if (loop.spawn(yield_then_stop(loop)) != task_spawn_result::accepted)
+                return false;
+            interrupted = loop.run() == event_loop_result::interrupted;
+        }
+        if (!interrupted) return false;
+    }
+    int sockets[2] {};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == -1)
+        return false;
+    event_loop loop;
+    unique_fd peer(sockets[1]);
+    auto owned = std::make_unique<tcp_stream>(loop, unique_fd(sockets[0]));
+    auto& stream = *owned;
+    loop.add(std::move(owned));
+    bool done = false;
+    if (loop.spawn(read_one(loop, stream, done)) != task_spawn_result::accepted ||
+        loop.spawn(yield_then_stop(loop)) != task_spawn_result::accepted ||
+        loop.run() != event_loop_result::stopped || done) return false;
+    const char byte = 'x';
+    if (::write(peer.get(), &byte, 1) != 1) return false;
+    for (int call = 0; call < calls && !done; ++call) {
+        if (loop.spawn(yield_then_stop(loop)) != task_spawn_result::accepted ||
+            loop.run() != event_loop_result::stopped) return false;
+    }
+    stream.close();
+    return done;
+}
+
 // While a loop lives on this thread, a write to a closed socket without
 // MSG_NOSIGNAL (as OpenSSL kTLS does) returns EPIPE instead of ending the
 // process. The last loop discards the pending signal and restores the mask.
@@ -656,6 +706,7 @@ auto main() -> int
     if (!shutdown_tests()) return 1;
 #ifndef _WIN32
     if (!signal_test()) return 1;
+    if (!skipped_poll_tests()) return 1;
 #endif
     return 0;
 }

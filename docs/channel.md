@@ -9,10 +9,13 @@ instead await capacity with `async_send`.
 ## Storage and ownership
 
 Construct with `channel<T>(loop, storage)`, where storage is a nonempty span of
-disengaged `std::optional<T>` slots. Invalid storage throws `invalid_argument`.
-The channel exclusively borrows the slots until its destruction; do not access
-them or lend them to another channel meanwhile. Destruction destroys remaining
-buffered values and leaves the slots disengaged. `T` must have nonthrowing move
+disengaged `std::optional<T>` slots. Empty storage throws `invalid_argument`.
+Disengaged slots are a precondition: builds without `NDEBUG` scan them and throw
+`invalid_argument` for occupied storage; release builds do not scan, so
+construction cost is independent of capacity. The channel exclusively borrows
+the slots until its destruction; do not access them or lend them to another
+channel meanwhile. Receives release consumed slots, so destruction visits only
+the remaining buffered values, destroys them, and leaves every slot disengaged. `T` must have nonthrowing move
 construction and destruction; default construction and move assignment are not
 required. Values may be move-only. Their alignment must not exceed `max_align_t`,
 matching the coroutine-frame pool's alignment limit.

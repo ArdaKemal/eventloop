@@ -318,11 +318,14 @@ auto invalid_storage(event_loop& loop) -> task<void>
         check(false, "empty storage must be rejected");
     } catch (const std::invalid_argument&) {}
     std::array<std::optional<int>, 1> storage {1};
+#ifndef NDEBUG
+    // Disengaged storage is a precondition, scanned only in checked builds.
     try {
         channel<int> occupied(loop, storage);
         check(false, "occupied storage must be rejected");
     } catch (const std::invalid_argument&) {}
     check(storage[0] == 1, "invalid construction leaves storage intact");
+#endif
     storage[0].reset();
     {
         channel<int> messages(loop, storage);
@@ -518,6 +521,29 @@ auto wrong_loop_receive(event_loop& loop, channel<int>& messages) -> task<void>
 
 } // namespace
 
+// Destruction walks the ring from its head, across the wrap, and destroys
+// exactly the buffered values; consumed slots were already released.
+auto wrapped_destruction(event_loop& loop) -> task<void>
+{
+    int live = 0;
+    std::array<std::optional<move_only>, 3> storage;
+    {
+        channel<move_only> messages(loop, storage);
+        for (int value = 0; value < 3; ++value) {
+            check(messages.try_send(move_only(value, live)).has_value(), "fill ring");
+        }
+        check(messages.try_receive()->value == 0, "consume first");
+        check(!storage[0], "receive releases its slot");
+        check(messages.try_send(move_only(3, live)).has_value(), "wrap ring");
+        check(messages.try_receive()->value == 1, "consume second");
+        check(live == 2 && storage[0] && !storage[1] && storage[2], "two buffered across the wrap");
+    }
+    check(live == 0, "destruction destroys buffered values");
+    for (const auto& slot : storage) check(!slot, "destruction leaves slots disengaged");
+    loop.stop();
+    co_return;
+}
+
 auto main(int argc, char** argv) -> int
 {
     if (argc == 2) programming_error(argv[1]);
@@ -538,6 +564,7 @@ auto main(int argc, char** argv) -> int
         {&shutdown_waiters, "shutdown_waiters"},
         {&invalid_storage, "invalid_storage"},
         {&value_lifetimes, "value_lifetimes"},
+        {&wrapped_destruction, "wrapped_destruction"},
         {&pipeline, "pipeline"},
         {&composition_cancellation, "composition_cancellation"},
     };

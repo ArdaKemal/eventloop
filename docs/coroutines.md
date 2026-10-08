@@ -25,6 +25,11 @@ under `eventloop/`. Platform readiness is private.
   intact. Stop posting before loop destruction. `task_executor()` runs
   independent work; workers must not access loop-owned objects. Return results
   through `post()` or blocking/file-operation completion.
+- An owner `stop()` ends `run()` after one more pass over queued work and
+  timers; a stop issued in that pass ends the next `run()`. A `run()` that
+  starts with queued work, or ends on an owner stop, may skip that pass's
+  zero-timeout readiness check; at most 8 are skipped in a row, so socket
+  readiness, signals, and other-thread stops wait at most that many passes.
 - Destroy the loop only after every frame retires; the loop checks this before
   destroying worker/poller state.
 - POSIX loops block SIGPIPE on their constructing thread while any loop lives
@@ -108,6 +113,9 @@ and cancellation before or after reservation.
 ## Composition
 
 Include `eventloop/task_composition.h` for fixed-arity `when_all`, `race`, and
-`with_timeout`. Operands must be unstarted tasks on the same loop. Large
+`with_timeout`. Operands must be unstarted tasks on the same loop.
+`with_timeout` returns an awaiter, not a task: await it directly, or wrap it
+in a coroutine to spawn or compose it. An operation that completes before
+suspending never arms the timer. Large
 combinations can exceed the largest frame class and return
 `frame_allocation_failure`.

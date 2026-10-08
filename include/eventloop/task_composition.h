@@ -300,52 +300,139 @@ struct timeout_result {
 };
 
 namespace detail {
-// Reports whether the awaiting task's cancellation was already requested.
-struct cancellation_requested_awaiter {
-    bool requested {false};
-    [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
-    template<typename Promise>
-    auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
-    {
-        requested = handle.promise().cancellation_state()->requested;
-        return false;
-    }
-    [[nodiscard]] auto await_resume() const noexcept -> bool { return requested; }
-};
+// Runs one operation against a deadline in the awaiting frame. An operation
+// that completes synchronously never arms the timer. Expiry and parent
+// cancellation cancel the operation and resume the parent only after it
+// retires, as race does.
+template<typename T>
+class timeout_awaiter {
+    using outcome = typename timeout_result<T>::outcome;
 
-inline auto timeout_timer(event_loop& loop, event_loop::clock::duration duration)
-    -> task<void>
-{
-    // An operation that completed synchronously has already cancelled this
-    // branch; skip reading the clock for a deadline nobody waits on.
-    if (co_await cancellation_requested_awaiter {}) co_return;
-    (void)co_await sleep_for(loop, duration);
-}
+public:
+    timeout_awaiter(event_loop& loop, task<T>&& operation,
+                    event_loop::clock::duration duration)
+        : loop_(loop), operation_(std::move(operation)), duration_(duration)
+    {
+        parent_node_.operation = this;
+        parent_node_.cancel = &cancel_parent;
+        // The timer's own cancellation node is never attached; parent_node_
+        // handles cancellation, so it only locates this awaiter on expiry.
+        timer_.cancellation.operation = this;
+        timer_.expire = &expire;
+    }
+    timeout_awaiter(const timeout_awaiter&) = delete;
+    auto operator=(const timeout_awaiter&) -> timeout_awaiter& = delete;
+    timeout_awaiter(timeout_awaiter&&) = delete;
+    [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+
+    template<typename Promise>
+    auto await_suspend(std::coroutine_handle<Promise> parent) -> bool
+    {
+        auto& promise = parent.promise();
+        if (promise.owner_loop() != &loop_) std::terminate();
+        const auto* child_loop = composition_task_access::loop(operation_);
+        if (composition_task_access::started(operation_) ||
+            (child_loop != nullptr && child_loop != &loop_)) {
+            throw std::logic_error("timeout operand is not an unstarted task on this loop");
+        }
+        if (duration_ <= event_loop::clock::duration::zero()) {
+            state_ = outcome::timed_out;
+            return false;
+        }
+        parent_ = parent;
+        if (!coroutine_frame_access::attach_cancellation(
+                *promise.cancellation_state(), parent_node_)) {
+            state_ = outcome::cancelled;
+            return false;
+        }
+        if (composition_task_access::done(operation_)) {
+            finished_ = true;
+        } else {
+            driving_ = true;
+            composition_task_access::start(operation_, operation_cancellation_,
+                                           this, &complete);
+            driving_ = false;
+        }
+        if (finished_) {
+            coroutine_frame_access::detach_cancellation(parent_node_);
+            return false;
+        }
+        timer_.deadline = deadline_after(duration_);
+        timer_.handle = parent;
+        timer_.owner = &loop_;
+        coroutine_frame_access::register_timer(loop_, timer_);
+        return true;
+    }
+
+    auto await_resume() -> std::expected<timeout_result<T>, task_result>
+    {
+        if (state_ != outcome::completed) return timeout_result<T> {state_, {}};
+        return timeout_result<T> {outcome::completed,
+                                  composition_task_access::result(operation_)};
+    }
+
+private:
+    static auto complete(void* context) noexcept -> std::coroutine_handle<>
+    {
+        auto& self = *static_cast<timeout_awaiter*>(context);
+        self.finished_ = true;
+        if (self.timer_.owner != nullptr) {
+            coroutine_frame_access::cancel_timer(self.timer_);
+        }
+        if (self.driving_) return std::noop_coroutine();
+        coroutine_frame_access::detach_cancellation(self.parent_node_);
+        return self.parent_;
+    }
+
+    static auto expire(coroutine_timer_node& timer) noexcept -> void
+    {
+        auto& self = *static_cast<timeout_awaiter*>(timer.cancellation.operation);
+        self.state_ = outcome::timed_out;
+        self.cancel_operation();
+    }
+
+    static auto cancel_parent(coroutine_cancellation_node& node) noexcept -> void
+    {
+        auto& self = *static_cast<timeout_awaiter*>(node.operation);
+        if (self.timer_.owner != nullptr) {
+            coroutine_frame_access::cancel_timer(self.timer_);
+        }
+        self.state_ = outcome::cancelled;
+        self.cancel_operation();
+    }
+
+    // Resumes the parent here if the operation retires synchronously;
+    // otherwise its completion does.
+    auto cancel_operation() noexcept -> void
+    {
+        coroutine_frame_access::detach_cancellation(parent_node_);
+        driving_ = true;
+        composition_task_access::request_cancel(operation_cancellation_);
+        driving_ = false;
+        if (finished_) parent_.resume();
+    }
+
+    event_loop& loop_;
+    task<T> operation_;
+    event_loop::clock::duration duration_;
+    coroutine_cancellation_state operation_cancellation_ {};
+    coroutine_cancellation_node parent_node_ {};
+    coroutine_timer_node timer_ {};
+    std::coroutine_handle<> parent_ {};
+    outcome state_ {outcome::completed};
+    bool finished_ {false};
+    bool driving_ {false};
+};
 } // namespace detail
 
+// Awaits operation for at most duration. Await the result directly; it is
+// not a task, so wrap it in a coroutine to spawn or compose it.
 template<typename T>
 [[nodiscard]] auto with_timeout(event_loop& loop, task<T> operation,
                                 event_loop::clock::duration duration)
-    -> task<timeout_result<T>>
+    -> detail::timeout_awaiter<T>
 {
-    if (duration <= event_loop::clock::duration::zero()) {
-        const auto* child_loop = detail::composition_task_access::loop(operation);
-        if (detail::composition_task_access::started(operation) ||
-            (child_loop != nullptr && child_loop != &loop)) {
-            throw std::logic_error("timeout operand is not an unstarted task on this loop");
-        }
-        co_return timeout_result<T> {timeout_result<T>::outcome::timed_out, {}};
-    }
-    auto winner = co_await race(std::move(operation),
-                                detail::timeout_timer(loop, duration));
-    if (!winner) co_return timeout_result<T> {timeout_result<T>::outcome::cancelled, {}};
-    if (winner->index == 1) {
-        co_return timeout_result<T> {timeout_result<T>::outcome::timed_out, {}};
-    }
-    co_return timeout_result<T> {
-        timeout_result<T>::outcome::completed,
-        std::get<0>(std::move(winner->result))
-    };
+    return detail::timeout_awaiter<T>(loop, std::move(operation), duration);
 }
 
 } // namespace eventloop

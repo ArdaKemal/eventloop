@@ -98,6 +98,10 @@ struct sigpipe_block {};
 
 constexpr std::size_t max_posted_tasks_per_iteration = 64;
 constexpr std::size_t max_timers_per_iteration = 64;
+// Consecutive zero-timeout polls run() may skip on entry or stop. Queues and
+// timers are checked without the poller; readiness, signals, cross-thread
+// stops, and IOCP packets wait at most this many passes.
+constexpr std::size_t max_skipped_polls = 8;
 #if defined(_WIN32) || defined(__APPLE__)
 constexpr std::size_t coroutine_frame_alignment =
     std::max<std::size_t>(alignof(std::max_align_t), 16);
@@ -698,8 +702,12 @@ public:
             unlink_coroutine_timer(*timer);
             detail::coroutine_frame_access::detach_cancellation(
                 timer->cancellation);
-            const auto handle = timer->handle;
-            handle.resume();
+            if (timer->expire != nullptr) {
+                timer->expire(*timer);
+            } else {
+                const auto handle = timer->handle;
+                handle.resume();
+            }
             ++count;
         }
         arm_next_timer();
@@ -904,6 +912,8 @@ public:
     // Owner-thread stop(): the owner cannot be blocked in the poller, so the
     // next poll only has to skip blocking. Other threads use the poller.
     bool local_stop_pending {false};
+    // Zero-timeout polls skipped since the last real one, across run() calls.
+    std::size_t skipped_polls {0};
     // Notified wakeup waiters, resumed in order with posted work.
     detail::wakeup_node* ready_wakeups {nullptr};
     detail::wakeup_node** ready_wakeups_tail {&ready_wakeups};
@@ -961,8 +971,8 @@ event_loop::handler_call_scope::~handler_call_scope() noexcept
 
 auto event_loop::run() -> event_loop_result
 {
-    std::array<ready_event, 64> events {};
-    for (;;) {
+    std::array<ready_event, 64> events;
+    for (bool entering = true;; entering = false) {
         implementation_->drain_completed_roots();
         if (implementation_->shutdown_complete()) {
             return event_loop_result::stopped;
@@ -971,9 +981,19 @@ auto event_loop::run() -> event_loop_result
         // poll ends this iteration; a later one ends the next.
         const bool stopping =
             std::exchange(implementation_->local_stop_pending, false);
-        const auto result = implementation_->poller.poll(
-            events, stopping || implementation_->local_post_pending ||
-                        implementation_->wake_pending.load(std::memory_order_relaxed));
+        const bool nonblocking = stopping ||
+            implementation_->local_post_pending ||
+            implementation_->wake_pending.load(std::memory_order_relaxed);
+        // A run() that enters with ready work or ends on a stop skips its
+        // zero-timeout poll, within a bound; later passes always poll.
+        decltype(implementation_->poller.poll(events, false)) result {};
+        if (nonblocking && (entering || stopping) &&
+            implementation_->skipped_polls < max_skipped_polls) {
+            ++implementation_->skipped_polls;
+        } else {
+            implementation_->skipped_polls = 0;
+            result = implementation_->poller.poll(events, nonblocking);
+        }
         if (result.event_count != 0) ++implementation_->dispatch_depth;
 
         try {

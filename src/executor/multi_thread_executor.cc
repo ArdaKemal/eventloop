@@ -3,11 +3,16 @@
 #include "bounded_task_queue.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86) || defined(_M_ARM64))
+#include <intrin.h>
+#endif
 
 namespace eventloop {
 
@@ -18,12 +23,25 @@ namespace {
     return value != 0 && (value & (value - 1)) == 0;
 }
 
+auto cpu_relax() noexcept -> void
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(_M_X64) || defined(_M_IX86)
+    _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(_M_ARM64)
+    __yield();
+#endif
+}
+
 // libstdc++'s futex-backed counting_semaphore can miss a wake after the
 // counter changes away from and back to the value observed by a waiter. Keep
 // waiter registration separate and only wait while the permit count is zero.
 class wake_semaphore {
 public:
-    wake_semaphore() = default;
+    explicit wake_semaphore(bool polling) noexcept : polling_(polling) {}
 
     wake_semaphore(const wake_semaphore&) = delete;
     auto operator=(const wake_semaphore&) -> wake_semaphore& = delete;
@@ -39,7 +57,7 @@ public:
     auto acquire() noexcept -> void
     {
         for (;;) {
-            int permits = permits_.load(std::memory_order_relaxed);
+            int permits = poll_permits();
             while (permits == 0) {
                 // The producer cannot miss this waiter while this worker
                 // also misses the producer's new permit.
@@ -60,15 +78,37 @@ public:
     }
 
 private:
+    // Waking a sleeping worker costs the producer a futex syscall and the
+    // worker several microseconds. A single worker polls briefly so work
+    // submitted in reply to its last completion, such as a sequential file
+    // read, usually finds it awake. Multiple workers retain the sleeping path:
+    // polling can expose a ring slot held by a descheduled consumer on wrap.
+    static constexpr std::chrono::microseconds poll_limit {10};
+
+    [[nodiscard]] auto poll_permits() const noexcept -> int
+    {
+        int permits = permits_.load(std::memory_order_relaxed);
+        if (permits != 0 || !polling_) return permits;
+        const auto deadline = std::chrono::steady_clock::now() + poll_limit;
+        do {
+            for (int spin = 0; spin < 16 && permits == 0; ++spin) {
+                cpu_relax();
+                permits = permits_.load(std::memory_order_relaxed);
+            }
+        } while (permits == 0 && std::chrono::steady_clock::now() < deadline);
+        return permits;
+    }
+
     // int is libstdc++'s Linux futex wait type, avoiding its waiter-pool path.
     std::atomic<int> permits_ {0};
     std::atomic<int> waiters_ {0};
+    const bool polling_;
 };
 
 class multi_thread_executor final : public executor {
 public:
     explicit multi_thread_executor(const multi_thread_executor_options& options)
-        : queue_(options.queue_capacity)
+        : queue_(options.queue_capacity), ready_(options.worker_count == 1)
     {
         workers_.reserve(options.worker_count);
         try {

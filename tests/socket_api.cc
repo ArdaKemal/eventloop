@@ -28,6 +28,7 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #endif
 
@@ -85,6 +86,13 @@ auto tcp_server(event_loop& loop, tcp_acceptor& listener, int& completed,
         co_return;
     }
     listener.close();
+    bool no_delay = true;
+#ifndef _WIN32
+    int enabled = 0;
+    socklen_t length = sizeof(enabled);
+    no_delay = ::getsockopt(accepted->get(), IPPROTO_TCP, TCP_NODELAY,
+                            &enabled, &length) == 0 && enabled != 0;
+#endif
     auto stream = std::make_unique<tcp_stream>(loop, std::move(*accepted));
     auto* peer = stream.get();
     loop.add(std::move(stream));
@@ -92,7 +100,7 @@ auto tcp_server(event_loop& loop, tcp_acceptor& listener, int& completed,
     const auto read = co_await peer->async_read_some(input);
     constexpr std::array<std::byte, 1> reply {std::byte {'b'}};
     const auto write = co_await peer->async_write_some(reply);
-    passed = read && *read == 1 && input[0] == std::byte {'a'} &&
+    passed = no_delay && read && *read == 1 && input[0] == std::byte {'a'} &&
              write && *write == 1;
     peer->close();
     finish(loop, completed, passed);

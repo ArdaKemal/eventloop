@@ -6,7 +6,7 @@
 
 #include <array>
 #include <cerrno>
-#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <limits>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -70,6 +70,10 @@ auto socket_operations::prepare_listener(native_socket socket,
     if (reuse_port && ::setsockopt(socket, SOL_SOCKET, SO_REUSEPORT,
                                     &enabled, sizeof(enabled)) == -1)
         throw std::system_error(errno, std::system_category(), "SO_REUSEPORT");
+    // Accepted sockets inherit TCP_NODELAY, saving a syscall per connection.
+    if (::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &enabled,
+                     sizeof(enabled)) == -1)
+        throw std::system_error(errno, std::system_category(), "TCP_NODELAY");
     const auto address = native_endpoint(endpoint);
     if (::bind(socket, address.address(), address.length) == -1)
         throw std::system_error(errno, std::system_category(), "bind");
@@ -131,9 +135,9 @@ auto socket_operations::configure_client(native_socket socket,
 auto socket_operations::activate(native_socket socket) noexcept
     -> std::error_code
 {
-    const int flags = ::fcntl(socket, F_GETFL);
-    if (flags == -1 || ::fcntl(socket, F_SETFL, flags | O_NONBLOCK) == -1)
-        return code(errno);
+    // One syscall, unlike F_GETFL/F_SETFL; accepted sockets pay it per stream.
+    int enabled = 1;
+    if (::ioctl(socket, FIONBIO, &enabled) == -1) return code(errno);
     return {};
 }
 
@@ -149,24 +153,16 @@ auto socket_operations::pending_error(native_socket socket,
     return code(error);
 }
 
-auto socket_operations::start_accept(native_socket listener, int unix_socket,
+auto socket_operations::start_accept(native_socket listener, int,
                                      std::span<std::byte>,
                                      socket_operation&) noexcept
     -> socket_result
 {
     for (int attempt = 0; attempt < 64; ++attempt) {
+        // TCP_NODELAY is inherited from the listener; see prepare_listener().
         const int accepted = ::accept4(listener, nullptr, nullptr,
                                        SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (accepted >= 0) {
-            const int enabled = 1;
-            if (!unix_socket && ::setsockopt(accepted, IPPROTO_TCP, TCP_NODELAY,
-                                            &enabled, sizeof(enabled)) != 0) {
-                const int error = errno;
-                ::close(accepted);
-                return {.error = code(error)};
-            }
-            return {.accepted = accepted};
-        }
+        if (accepted >= 0) return {.accepted = accepted};
         if (errno == EAGAIN || errno == EWOULDBLOCK) return {.pending = true};
         if (!retryable_accept_error(errno)) return {.error = code(errno)};
     }

@@ -76,6 +76,8 @@ struct coroutine_timer_node {
     std::coroutine_handle<> handle {};
     event_loop* owner {nullptr};
     coroutine_cancellation_node cancellation;
+    // When set, expiry calls this instead of resuming handle.
+    void (*expire)(coroutine_timer_node&) noexcept {nullptr};
 };
 
 // A waiter that eventloop::wakeup::notify() queued for resumption.

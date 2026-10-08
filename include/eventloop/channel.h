@@ -21,9 +21,9 @@ namespace detail {
 template<typename T, bool Sending> class channel_awaiter;
 }
 
-// Loop-local FIFO with caller-owned, initially disengaged slots. The storage
-// is exclusively borrowed until destruction. T need not be default constructible
-// or assignable. Channel and storage must outlive pending operations, including
+// Loop-local FIFO with caller-owned slots that must be initially disengaged
+// (checked only without NDEBUG). The storage is exclusively borrowed until
+// destruction. T need not be default constructible or assignable. Channel and storage must outlive pending operations, including
 // queued resumptions. See docs/channel.md for transfer, close, and lifetime rules.
 template<typename T>
 class channel {
@@ -95,15 +95,23 @@ public:
         : loop_(loop), storage_(storage)
     {
         if (storage.empty()) throw std::invalid_argument("channel storage is empty");
+#ifndef NDEBUG
+        // Disengaged storage is a precondition; only checked builds scan it,
+        // so construction stays independent of capacity.
         for (const auto& slot : storage) {
             if (slot) throw std::invalid_argument("channel storage is occupied");
         }
+#endif
     }
     ~channel()
     {
         check_thread();
         if (active_waiters_ != 0) std::terminate();
-        for (auto& slot : storage_) slot.reset();
+        // Receives reset consumed slots, so only buffered values are engaged.
+        for (; size_ != 0; --size_) {
+            storage_[head_].reset();
+            head_ = next(head_);
+        }
     }
     channel(const channel&) = delete;
     auto operator=(const channel&) -> channel& = delete;
