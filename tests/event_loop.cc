@@ -65,6 +65,26 @@ auto post_tests() -> bool
             observed != expected) return false;
     }
     {
+        // An owner stop() before run() still drains queued posts; one issued
+        // during that final iteration ends the next run().
+        event_loop loop;
+        int count = 0;
+        if (!loop.post(execution_task([&]() noexcept {
+                ++count;
+                loop.stop();
+            }))) return false;
+        loop.stop();
+        if (loop.run() != event_loop_result::stopped || count != 1) {
+            return false;
+        }
+        if (!loop.post(execution_task([&]() noexcept { ++count; }))) {
+            return false;
+        }
+        if (loop.run() != event_loop_result::stopped || count != 2) {
+            return false;
+        }
+    }
+    {
         event_loop loop;
         std::atomic<bool> ran {false};
         std::atomic<bool> on_loop {false};

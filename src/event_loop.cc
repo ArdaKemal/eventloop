@@ -901,6 +901,9 @@ public:
     // continuations and same-thread posts use posted_tasks without writing
     // to the backend wake notifier.
     bool local_post_pending {false};
+    // Owner-thread stop(): the owner cannot be blocked in the poller, so the
+    // next poll only has to skip blocking. Other threads use the poller.
+    bool local_stop_pending {false};
     // Notified wakeup waiters, resumed in order with posted work.
     detail::wakeup_node* ready_wakeups {nullptr};
     detail::wakeup_node** ready_wakeups_tail {&ready_wakeups};
@@ -964,8 +967,12 @@ auto event_loop::run() -> event_loop_result
         if (implementation_->shutdown_complete()) {
             return event_loop_result::stopped;
         }
+        // Like the poller's stop notification, a stop() issued before this
+        // poll ends this iteration; a later one ends the next.
+        const bool stopping =
+            std::exchange(implementation_->local_stop_pending, false);
         const auto result = implementation_->poller.poll(
-            events, implementation_->local_post_pending ||
+            events, stopping || implementation_->local_post_pending ||
                         implementation_->wake_pending.load(std::memory_order_relaxed));
         if (result.event_count != 0) ++implementation_->dispatch_depth;
 
@@ -1043,7 +1050,7 @@ auto event_loop::run() -> event_loop_result
         if (implementation_->shutdown_complete()) {
             return event_loop_result::stopped;
         }
-        if (result.stop_requested) {
+        if (stopping || result.stop_requested) {
             return event_loop_result::stopped;
         }
         if (result.signal_requested) {
@@ -1054,6 +1061,10 @@ auto event_loop::run() -> event_loop_result
 
 auto event_loop::stop() -> void
 {
+    if (std::this_thread::get_id() == implementation_->owner_thread) {
+        implementation_->local_stop_pending = true;
+        return;
+    }
     implementation_->poller.request_stop();
 }
 

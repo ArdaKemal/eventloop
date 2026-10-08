@@ -300,9 +300,25 @@ struct timeout_result {
 };
 
 namespace detail {
+// Reports whether the awaiting task's cancellation was already requested.
+struct cancellation_requested_awaiter {
+    bool requested {false};
+    [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+    template<typename Promise>
+    auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
+    {
+        requested = handle.promise().cancellation_state()->requested;
+        return false;
+    }
+    [[nodiscard]] auto await_resume() const noexcept -> bool { return requested; }
+};
+
 inline auto timeout_timer(event_loop& loop, event_loop::clock::duration duration)
     -> task<void>
 {
+    // An operation that completed synchronously has already cancelled this
+    // branch; skip reading the clock for a deadline nobody waits on.
+    if (co_await cancellation_requested_awaiter {}) co_return;
     (void)co_await sleep_for(loop, duration);
 }
 } // namespace detail

@@ -971,6 +971,13 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(coroutine_socket_benchmark PRIVATE -Wno-mismatched-new-delete)
 endif()
 
+add_executable(tokio_comparison_benchmark benchmark/tokio_comparison_benchmark.cc)
+target_link_libraries(tokio_comparison_benchmark PRIVATE eventloop::eventloop)
+target_compile_options(tokio_comparison_benchmark PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(tokio_comparison_benchmark PRIVATE -Wno-mismatched-new-delete)
+endif()
+
 if(BUILD_TESTING)
     add_executable(http_api_test tests/http_api.cc)
     target_link_libraries(http_api_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
