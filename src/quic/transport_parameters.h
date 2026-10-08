@@ -101,7 +101,7 @@ struct transport_parameters {
         }
         const auto cid_size = std::to_integer<std::uint8_t>(value[24]);
         if (cid_size == 0 || cid_size > 20 ||
-            value.size() != 25 + cid_size + 16) {
+            value.size() != std::size_t{25} + cid_size + 16) {
             return std::unexpected(parameter_error::invalid_value);
         }
     } else if (id == 0x0c || id == 0x2ab2) {

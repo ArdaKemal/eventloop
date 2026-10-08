@@ -1,99 +1,71 @@
 # HTTP/3 API contract
 
-The [coroutine and event-loop contract](coroutines.md) defines task results, loop affinity,
-borrowed-buffer lifetimes, and cancellation. The [shared HTTP contract](http.md)
-defines routing and request/response operations. Read those rules together with
-this protocol's limits and behavior; the other HTTP protocol contracts are not
-required for changes confined to this protocol.
+Shared results/affinity/cancellation: [coroutines](coroutines.md).
+Routing, request/response ownership, static files, listings, and cache:
+[shared HTTP](http.md). Names below are relative to `eventloop`.
 
 ## Server lifetime and capacity
 
-- `eventloop::http::http3_server` listens on a QUIC UDP endpoint with ALPN
-  `h3`, a certificate/key pair, and an owned document-root descriptor when
-  `document_root` is set. Its
-  `run()` task accepts connections; `close()` stops acceptance and
-  `async_close()` waits for endpoint retirement. Keep the server and its
-  observed `run()` task alive until both operations complete. Routed
-  requests run their handlers as described in the shared HTTP contract; other
-  GET, HEAD, and OPTIONS requests serve static files or `index.html` using the shared secure
-  resource walk. Request header blocks are capped at 16 KiB and 128 fields, dynamic
-  QPACK tables are disabled, and QUIC caps each connection at 32 peer
-  simultaneously active bidirectional and eight peer unidirectional streams.
-  The server has eight
-  concurrent connection slots by default; `server_options::connection_capacity`
-  accepts 1 to 256. Endpoint routing, connection state,
-  waiters, and HTTP/3 task handles are allocated at construction in proportion
-  to that capacity. Connections beyond it are rejected. Each connection has
-  storage for 40 concurrent stream tasks. Completed task slots are reused.
-  `server_options::request_capacity` reserves reusable request scratch
-  buffers at startup; zero selects four per connection, and explicit values
-  from 1 to 8192 are accepted. A request arriving while every buffer is in
-  use, or whose coroutine frame cannot be allocated, is refused with
-  `H3_REQUEST_REJECTED` on its stream; the connection continues. A buffer is
-  held until the request stream ends, the server stops reading it, or it
-  fails.
-  `server_options::max_udp_payload_size` bounds application datagrams
-  to 1200..8192 bytes and is negotiated down to the peer's advertised limit;
-  handshake packets remain at 1200 so anti-amplification is unaffected. It
-  defaults to 1472 (the standard Ethernet payload) because path MTU discovery
-  is not implemented; constrained paths may lower it.
-  Each scratch buffer is about 52 KiB. Ordinary static-file responses use that
-  storage for HTTP/3 headers and I/O; directory listing still allocates its
-  bounded entry and output vectors, and OpenSSL may allocate separately.
-  Each active request holds one
-  coroutine frame from the loop's 2048-byte size class, so callers should size
-  `eventloop::event_loop_options::coroutine_frame_capacities` for the expected
-  request concurrency; the shipped HTTP/3 examples scale those frame caps with
-  the configured capacity. A frame-allocation
-  failure rejects only the affected connection instead of stopping the
-  listener; one for a peer unidirectional stream closes that connection with
-  `H3_INTERNAL_ERROR`.
+`http::http3_server` listens on QUIC UDP with ALPN h3 and certificate/key,
+owning the document-root descriptor when configured. `run()` accepts;
+`close()` stops acceptance; `async_close()` waits for endpoint retirement.
+Keep the server and observed run task alive through completion. Unmatched
+GET/HEAD/OPTIONS use shared static-resource traversal.
 
-## Routed handlers and request bodies
+| Capacity | Default / limit |
+| --- | --- |
+| `http::server_options::connection_capacity` | 8; 1..256 |
+| `request_capacity` | 0 selects four scratch buffers per connection; explicit 1..8192 |
+| Peer active bidirectional / unidirectional streams | 32 / 8 per connection |
+| Reusable stream-task slots | 40 per connection |
+| Request header block / decoded fields | 16 KiB / 128 |
+| QPACK dynamic table | Disabled |
+| `max_udp_payload_size` | 1472; clamped to 1200..8192, negotiated down to peer limit |
 
-- HTTP/3 runs a handler inside each request's existing coroutine, using
-  that request's scratch buffer. Request concurrency and refusal follow the
-  server capacity above.
-- Split Cookie field lines are joined with `; ` in their original order before
-  reaching a handler. Joining uses the unused portion of the request's 16 KiB
-  decoded-string storage; exhaustion resets the stream with `H3_EXCESSIVE_LOAD`.
-- HTTP/3 bodies may omit Content-Length. A read past
-  `max_request_body` returns `message_size`, and the server answers 413
-  if the handler then returns without a response. A malformed body
-  (DATA beyond Content-Length, a truncated frame, invalid trailers)
-  returns `bad_message` and resets the stream with the RFC 9114 code.
-  Request trailers are validated but not exposed.
-- For a case-insensitive `100-continue` member in any `Expect` field's
-  comma-separated list, a handler's body read sends
-  an interim HEADERS section containing only `:status: 100` before waiting
-  for content. It is omitted when content is already available, Content-Length
-  is zero, or a final response has started. The interim section does not
-  start the final response or end the stream.
-- Decimal Content-Length values above QUIC's `2^62 - 1` stream-data limit
-  are valid declarations but cannot be satisfied. Matched routed requests
-  answer 413 without running the handler, even when `max_request_body` is
-  larger. Smaller values remain exact; duplicate declarations compare
-  numerically, including leading zeros. Static requests retain the unread-body
-  policy below; a FIN that cannot match the declaration is `H3_MESSAGE_ERROR`.
+Startup allocates endpoint routes/state/waiters/handles proportional to
+connection capacity, plus about 52 KiB per request scratch buffer. Excess
+connections are rejected. Full scratch pool or request-frame exhaustion sends
+H3_REQUEST_REJECTED only on that request; the connection continues. Scratch
+stays held until the request ends, reading stops, or failure. Connection-frame
+exhaustion rejects that connection without stopping the listener; peer
+unidirectional-frame exhaustion closes it with H3_INTERNAL_ERROR.
 
-- An unread request body is ended with STOP_SENDING `H3_NO_ERROR` after the
-  response (RFC 9114 4.1).
+Static headers/I/O use scratch; listings and OpenSSL may allocate separately.
+Request frames use the 2048-byte class: size
+`event_loop_options::coroutine_frame_capacities` for concurrency, as examples do.
+Handshake datagrams stay bounded at 1200 bytes; path MTU discovery is absent, so lower
+application payloads for constrained paths.
 
-## Routed responses
+## Routed bodies and responses
 
-- Without content-length, finishing a response ends the stream. Response
-  trailers are always sent. Response sections and trailers are limited to
-  61 and 64 fields respectively; more is `message_size`.
-- A handler that returns after `async_start` but before `async_finish` resets
-  the stream with `H3_INTERNAL_ERROR`.
+Each request invokes its handler using its scratch buffer; concurrency/refusal
+follows the capacities above.
 
-- With a router, the server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and
-  accepts routed WebSockets through Extended CONNECT (RFC 9220). See the
-  [WebSocket contract](websocket.md#routed-http2-and-http3-websockets) for
-  acceptance, scratch-slot lifetimes, and stream closure. Unsupported
-  Extended CONNECT protocols receive 501. Accepted tunnels carry DATA only
-  (plus permitted unknown extension frames); trailing HEADERS are
-  H3_FRAME_UNEXPECTED, a connection error.
+- Cookie lines join with `; ` in arrival order in unused 16 KiB decoded-string
+  storage; exhaustion resets with H3_EXCESSIVE_LOAD.
+- Bodies may omit Content-Length. Reads beyond `max_request_body` return
+  `message_size`; if the handler returns without responding, answer 413.
+  Malformed bodies (overrun, truncated frame, invalid trailers) return
+  `bad_message` with the RFC 9114 error below. Request trailers validate but
+  are not exposed.
+- A body read sends interim `:status: 100` for a case-insensitive
+  `100-continue` member of any comma-separated Expect field, before waiting
+  for content. Omit when content is available, length is zero, or final
+  response has started; this does not start/end the final response.
+- Decimal Content-Length > QUIC's `2^62-1` is valid but unsatisfiable: matched
+  routes answer 413 even with a larger body limit. Smaller values stay exact;
+  duplicates compare numerically (leading zeros allowed). Static unread-body
+  policy remains below; mismatched FIN is H3_MESSAGE_ERROR.
+- After response, unread bodies end with STOP_SENDING H3_NO_ERROR (RFC 9114 4.1).
+- Without content-length, finish ends the stream. Response trailers are always
+  sent. Sections/trailers allow 61/64 fields; overflow is `message_size`.
+  Returning after start without finish resets with H3_INTERNAL_ERROR.
+
+With routes, SETTINGS_ENABLE_CONNECT_PROTOCOL enables RFC 9220
+[routed WebSockets](websocket.md#routed-http2-and-http3-websockets).
+Unsupported Extended CONNECT protocols answer 501. Accepted tunnels allow DATA
+and unknown extension frames; trailing HEADERS is a connection
+H3_FRAME_UNEXPECTED.
 
 ## Control streams and QPACK
 
@@ -159,21 +131,17 @@ request: DATA is counted and dropped, and trailers are decoded into the
 request's own storage. Violations found after the response reset a stream
 whose response may already be complete. After 1 MiB of request DATA the
 server stops reading with STOP_SENDING `H3_NO_ERROR` (RFC 9114 4.1), so
-Content-Length is not checked past that point. These static request bodies
-are discarded; routed request bodies follow the handler rules above. Directory listings are available when the server is
-constructed with `directory_listing` and follow the shared bounded
-renderer. Their HEAD responses preserve the GET representation length without
-sending DATA. Generated static and automatic responses include Date.
+Content-Length is not checked past that point. Routed bodies follow handler
+rules above. Shared bounded listings preserve GET length on HEAD without DATA. Static/automatic responses include Date.
 HTTP/3 server push and WebTransport are not supported.
 
-## Allocation measurements and transport references
+## Allocation measurements
 
-`tests/http3_routing_allocations.cc` checks steady-state routed requests and
-static-file requests, including OpenSSL's own allocations through its allocator
-hook: those are zero per request in the measured paths. QUIC handshakes allocate
-inside OpenSSL for key exchange, transcript hashing, and the key schedule on
-every new connection. QUIC packet-protection keys are derived with one
-per-thread HMAC-SHA256 context instead of an OpenSSL KDF context per derivation.
+[http3_routing_allocations](../tests/http3_routing_allocations.cc) checks zero
+per-request general-heap/OpenSSL allocations on warmed routed/static-file paths.
+New QUIC handshakes allocate for key exchange, transcript hashing, and key
+schedule. Packet-protection derivation reuses one per-thread HMAC-SHA256 context
+rather than allocating a KDF context per derivation.
 
 QUIC stream reservations, receive windows, reset/stop-sending behavior, and
 connection-close ownership are specified in the [QUIC contract](quic.md).

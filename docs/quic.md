@@ -1,66 +1,61 @@
 # QUIC API contract
 
-Task results, loop affinity, and cancellation follow the
-[coroutine and event-loop contract](coroutines.md). Read that contract
-together with the rules below.
+Shared async rules: [coroutines](coroutines.md). HTTP/3 behavior:
+[HTTP/3](http3.md). Public names below are in `eventloop`; include `eventloop/quic.h`.
 
-QUIC endpoints reserve 80 active stream slots per connection: 32 bidirectional
-and 8 unidirectional streams for each initiator. Requested advertised counts
-are capped to those peer reservations; local opens obey the peer's cumulative
-grant and the separate local active reservation. A stream releases its slot
-after both directions complete and sent data is acknowledged. Retired peer
-streams replenish `MAX_STREAMS` credit. Retired IDs are kept in bounded
-ordinal ranges so delayed packets cannot reopen them; pathological sparse
-retirement can exhaust that range storage and delay further reclamation.
-The aggregate receive-data window remains at most 128 KiB, independently
-of stream count, with at most 4 KiB buffered per stream. No stream storage falls
-back to an unbounded allocation.
+## Streams and I/O
 
-`quic_endpoint::async_accept()` reports a connection that failed, or that its
-peer closed, before acceptance as that connection's error; accept again to
-continue. After `close()`, or when the accepting task is cancelled, it reports
-`operation_canceled`.
+Endpoints own connections in bounded slots. `quic_connection` is a move-only
+handle that must not outlive its endpoint; it does not own the connection.
 
-`quic_connection::async_write()` returns the bytes accepted into bounded send
-storage, which can be fewer than supplied. Retry the remaining span; `fin`
-closes the send side only when the entire supplied span is accepted. The
-caller owns and keeps that span valid until completion, including cancellation.
+Endpoints reserve 80 active slots per connection: 32 bidirectional and eight
+unidirectional for each initiator. Advertised counts cap to peer reservations;
+local opens obey peer cumulative grants and local active reservations. Slots
+retire after both directions finish and sent data is acknowledged; peer
+retirement replenishes MAX_STREAMS. Bounded ordinal ranges retain retired IDs
+against delayed reopening; sparse retirement can exhaust ranges and delay
+reclamation. Aggregate receive window <=128 KiB, per-stream buffering <=4 KiB;
+no unbounded fallback. These windows bound buffered data, not total transfers.
 
-`quic_connection::reset_stream()` and `stop_sending()` take an application
-error code up to 2^62-1 and complete synchronously on the owner loop; the
-frame is queued in the stream's fixed slot and retransmitted until
-acknowledged. A reset discards queued bytes that were not yet sent, and later
-writes fail with `quic_errc::stream_reset`; a peer STOP_SENDING has the same
-effect. After `stop_sending()`, buffered and later data are discarded and the
-peer's RESET_STREAM is consumed internally, so the stream retires without
-further reads; reads fail with `quic_errc::invalid_state`. Both operations
-leave an already finished direction unchanged, return
-`quic_errc::invalid_argument` for an unknown stream or the missing direction of
-a unidirectional stream, and return `quic_errc::not_connected` once the
-connection is closing. A write to a stream that has already retired returns
-`quic_errc::invalid_argument`. Every local close sends one CONNECTION_CLOSE
-at the highest encryption level with keys: `close()` and `quic_endpoint::close()`
-send transport `NO_ERROR`, `close_application()` sends its code (as
-`APPLICATION_ERROR` before 1-RTT keys exist), and a local protocol failure
-sends the RFC 9000 code (`PROTOCOL_VIOLATION` for stream and flow violations,
-`CRYPTO_ERROR` with the TLS alert for handshake failures). Initial-level closes
-are padded to 1200 bytes. A connection closed while its endpoint stays open
-retains its existing driver, route, and capacity slot for three current PTOs.
-Application operations finish promptly; this retention only handles delayed
-packets. Closing resends the cached close packet when the peer sends again,
-at most once per PTO and no more than three times the received packet bytes.
-It does not process application frames. Draining discards packets and sends
-nothing. These paths reuse driver storage and its frame-local timer; no new
-queue or buffer is allocated. Deadlines saturate and repeated packets do not
-extend the retention period. Connection-capacity exhaustion during retention
-has the same result as exhaustion while active.
+`quic_endpoint::async_accept()` returns an early failure/peer-close as that
+connection's error; accept again to continue. Endpoint close or accept-task
+cancellation returns `operation_canceled`.
 
-Endpoint close keeps its socket open until every running connection has sent
-its close and retired, then closes the UDP socket; it can end retention early
-as allowed by RFC 9000 10.2. A UDP failure or event-loop cancellation retires
-immediately. Public handles, pending tasks, and borrowed buffers still follow
-the coroutine ownership rules; delayed close processing remains on the owner
-loop on Linux, macOS, and Windows.
+`quic_connection::async_write()` returns bytes accepted into bounded send
+storage, possibly partial. Retry remaining bytes; `fin` closes only when the
+whole supplied span is accepted. Borrow the span through completion/cancellation.
 
-HTTP/3 application behavior is specified separately in the
-[HTTP/3 contract](http3.md).
+## Reset and stop-sending
+
+`reset_stream()`/`stop_sending()` synchronously queue application codes <=2^62-1
+in fixed stream slots on the owner loop; retransmit until acknowledged.
+
+- Reset drops unsent queued bytes; later writes return `stream_reset`.
+  Peer STOP_SENDING has the same effect.
+- Stop-sending drops buffered/later data and consumes peer RESET_STREAM
+  internally, allowing retirement without reads; later reads return `invalid_state`.
+- Finished directions stay unchanged. Unknown stream/missing unidirectional
+  direction returns `invalid_argument`; closing connection returns
+  `not_connected`; writing a retired stream returns `invalid_argument`.
+  These errors are `quic_errc`.
+
+## Connection and endpoint close
+
+Local close sends CONNECTION_CLOSE at the highest keyed encryption level:
+`close()`/endpoint close use transport NO_ERROR; `close_application()` uses its
+code (APPLICATION_ERROR before 1-RTT); protocol failures use RFC 9000 codes
+(PROTOCOL_VIOLATION for stream/flow violations, CRYPTO_ERROR plus TLS alert
+for handshake failure). Initial closes are padded to 1200 bytes.
+
+While the endpoint stays open, a closed connection retains driver/route/capacity
+for three current PTOs. Application operations finish promptly. Closing only
+resends the cached close on incoming packets, at most once/PTO and <=3 times
+received bytes; draining discards without sending. Both reuse driver storage
+and its frame-local timer. Deadlines saturate; packets do not extend retention.
+Capacity exhaustion has the same result during retention as while active.
+
+Endpoint close keeps UDP open until running connections send close and retire,
+then closes it; it may shorten retention (RFC 9000 10.2). UDP failure/loop
+cancellation retires immediately. Handles/tasks/borrowed buffers retain shared
+ownership rules; delayed close processing stays on the owner loop on all
+supported platforms.

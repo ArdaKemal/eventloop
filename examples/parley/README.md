@@ -16,9 +16,9 @@ event loop that serves it over TLS HTTP/2 (and optionally HTTP/3).
 ## Build and run
 
 ```sh
-cmake -S examples/parley -B build-parley -DCMAKE_BUILD_TYPE=Release
-cmake --build build-parley --target parley
-./build-parley/parley            # https://localhost:8443/
+cmake -S examples/parley -B /tmp/parley-build -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/parley-build --target parley
+/tmp/parley-build/parley            # https://localhost:8443/
 ```
 
 On first start, Parley writes a self-signed certificate for `localhost`,
@@ -36,11 +36,10 @@ context that HTTPS provides.
 | `--certificate FILE`, `--private-key FILE` | generated | PEM chain and key |
 | `--http3` | off | Also serve HTTP/3 and advertise it with `Alt-Svc` |
 
-Press Ctrl-C to stop. Shutdown cancels every connection and writes any
-journal lines that were still queued.
+Press Ctrl-C to stop. Shutdown cancels connections and flushes queued journal lines.
 
-To build against an installed eventloop package instead of this checkout,
-configure with `-DEVENTLOOP_SOURCE_DIR=`.
+Installed package: configure with `-DEVENTLOOP_SOURCE_DIR=` and
+`-DCMAKE_PREFIX_PATH=/path/to/eventloop-install`.
 
 ## How it uses eventloop
 
@@ -66,18 +65,16 @@ the wait.
 
 ## Realtime transport
 
-The client opens `wss://host/api/ws`. Chromium and Firefox send it as
-Extended CONNECT on the page's HTTP/2 connection. If the WebSocket is
-refused while ordinary requests work (an HTTP/1.1 upgrade attempt is
-answered with 426, and browsers don't offer WebSockets over HTTP/3), the
-client switches to `EventSource('/api/events')` and posts commands to
-`/api/command`. Events and commands are the same JSON in both modes:
+The client opens `wss://host/api/ws`; the server requires Extended CONNECT.
+HTTP/1.1 upgrades receive 426. If opening fails while bootstrap requests work,
+the client falls back to `EventSource('/api/events')` with commands posted to
+`/api/command`. Both modes use the same command fields and JSON events:
 
-| Client command | Effect |
+| `t` / command fields | Effect |
 | --- | --- |
-| `{"t":"send","conv","text","media","duration","reply_to","client_id"}` | Store and fan out a message |
-| `{"t":"delivered"\|"read","conv","upto"}` | Advance this user's receipt |
-| `{"t":"typing","conv","recording"}` | Forward a typing or recording indicator |
+| `send`: conv, text, media, duration, reply_to, client_id | Store and fan out a message |
+| `delivered`/`read`: conv, upto | Advance this user's receipt |
+| `typing`: conv, recording | Forward a typing or recording indicator |
 
 Server events have `t` set to `message`, `receipt`, `typing`, `presence`,
 `user`, `conversation`, `error`, or `ping`. After every (re)connect the client
@@ -138,7 +135,7 @@ the connection's eight 16 KiB body slots for its lifetime.
 ## Smoke test
 
 ```sh
-examples/parley/smoke.sh ./build-parley/parley
+examples/parley/smoke.sh /tmp/parley-build/parley
 ```
 
 The script uses curl over HTTP/2 to cover accounts, conversations, events,

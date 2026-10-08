@@ -1,8 +1,6 @@
 # Unix domain stream socket API contract
 
-Task results, loop affinity, and cancellation follow the
-[coroutine and event-loop contract](coroutines.md). Read that contract
-together with the rules below.
+Shared results, ownership, affinity, and cancellation: [coroutines](coroutines.md).
 
 - Include `eventloop/unix_socket.h` for filesystem-path `unix_acceptor` and
   `unix_stream`. Windows does not build this API. Construct a listener with a

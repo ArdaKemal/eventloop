@@ -53,8 +53,6 @@ static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcep
         std::ranges::equal(value.first(parameters.size()), parameters) &&
         std::ranges::equal(value.subspan(parameters.size()), grease);
 }
-static bool on_frame(void* argument, tls_level, const decoded_frame&) noexcept
-{ ++*static_cast<int*>(argument); return true; }
 struct buffers {
     std::array<std::uint8_t, 2048> encoded {}, frame {}, build_scratch {},
         packet_scratch {}, plaintext {}, auth_scratch {};

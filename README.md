@@ -1,169 +1,31 @@
 # eventloop
 
-**C++23 networking with coroutines, explicit ownership, and memory limits you can plan around.**
-
-`eventloop` lets a connection read, write, wait, and recover in ordinary
-coroutine control flow. The event loop keeps I/O and resumption on the owning
-thread; bounded frame pools and queues make resource exhaustion visible instead
-of allowing an unplanned heap fallback. The result is a useful foundation for
-network services that need both straightforward application code and predictable
-behavior under load.
-
-The library provides awaitable TCP, TLS, UDP, and Unix domain stream operations
-(Unix sockets on Linux and macOS); QUIC endpoints
-and streams; HTTP/1.1, TLS HTTP/2, and HTTP/3 servers with coroutine request
-routing and static files; a bounded HTTP/2
-client API; WebSocket framing; and bounded file I/O. It has Linux epoll,
-macOS kqueue, and Windows IOCP backends.
-
-For a local stream service, use `unix_acceptor` and `unix_stream` from
-`eventloop/unix_socket.h`. [unix_echo](examples/unix_echo.cc) shows a complete
-server. The listener removes its socket path on close if that path still names
-its socket; it never removes an existing path before bind.
-
-Four applications show how these pieces work together using public headers:
-[Wayfarer](examples/wayfarer/README.md) fetches over HTTP/1.1, HTTP/2, or
-HTTP/3, while [Stonegate](examples/stonegate/README.md) serves a document root
-over the same protocol generations. [Parley](examples/parley/README.md) is a
-browser chat application with routed APIs, uploads, and realtime messages over
-WebSockets on HTTP/2. [Lantern](examples/lantern/README.md) is a video site
-with resumable chunked uploads and seekable playback over every HTTP version,
-plus a stress test that drops range requests mid-body. They build as separate
-example projects, keeping the core library's examples small.
-
-## A complete echo server
-
-This small server accepts TCP connections on loopback and echoes each byte
-back. The event loop owns the listener and streams. Each connection gets a
-coroutine with a 512-byte buffer in its bounded frame:
-
-```cpp
-#include <array>
-#include <chrono>
-#include <cstddef>
-#include <memory>
-#include <span>
-#include <utility>
-
-#include "eventloop/event_loop.h"
-#include "eventloop/task.h"
-#include "eventloop/tcp_acceptor.h"
-#include "eventloop/tcp_stream.h"
-
-using namespace eventloop;
-
-auto echo_session(event_loop& loop, tcp_stream& stream) -> task<void>
-{
-    (void)loop;
-    std::array<std::byte, 512> buffer{};
-
-    for (;;) {
-        auto received = co_await stream.async_read_some(buffer);
-        if (!received || *received == 0) break;
-
-        std::size_t offset = 0;
-        while (offset < *received) {
-            auto sent = co_await stream.async_write_some(
-                std::span<const std::byte>(buffer)
-                    .first(*received).subspan(offset));
-            if (!sent || *sent == 0) {
-                stream.close();
-                co_return;
-            }
-            offset += *sent;
-        }
-    }
-    stream.close();
-}
-
-auto serve(event_loop& loop, tcp_acceptor& listener) -> task<void>
-{
-    for (;;) {
-        auto accepted = co_await listener.async_accept();
-        if (!accepted) co_return;
-
-        auto stream = std::make_unique<tcp_stream>(loop, std::move(*accepted));
-        auto* session = stream.get();
-        loop.add(std::move(stream));
-        if (loop.spawn(echo_session(loop, *session)) != task_spawn_result::accepted)
-            session->close();
-    }
-}
-
-int main()
-{
-    event_loop loop;
-    auto acceptor = std::make_unique<tcp_acceptor>(
-        loop, ip_endpoint::loopback_v4(7000));
-    auto* listener = acceptor.get();
-    loop.add(std::move(acceptor));
-
-    if (loop.spawn(serve(loop, *listener)) != task_spawn_result::accepted) {
-        listener->close();
-        return 1;
-    }
-    if (loop.run() == event_loop_result::interrupted) {
-        loop.shutdown(std::chrono::seconds{0});
-        (void)loop.run();
-    }
-}
-```
-
-The read and write calls may complete partially, so the session handles both
-cases. Closing a stream cancels its pending operations and removes it from the
-loop. The full [TCP echo example](examples/tcp_echo.cc) adds port parsing and
-error reporting. Build and run that example with the commands below.
+C++23 coroutine networking with explicit ownership and bounded resource use.
+Linux uses epoll, macOS kqueue, and Windows IOCP. I/O, cancellation, and
+coroutine resumption run on the owning event-loop thread; workers return
+completions to it.
 
 ## Build and run
 
-You need a C++23 compiler, CMake 3.20 or newer, OpenSSL 3.5 or newer, and
-thread support.
+Requires a C++23 compiler, CMake 3.20+, OpenSSL 3.5+, and threads.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j2
 ctest --test-dir build --output-on-failure
-```
-
-Start the echo server on loopback port 7000:
-
-```sh
 ./build/tcp_echo 7000
 ```
 
-For a more complete HTTP example, build Stonegate and Wayfarer from the same
-checkout:
+[TCP echo](examples/tcp_echo.cc) is a complete public-header server: it accepts
+an owning `unique_fd`, transfers the stream to the loop, handles partial I/O
+with a frame-local buffer, and closes sessions on completion or failure.
+[Unix echo](examples/unix_echo.cc) uses filesystem-path sockets on Linux/macOS.
+On Windows, use a Visual Studio CMake generator and run executables from the
+build configuration directory. `EVENTLOOP_WINDOWS_TLS` defaults to `ON`;
+turning it off omits TLS/WebSocket and HTTP/2 support, but still requires
+OpenSSL for QUIC.
 
-```sh
-cmake -S examples/stonegate -B /tmp/stonegate-build -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/stonegate-build --target stonegate -j2
-cmake -S examples/wayfarer -B /tmp/wayfarer-build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-cmake --build /tmp/wayfarer-build --target wayfarer -j2
-```
-
-Serve a local directory and fetch its index page:
-
-```sh
-mkdir -p /tmp/stonegate-root
-printf 'hello from eventloop\n' > /tmp/stonegate-root/index.html
-/tmp/stonegate-build/stonegate --root /tmp/stonegate-root --http-port 8080
-```
-
-In another terminal:
-
-```sh
-/tmp/wayfarer-build/wayfarer http://127.0.0.1:8080/
-```
-
-Stonegate can also enable TLS HTTP/1.1 and HTTP/2 and serve HTTP/3 over UDP
-with a certificate and private key. Wayfarer can select HTTP/2 or QUIC v1/v2
-HTTP/3 explicitly, follow redirects, and save completed downloads to a file.
-Their guides cover the commands and limits. On Windows, use a Visual Studio
-CMake generator and run programs from the build configuration directory.
-
-## Use it in your project
-
-Install the library and link the exported CMake target:
+## Link from your project
 
 ```sh
 cmake --install build --prefix /path/to/eventloop-install
@@ -174,88 +36,75 @@ find_package(eventloop CONFIG REQUIRED)
 target_link_libraries(your_app PRIVATE eventloop::eventloop)
 ```
 
-Pass `-DCMAKE_PREFIX_PATH=/path/to/eventloop-install` when configuring a
-consumer outside CMake's usual package search paths. Public headers are under
-`include/eventloop/`.
+Configure consumers with `-DCMAKE_PREFIX_PATH=/path/to/eventloop-install`.
+Public headers are under `include/eventloop/`; readiness APIs remain private.
 
-| Build with | Public entry point | Runnable example |
+## APIs and examples
+
+| API | Public header under `eventloop/` | Contract / caller |
 | --- | --- | --- |
-| TCP and TLS services | `tcp_acceptor.h`, `tcp_stream.h`, `tls_stream.h` | `tcp_echo`, `tls_echo` |
-| UDP services | `udp_socket.h`, `ip_endpoint.h` | `coroutine_socket_benchmark` |
-| HTTP client | `http2/client.h`, TCP/TLS and QUIC APIs | [Wayfarer](examples/wayfarer/README.md) |
-| HTTP server and routing | `http/server.h`, `http/http3_server.h`, `http/router.h` | [Stonegate](examples/stonegate/README.md), `routing_server` |
-| WebSocket | `ws/web_socket.h` | `websocket_echo_server`, `websocket_client` |
-| Bounded file operations | `file_io.h` | `file_io_benchmark` |
-| QUIC streams and DATAGRAMs | `quic.h` | `quic_echo_server` |
-| TOML configuration | `util/toml.h` | — |
+| Tasks, timers, composition, workers | `event_loop.h`, `task.h`, `task_composition.h`, `wakeup.h` | [Coroutines](docs/coroutines.md) |
+| TCP | `tcp_acceptor.h`, `tcp_stream.h`, `ip_endpoint.h` | [TCP](docs/tcp.md), [echo](examples/tcp_echo.cc) |
+| TLS | `tls_stream.h`, `tls_context.h` | [TLS](docs/tls.md), [echo](examples/tls_echo.cc) |
+| Unix streams (Linux/macOS) | `unix_socket.h` | [Unix sockets](docs/unix-sockets.md), [echo](examples/unix_echo.cc) |
+| UDP | `udp_socket.h` | [UDP](docs/udp.md) |
+| QUIC v1/v2 streams and DATAGRAMs | `quic.h` | [QUIC](docs/quic.md), [echo](examples/quic_echo_server.cc) |
+| HTTP servers and routing | `http/server.h`, `http/http3_server.h`, `http/router.h` | [Shared HTTP](docs/http.md), [routing server](examples/routing_server.cc) |
+| HTTPS HTTP/2 client | `http2/client.h` | [Client contract](docs/http2.md#outbound-client), Wayfarer below |
+| WebSocket | `ws/web_socket.h` | [WebSocket](docs/websocket.md), [client guide](examples/README-websocket-client.md) |
+| File I/O | `file_io.h` | [File I/O](docs/file-io.md) |
+| Synchronous TOML configuration | `util/toml.h` | [TOML](docs/toml.md) |
 
-The older single-protocol HTTP programs needed by the root integration tests
-live under `tests/fixtures/`. Benchmark-only programs live under `benchmark/`.
+Standalone applications build from their own example directories:
 
-For configuration files, `eventloop::util::parse_toml` parses
-[TOML 1.1.0](https://toml.io/en/v1.1.0) into caller-provided node and decoded
-string buffers. The document borrows those buffers and the input; exhaustion
-returns an error. Parsing is synchronous and portable. See the
-[TOML API contract](docs/toml.md) for
-storage lifetimes, limits, and error behavior.
+- [Wayfarer](examples/wayfarer/README.md): HTTP/1.1, HTTP/2, and HTTP/3 CLI
+  client; redirects and file downloads.
+- [Stonegate](examples/stonegate/README.md): file server across all three
+  protocols, TLS, redirects, directory listings, and a `/healthz` route.
+- [Parley](examples/parley/README.md): browser chat, uploads, routed APIs,
+  HTTP/2 WebSockets, and event-stream fallback.
+- [Lantern](examples/lantern/README.md): resumable video uploads, ranged
+  playback, and concurrent disconnect stress tests.
 
-The library also provides `task<T>`, observed `task_handle<T>` roots,
-`when_all`, `race`, and `with_timeout` for composing loop-owned work.
-The [coroutine and event-loop contract](docs/coroutines.md) explains task results,
-cancellation, buffer lifetimes, and capacity errors. The
-[shared HTTP contract](docs/http.md) links to focused HTTP/1.1, HTTP/2, and
-HTTP/3 contracts. The
-[API conventions](docs/api-conventions.md) describe how public operations fit
-together. The [API contract index](docs/api-contract.md) links to each topic.
+Root test fixtures are in `tests/fixtures/`; benchmarks are in `benchmark/`.
+[API conventions](docs/api-conventions.md) guide API changes;
+[the contract index](docs/api-contract.md) links shared rules and topic details.
 
-## Designed for bounded services
+## Ownership and limits
 
-Coroutine frames come from configurable, per-loop size classes. Socket
-awaiters use caller-owned buffers and frame-local state; file operations run
-on a dedicated bounded worker. Queues and protocol buffers have limits, and
-operations report when a limit is reached. OpenSSL and setup code may allocate,
-so the library does not promise a heap-free process.
-
-Ownership is visible at the API boundary. For example, accepting a TCP
-connection returns an owning `unique_fd`, while a `std::span` passed to an
-asynchronous read remains the caller's buffer until completion. Cancellation
-is a request; an in-flight worker or I/O operation must retire before its
-frame and borrowed inputs can be released. Event-loop objects and their
-coroutines stay on the owning thread.
-
-The socket APIs use numeric IPv4 and IPv6 endpoints. Applications resolve DNS
-separately; Wayfarer and the WebSocket client do so on a bounded worker.
+- Coroutine frames use configurable per-loop size classes with bounded slab
+  growth; individual frames never fall back to the general heap. Queues,
+  file workers, and protocol storage also have explicit limits and exhaustion
+  results. Setup, slab growth, OpenSSL, and some request paths may allocate;
+  allocation tests and exceptions are documented per protocol.
+- Descriptors transferred as `unique_fd` are owned. Async spans and borrowed
+  descriptors stay valid until completion, including after cancellation.
+  Cancellation requests do not release frames or worker references.
+  Keep observed `task_handle<T>` roots alive until `done()`.
+- Socket endpoints are numeric IPv4/IPv6; applications resolve DNS separately.
+  Wayfarer and the WebSocket client use a bounded worker for resolution.
+- Shutdown cancels active roots immediately. Its grace timeout does not let
+  built-in HTTP responses drain.
 
 ## Protocol scope
 
-- The server APIs support HTTP/1.1, TLS HTTP/2, and HTTP/3. One
-  `http::router` runs coroutine handlers that stream request and response
-  bodies on all three; unmatched paths serve static files.
-  `examples/routing_server.cc` shows the routing API, and Stonegate composes
-  the servers into one configurable program with a `/healthz` route. File access uses
-  bounded buffers and a component-by-component path walk that blocks symlink
-  escapes. Stonegate supports conditional requests, single byte ranges, and
-  bounded directory listings. Linux plain HTTP uses `sendfile` for larger
-  files. HTTPS HTTP/1.1 and HTTP/2 use OpenSSL kTLS `sendfile` for file
-  responses when transmit kTLS is active for the connection, with bounded
-  buffered paths otherwise.
-- The outbound HTTP/2 client performs one HTTPS request per connection using
-  ALPN `h2`. It supports general methods, bounded owned request bodies,
-  streamed uploads, and streamed response bodies and headers. See
-  [HTTP/2 contract](docs/http2.md#outbound-client) for its limits and
-  [Wayfarer](examples/wayfarer/README.md) for a public-header caller.
-- WebSocket receive and send are awaitable and bounded by configured message
-  and output limits. The [WebSocket client guide](examples/README-websocket-client.md)
-  covers its outbound echo example. HTTP/2 and HTTP/3 CONNECT routes can accept
-  WebSockets using RFC 8441/9220; [websocket_routing_server](examples/websocket_routing_server.cc)
-  serves an echo route on both. See the [WebSocket contract](docs/websocket.md)
-  for handshake, capacity, and ownership rules.
-- The public QUIC API supports v1/v2 connections, streams, and DATAGRAMs.
-  Wayfarer and Stonegate exercise the client and server sides of HTTP/3.
-  QUIC transport release qualification is still active. See the
-  [QUIC contract](docs/quic.md) for stream limits and lifecycle rules.
-- The HTTP server cancels active connection tasks on shutdown; its grace
-  timeout does not drain unfinished responses.
+HTTP/1.1, TLS HTTP/2, and HTTP/3 share coroutine routing and secure static-file
+traversal. Static responses support GET/HEAD/OPTIONS, validators, single byte
+ranges, and bounded directory listings. Linux plain HTTP uses `sendfile` for
+large files; TLS HTTP/1.1 and HTTP/2 can use transmit kTLS, with bounded
+buffered fallback. See [shared HTTP](docs/http.md) and
+[HTTP/1.1](docs/http1.1.md), [HTTP/2](docs/http2.md), or [HTTP/3](docs/http3.md).
 
-Benchmark programs and harnesses live in `benchmark/`. They exercise local
-workloads and are not throughput guarantees for other machines or networks.
+The HTTP/2 client performs one HTTPS request per connection with ALPN `h2`,
+bounded owned bodies or streamed uploads/responses. QUIC exposes v1/v2
+endpoints, streams, and DATAGRAMs; Wayfarer's HTTP/3 codec has narrower limits
+than the server. WebSocket framing is bounded; HTTP/2 and HTTP/3 CONNECT routes
+can accept RFC 8441/9220 WebSockets. The
+[routed echo example](examples/websocket_routing_server.cc) exercises both.
+Keep interoperability and performance claims scoped to the tested paths;
+local benchmark workloads are not throughput guarantees.
+
+## License
+
+[MIT](LICENSE). Use it freely, but keep the copyright notice and license text
+in copies and substantial portions, which credits the original author.

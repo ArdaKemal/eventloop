@@ -53,8 +53,6 @@ static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcep
         std::ranges::equal(value.first(parameters.size()), parameters) &&
         std::ranges::equal(value.subspan(parameters.size()), grease);
 }
-static bool on_frame(void* argument, tls_level, const decoded_frame&) noexcept
-{ ++*static_cast<int*>(argument); return true; }
 struct buffers {
     std::array<std::uint8_t, packet_scheduler::maximum_datagram> encoded {}, frame {},
         build_scratch {}, packet_scratch {}, plaintext {}, auth_scratch {};
@@ -247,8 +245,8 @@ int main()
             check(send(*client,*server,outgoing,incoming,tls_level::application));
             check(server->stream(*bulk)->receive->readable().size()==block.size());
             check(server->consume_stream(*bulk,block.size()).has_value());
-            check(server->flow().receive_max_data()==1027+(round+1)*1024);
-            check(server->stream(*bulk)->receive->flow_limit()==1024+(round+1)*1024);
+            check(server->flow().receive_max_data()==1027u+(round+1)*1024u);
+            check(server->stream(*bulk)->receive->flow_limit()==1024u+(round+1)*1024u);
             check(send(*server,*client,incoming,outgoing,tls_level::application));
         }
         check(client->flow().sent_total()==3075);

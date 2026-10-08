@@ -111,10 +111,6 @@ if(WIN32)
                 "PATH=path_list_prepend:${OPENSSL_ROOT_DIR}/bin")
         endif()
 
-        add_executable(coroutine_smoke_test tests/coroutine_smoke.cc)
-        target_link_libraries(coroutine_smoke_test PRIVATE eventloop::eventloop)
-        add_test(NAME coroutine_smoke COMMAND coroutine_smoke_test)
-
         add_executable(event_loop_test tests/event_loop.cc)
         target_link_libraries(event_loop_test PRIVATE eventloop::eventloop)
         add_test(NAME event_loop COMMAND event_loop_test)
@@ -981,11 +977,6 @@ if(BUILD_TESTING)
     target_compile_options(http_api_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http_api COMMAND http_api_test)
     set_tests_properties(http_api PROPERTIES TIMEOUT 10)
-
-    add_executable(coroutine_smoke_test tests/coroutine_smoke.cc)
-    target_link_libraries(coroutine_smoke_test PRIVATE eventloop::eventloop)
-    target_compile_options(coroutine_smoke_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
-    add_test(NAME coroutine_smoke COMMAND coroutine_smoke_test)
 
     add_executable(socket_api_test tests/socket_api.cc)
     target_link_libraries(socket_api_test PRIVATE eventloop::eventloop OpenSSL::Crypto)

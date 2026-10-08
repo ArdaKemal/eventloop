@@ -1,39 +1,34 @@
 # TLS API contract
 
-Task results, loop affinity, and cancellation follow the
-[coroutine and event-loop contract](coroutines.md). Read that contract
-together with the rules below.
+Shared results, ownership, affinity, and cancellation: [coroutines](coroutines.md).
+Setup/inherited operations: [TCP](tcp.md). Names below are in `eventloop`.
 
-- `eventloop::tls_stream` adds `async_handshake`, `async_read_some`,
-  `async_write_some`, and `async_close`. Await `async_close()` to flush TLS
-  `close_notify`, then call `close()` to retire the transport. `close()` itself immediately
-  cancels operations and closes the transport. One TLS read and one TLS write
-  may be pending together. A second read or second write returns `EBUSY`.
-  Handshake and `async_close()` require all other TLS operations to be idle.
-  For outbound TLS, construct with an `ip_endpoint`, a client context, and
-  `tls_client_options` containing the verification hostname; await inherited
-  `async_connect()` before `async_handshake()`. The hostname also supplies SNI,
-  and `application_protocols` configures ALPN. A handshake on an unconnected
-  socket returns `ENOTCONN`. Raw TCP `async_send_file()` is hidden from
-  `tls_stream` because it would bypass TLS framing.
-  Construction preallocates OpenSSL's read and write record buffers and throws
-  `std::bad_alloc` if that allocation fails. The stream retains drained record
-  buffers; OpenSSL may still allocate for other TLS processing.
-- On Linux, `tls_stream::kernel_sendfile_available()` reports whether the
-  completed handshake enabled OpenSSL transmit kTLS for this connection.
-  When true, `tls_stream::async_send_file(file, offset, size)` owns the file
-  descriptor through completion and sends that range as encrypted TLS data
-  using `SSL_sendfile()`. It shares the one-write limit and returns `EBUSY`
-  for a concurrent write, `EOVERFLOW` for an unrepresentable file range, and
-  `EOPNOTSUPP` when transmit kTLS is unavailable. Cancellation and transport
-  errors close the stream once sending has begun. On other platforms this
-  operation returns `EOPNOTSUPP`. The overload taking a native descriptor
-  borrows the file without duplicating or closing it; callers must keep it open
-  until completion, including after requesting cancellation. It has the same
-  error, cancellation, and one-write rules as the owning overload. Its optional
-  prefix span is sent before the file range under the same write operation;
-  callers must keep the prefix storage valid and unchanged until completion.
-  HTTPS HTTP/1.1 file responses use this path
-  when available and otherwise use a bounded 4 KiB read/write buffer.
+- `tls_stream` adds `async_handshake`, encrypted `async_read_some`/
+  `async_write_some`, and `async_close`. Await `async_close()` to flush
+  `close_notify`, then `close()` to retire the transport. `close()` immediately
+  cancels/closes it; a loop-owned stream pointer is invalid after removal.
+- One TLS read and write may coexist; duplicate directions return `EBUSY`.
+  Handshake/async-close require other TLS operations idle. For outbound TLS,
+  construct with an `ip_endpoint`, client context, and `tls_client_options`
+  verification hostname (also SNI); `application_protocols` sets ALPN.
+  Await inherited connect before handshake; unconnected handshake is `ENOTCONN`.
+  Raw TCP send-file is hidden because it bypasses TLS framing.
+- Construction preallocates OpenSSL read/write record buffers, throwing
+  `std::bad_alloc` on failure, and retains drained buffers. Other OpenSSL
+  processing may allocate.
 
-Connection setup and inherited TCP operations follow the [TCP contract](tcp.md).
+## kTLS file sending
+
+On Linux, `kernel_sendfile_available()` reports transmit kTLS after handshake.
+`async_send_file(file, offset, size)` owns the file through completion and uses
+`SSL_sendfile()` for encrypted data. It shares the one-write limit (`EBUSY`),
+rejects unrepresentable ranges (`EOVERFLOW`), and returns `EOPNOTSUPP` without
+transmit kTLS or on other platforms. Cancellation/transport errors close the
+stream once sending begins.
+
+The native-descriptor overload borrows without duplicating/closing the file;
+keep it open through completion, including cancellation. Its optional prefix
+span is borrowed unchanged for the same period and sent before the range under
+the same write operation. All other rules match the owning overload. HTTPS
+HTTP/1.1 file responses use kTLS when available, otherwise a bounded 4 KiB
+read/write buffer.

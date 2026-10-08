@@ -1,82 +1,61 @@
 # WebSocket API contract
 
-Task results, loop affinity, and cancellation follow the
-[coroutine and event-loop contract](coroutines.md). Read that contract
-together with the rules below.
+Shared async rules: [coroutines](coroutines.md). Names are relative to
+`eventloop`; transports follow [TCP](tcp.md)/[TLS](tls.md).
 
-- The WebSocket API is `eventloop::ws::web_socket<Stream>` over a stream with
-  coroutine read/write operations. Use `async_receive`, `async_send_text`,
-  `async_send_binary`, and `async_close`. One receive and one send may run
-  concurrently. A returned payload view remains valid until the next receive
-  or socket destruction; send buffers remain caller-owned until completion.
-- WebSocket framing is bounded by the configured message limit plus frame and
-  control overhead. Errors retire the parser/output state and close the
-  transport. Fan-out helpers are best-effort: a full recipient drops only the
-  current message and the result counts those drops.
-
-See the [WebSocket client guide](../examples/README-websocket-client.md) for
-a public API example. Transport behavior is specified in the [TCP](tcp.md)
-and [TLS](tls.md) contracts.
+`ws::web_socket<Stream>` uses coroutine stream reads/writes. Operations:
+`async_receive`, `async_send_text`, `async_send_binary`, `async_close`.
+One receive and send may coexist. Payload views expire at next receive/socket
+destruction; send buffers borrow through completion. Message/output limits
+bound framing plus control overhead. Failures retire framing state and close
+transport. Best-effort fan-out drops only the current message for a full
+recipient and counts drops. [Client guide](../examples/README-websocket-client.md).
 
 ## Routed HTTP/2 and HTTP/3 WebSockets
 
-HTTP/2 and HTTP/3 servers with a router support Extended CONNECT from
-[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) and
-[RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html). Register a CONNECT
-route and call `request::async_accept_websocket(subprotocol)` before starting
-the response or reading its body. `request::connect_protocol()` exposes
-`:protocol` (empty on ordinary requests). Acceptance requires `websocket`,
-version 13, no Content-Length, and, when selected, one subprotocol offered by
-the peer. The subprotocol view is borrowed through acceptance. Invalid
-handshakes return `invalid_argument` without sending a response; the handler
-can send an HTTP rejection (include Sec-WebSocket-Version: 13 when rejecting
-an unsupported version). HTTP/1.1 acceptance returns
-`operation_not_supported`. Authentication and Origin policy are the handler's
-responsibility. Extensions are not negotiated.
+Servers with routes support Extended CONNECT:
+[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) /
+[RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html). Register CONNECT and
+call `request::async_accept_websocket(subprotocol)` before response start/body
+read. `connect_protocol()` exposes :protocol (empty on ordinary requests).
 
-Acceptance sends status 200 without Content-Length or END_STREAM/FIN and
-returns a move-only `http::websocket_stream` for `ws::web_socket`. It borrows
-the server-owned exchange until the handler completes; it must not escape the
-handler. Its read/write spans remain borrowed until completion, including
-cancellation. One read and one write may run concurrently. Ordinary request
-body and response operations are invalid after acceptance. Destroying or
-calling `close()` on the stream aborts only that stream, using HTTP/2 CANCEL
-or HTTP/3 H3_REQUEST_CANCELLED; locally aborted pending I/O reports
-`operation_canceled`, while a peer reset reports `connection_reset`.
-`async_close()` ends the send direction and
-reads through peer END_STREAM/FIN before completing; cancel or abort it to
-stop waiting. Do not start other I/O while `async_close()` is pending. Pending
-operations must retire before destruction or moving.
-Wrong-loop use remains a programming error.
+- Acceptance requires websocket, version 13, no Content-Length, and any
+  selected subprotocol offered by the peer. Borrow subprotocol through
+  acceptance. Invalid handshake returns `invalid_argument` without responding;
+  the handler can reject (include Sec-WebSocket-Version: 13 for unsupported
+  version). HTTP/1.1 returns `operation_not_supported`. Handler owns
+  authentication/Origin policy; extensions are not negotiated.
+- Success sends 200 without Content-Length or END_STREAM/FIN, returning
+  move-only `http::websocket_stream` for `ws::web_socket`. It borrows the
+  server-owned exchange and must not escape the handler. Ordinary request/
+  response operations become invalid. No descriptor transfers to the handler;
+  the connection owns TLS/QUIC and HTTP buffers.
+- One read/write may coexist, borrowing spans through completion/cancellation.
+  Destruction/`close()` aborts only this stream (HTTP/2 CANCEL, HTTP/3
+  H3_REQUEST_CANCELLED). Local abort returns `operation_canceled`; peer reset
+  `connection_reset`. Pending operations must retire before moving/destruction.
+- `async_close()` ends sending and reads through peer END_STREAM/FIN; cancel
+  or abort to stop waiting. No other I/O while close is pending. Wrong-loop
+  use is a programming error.
+- Long-lived WebSockets retain one of eight 16 KiB HTTP/2 body slots
+  (exhaustion REFUSED_STREAM) or one HTTP/3 scratch slot (H3_REQUEST_REJECTED).
+  Accepted DATA has no cumulative request-body limit; configured WebSocket
+  message/output bounds remain. The adapter allocates no buffers; framing
+  vectors may allocate within bounds. Size HTTP/3's 2048-byte frame class
+  for simultaneous requests.
 
-The HTTP connection owns its descriptor, TLS/QUIC state, and HTTP buffers.
-No descriptor is transferred to the handler. WebSocket DATA uses the existing
-eight 16 KiB HTTP/2 body slots per connection (exhaustion refuses the stream
-with REFUSED_STREAM) or an HTTP/3 request scratch slot (exhaustion uses
-H3_REQUEST_REJECTED). Long-lived streams retain these slots. Accepted DATA is
-not limited by the cumulative HTTP request body limit; individual messages
-and pending WebSocket output retain the configured framing bounds and errors
-above. The adapter allocates no buffers; the existing WebSocket framing
-vectors may allocate within their bounds. Support is portable across the
-existing TLS HTTP/2 and QUIC HTTP/3 platforms; cleartext HTTP/2 and HTTP/1.1
-route upgrades are outside this operation.
+Portable across TLS HTTP/2/QUIC HTTP/3 platforms; cleartext HTTP/2 and HTTP/1.1
+route upgrades are unsupported. Session/framing setup may allocate.
 
-[websocket_routing_server](../examples/websocket_routing_server.cc) is a
-public-header echo server on TLS HTTP/2 and QUIC HTTP/3:
+[websocket_routing_server](../examples/websocket_routing_server.cc) echoes
+`/chat` and serves ordinary HTTP at `/hello`; peers need Extended CONNECT:
 
 ```sh
 ./build/websocket_routing_server certificate.pem private-key.pem 8443
 ```
 
-Its `/chat` route echoes messages, and `/hello` serves ordinary HTTP. An
-Extended CONNECT-capable peer is required; the example does not implement an
-HTTP/1.1 WebSocket handshake. Session setup and framing storage may allocate.
-As with other HTTP/3 handlers, size the loop's 2048-byte coroutine-frame class
-for simultaneous long-lived requests.
-
-`tests/run_http_websocket_interop.py` exercises that public example with
-independent hyper-h2, wsproto, and aioquic 1.3.0 peers. If those optional Python
-packages are installed in `Python3_EXECUTABLE`, CMake registers
-`http_websocket_interop`. It checks negotiation, concurrent HTTP and WebSocket
-streams, fragmentation and Ping/Pong, flow control, Close/FIN ordering, and
-reset isolation over HTTP/2 and HTTP/3 with QUIC v1 and v2.
+`tests/run_http_websocket_interop.py` uses independent hyper-h2, wsproto, and
+aioquic 1.3.0 peers. With those packages in `Python3_EXECUTABLE`, CMake registers
+`http_websocket_interop`: negotiation, concurrent HTTP/WebSocket streams,
+fragmentation/Ping/Pong, flow control, Close/FIN ordering, and reset isolation
+on HTTP/2 and HTTP/3 QUIC v1/v2.

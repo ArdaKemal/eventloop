@@ -1,153 +1,137 @@
 # HTTP/2 API contract
 
-The [coroutine and event-loop contract](coroutines.md) defines task results, loop affinity,
-borrowed-buffer lifetimes, and cancellation. The [shared HTTP contract](http.md)
-defines routing and request/response operations. Read those rules together with
-this protocol's limits and behavior; the other HTTP protocol contracts are not
-required for changes confined to this protocol.
+Shared async rules: [coroutines](coroutines.md). Routing, ownership, static
+resources, listings/cache: [shared HTTP](http.md). Names are relative to `eventloop`.
 
-## TLS server and static responses
+## TLS server and capacities
 
-- `eventloop::http::https_server` advertises `h2` and `http/1.1` with ALPN by
-  default. Set `eventloop::http::server_options::enable_http2` to `false` to
-  disable HTTP/2. The HTTP/2 path serves static GET, HEAD, and OPTIONS over TLS and routed
-  requests as described in the shared HTTP contract, supports up to 32 active
-  streams per connection, decodes bounded HPACK header blocks, and observes connection and
-  stream DATA flow control. Static request bodies are discarded and limited to
-  1 MiB. File responses stream from their owned descriptors; inline
-  response bodies are bounded to 4 MiB per connection. Responses are scheduled
-  by RFC 9218 priority, taken from the request `priority` field and replaced
-  by PRIORITY_UPDATE frames. Lower urgency goes first. Within one urgency,
-  non-incremental responses are sent one at a time in stream order, then
-  incremental responses share DATA frames round-robin. A stream blocked by flow
-  control does not hold back others. Requests without a signal use urgency 3,
-  non-incremental. A malformed Priority value keeps the defaults, and an update
-  for a stream that is not open is ignored. The server advertises
-  SETTINGS_NO_RFC7540_PRIORITIES and ignores RFC 7540 PRIORITY frames apart
-  from their validity checks. On Linux, file response
-  DATA uses OpenSSL `SSL_sendfile()` when transmit kTLS is active, and otherwise
-  uses the bounded buffered path. Directory-root traversal uses the shared HTTP contract's
-  component-by-component `O_NOFOLLOW` checks. Cleartext
-  prior-knowledge HTTP/2, h2c upgrade, and ordinary CONNECT proxy tunnels are
-  not supported. With a router, the server advertises
-  SETTINGS_ENABLE_CONNECT_PROTOCOL and supports routed WebSockets through
-  Extended CONNECT (RFC 8441). See the [WebSocket contract](websocket.md#routed-http2-and-http3-websockets)
-  for acceptance, storage capacity, and stream closure. Plain `http::server`
-  continues to serve HTTP/1.1.
+`http::https_server` advertises `h2`/`http/1.1` by default;
+`http::server_options::enable_http2 = false` disables h2. Static GET/HEAD/OPTIONS and
+routed requests run over TLS. Plain `http::server` stays HTTP/1.1. Cleartext
+prior knowledge, h2c upgrade, and ordinary CONNECT tunnels are unsupported.
+With routes, SETTINGS_ENABLE_CONNECT_PROTOCOL enables RFC 8441
+[routed WebSockets](websocket.md#routed-http2-and-http3-websockets).
 
-## Routed handlers, flow control, and cancellation
+| Per connection | Bound |
+| --- | --- |
+| Active streams / handler slots | 32 |
+| Request header blocks/lists | 64 KiB |
+| Discarded static request body | 1 MiB |
+| Queued inline response bodies | 4 MiB |
+| Output byte queue | 256 KiB |
+| Routed body pool | Eight 16 KiB slots |
 
-A SETTINGS_INITIAL_WINDOW_SIZE change that overflows any stream's send window
-ends the connection with FLOW_CONTROL_ERROR (RFC 9113 6.9.2). A stream's
-WINDOW_UPDATE that overflows only that stream remains a stream error.
+Files stream from owned descriptors; Linux DATA can use `SSL_sendfile()` with
+transmit kTLS, otherwise bounded buffering. HPACK decoding is bounded;
+connection/stream DATA flow control is enforced. No idle, SETTINGS, write-stall,
+or flood limits are implemented.
 
-- HTTP/2 runs one handler task per stream, up to 32 per connection, next to
-  a reader task and the connection task, which writes. A handler's
-  `async_write` completes once its bytes enter the connection's 256 KiB
-  output queue under flow control and RFC 9218 priority; `async_send_file`
-  completes once the last range is queued. Each connection allocates its
-  session, 32 handler slots, and their request views once.
-  - Routed uploads use a pool of eight 16 KiB stream buffers, allocated the
-    first time a routed request with a body arrives. With routes, the
-    server advertises a 16 KiB initial stream window and returns credit as
-    handlers read. An upload arriving while all eight buffers are busy is
-    refused with RST_STREAM REFUSED_STREAM, which clients may retry.
-  - A client may send up to the default 64 KiB window before it applies
-    that SETTINGS. A DATA frame that does not fit its stream buffer pauses
-    reading the connection until the handler reads, so other streams wait
-    meanwhile; a handler that never reads is ended when it responds.
-  - Cancelling a handler task, for example with `with_timeout` around
-    `async_read_body`, resumes a waiting read or write with
-    `operation_canceled`. A cancelled write or file send also resets the
-    stream with CANCEL, so the connection stops borrowing its data.
-    Connection loss resumes every waiting handler with `connection_reset`,
-    and the connection waits for all handlers before it is released.
+RFC 9218 scheduling uses request `priority`, replaced by PRIORITY_UPDATE.
+Lower urgency wins; within an urgency, non-incremental responses run in stream
+order, then incremental responses share DATA round-robin. Flow-blocked streams
+do not block others. Defaults are urgency 3/non-incremental; malformed values
+keep defaults, updates for unopened streams are ignored.
+SETTINGS_NO_RFC7540_PRIORITIES is advertised; RFC 7540 PRIORITY frames receive
+validity checks but do not affect scheduling.
 
-## Request bodies and responses
+## Handlers, flow control, and cancellation
 
-- HTTP/2 bodies may omit Content-Length. A read past
-  `max_request_body` returns `message_size`, and the server answers 413 if
-  the handler then returns without a response. A malformed body (DATA beyond
-  Content-Length, or a body shorter than it at END_STREAM) resets the stream with PROTOCOL_ERROR, and reads
-  return `connection_reset`. Request trailers are validated but not
-  exposed.
+One handler runs per stream, alongside a reader task and the connection writer.
+Session, 32 slots, and request views allocate once per connection. `async_write`
+completes when bytes enter the output queue under flow control/priority;
+`async_send_file` completes when its last range is queued.
 
-- Without content-length, finishing a response ends the stream. Response
-  trailers are always sent.
-- A handler that returns after `async_start` but before `async_finish` resets
-  the stream with INTERNAL_ERROR.
-- An unread request body is ended with RST_STREAM NO_ERROR after the response
-  (RFC 9113 8.1).
+- Body slots allocate on the first routed body. With routes, initial stream
+  window is 16 KiB and handler reads return credit. All eight slots busy:
+  RST_STREAM REFUSED_STREAM (retryable).
+- Before applying SETTINGS, clients may use the default 65535-byte window.
+  DATA that cannot fit pauses connection reading until the handler reads,
+  delaying other streams. A non-reading handler's stream ends on response.
+- Cancelling a waiting handler read/write returns `operation_canceled`;
+  cancelled writes/file sends also reset with CANCEL to release borrowed data.
+  Loss resumes waiters with `connection_reset`; release the connection only
+  after all handlers retire.
+- SETTINGS_INITIAL_WINDOW_SIZE overflow on any stream is a connection
+  FLOW_CONTROL_ERROR; stream WINDOW_UPDATE overflow is a stream error.
+
+## Bodies and responses
+
+Bodies may omit Content-Length. Reads beyond `max_request_body` return
+`message_size`; if the handler returns without a response, answer 413.
+DATA overruns or short END_STREAM reset with PROTOCOL_ERROR; reads return
+`connection_reset`. Request trailers are validated, not exposed.
+
+Without content-length, finish ends the stream; response trailers are always
+sent. Returning after start without finish resets with INTERNAL_ERROR. Unread
+request bodies end with RST_STREAM NO_ERROR after the response (RFC 9113 8.1).
+
+## Closed streams and errors
+
+`src/http2/session.h` retains 64 closure reasons. For retired-stream DATA/HEADERS:
+normal completion of both directions gives a STREAM_CLOSED connection error;
+peer RST_STREAM gives a STREAM_CLOSED stream error; frames racing a local reset
+are discarded. Lower IDs skipped by the peer give PROTOCOL_ERROR. Evicted IDs
+at/below the closure floor are treated as local resets. DATA after END_STREAM
+on a still-active stream is a stream error; Content-Length overrun is stream
+PROTOCOL_ERROR. Regression coverage: [http2_hardening](../tests/http2_hardening.cc).
+
+CMake registers `http2_h2spec` when h2spec is on PATH or
+`-DH2SPEC_EXECUTABLE=/path/to/h2spec` is set; the binary is not vendored.
+`tests/run_h2spec.sh` runs
+`-t -k -S`, requires zero failures/skips, and serves 300000 bytes so the window
+case is exercised. Run it to establish conformance; old pass counts are not
+current test results.
 
 ## Allocation measurements
 
-HTTP/2 decodes request fields into the connection's existing strings, keeps
-its HPACK dynamic table in one 4 KiB ring allocated with the first entry, and
-encodes response fields from views into one reused buffer, so only a header
-value longer than earlier ones on the connection can still allocate. `tests/http2_routing_allocations.cc` checks steady-state routed
-requests and static-file requests, including OpenSSL's own allocations through
-its allocator hook: those are zero per request in the measured paths. TLS
-handshakes allocate inside OpenSSL for key exchange, transcript hashing, and
-the key schedule on every new connection.
+[http2_routing_allocations](../tests/http2_routing_allocations.cc) checks warmed
+routed/static-file requests, counting general-heap and OpenSSL allocations.
+The target is zero in these paths. Request fields reuse existing strings;
+HPACK's dynamic table uses a 4 KiB ring allocated with its first entry;
+response fields encode from views into reused storage. Longer-than-warmed
+header values may allocate. TLS handshake key exchange/transcript/key schedule
+allocates on each new connection.
 
 ## Outbound client
 
-- Include `eventloop/http2/client.h` for one outbound HTTPS HTTP/2 request.
-  `http2::async_request(loop, endpoint, context, hostname, request)` owns the
-  TLS socket from connect through close. `hostname` is used for certificate
-  verification, SNI, and the default `:authority`; `endpoint` is a numeric
-  address, so name resolution belongs to the caller. ALPN must select `h2`.
-  Requests own their method, target, authority override, header strings, and
-  body bytes or a `request_body_source` callback.
-  Requests and all three callback types are move-only; pass named requests
-  and callbacks with `std::move`. Callbacks may exclusively own resources
-  through move-only captures, which remain task-owned through task completion,
-  including cancellation. Callback construction may allocate.
-  Any valid HTTP method token is accepted, including GET, HEAD, POST, PUT,
-  PATCH, DELETE, and OPTIONS.
-  CONNECT returns `operation_not_supported` because a tunnel does not fit one
-  buffered exchange.
-  The owned body is limited to 4 MiB; a source can produce up to 1 TiB in
-  chunks of at most 16 KiB. Set either the owned body or the source. The source
-  is task-owned and called on the loop thread with a writable borrowed span;
-  it returns 0 for EOF, a byte count within the span, or an operation error.
-  Resources captured by the source must remain valid through completion,
-  including cancellation. `Content-Length` is optional and can be supplied as
-  a request header when known; it must be decimal and equal the owned body
-  size or the source's total. A mismatch reports `invalid_argument`, before
-  connecting for an owned body, or when a source exceeds the value or ends
-  short of it. Connection-specific request fields and TE other than
-  `trailers` are also `invalid_argument`. DATA transmission observes the peer's connection
-  and stream flow-control windows. Responses own status and headers. The
-  five-argument operation owns the response body, capped at 4 MiB. Passing a
-  sixth `response_sink` argument
-  streams DATA chunks synchronously to that callback on the loop thread;
-  `response.body` is then empty. A sink receives a borrowed chunk valid only
-  during the call and returns `std::error_code`; a nonzero result aborts the
-  request and becomes the operation error. An optional seventh
-  `response_header_sink` receives each complete header block before subsequent
-  DATA: its status argument is 1xx for informational headers, the final HTTP
-  status for final headers, and zero for trailers. The fields span is borrowed
-  only during the call; a nonzero callback error aborts the request. Final
-  response headers and trailers remain owned in the returned response.
-  Responses are malformed, reporting `protocol_error`, when they carry
-  connection-specific fields or any TE field, a non-numeric or
-  conflicting Content-Length, DATA whose total differs from Content-Length,
-  or any DATA content after a HEAD request or with status 204 or 304.
-  Content-Length on those bodyless responses is not compared.
-  RST_STREAM on the request stream returns `connection_reset`. A GOAWAY
-  whose last stream ID is zero returns `connection_reset` because the request
-  was not processed; otherwise the response continues to completion.
-  A malformed RST_STREAM or GOAWAY frame is `protocol_error`.
-  Streamed response bodies are limited to 1 TiB while buffering remains one
-  16 KiB frame. The operation uses one
-  stream per connection. Connection reuse and server push are outside its scope.
-  Request and response header blocks are limited to 64 KiB and 128 fields.
-  Frames from the server are limited to 16 KiB as advertised in client
-  SETTINGS. Reaching
-  a limit returns `message_size`; malformed HTTP/2 returns `protocol_error`.
-  Each request allocates its own bounded frame, header, and response storage;
-  TLS and OpenSSL may allocate separately.
-  A TLS connect, handshake, read, or write error is returned directly; task
-  cancellation closes the owned transport. All I/O and resumption occur on
-  `loop`, and the outer task result remains distinct from the operation error.
+Include `eventloop/http2/client.h`. `http2::async_request(loop, endpoint,
+context, hostname, request, sink = {}, header_sink = {})` performs one HTTPS
+request on one owned TLS connection. Numeric endpoint resolution belongs to
+the caller; hostname supplies verification, SNI, and default `:authority`.
+ALPN must select h2. General token methods work; CONNECT returns
+`operation_not_supported`. No connection reuse or push.
+
+Requests own method/target/authority/header strings and either body bytes or a
+`request_body_source`. Requests/callbacks are move-only: move named values.
+Captured resources remain task-owned through completion/cancellation; callback
+construction may allocate. All callbacks run synchronously on the loop thread.
+
+| Storage / data | Limit / behavior |
+| --- | --- |
+| Owned request / buffered response body | 4 MiB each |
+| Streamed source / sink total | 1 TiB each |
+| Source chunk / received frame | 16 KiB |
+| Request / response header block | 64 KiB, 128 fields |
+| `request_body_source(span<byte>)` | Borrowed writable chunk; return count, 0 EOF, or error |
+| `response_sink(span<const byte>)` | Chunk borrowed only during call; returned response body empty |
+| `response_header_sink(status, fields)` | Borrowed block before DATA: 1xx informational, final status, 0 trailers |
+
+A nonzero sink/header-sink error aborts and becomes the operation error. Final
+headers/trailers remain owned by the returned response. Source-captured loans
+must remain valid through task completion. DATA obeys peer stream/connection
+windows; streaming buffers one frame at a time.
+
+Optional decimal Content-Length must equal owned body size or source total;
+mismatch is `invalid_argument` before connecting for owned bodies, or on
+source overrun/short EOF. Supplying both body/source, connection-specific
+request fields, or TE other than `trailers` is also invalid.
+
+Malformed responses return `protocol_error`: connection-specific fields or any
+TE, nonnumeric/conflicting Content-Length, mismatched DATA totals, or DATA
+content on HEAD/204/304. Bodyless Content-Length is not compared. Request-stream
+RST_STREAM or GOAWAY with last stream 0 returns `connection_reset`; other GOAWAY
+permits completion. Malformed RST_STREAM/GOAWAY is `protocol_error`.
+Limits return `message_size`; TLS errors pass through. Cancellation closes the
+owned transport. Each request allocates bounded frame/header/response storage;
+OpenSSL may allocate separately. Outer task results remain distinct from I/O
+errors; ownership/resumption stay on `loop`.

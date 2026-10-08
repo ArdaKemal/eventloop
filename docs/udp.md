@@ -1,8 +1,6 @@
 # UDP API contract
 
-Task results, loop affinity, and cancellation follow the
-[coroutine and event-loop contract](coroutines.md). Read that contract
-together with the rules below.
+Shared results, ownership, affinity, and cancellation: [coroutines](coroutines.md).
 
 - Include `eventloop/udp_socket.h` for IPv4 or IPv6 datagrams using
   `eventloop::ip_endpoint`. Datagrams stay atomic:

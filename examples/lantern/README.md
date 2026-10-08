@@ -22,9 +22,9 @@ loopback by default.
 ## Build and run
 
 ```sh
-cmake -S examples/lantern -B build-lantern -DCMAKE_BUILD_TYPE=Release
-cmake --build build-lantern --target lantern
-./build-lantern/lantern            # https://localhost:8443/
+cmake -S examples/lantern -B /tmp/lantern-build -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/lantern-build --target lantern
+/tmp/lantern-build/lantern            # https://localhost:8443/
 ```
 
 On first start, Lantern writes a self-signed certificate for `localhost`,
@@ -46,8 +46,8 @@ Your browser shows a certificate warning for it; pass `--certificate` and
 Press Ctrl-C to stop. Shutdown cancels every request; an interrupted upload
 resumes from the bytes already on disk.
 
-To build against an installed eventloop package instead of this checkout,
-configure with `-DEVENTLOOP_SOURCE_DIR=`.
+Installed package: configure with `-DEVENTLOOP_SOURCE_DIR=` and
+`-DCMAKE_PREFIX_PATH=/path/to/eventloop-install`.
 
 ## How it uses eventloop
 
@@ -97,11 +97,10 @@ viewer seeks. Two more uploads run meanwhile. Completed ranges must match the
 file byte for byte, and Ctrl-C must stop the server cleanly.
 
 ```sh
-python3 examples/lantern/stress.py build-lantern/lantern --viewers 48 --requests 60
+python3 examples/lantern/stress.py /tmp/lantern-build/lantern --viewers 48 --requests 60
 LANTERN_WRAPPER="valgrind --error-exitcode=99" \
-    python3 examples/lantern/stress.py build-lantern/lantern --viewers 4 --requests 30
+    python3 examples/lantern/stress.py /tmp/lantern-build/lantern --viewers 4 --requests 30
 ```
 
-It needs curl built with HTTP/3 support. This test found that one HTTP/3 client
-closing before the server accepted its connection stopped HTTP/3 for everyone,
-fixed in the library alongside this example.
+Requires curl with HTTP/3. Early peer-close isolation is also covered by
+[http3_server_peer_close](../../tests/http3_server_peer_close.cc).

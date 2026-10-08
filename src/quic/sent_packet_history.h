@@ -157,8 +157,8 @@ private:
                 return std::unexpected(sent_packet_error::invalid_ack);
             for (std::size_t index = size_; index > 0; --index) {
                 const auto& packet = packets_[index - 1];
-                if (packet.number < (*range)->smallest ||
-                    packet.number > (*range)->largest) continue;
+                if ((*range)->smallest > packet.number ||
+                    (*range)->largest < packet.number) continue;
                 ++preview.count;
                 preview.any_ack_eliciting |= packet.ack_eliciting;
                 if (packet.number == frame.largest_acknowledged)
