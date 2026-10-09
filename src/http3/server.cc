@@ -44,6 +44,9 @@ struct stream_storage {
     std::array<std::byte, 4096> io {};
     std::array<http::header, h3::qpack_max_fields> request_headers {};
     std::array<std::byte, 8 * 1024> body {};
+    // Static-file validators and range, kept out of serve_request so its frame
+    // stays in the 2048-byte class (GCC reached 2056 bytes with it there).
+    detail::file_response file_response {};
     bool in_use {false};
 };
 
@@ -825,7 +828,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     http::detail::static_file file;
     std::uint64_t size = 0;
     std::uint64_t offset = 0;
-    detail::file_response selected;
+    auto& selected = s.file_response;
     bool have_file = false;
     bool have_listing = false;
     std::vector<char> listing;
