@@ -628,7 +628,7 @@ private:
             const auto direction = stream_type(slot.id);
             (void)flow_.remove_stream(slot.id);
             slot.receive.reset();
-            slot.send = stream_send_buffer<send_bytes> {};
+            slot.send.reset();
             slot.state = {};
             slot.id = slot.sent_highest = slot.receive_window = 0;
             slot.receive_limit = slot.consumed = 0;
