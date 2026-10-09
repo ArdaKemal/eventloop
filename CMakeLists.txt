@@ -1027,6 +1027,12 @@ if(BUILD_TESTING)
     add_test(NAME http_connection_lifetime COMMAND http_connection_lifetime_test)
     set_tests_properties(http_connection_lifetime PROPERTIES TIMEOUT 15)
 
+    add_executable(https_default_capacity_test tests/https_default_capacity.cc)
+    target_link_libraries(https_default_capacity_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(https_default_capacity_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME https_default_capacity COMMAND https_default_capacity_test)
+    set_tests_properties(https_default_capacity PROPERTIES TIMEOUT 15)
+
     add_executable(wakeup_test tests/wakeup.cc)
     target_link_libraries(wakeup_test PRIVATE eventloop::eventloop)
     target_compile_options(wakeup_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)

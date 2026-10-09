@@ -58,7 +58,8 @@ application errors as values.
 `event_loop_options` controls frame/queue limits; full pools/queues report
 failure rather than allocating replacements. Frame payload classes are
 128/256/512/1024/2048/4096 bytes. Default hard slots are
-64/32/16/10240/4/2; warm slots 64/32/16/160/4/2. Zero disables a class;
+8192/8192/10240/32768/10240/64, backed lazily; warm slots 64/32/16/160/4/2.
+Zero disables a class;
 warm counts clamp to hard limits. Frame state must not exceed `max_align_t`
 alignment. `post_capacity` defaults to 1024, `coroutine_completion_capacity`
 and `file_io_depth` to 128; each must be a power of two >= 2.
