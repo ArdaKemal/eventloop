@@ -86,9 +86,11 @@ current test results.
 
 [http2_routing_allocations](../tests/http2_routing_allocations.cc) checks warmed
 routed/static-file requests, counting general-heap and OpenSSL allocations.
-The target is zero in these paths. Request fields reuse existing strings;
-HPACK's dynamic table uses a 4 KiB ring allocated with its first entry;
-response fields encode from views into reused storage. Longer-than-warmed
+The target is zero in these paths; for OpenSSL, only with transmit kTLS,
+since OpenSSL's own record writer allocates small metadata per TLS record.
+Request fields reuse existing strings; HPACK's dynamic table uses a 4 KiB ring
+allocated with its first entry; response fields encode from views into reused
+storage. Longer-than-warmed
 header values may allocate. TLS handshake key exchange/transcript/key schedule
 allocates on each new connection.
 
