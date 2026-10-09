@@ -277,6 +277,7 @@ private:
     };
 
     static constexpr std::uint64_t block_magic = 0xc07a4e5f4a4d4501ULL;
+    static constexpr std::size_t max_growth_slots = 256;
 
     static auto remove_available(size_class& current, slab_header& slab) noexcept
         -> void
@@ -347,9 +348,12 @@ private:
     {
         if (current.backed_capacity >= current.maximum_capacity) return false;
         const auto remaining = current.maximum_capacity - current.backed_capacity;
-        const auto growth = current.backed_capacity == 0
-            ? std::min<std::size_t>(64, remaining)
-            : std::min(current.backed_capacity, remaining);
+        // Double small classes, then add fixed slabs so a burst backs at
+        // most max_growth_slots more slots than it needs.
+        const auto growth = std::min(
+            {current.backed_capacity == 0 ? std::size_t {64}
+                                          : current.backed_capacity,
+             max_growth_slots, remaining});
         try {
             create_slab(current, class_index, growth, false);
         } catch (const std::bad_alloc&) {
