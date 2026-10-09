@@ -184,8 +184,9 @@ auto bound_port(native_socket descriptor) -> std::uint16_t
 
 auto run_tcp(std::size_t transactions, std::size_t clients) -> bool
 {
+    // Accept task, one session and one client per connection, and the watchdog.
     event_loop_options options;
-    options.coroutine_frame_capacities.fill(64);
+    options.coroutine_frame_capacities.fill(2 * clients + 2);
     event_loop loop(options);
     auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4());
     auto* listener_ptr = listener.get();
@@ -289,8 +290,9 @@ auto udp_client(event_loop&, udp_socket& socket, ip_endpoint destination,
 
 auto run_udp(std::size_t transactions, std::size_t clients) -> bool
 {
+    // Server task, one task per client, and the watchdog.
     event_loop_options options;
-    options.coroutine_frame_capacities.fill(64);
+    options.coroutine_frame_capacities.fill(clients + 2);
     event_loop loop(options);
     auto server = std::make_unique<udp_socket>(loop, ip_endpoint::loopback_v4());
     auto* server_ptr = server.get();
