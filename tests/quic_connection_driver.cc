@@ -26,10 +26,13 @@ struct contexts {
         check(X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -60) != nullptr);
         check(X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3600) != nullptr);
         check(X509_set_pubkey(certificate.get(), key.get()) == 1);
-        auto* name = X509_get_subject_name(certificate.get());
-        check(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+        std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name {
+            X509_NAME_new(), X509_NAME_free};
+        check(name != nullptr);
+        check(X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_ASC,
               reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) == 1);
-        check(X509_set_issuer_name(certificate.get(), name) == 1);
+        check(X509_set_subject_name(certificate.get(), name.get()) == 1);
+        check(X509_set_issuer_name(certificate.get(), name.get()) == 1);
         std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> san {
             X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
                                const_cast<char*>("DNS:localhost")), X509_EXTENSION_free};

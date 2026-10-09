@@ -3,7 +3,6 @@
 
 #include <array>
 #include <atomic>
-#include <pthread.h>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -17,6 +16,7 @@
 #include <thread>
 
 #ifndef _WIN32
+#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -363,13 +363,13 @@ auto posted_deadline_test() -> bool
 {
     event_loop loop;
     timer_wait_result distant = timer_wait_result::expired;
-    timer_wait_result near = timer_wait_result::cancelled;
+    timer_wait_result earlier = timer_wait_result::cancelled;
     task_handle<void> waiting;
     if (loop.spawn(wait_until(loop, event_loop::clock::now() + 1h, distant, false),
                    waiting) != task_spawn_result::accepted) return false;
     std::jthread poster([&] {
         std::this_thread::sleep_for(20ms);
-        stop_after_post(loop, near);
+        stop_after_post(loop, earlier);
     });
     const auto started = event_loop::clock::now();
     const bool stopped = loop.run() == event_loop_result::stopped;
@@ -378,7 +378,7 @@ auto posted_deadline_test() -> bool
     (void)waiting.cancel();
     loop.stop();
     (void)loop.run();
-    return stopped && near == timer_wait_result::expired && elapsed < 5s &&
+    return stopped && earlier == timer_wait_result::expired && elapsed < 5s &&
            distant == timer_wait_result::cancelled;
 }
 

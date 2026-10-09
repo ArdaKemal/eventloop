@@ -85,9 +85,13 @@ auto main() -> int
         check(wake.wake_requested && wake.event_count == 0,
               "cross-thread wake packet missing");
 
+        const auto started = std::chrono::steady_clock::now();
         loop.arm_timer(1ms);
         const auto timer = loop.poll(events);
-        check(timer.timer_requested, "IOCP deadline missing");
+        check(std::chrono::steady_clock::now() - started >= 1ms &&
+                  timer.event_count == 0 && !timer.wake_requested &&
+                  !timer.stop_requested && !timer.signal_requested,
+              "IOCP deadline missing");
         loop.arm_timer(std::nullopt);
 
         const SOCKET socket = ::WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP,

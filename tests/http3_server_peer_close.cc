@@ -45,10 +45,14 @@ auto make_certificate(const std::filesystem::path& directory) -> bool
     X509_gmtime_adj(X509_getm_notBefore(certificate.get()), -60);
     X509_gmtime_adj(X509_getm_notAfter(certificate.get()), 3600);
     X509_set_pubkey(certificate.get(), key.get());
-    auto* name = X509_get_subject_name(certificate.get());
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-        reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
-    X509_set_issuer_name(certificate.get(), name);
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name {
+        X509_NAME_new(), X509_NAME_free};
+    if (!name) return false;
+    if (X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) != 1)
+        return false;
+    if (X509_set_subject_name(certificate.get(), name.get()) != 1) return false;
+    if (X509_set_issuer_name(certificate.get(), name.get()) != 1) return false;
     std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> san {
         X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
                             const_cast<char*>("DNS:localhost")), X509_EXTENSION_free};

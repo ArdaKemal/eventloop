@@ -25,10 +25,13 @@ inline auto make_localhost_certificate(const std::filesystem::path& certificate_
     check(ASN1_TIME_set_string(X509_getm_notBefore(cert), "20260101000000Z") == 1);
     check(ASN1_TIME_set_string(X509_getm_notAfter(cert), "20300101000000Z") == 1);
     check(X509_set_pubkey(cert, key.get()) == 1);
-    auto* subject = X509_get_subject_name(cert);
-    check(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> subject {
+        X509_NAME_new(), X509_NAME_free};
+    check(subject != nullptr);
+    check(X509_NAME_add_entry_by_txt(subject.get(), "CN", MBSTRING_ASC,
         reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) == 1);
-    check(X509_set_issuer_name(cert, subject) == 1);
+    check(X509_set_subject_name(cert, subject.get()) == 1);
+    check(X509_set_issuer_name(cert, subject.get()) == 1);
     std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> san {
         X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
                           const_cast<char*>("DNS:localhost")), X509_EXTENSION_free};
