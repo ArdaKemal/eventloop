@@ -15,8 +15,11 @@ https_port)` returns 308 for every request.
 
 Connection tasks own sessions/I/O buffers and share document-root/router
 ownership with the listener. Small file reads/metadata calls are synchronous;
-large plain HTTP files use sendfile. Preserve component-by-component
-`O_NOFOLLOW` traversal. Parsers, sessions, and listing renderers are private.
+large plain HTTP files use sendfile. Static-file opens reject symlinks in every
+path component. Linux uses `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`;
+unavailable or blocked calls fall back to the component-by-component
+`O_NOFOLLOW` walk. Other platforms retain their component walk. Parsers,
+sessions, and listing renderers are private.
 
 ## Routing
 
@@ -93,8 +96,8 @@ All protocols use the same renderer and secure traversal.
 `open_file_cache_capacity` defaults to 0 (off), maximum 65536 regular files per
 server/loop. Each entry owns a descriptor/metadata; startup allocates storage,
 hits make no general-heap allocation. Decoded-path keys open/revalidate only
-through the `O_NOFOLLOW` walk. Hits within one second reuse file/metadata;
-later hits rewalk, reopening or dropping changed/replaced/removed files or
+through the shared secure traversal. Hits within one second reuse file/metadata;
+later hits reopen, replacing or dropping changed/replaced/removed files or
 symlinks. Replace files atomically: in-place edits may pair old metadata with
 new bytes during that interval.
 

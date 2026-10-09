@@ -4,8 +4,16 @@
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstring>
 #include <span>
 #include <utility>
+
+#if defined(__linux__) && __has_include(<linux/openat2.h>)
+#include <fcntl.h>
+#include <linux/openat2.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace eventloop::http::detail {
 namespace {
@@ -75,6 +83,25 @@ auto decode_target(std::string_view target, std::span<char> output) noexcept
 auto open_decoded(native_socket root, std::span<const char> path) noexcept
     -> unique_fd
 {
+#if defined(SYS_openat2) && defined(RESOLVE_NO_SYMLINKS)
+    std::string_view relative(path.data(), path.size());
+    if (relative.find('\0') != std::string_view::npos) return {};
+    while (relative.starts_with('/')) relative.remove_prefix(1);
+    if (relative.empty()) relative = ".";
+    if (relative.size() < 4096) {
+        std::array<char, 4096> name {};
+        std::memcpy(name.data(), relative.data(), relative.size());
+        const open_how how {
+            .flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+            .mode = 0,
+            .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        };
+        const auto descriptor = ::syscall(SYS_openat2, root, name.data(), &how, sizeof(how));
+        if (descriptor >= 0) return unique_fd(static_cast<int>(descriptor));
+        // Only unavailable or filtered syscalls use the component walk.
+        if (errno != ENOSYS && errno != EPERM) return {};
+    }
+#endif
     std::size_t start = 0;
     native_socket parent = root;
     unique_fd owned_parent;

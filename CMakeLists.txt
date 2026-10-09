@@ -1084,6 +1084,10 @@ if(BUILD_TESTING)
         target_link_libraries(http_open_file_cache_test PRIVATE eventloop::eventloop)
         target_compile_options(http_open_file_cache_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
         add_test(NAME http_open_file_cache COMMAND http_open_file_cache_test)
+        add_test(NAME http_open_file_cache_openat2_unavailable
+            COMMAND http_open_file_cache_test ENOSYS)
+        add_test(NAME http_open_file_cache_openat2_blocked
+            COMMAND http_open_file_cache_test EPERM)
 
         add_executable(http2_file_send_test tests/http2_file_send.cc)
         target_include_directories(http2_file_send_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

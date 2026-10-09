@@ -2,6 +2,8 @@
 
 #include <array>
 #include <chrono>
+#include <cerrno>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -10,7 +12,11 @@
 #include <string_view>
 
 #include <fcntl.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 using namespace eventloop;
@@ -53,8 +59,27 @@ auto contents(const static_file& file, std::size_t size) -> std::string
 
 } // namespace
 
-auto main() -> int
+auto main(int argc, char* argv[]) -> int
 {
+    if (argc == 2) {
+        const std::string_view error(argv[1]);
+        check(error == "ENOSYS" || error == "EPERM", "unknown syscall filter");
+#ifdef SYS_openat2
+        // Exercise the same traversal/cache tests with the Linux fast path
+        // unavailable or denied by a sandbox, without production test hooks.
+        std::array<sock_filter, 4> filter {{
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_openat2, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO |
+                static_cast<unsigned int>(error == "ENOSYS" ? ENOSYS : EPERM)),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        }};
+        sock_fprog program {static_cast<unsigned short>(filter.size()), filter.data()};
+        check(::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 &&
+              ::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == 0,
+              "install openat2 filter");
+#endif
+    }
     const auto directory = std::filesystem::temp_directory_path() /
         ("eventloop-open-file-cache-" + std::to_string(::getpid()));
     std::filesystem::remove_all(directory);
@@ -67,6 +92,36 @@ auto main() -> int
     const unique_fd root(::open(www.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     check(static_cast<bool>(root), "open root");
     const auto start = std::chrono::steady_clock::now();
+
+    {
+        std::filesystem::create_directory_symlink("assets", www / "linked-assets");
+        std::filesystem::create_directory_symlink(directory, www / "escape");
+        std::filesystem::create_symlink("assets/app.js", www / "app-link.js");
+        open_file_cache cache(4);
+        for (auto* files : {static_cast<open_file_cache*>(nullptr), &cache}) {
+            for (std::string_view target : {"/assets/app.js", "//assets//./app.js"}) {
+                auto file = open_static(root.get(), files, target);
+                check(file && contents(file->file, 5) == "first", "nested path");
+                check((::fcntl(file->file.get(), F_GETFD) & FD_CLOEXEC) != 0,
+                      "opened file is close-on-exec");
+            }
+            for (std::string_view target : {"/", "///", "/assets//"}) {
+                auto folder = open_static(root.get(), files, target);
+                check(folder && folder->info.kind == file_info::type::directory,
+                      "root and trailing directory slashes");
+            }
+            for (std::string_view target : {"/linked-assets/app.js", "/app-link.js",
+                    "/escape/secret.txt", "/assets/app.js/", "/assets/app.js/child",
+                    "/missing", "/assets/%2e%2e/secret.txt"}) {
+                check(!open_static(root.get(), files, target), "unsafe or invalid path");
+            }
+            // A full decode buffer cannot be NUL-terminated for openat2;
+            // retain the component walk's ability to open this valid path.
+            const std::string longest = "/assets/" + std::string(4083, '/') + "app.js";
+            auto file = open_static(root.get(), files, longest);
+            check(file && contents(file->file, 5) == "first", "maximum decoded path");
+        }
+    }
 
     {
         open_file_cache cache(4);

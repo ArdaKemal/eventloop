@@ -18,3 +18,7 @@ frame; a dedicated bounded worker completes on the owning loop.
   two >= 2. Full operation/worker capacity returns `EAGAIN`; shutdown or
   cancellation returns `ECANCELED`. Cancellation still waits for worker
   retirement and can follow an already performed file operation.
+
+A `preadv2(RWF_NOWAIT)` experiment was tested with Stonegate on 2026-10-09
+(1/4/64 KiB static files) and dropped after showing no attributable serving gain.
+Stonegate uses synchronous reads/sendfile and does not exercise `async_read_at`.

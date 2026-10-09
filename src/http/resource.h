@@ -22,13 +22,13 @@ enum class resource_error {
 [[nodiscard]] auto decode_target(std::string_view target, std::span<char> output) noexcept
     -> std::expected<std::size_t, resource_error>;
 
-// Opens a decoded path below root one component at a time with O_NOFOLLOW.
+// Opens a decoded path below root, rejecting symlinks in every component.
+// Linux uses openat2 when available, with the component walk as fallback.
 [[nodiscard]] auto open_decoded(native_socket root, std::span<const char> path) noexcept
     -> unique_fd;
 
-// Decode a request target and walk below root one component at a time.
-// Every opened component uses O_NOFOLLOW; open failures are left to the
-// caller to map to its protocol's response.
+// Decode a request target and open it below root without following symlinks.
+// Open failures are left to the caller to map to its protocol's response.
 [[nodiscard]] auto open_resource(native_socket root, std::string_view target) noexcept
     -> std::expected<unique_fd, resource_error>;
 
