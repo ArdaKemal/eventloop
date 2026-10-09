@@ -39,6 +39,15 @@ public:
     {
     }
 
+    // Empties the buffer for a new stream without rewriting the byte storage.
+    constexpr auto reset() noexcept -> void
+    {
+        bytes_.reset();
+        flow_limit_ = 0;
+        final_size_.reset();
+        fin_pending_ = fin_sent_ = fin_acked_ = false;
+    }
+
     [[nodiscard]] constexpr auto valid() const noexcept -> bool
     {
         return flow_limit_ <= max_varint_value;

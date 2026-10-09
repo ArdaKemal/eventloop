@@ -302,7 +302,9 @@ struct decoded_frame {
     };
     std::uint64_t length = 0;
     switch (frame.type) {
-    case 0x00: // PADDING: one byte per decoded frame.
+    case 0x00: // PADDING: a run of zero bytes decodes as one frame.
+        while (cursor < input.size() && input[cursor] == std::byte {0}) ++cursor;
+        break;
     case 0x01: // PING
     case 0x1e: // HANDSHAKE_DONE
         break;
