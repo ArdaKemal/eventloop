@@ -4,7 +4,8 @@
 // TLS, and the loop. Requests carry header values longer than the small-string
 // buffer, as browsers do, so HPACK decoding must reuse string capacity.
 // OpenSSL's own allocations are counted separately through its allocator
-// hook. Steady-state requests must not allocate in either.
+// hook. Steady-state requests must not allocate in either; OpenSSL is held to
+// that only with transmit kTLS.
 #include "eventloop/event_loop.h"
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
@@ -133,6 +134,7 @@ struct measurement {
     std::size_t routed_openssl {0};
     std::size_t static_openssl {0};
     std::size_t requests {0};
+    bool kernel_tls {false};
     bool done {false};
 };
 
@@ -207,6 +209,7 @@ auto client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> c
         secured = handshake && *handshake;
     }
     check(secured, "TLS handshake");
+    result.kernel_tls = peer->kernel_sendfile_available();
     constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     std::vector<std::byte> opening(std::as_bytes(std::span(preface)).begin(),
                                    std::as_bytes(std::span(preface)).end());
@@ -312,8 +315,14 @@ auto main() -> int
                   << result->routed << ", static " << result->static_files << "; OpenSSL routed "
                   << result->routed_openssl << ", static " << result->static_openssl << '\n';
     }
+    // Without transmit kTLS, OpenSSL builds each record itself and allocates
+    // small WPACKET metadata per record (as tls_openssl shows); only the
+    // kTLS path can be held to zero OpenSSL allocations.
+    if (!uncached.kernel_tls)
+        std::cout << "No transmit kTLS: OpenSSL record allocations are not checked\n";
     for (const auto* result : {&uncached, &cached})
         check(result->routed == 0 && result->static_files == 0 &&
-              result->routed_openssl == 0 && result->static_openssl == 0,
+              (!result->kernel_tls ||
+               (result->routed_openssl == 0 && result->static_openssl == 0)),
               "steady-state requests allocate");
 }
