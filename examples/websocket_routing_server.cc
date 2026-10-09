@@ -63,11 +63,7 @@ auto main(int argc, char** argv) -> int
         auto routes = std::make_shared<http::router>();
         if (!routes->add(http::method_type::connect, "/chat", chat) ||
             !routes->add(http::method_type::get, "/hello", hello)) return 1;
-        event_loop_options loop_options;
-        // HTTP/3 retains a 2 KiB request frame per live WebSocket. Allow the
-        // thirty-two request slots in the default server to stay occupied.
-        loop_options.coroutine_frame_capacities[4] = 64;
-        event_loop loop(loop_options);
+        event_loop loop;
         auto tls = std::make_unique<http::https_server>(loop, ip_endpoint::loopback_v4(port),
             tls_context::make_server(argv[1], argv[2]), http::server_options {.routes = routes});
         auto* listener = tls.get();

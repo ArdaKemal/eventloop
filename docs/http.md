@@ -38,8 +38,10 @@ TLS HTTP/2, and HTTPS HTTP/3. Build a router before passing it as
   `invalid_argument`, capacity `no_buffer_space`.
 - Handlers are free coroutines `task<void>(event_loop&, request&, response&)`;
   coroutine lambdas cannot supply the required first loop argument for frame
-  allocation. Fit the default 1024-byte class (10240 slots); larger classes
-  have few slots. Frame exhaustion answers 503. `route_context()` returns the
+  allocation. Fit the default 1024-byte class (10240 slots); the 2048- and
+  4096-byte classes default to 2048 and 64 slots. HTTPS connection frames may
+  exceed 1 KiB and use the 2048-byte class, which bounds concurrent TLS
+  connections per loop; raise it for more. Frame exhaustion answers 503. `route_context()` returns the
   registration pointer; it must outlive every server using the router.
 
 ## Requests
