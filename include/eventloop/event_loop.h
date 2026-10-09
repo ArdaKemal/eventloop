@@ -141,11 +141,11 @@ struct event_loop_options {
     std::size_t file_io_depth {128};
     // Per-loop maximum coroutine-frame slots by payload size class. Growth is
     // bounded by these limits; a zero capacity disables a class. Slots are
-    // backed only as frames need them. The 1 KiB class defaults to 10,240
-    // slots for the 10k-connection target; smaller classes keep small frames
-    // from spilling into it, and the 2 KiB class holds TLS connection frames.
+    // backed only as frames need them. The defaults let one loop hold 10k
+    // HTTPS connections: TLS connection frames exceed 1 KiB, and HTTP/2 keeps
+    // several sub-1 KiB frames per connection.
     std::array<std::size_t, 6> coroutine_frame_capacities {
-        8192, 8192, 8192, 10240, 2048, 64,
+        8192, 8192, 10240, 32768, 10240, 64,
     };
     // Warm slots allocated when the loop is constructed. Further slots are
     // added in bounded slabs as needed and empty growth slabs are released.

@@ -31,7 +31,7 @@ exhaustion rejects that connection without stopping the listener; peer
 unidirectional-frame exhaustion closes it with H3_INTERNAL_ERROR.
 
 Static headers/I/O use scratch; listings and OpenSSL may allocate separately.
-Request frames use the 2048-byte class (2048 slots by default, shared with
+Request frames use the 2048-byte class (10240 slots by default, shared with
 HTTPS connections); raise `event_loop_options::coroutine_frame_capacities` for
 more concurrency.
 Handshake datagrams stay bounded at 1200 bytes; path MTU discovery is absent, so lower
