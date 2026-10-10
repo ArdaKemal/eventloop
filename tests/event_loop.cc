@@ -367,7 +367,7 @@ auto posted_deadline_test() -> bool
     task_handle<void> waiting;
     if (loop.spawn(wait_until(loop, event_loop::clock::now() + 1h, distant, false),
                    waiting) != task_spawn_result::accepted) return false;
-    std::jthread poster([&] {
+    std::thread poster([&] {
         std::this_thread::sleep_for(20ms);
         stop_after_post(loop, earlier);
     });
@@ -398,7 +398,7 @@ auto interrupted_wait_test() -> bool
         task_spawn_result::accepted) return false;
     std::atomic<bool> done {false};
     const auto target = pthread_self();
-    std::jthread interrupter([&] {
+    std::thread interrupter([&] {
         while (!done.load()) {
             (void)pthread_kill(target, SIGUSR1);
             std::this_thread::sleep_for(2ms);
@@ -461,7 +461,7 @@ auto run_ready_ring(ready_ring& ring, Drive&& drive) -> bool
     std::vector<tcp_stream*> streams;
     for (std::size_t pair = 0; pair < ring_pairs; ++pair) {
         int sockets[2] {};
-        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == -1)
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == -1)
             return false;
         for (int side = 0; side < 2; ++side) {
             auto stream = std::make_unique<tcp_stream>(loop, unique_fd(sockets[side]));
@@ -512,7 +512,7 @@ auto ready_ring_post_test() -> bool
     ready_ring ring;
     const bool ran = run_ready_ring(ring, [&](event_loop& loop) {
         std::atomic<bool> requested {false};
-        std::jthread poster([&] {
+        std::thread poster([&] {
             while (!requested.load(std::memory_order_acquire)) {}
             const auto published = ring.completions.load(std::memory_order_relaxed);
             if (!loop.post(execution_task([&loop, &ring, published]() noexcept {
@@ -521,6 +521,7 @@ auto ready_ring_post_test() -> bool
         });
         ring.trigger = [&] { requested.store(true, std::memory_order_release); };
         (void)loop.run();
+        poster.join();
     });
     if (!ran || ring.delay >= 2 * batch_capacity)
         std::cerr << "ready ring post delay " << ring.delay << '\n';
@@ -623,7 +624,9 @@ auto skipped_poll_tests() -> bool
     constexpr int calls = 16;
     {
         event_loop loop;
-        if (::raise(SIGTERM) != 0) return false;
+        // Process-directed, like an external SIGTERM: macOS kqueue does not
+        // report a signal raised on one thread.
+        if (::kill(::getpid(), SIGTERM) != 0) return false;
         bool interrupted = false;
         for (int call = 0; call < calls && !interrupted; ++call) {
             if (loop.spawn(yield_then_stop(loop)) != task_spawn_result::accepted)
@@ -633,7 +636,7 @@ auto skipped_poll_tests() -> bool
         if (!interrupted) return false;
     }
     int sockets[2] {};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == -1)
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == -1)
         return false;
     event_loop loop;
     unique_fd peer(sockets[1]);
