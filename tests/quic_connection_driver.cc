@@ -134,6 +134,36 @@ static auto receive_packet(event_loop&,udp_socket& peer,std::span<std::byte> buf
     -> task<std::expected<udp_datagram,std::error_code>>
 { co_return co_await peer.async_receive_from(buffer); }
 
+// Retries and tiny packets while closing are throttled, not answered at once.
+// Separate from lost_close so each frame fits the largest frame class even
+// with unoptimized compilers.
+static auto closing_limits(event_loop& loop,connection_driver& driver,bounded_connection& server,
+    udp_endpoint& endpoint,udp_socket& peer,buffers& storage,std::size_t size,
+    std::span<const std::byte> cached,lifecycle_duration pto,lifecycle_time_point deadline)
+    -> task<void>
+{
+    auto input=std::as_writable_bytes(std::span(storage.plaintext));
+    // A full-sized retry earns credit, but cannot trigger a second immediate
+    // response. It is answered at the next PTO without extending retention.
+    check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(size)),
+                                      endpoint.local_endpoint())).has_value());
+    auto throttled=co_await with_timeout(loop,receive_packet(loop,peer,input),10ms);
+    check((throttled && throttled->state==timeout_result<
+        std::expected<udp_datagram,std::error_code>>::outcome::timed_out));
+    auto third=co_await peer.async_receive_from(input);
+    check(third && std::ranges::equal(input.first(third->size),cached));
+    check(server.core().next_deadline(pto)==deadline);
+    // Even a validated address cannot amplify unauthenticated closing traffic.
+    std::array<std::byte,32> tiny {};
+    tiny[0]=std::byte{0x40};
+    std::memcpy(tiny.data()+1,dcid.data(),dcid.size());
+    check((co_await peer.async_send_to(tiny,endpoint.local_endpoint())).has_value());
+    auto withheld=co_await with_timeout(loop,receive_packet(loop,peer,input),10ms);
+    check((withheld && withheld->state==timeout_result<
+        std::expected<udp_datagram,std::error_code>>::outcome::timed_out));
+    while (!driver.retired()) check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
+}
+
 // The raw peer intentionally ignores the first close and sends another packet.
 // It must receive the cached close while the driver retains its route (10.2).
 static auto lost_close(event_loop& loop,connection_driver& driver,bounded_connection& server,
@@ -163,25 +193,7 @@ static auto lost_close(event_loop& loop,connection_driver& driver,bounded_connec
     auto second=co_await peer.async_receive_from(input);
     check(second && std::ranges::equal(input.first(second->size),cached));
     check(server.core().next_deadline(pto)==deadline);
-    // A full-sized retry earns credit, but cannot trigger a second immediate
-    // response. It is answered at the next PTO without extending retention.
-    check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*size)),
-                                      endpoint.local_endpoint())).has_value());
-    auto throttled=co_await with_timeout(loop,receive_packet(loop,peer,input),10ms);
-    check((throttled && throttled->state==timeout_result<
-        std::expected<udp_datagram,std::error_code>>::outcome::timed_out));
-    auto third=co_await peer.async_receive_from(input);
-    check(third && std::ranges::equal(input.first(third->size),cached));
-    check(server.core().next_deadline(pto)==deadline);
-    // Even a validated address cannot amplify unauthenticated closing traffic.
-    std::array<std::byte,32> tiny {};
-    tiny[0]=std::byte{0x40};
-    std::memcpy(tiny.data()+1,dcid.data(),dcid.size());
-    check((co_await peer.async_send_to(tiny,endpoint.local_endpoint())).has_value());
-    auto withheld=co_await with_timeout(loop,receive_packet(loop,peer,input),10ms);
-    check((withheld && withheld->state==timeout_result<
-        std::expected<udp_datagram,std::error_code>>::outcome::timed_out));
-    while (!driver.retired()) check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
+    (void)co_await closing_limits(loop,driver,server,endpoint,peer,storage,*size,cached,pto,*deadline);
     check(server.core().state()==connection_state::closed);
     check(lifecycle_time_point::clock::now()>=*deadline);
     done=true;

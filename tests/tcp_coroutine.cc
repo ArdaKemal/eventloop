@@ -358,9 +358,8 @@ auto duplicate_accept_and_close() -> bool
         return false;
     }
     owner->close();
-    // Root frames completed by close() are retired when the loop next drains
-    // completed roots.
-    loop.stop();
+    // IOCP reports the cancelled accept later; run until every root retires.
+    loop.shutdown(event_loop::clock::duration::zero());
     (void)loop.run();
     return pending == ECANCELED && duplicate == EBUSY &&
            closed_descriptor(descriptor) &&
