@@ -178,9 +178,10 @@ auto blocking_child(event_loop& loop, std::atomic<bool>& release,
     co_return 8;
 }
 auto worker_race_root(event_loop& loop, std::atomic<bool>& release,
-                      bool& cancelled, bool& passed) -> task<void>
+                      std::atomic<bool>& started, bool& cancelled, bool& passed)
+    -> task<void>
 {
-    auto result = co_await race(blocking_child(loop, release, cancelled),
+    auto result = co_await race(blocking_child(loop, release, cancelled, &started),
                                 later(loop, 2, 1ms, passed));
     passed = result && result->index == 1 && cancelled &&
              release.load(std::memory_order_acquire);
@@ -191,24 +192,26 @@ auto worker_race_test() -> bool
     options.worker_count = 1;
     event_loop loop(options);
     std::atomic<bool> release {false};
+    std::atomic<bool> started {false};
     bool cancelled = false;
     bool passed = false;
     if (loop.spawn(stop_when_done(
-            loop, worker_race_root(loop, release, cancelled, passed))) !=
-            task_spawn_result::accepted ||
-        loop.spawn(release_after(loop, release, 5ms)) !=
-            task_spawn_result::accepted) {
-        return false;
-    }
+            loop, worker_race_root(loop, release, started, cancelled, passed))) !=
+        task_spawn_result::accepted) return false;
+    // Cancel while the worker runs the function, as in timeout_shutdown_test.
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    if (loop.spawn(release_after(loop, release, 5ms)) !=
+        task_spawn_result::accepted) return false;
     (void)loop.run();
     return passed && loop.coroutine_statistics().active_roots == 0;
 }
 // Expiry cancels the worker operation and resumes only after it retires.
 auto worker_timeout_root(event_loop& loop, std::atomic<bool>& release,
-                         bool& cancelled, bool& passed) -> task<void>
+                         std::atomic<bool>& started, bool& cancelled, bool& passed)
+    -> task<void>
 {
     auto result = co_await with_timeout(
-        loop, blocking_child(loop, release, cancelled), 1ms);
+        loop, blocking_child(loop, release, cancelled, &started), 1ms);
     passed = result && result->state == timeout_result<int>::outcome::timed_out &&
              cancelled && release.load(std::memory_order_acquire);
 }
@@ -218,15 +221,16 @@ auto worker_timeout_test() -> bool
     options.worker_count = 1;
     event_loop loop(options);
     std::atomic<bool> release {false};
+    std::atomic<bool> started {false};
     bool cancelled = false;
     bool passed = false;
     if (loop.spawn(stop_when_done(
-            loop, worker_timeout_root(loop, release, cancelled, passed))) !=
-            task_spawn_result::accepted ||
-        loop.spawn(release_after(loop, release, 5ms)) !=
-            task_spawn_result::accepted) {
-        return false;
-    }
+            loop, worker_timeout_root(loop, release, started, cancelled, passed))) !=
+        task_spawn_result::accepted) return false;
+    // Cancel while the worker runs the function, as in timeout_shutdown_test.
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    if (loop.spawn(release_after(loop, release, 5ms)) !=
+        task_spawn_result::accepted) return false;
     (void)loop.run();
     return passed && loop.coroutine_statistics().active_roots == 0;
 }
