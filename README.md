@@ -25,6 +25,11 @@ build configuration directory. `EVENTLOOP_WINDOWS_TLS` defaults to `ON`;
 turning it off omits TLS/WebSocket and HTTP/2 support, but still requires
 OpenSSL for QUIC.
 
+`-DEVENTLOOP_FUZZ=ON` (Clang 19+) builds `parser_fuzzer`, a libFuzzer target
+for the HTTP/1.1, HPACK, QPACK, HTTP/3 request-frame, and QUIC packet/frame
+parsers. Add `-fsanitize=address,undefined,fuzzer-no-link` to
+`CMAKE_CXX_FLAGS` to instrument the library too, as CI does.
+
 ## Link from your project
 
 ```sh

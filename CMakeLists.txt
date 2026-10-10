@@ -5,6 +5,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+option(EVENTLOOP_FUZZ "Build the libFuzzer parser target (Clang only)" OFF)
 option(EVENTLOOP_HTTP3_INTEROP_TESTS
     "Enable optional outbound HTTP/3 v1/v2 tests using aioquic 1.3.0" OFF)
 function(eventloop_register_http3_interop_tests)
@@ -1789,3 +1790,14 @@ if(BUILD_TESTING)
 endif()
 
 eventloop_register_http3_interop_tests()
+
+if(EVENTLOOP_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "EVENTLOOP_FUZZ requires Clang")
+    endif()
+    add_executable(parser_fuzzer tests/fuzz/parsers.cc)
+    target_include_directories(parser_fuzzer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(parser_fuzzer PRIVATE eventloop::eventloop)
+    target_compile_options(parser_fuzzer PRIVATE -fsanitize=fuzzer)
+    target_link_options(parser_fuzzer PRIVATE -fsanitize=fuzzer)
+endif()
