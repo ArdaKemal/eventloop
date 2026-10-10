@@ -61,6 +61,9 @@ public:
         bool receive_abandoned {false};
         bool accepted {false};
         bool occupied {false};
+        // Ranges of this stream in occupied sent records; the slot cannot
+        // retire while any are outstanding.
+        std::size_t in_flight {0};
     };
 
     explicit bounded_connection(endpoint_role role, connection_callbacks callbacks,
@@ -112,6 +115,8 @@ public:
         if (const auto applied = core_.apply_retry(dcid); !applied) return applied;
         if (!recovery_.reset(1200)) return std::unexpected(connection_error::invalid_state);
         for (auto& record : sent_) record = {};
+        sent_keys_.fill(no_record);
+        for (auto& slot : slots_) slot.in_flight = 0;
         return {};
     }
 
@@ -180,7 +185,13 @@ public:
         return *id;
     }
     [[nodiscard]] auto stream(std::uint64_t id) noexcept -> stream_slot*
-    { check_owner(); for (auto& s : slots_) if (s.occupied && s.id == id) return &s; return nullptr; }
+    {
+        check_owner();
+        // Scan the compact id array rather than the large slots.
+        for (std::size_t i = 0; i < slot_ids_.size(); ++i)
+            if (slot_ids_[i] == id) return &slots_[i];
+        return nullptr;
+    }
     [[nodiscard]] auto stream_slots() noexcept -> std::span<stream_slot>
     { check_owner(); return slots_; }
     [[nodiscard]] auto stream_slots() const noexcept -> std::span<const stream_slot>
@@ -203,7 +214,7 @@ public:
         check_owner();
         if (static_cast<std::size_t>(level) >= 3)
             return std::unexpected(connection_error::invalid_configuration);
-        if (std::ranges::none_of(sent_, [](const auto& r) { return !r.occupied; }))
+        if (std::ranges::find(sent_keys_, no_record) == sent_keys_.end())
             return std::unexpected(connection_error::capacity_exceeded);
         if (!recovery_.preflight_record(static_cast<packet_number_space>(level), packet, probe))
             return std::unexpected(connection_error::capacity_exceeded);
@@ -324,17 +335,17 @@ public:
             !stream_credit_pending_[0] && !stream_credit_pending_[1])
             return {};
         decoded_frame frame;
-        for (auto& s : slots_) if (s.occupied && s.reset_pending) {
+        for (auto* active : active_slots()) if (auto& s = *active; s.reset_pending) {
             frame.type = 4; frame.stream_id = s.id;
             frame.final_size = *s.state.send_final_size();
             frame.error_code = s.reset_error; return frame;
         }
-        for (auto& s : slots_) if (s.occupied && s.stop_sending_pending) {
+        for (auto* active : active_slots()) if (auto& s = *active; s.stop_sending_pending) {
             frame.type = 5; frame.stream_id = s.id;
             frame.error_code = s.stop_sending_error; return frame;
         }
         if (data_credit_pending_) { frame.type = 0x10; frame.limit = flow_.receive_max_data(); return frame; }
-        for (auto& s : slots_) if (s.occupied && s.credit_pending) {
+        for (auto* active : active_slots()) if (auto& s = *active; s.credit_pending) {
             frame.type = 0x11; frame.stream_id = s.id; frame.limit = s.receive_limit; return frame;
         }
         stream_control_pending_ = false;
@@ -438,9 +449,9 @@ public:
         const auto space = static_cast<packet_number_space>(level);
         if (static_cast<std::size_t>(level) >= 3 || ranges.size() > frames_per_packet)
             return std::unexpected(connection_error::invalid_configuration);
-        packet_record* record = nullptr;
-        for (auto& candidate : sent_) if (!candidate.occupied) { record = &candidate; break; }
-        if (!record) return std::unexpected(connection_error::capacity_exceeded);
+        const auto free_key = std::ranges::find(sent_keys_, no_record);
+        if (free_key == sent_keys_.end()) return std::unexpected(connection_error::capacity_exceeded);
+        auto* record = &sent_[static_cast<std::size_t>(free_key - sent_keys_.begin())];
         auto next_flow = flow_.stage_send<frames_per_packet>();
         std::array<stream_slot*, frames_per_packet> range_streams {};
         std::size_t range_index = 0;
@@ -460,10 +471,13 @@ public:
             return std::unexpected(connection_error::capacity_exceeded);
         next_flow.commit();
         record->occupied = true; record->space = space; record->number = packet.number;
+        *free_key = record_key(space, packet.number);
         record->carried_ack_largest = carried_ack_largest;
         record->count = ranges.size();
         std::copy(ranges.begin(), ranges.end(), record->ranges.begin());
         record->stream_slots = range_streams;
+        for (std::size_t j = 0; j < ranges.size(); ++j)
+            if (!ranges[j].crypto) ++range_streams[j]->in_flight;
         range_index = 0;
         for (const auto& range : ranges) {
             if (range.crypto) {
@@ -569,6 +583,7 @@ private:
             if (s.occupied) continue;
             if (!flow_.add_stream(id, send_limit, receive_limit)) return nullptr;
             s.id = id; s.occupied = true; s.state = *stream_state::create(id, role);
+            slot_ids_[static_cast<std::size_t>(&s - slots_.data())] = id;
             s.receive_window = s.receive_limit = receive_limit;
             s.receive.emplace(s.bytes, s.coverage, receive_limit);
             (void)s.send.extend_flow_limit(send_limit);
@@ -612,18 +627,7 @@ private:
         while (active < active_count_) {
             auto& slot = *active_slots_[active];
             if (!slot.occupied || !slot.state.closed()) { ++active; continue; }
-            bool outstanding = false;
-            for (const auto& packet : sent_) {
-                if (!packet.occupied) continue;
-                for (std::size_t i = 0; i < packet.count; ++i) {
-                    if (!packet.ranges[i].crypto && packet.ranges[i].stream_id == slot.id) {
-                        outstanding = true;
-                        break;
-                    }
-                }
-                if (outstanding) break;
-            }
-            if (outstanding || !registry_.close(slot.id)) { ++active; continue; }
+            if (slot.in_flight != 0 || !registry_.close(slot.id)) { ++active; continue; }
             const auto peer = stream_initiator(slot.id) != local_role;
             const auto direction = stream_type(slot.id);
             (void)flow_.remove_stream(slot.id);
@@ -636,6 +640,7 @@ private:
             slot.reset_error = slot.stop_sending_error = 0;
             slot.stop_sending_pending = slot.receive_abandoned = false;
             slot.accepted = slot.occupied = false;
+            slot_ids_[static_cast<std::size_t>(&slot - slots_.data())] = no_stream;
             std::move(active_slots_.begin() + active + 1,
                 active_slots_.begin() + active_count_,
                 active_slots_.begin() + active);
@@ -647,18 +652,27 @@ private:
             }
         }
     }
+    auto release(packet_record& record) noexcept -> void
+    {
+        for (std::size_t j = 0; j < record.count; ++j)
+            if (!record.ranges[j].crypto && record.stream_slots[j] != nullptr)
+                --record.stream_slots[j]->in_flight;
+        record.occupied = false;
+        sent_keys_[static_cast<std::size_t>(&record - sent_.data())] = no_record;
+    }
     auto retire(std::size_t count) noexcept -> bool
     {
         for (std::size_t i = 0; i < count; ++i) {
             const auto& retired = retired_[i];
-            for (auto& record : sent_) {
-                if (!record.occupied || record.space != retired.space || record.number != retired.packet.number) continue;
+            const auto key = std::ranges::find(sent_keys_, record_key(retired.space, retired.packet.number));
+            if (key != sent_keys_.end()) {
+                auto& record = sent_[static_cast<std::size_t>(key - sent_keys_.begin())];
                 if (retired.reason == retirement_reason::discarded) {
-                    record.occupied = false;
+                    release(record);
                     if (retirement_callback_) retirement_callback_(retirement_argument_,
                         static_cast<tls_level>(record.space), record.number,
                         retirement_reason::discarded);
-                    break;
+                    continue;
                 }
                 if (retired.reason == retirement_reason::acknowledged &&
                     record.space == packet_number_space::application_data) {
@@ -686,11 +700,10 @@ private:
                         if (s->send.complete() && !s->state.all_data_acked()) return false;
                     }
                 }
-                record.occupied = false;
+                release(record);
                 if (retirement_callback_) retirement_callback_(retirement_argument_,
                     static_cast<tls_level>(record.space), record.number,
                     retired.reason);
-                break; // Packet numbers are unique within their number space.
             }
         }
         retire_closed_streams();
@@ -784,10 +797,28 @@ private:
     flow_control<stream_capacity> flow_;
     std::array<stream_slot, stream_capacity> slots_;
     std::array<stream_slot*, stream_capacity> active_slots_ {};
+    // Stream id of each occupied slot, no_stream otherwise (ids stay below 2^62).
+    static constexpr std::uint64_t no_stream = ~std::uint64_t {0};
+    std::array<std::uint64_t, stream_capacity> slot_ids_ = [] {
+        std::array<std::uint64_t, stream_capacity> ids {};
+        ids.fill(no_stream);
+        return ids;
+    }();
     std::size_t active_count_ {0};
     recovery_orchestration<packet_capacity> recovery_;
     path_recovery_state<4> path_recovery_ {};
     std::array<packet_record, packet_capacity * 3> sent_ {};
+    // Space and number of each occupied record in sent_, no_record otherwise,
+    // so lookups scan 3 KiB instead of the records themselves.
+    static constexpr std::uint64_t no_record = ~std::uint64_t {0};
+    static constexpr auto record_key(packet_number_space space, std::uint64_t number) noexcept
+        -> std::uint64_t
+    { return number << 2 | static_cast<std::uint64_t>(space); }
+    std::array<std::uint64_t, packet_capacity * 3> sent_keys_ = [] {
+        std::array<std::uint64_t, packet_capacity * 3> keys {};
+        keys.fill(no_record);
+        return keys;
+    }();
     std::array<retired_packet, packet_capacity * 3> retired_ {};
     peer_connection_id_registry<8> peer_ids_;
     local_connection_id_registry<8> local_ids_;
