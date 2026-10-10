@@ -343,12 +343,44 @@ public:
     bool too_large {false};
 };
 
+// Stops the connection deadline while a request is in progress and restarts
+// it with the idle timeout after the last one; until the first request, the
+// deadline from accept keeps running.
+class idle_deadline {
+public:
+    idle_deadline(http::detail::connection_deadline& deadline,
+                  std::chrono::milliseconds timeout) noexcept
+        : deadline_(deadline), timeout_(timeout) {}
+
+    auto update(const session& state) -> void
+    {
+        if (!state.idle()) {
+            if (!busy_) deadline_.stop();
+            busy_ = true;
+        } else if (busy_) {
+            busy_ = false;
+            deadline_.start(timeout_);
+        }
+    }
+
+    [[nodiscard]] auto deadline() noexcept -> http::detail::connection_deadline&
+    {
+        return deadline_;
+    }
+
+private:
+    http::detail::connection_deadline& deadline_;
+    std::chrono::milliseconds timeout_;
+    bool busy_ {false};
+};
+
 struct connection_state {
     connection_state(event_loop& loop, tls_stream& peer, session& state,
                      const http::router& routes, native_socket root,
-                     http::detail::open_file_cache* files, bool directory_listing)
+                     http::detail::open_file_cache* files, bool directory_listing,
+                     idle_deadline deadline)
         : loop(loop), peer(peer), state(state), routes(routes), root(root), files(files),
-          directory_listing(directory_listing)
+          directory_listing(directory_listing), deadline(deadline)
     {
         for (auto& exchange : exchanges) exchange.owner = this;
     }
@@ -401,6 +433,7 @@ struct connection_state {
     native_socket root;
     http::detail::open_file_cache* files;
     bool directory_listing;
+    idle_deadline deadline;
     std::array<http2_exchange, max_concurrent_streams> exchanges {};
     std::array<std::optional<task_handle<void>>, max_concurrent_streams> handlers {};
     std::coroutine_handle<> reader_waiter;
@@ -760,6 +793,7 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
         connection.batching = false;
         connection.drain();
         if (connection.broken || state.closed()) co_return;
+        connection.deadline.update(state);
         const auto buffer = state.read_buffer();
         if (buffer.empty()) {
             if (!co_await park(connection.reader_waiter,
@@ -779,13 +813,13 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
 auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
                   http::detail::open_file_cache* files, bool directory_listing,
                   const http::router& routes,
-                  std::uint64_t max_request_body) -> task<bool>
+                  std::uint64_t max_request_body, idle_deadline deadline) -> task<bool>
 {
     // Session, task slots and exchanges are allocated once per connection.
     auto state = std::make_unique<session>(peer.kernel_sendfile_available(), &routes,
                                            max_request_body);
     auto connection = std::make_unique<connection_state>(loop, peer, *state, routes, root,
-                                                         files, directory_listing);
+                                                         files, directory_listing, deadline);
     state->set_release_hook(&connection_state::released, connection.get());
     task_handle<void> reader;
     if (loop.spawn(read_loop(loop, *connection), reader) != task_spawn_result::accepted)
@@ -813,7 +847,9 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
             break;
         }
         if (connection->broken) break;
-        // Cancellation (server close or loop shutdown) ends the connection.
+        connection->deadline.update(*state);
+        // Cancellation (server close, loop shutdown, or the connection
+        // deadline) ends the connection.
         if (!co_await park(connection->writer_waiter,
                            connection->broken || state->has_output() || state->closed()))
             break;
@@ -839,19 +875,23 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
 auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
            std::shared_ptr<http::detail::document_root> document_root,
            bool directory_listing, std::shared_ptr<const http::router> routes,
-           std::uint64_t max_request_body) -> task<bool>
+           std::uint64_t max_request_body, http::detail::connection_deadline& deadline,
+           std::chrono::milliseconds idle_timeout) -> task<bool>
 {
     if (routes) {
         try {
             co_return (co_await serve_routed(loop, peer, document_root->descriptor.get(),
                                              document_root->cache.get(), directory_listing,
-                                             *routes, max_request_body)).value_or(false);
+                                             *routes, max_request_body,
+                                             idle_deadline {deadline, idle_timeout}))
+                .value_or(false);
         } catch (...) {
             co_return false;
         }
     }
     try {
         auto state = std::make_unique<session>(peer.kernel_sendfile_available());
+        idle_deadline idle {deadline, idle_timeout};
         request incoming;
         for (;;) {
             while (state->pop_request(incoming)) {
@@ -877,6 +917,7 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
             }
             if (state->closed()) co_return true;
 
+            idle.update(*state);
             auto received = operation_result(
                 co_await peer.async_read_some(state->read_buffer()));
             if (!received || *received == 0) co_return false;

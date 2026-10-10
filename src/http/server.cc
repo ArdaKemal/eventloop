@@ -3,6 +3,7 @@
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 #include "../http2/connection.h"
 #endif
+#include "connection_deadline.h"
 #include "file_operations.h"
 #include "http1_exchange.h"
 #include "parser.h"
@@ -40,14 +41,16 @@ using detail::parse_status;
 struct connection_options {
     std::shared_ptr<const router> routes;
     std::uint64_t max_request_body {0};
+    std::chrono::milliseconds header_timeout {};
+    std::chrono::milliseconds idle_timeout {};
     bool directory_listing {false};
     bool enable_http2 {false};
 };
 
 [[nodiscard]] auto for_connection(const server_options& options) -> connection_options
 {
-    return {options.routes, options.max_request_body, options.directory_listing,
-            options.enable_http2};
+    return {options.routes, options.max_request_body, options.header_timeout,
+            options.idle_timeout, options.directory_listing, options.enable_http2};
 }
 
 // An empty document root means routes only; static requests answer 404.
@@ -138,6 +141,10 @@ template<typename Stream>
     Stream* peer = nullptr;
     bool registered = false;
     try {
+        // Expiry cancels this task, so the pending read or handshake fails.
+        auto deadline = std::make_unique<detail::connection_deadline>(
+            loop, co_await detail::current_cancellation {});
+        deadline->start(options.header_timeout);
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         if constexpr (std::is_same_v<Stream, tls_stream>) {
             socket = std::make_unique<tls_stream>(
@@ -167,7 +174,7 @@ template<typename Stream>
             if (options.enable_http2 && peer->application_protocol() == "h2") {
                 const auto served = co_await http2::detail::serve(
                     loop, *peer, root, options.directory_listing, options.routes,
-                    options.max_request_body);
+                    options.max_request_body, *deadline, options.idle_timeout);
                 if (served && *served) {
                     const auto closed = co_await peer->async_close();
                     (void)closed;
@@ -203,6 +210,8 @@ template<typename Stream>
                     state->receive(std::span {&excess, std::size_t {1}});
                     break;
                 }
+                // The deadline runs from accept, or restarts after a response.
+                if (!deadline->running()) deadline->start(options.idle_timeout);
                 auto received = operation_result(co_await peer->async_read_some(buffer));
                 if (!received || *received == 0) {
                     peer->close();
@@ -210,6 +219,7 @@ template<typename Stream>
                 }
                 state->commit_read(*received);
             }
+            deadline->stop();
             if (state->closed()) break;
             if (state->routed()) {
                 const auto kept = co_await detail::http1_exchange<Stream>::serve(loop, *exchange);
