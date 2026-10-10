@@ -354,13 +354,21 @@ public:
 
     auto update(const session& state) -> void
     {
-        if (!state.idle()) {
+        // After GOAWAY the session closes itself once its streams finish.
+        if (state.going_away()) {
+            deadline_.stop();
+        } else if (!state.idle()) {
             if (!busy_) deadline_.stop();
             busy_ = true;
         } else if (busy_) {
             busy_ = false;
             deadline_.start(timeout_);
         }
+    }
+
+    [[nodiscard]] auto deadline() noexcept -> http::detail::connection_deadline&
+    {
+        return deadline_;
     }
 
 private:
@@ -378,6 +386,20 @@ struct connection_state {
           directory_listing(directory_listing), deadline(deadline)
     {
         for (auto& exchange : exchanges) exchange.owner = this;
+        this->deadline.deadline().on_drain = &goaway;
+        this->deadline.deadline().drain_context = this;
+    }
+    connection_state(const connection_state&) = delete;
+    auto operator=(const connection_state&) -> connection_state& = delete;
+    ~connection_state() { deadline.deadline().on_drain = nullptr; }
+
+    // The server drains: no new streams, and the writer ends the connection
+    // once the open ones finish.
+    static auto goaway(void* context) -> void
+    {
+        auto& self = *static_cast<connection_state*>(context);
+        self.state.goaway();
+        self.drain();
     }
 
     // Resumes parked tasks whose condition holds; reentrant calls repeat the

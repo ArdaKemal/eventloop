@@ -447,7 +447,7 @@ auto session::closed() const noexcept -> bool
 {
     if (output_size_ != 0 || file_send_active_) return false;
     if (fatal_) return true;
-    if (!peer_goaway_) return false;
+    if (!goaway_) return false;
     return std::none_of(streams_.begin(), streams_.end(),
                         [](const stream& value) { return value.active; });
 }
@@ -649,7 +649,7 @@ auto session::dispatch_frame() -> void
         } else if (frame_payload_size_ < 8) {
             connection_error(frame_size_error);
         } else {
-            peer_goaway_ = true;
+            goaway_ = true;
         }
         break;
     case window_update_frame: dispatch_window_update(); break;
@@ -706,7 +706,7 @@ auto session::dispatch_headers() -> void
             header_closed_reply_ = *reason == closed_reason::peer_reset;
         } else {
             last_stream_id_ = frame_stream_id_;
-            value = peer_goaway_ ? nullptr : allocate_stream(frame_stream_id_);
+            value = goaway_ ? nullptr : allocate_stream(frame_stream_id_);
             if (value == nullptr) {
                 header_refused_ = true;
                 record_closed(frame_stream_id_, closed_reason::local_reset);
@@ -1538,6 +1538,18 @@ auto session::stream_error(std::uint32_t id, std::uint32_t error) -> void
         return;
     }
     if (auto* value = find_stream(id)) reset_stream(*value, closed_reason::local_reset);
+}
+
+auto session::goaway() -> void
+{
+    if (fatal_ || goaway_) return;
+    std::array<std::byte, 8> payload {};
+    write_u32(payload.data(), last_stream_id_ & 0x7fffffffu);
+    if (!append_frame(goaway_frame, 0, 0, payload)) {
+        fatal_ = true;
+        return;
+    }
+    goaway_ = true;
 }
 
 auto session::connection_error(std::uint32_t error) -> void

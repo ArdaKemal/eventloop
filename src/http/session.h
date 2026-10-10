@@ -23,6 +23,8 @@ struct file_info;
 struct route_state {
     const router* routes {nullptr};
     std::uint64_t max_request_body {0};
+    // Set while the server drains: responses close the connection.
+    const bool* draining {nullptr};
     parsed_request request;
     route_match match;
     std::size_t head_size {0};

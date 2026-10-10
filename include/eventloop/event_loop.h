@@ -199,9 +199,11 @@ public:
     auto run() -> event_loop_result;
     auto stop() -> void;
 
-    // Stops accepting new handlers, asks existing handlers to drain, and
-    // force-closes any that remain at the deadline. A second call forces the
-    // shutdown immediately. Shutdown is terminal for this event loop.
+    // Stops accepting new handlers, cancels every active root task, and
+    // closes built-in sockets; other handlers are removed at the deadline.
+    // In-flight HTTP responses are not drained; see http::server's
+    // async_drain(). A second call forces the shutdown immediately.
+    // Shutdown is terminal for this event loop.
     auto shutdown(clock::duration timeout) -> void;
     auto add(std::unique_ptr<tcp_acceptor> handler) -> void;
     auto add(std::unique_ptr<tcp_stream> handler) -> void;

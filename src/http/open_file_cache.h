@@ -1,5 +1,7 @@
 #pragma once
 
+#include "connection_deadline.h"
+
 #include "file_operations.h"
 #include "resource.h"
 #include "eventloop/native_socket.h"
@@ -97,9 +99,12 @@ private:
 
 // The document root a server shares with its connections, and its optional
 // open-file cache.
+// State a server shares with its connection tasks, which keep it alive after
+// the listener is gone.
 struct document_root {
     unique_fd descriptor;
     std::unique_ptr<open_file_cache> cache;
+    connection_registry connections;
 };
 
 // Opens target below root through cache when it is set, otherwise as

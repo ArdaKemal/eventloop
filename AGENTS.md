@@ -46,7 +46,8 @@ only for measured paths, separately from startup and handshakes.
   `async_send_file` takes file ownership. Socket `close()` cancels and removes
   registered handlers; a loop-owned stream pointer may then be invalid.
 - `shutdown()` cancels active roots immediately; built-in socket handlers close
-  in `on_shutdown()`. The grace deadline does not drain HTTP responses.
+  in `on_shutdown()`. The grace deadline does not drain HTTP responses;
+  TCP HTTP servers' `async_drain()` does.
   Timer/shutdown deadlines saturate at the latest representable time point.
 - HTTP connection tasks own session state and share document roots/routers
   across listener removal. Preserve component-by-component `O_NOFOLLOW`

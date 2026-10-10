@@ -26,6 +26,12 @@ public:
     ~server() override;
 
     [[nodiscard]] auto run() -> task<void>;
+    // Closes the listener at once; the object may be destroyed by this call.
+    // Connections waiting for a request close, and the others close after
+    // the request in progress: HTTP/1.1 adds connection: close to routed
+    // responses, HTTP/2 sends GOAWAY. Connections still open after grace
+    // are cancelled. Completes once every connection has closed.
+    [[nodiscard]] auto async_drain(event_loop::clock::duration grace) -> task<void>;
 
 private:
     static auto accept_loop(event_loop& loop, server& listener,
@@ -45,6 +51,8 @@ public:
     ~https_server() override;
 
     [[nodiscard]] auto run() -> task<void>;
+    // As server::async_drain().
+    [[nodiscard]] auto async_drain(event_loop::clock::duration grace) -> task<void>;
 
 private:
     static auto accept_loop(event_loop& loop, https_server& listener,

@@ -10,6 +10,7 @@
 #include "open_file_cache.h"
 #include "session.h"
 #include "../socket_operations.h"
+#include "eventloop/task_composition.h"
 #include "eventloop/tcp_stream.h"
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 #include "eventloop/tls_stream.h"
@@ -143,7 +144,7 @@ template<typename Stream>
     try {
         // Expiry cancels this task, so the pending read or handshake fails.
         auto deadline = std::make_unique<detail::connection_deadline>(
-            loop, co_await detail::current_cancellation {});
+            loop, co_await detail::current_cancellation {}, root->connections);
         deadline->start(options.header_timeout);
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         if constexpr (std::is_same_v<Stream, tls_stream>) {
@@ -192,6 +193,7 @@ template<typename Stream>
             routing = std::make_unique<detail::route_state>();
             routing->routes = options.routes.get();
             routing->max_request_body = options.max_request_body;
+            routing->draining = &root->connections.draining;
         }
         auto state = std::make_unique<detail::session>(root->descriptor.get(),
             options.directory_listing, routing.get(), static_cast<bool>(root->descriptor),
@@ -397,6 +399,27 @@ struct redirect_state {
     }
 }
 
+auto wait_closed(event_loop& loop, detail::connection_registry& registry) -> task<void>
+{
+    (void)loop;
+    while (registry.count != 0) {
+        if (!co_await registry.drained->async_wait()) co_return;
+    }
+}
+
+auto drain_connections(event_loop& loop, std::shared_ptr<detail::document_root> root,
+                       event_loop::clock::duration grace) -> task<void>
+{
+    auto& registry = root->connections;
+    if (!registry.drained) registry.drained.emplace(loop);
+    detail::connection_deadline::drain(registry, false);
+    const auto drained = co_await with_timeout(loop, wait_closed(loop, registry), grace);
+    if (drained && drained->state == timeout_result<void>::outcome::cancelled) co_return;
+    if (registry.count == 0) co_return;
+    detail::connection_deadline::drain(registry, true);
+    (void)co_await wait_closed(loop, registry);
+}
+
 } // namespace
 
 server::server(event_loop& loop, ip_endpoint local, server_options options)
@@ -410,6 +433,14 @@ server::~server() = default;
 auto server::run() -> task<void>
 {
     return accept_loop(owner(), *this, root_descriptor_, options_);
+}
+
+auto server::async_drain(event_loop::clock::duration grace) -> task<void>
+{
+    auto& loop = owner();
+    auto root = root_descriptor_;
+    close();
+    return drain_connections(loop, std::move(root), grace);
 }
 
 auto server::accept_loop(event_loop& loop, server& listener,
@@ -443,6 +474,14 @@ https_server::~https_server() = default;
 auto https_server::run() -> task<void>
 {
     return accept_loop(owner(), *this, root_descriptor_, context_, options_);
+}
+
+auto https_server::async_drain(event_loop::clock::duration grace) -> task<void>
+{
+    auto& loop = owner();
+    auto root = root_descriptor_;
+    close();
+    return drain_connections(loop, std::move(root), grace);
 }
 
 auto https_server::accept_loop(event_loop& loop, https_server& listener,

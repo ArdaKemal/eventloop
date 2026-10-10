@@ -33,6 +33,8 @@ First versioned release.
   head or idle between requests.
 - A route handler that throws answers 500 instead of terminating the process;
   an exception leaving a directly awaited task is rethrown in the awaiting task.
+- `server::async_drain()` and `https_server::async_drain()` stop accepting and
+  let requests in progress finish before shutdown, with a grace deadline.
 
 ### Quality
 

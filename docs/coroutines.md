@@ -90,8 +90,8 @@ loop dequeues completion.
 - `shutdown(timeout)` is terminal: it stops registrations, cancels all active
   roots immediately, and calls handlers' `on_shutdown()`. Built-in acceptors/
   streams close immediately. The deadline bounds remaining registered handlers;
-  it does not drain HTTP responses. A second call removes remaining handlers
-  immediately.
+  it does not drain HTTP responses; await the servers' `async_drain()` first.
+  A second call removes remaining handlers immediately.
 
 ## Wakeups
 

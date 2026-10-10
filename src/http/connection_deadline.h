@@ -1,32 +1,62 @@
 #pragma once
 
 #include "eventloop/event_loop.h"
+#include "eventloop/wakeup.h"
 
 #include <coroutine>
+#include <cstddef>
+#include <optional>
 
 namespace eventloop::http::detail {
+
+class connection_deadline;
+
+// The open connections of one server, shared by its listener and connection
+// tasks so the server can drain them.
+struct connection_registry {
+    connection_deadline* head {nullptr};
+    std::size_t count {0};
+    bool draining {false};
+    // Draining ran past its grace: cancel every connection.
+    bool forced {false};
+    // Set while draining; notified when the last connection closes.
+    std::optional<wakeup> drained;
+};
 
 // Ends a connection task whose wait outlasts its deadline. Expiry requests
 // cancellation of the task's coroutine chain, so pending I/O completes with
 // ECANCELED and the task closes its stream. The connection task owns it.
+// While the server drains, a started deadline expires at once.
 class connection_deadline {
 public:
     connection_deadline(event_loop& loop,
-                        eventloop::detail::coroutine_cancellation_state& task) noexcept
-        : loop_(loop), task_(task)
+                        eventloop::detail::coroutine_cancellation_state& task,
+                        connection_registry& registry) noexcept
+        : loop_(loop), task_(task), registry_(registry), next_(registry.head)
     {
         timer_.cancellation.operation = this;
         timer_.expire = &expire;
+        if (next_ != nullptr) next_->previous_ = this;
+        registry.head = this;
+        ++registry.count;
     }
     connection_deadline(const connection_deadline&) = delete;
     auto operator=(const connection_deadline&) -> connection_deadline& = delete;
-    ~connection_deadline() { stop(); }
+    ~connection_deadline()
+    {
+        stop();
+        if (previous_ != nullptr) previous_->next_ = next_;
+        else registry_.head = next_;
+        if (next_ != nullptr) next_->previous_ = previous_;
+        if (--registry_.count == 0 && registry_.drained) registry_.drained->notify();
+    }
 
-    // Restarts the deadline; zero only stops it.
+    // Restarts the deadline; zero only stops it unless the server drains.
     auto start(event_loop::clock::duration timeout) -> void
     {
         stop();
-        if (timeout <= event_loop::clock::duration::zero()) return;
+        if (registry_.draining) timeout = {};
+        else if (timeout <= event_loop::clock::duration::zero()) return;
         timer_.deadline = eventloop::detail::deadline_after(timeout);
         timer_.owner = &loop_;
         eventloop::detail::coroutine_frame_access::register_timer(loop_, timer_);
@@ -37,16 +67,47 @@ public:
     }
     [[nodiscard]] auto running() const noexcept -> bool { return timer_.owner != nullptr; }
 
+    // Called once from the timer when the server starts draining, instead of
+    // cancelling the connection; HTTP/2 uses it to send GOAWAY and end the
+    // connection itself once its streams finish.
+    void (*on_drain)(void* context) {nullptr};
+    void* drain_context {nullptr};
+
+    // Starts draining: connections waiting for a request close, others close
+    // after their requests finish. With force, every connection closes now.
+    // Each connection reacts from its timer, never inside this loop.
+    static auto drain(connection_registry& registry, bool force) -> void
+    {
+        registry.draining = true;
+        registry.forced = force;
+        for (auto* deadline = registry.head; deadline != nullptr; deadline = deadline->next_) {
+            if (force || deadline->running() || deadline->on_drain != nullptr)
+                deadline->start({});
+        }
+    }
+
 private:
     static auto expire(eventloop::detail::coroutine_timer_node& timer) noexcept -> void
     {
         auto& self = *static_cast<connection_deadline*>(timer.cancellation.operation);
+        if (self.registry_.draining && !self.registry_.forced && self.on_drain != nullptr &&
+            !self.drain_notified_) {
+            self.drain_notified_ = true;
+            try {
+                self.on_drain(self.drain_context);
+                return;
+            } catch (...) {}
+        }
         eventloop::detail::coroutine_frame_access::request_cancellation(self.task_);
     }
 
     event_loop& loop_;
     eventloop::detail::coroutine_cancellation_state& task_;
+    connection_registry& registry_;
+    connection_deadline* previous_ {nullptr};
+    connection_deadline* next_ {nullptr};
     eventloop::detail::coroutine_timer_node timer_ {};
+    bool drain_notified_ {false};
 };
 
 // co_await yields the awaiting task's cancellation state without suspending.

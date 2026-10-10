@@ -15,6 +15,7 @@
 
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -95,6 +96,13 @@ auto serve(event_loop& loop, http::server& server) -> task<void>
     (void)co_await server.run();
 }
 
+// Lets requests in progress finish, for up to five seconds.
+auto drain(event_loop& loop, http::server& server) -> task<void>
+{
+    (void)co_await server.async_drain(std::chrono::seconds {5});
+    loop.stop();
+}
+
 } // namespace
 
 auto main(int argc, char** argv) -> int
@@ -123,6 +131,12 @@ auto main(int argc, char** argv) -> int
             return 1;
         }
         std::cout << "Routing on http://127.0.0.1:" << port << '\n';
+        // SIGINT or SIGTERM: stop accepting, drain, then shut down.
+        if (loop.run() == event_loop_result::interrupted &&
+            loop.spawn(drain(loop, *server)) == task_spawn_result::accepted) {
+            (void)loop.run();
+        }
+        loop.shutdown(event_loop::clock::duration::zero());
         (void)loop.run();
         return 0;
     } catch (const std::exception& error) {

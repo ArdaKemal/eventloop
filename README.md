@@ -91,7 +91,8 @@ Root test fixtures are in `tests/fixtures/`; benchmarks are in `benchmark/`.
 - Socket endpoints are numeric IPv4/IPv6; applications resolve DNS separately.
   Wayfarer and the WebSocket client use a bounded worker for resolution.
 - Shutdown cancels active roots immediately. Its grace timeout does not let
-  built-in HTTP responses drain.
+  built-in HTTP responses drain; HTTP servers' `async_drain()` does, and the
+  [routing server](examples/routing_server.cc) uses it on SIGINT/SIGTERM.
 
 ## Protocol scope
 

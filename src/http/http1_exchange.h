@@ -393,7 +393,10 @@ private:
             add("\r\n");
         }
         if (self.chunked_) add("transfer-encoding: chunked\r\n");
-        if (self.routing_.request.close_after_response) add("connection: close\r\n");
+        auto& parsed = self.routing_.request;
+        if (self.routing_.draining != nullptr && *self.routing_.draining)
+            parsed.close_after_response = true;
+        if (parsed.close_after_response) add("connection: close\r\n");
         add("\r\n");
 
         const auto pieces = 2 + headers.size() * 4;

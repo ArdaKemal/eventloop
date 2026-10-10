@@ -129,6 +129,10 @@ public:
     auto resume_input() -> void;
     // No complete request is being answered.
     [[nodiscard]] auto idle() const noexcept -> bool;
+    // Sends GOAWAY without an error and refuses later streams; the session
+    // closes once its streams finish.
+    auto goaway() -> void;
+    [[nodiscard]] auto going_away() const noexcept -> bool { return goaway_; }
 
 private:
     enum class connect_state : std::uint8_t { none, unsupported, websocket, accepted };
@@ -276,7 +280,8 @@ private:
     bool got_first_settings_ = false;
     bool server_settings_acked_ = false;
     bool fatal_ = false;
-    bool peer_goaway_ = false;
+    // Either side sent GOAWAY: no new streams.
+    bool goaway_ = false;
     bool stalled_ = false;
     std::size_t held_input_ = 0;
     std::size_t stalled_need_ = 0;

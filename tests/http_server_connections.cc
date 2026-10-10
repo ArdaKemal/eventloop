@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -70,11 +71,19 @@ auto slow(event_loop& loop, http::request&, http::response& response) -> task<vo
     (void)co_await response.async_send(200, {}, bytes("ok"));
 }
 
+// Outlasts any drain grace in this test.
+auto hang(event_loop& loop, http::request&, http::response& response) -> task<void>
+{
+    (void)co_await sleep_for(loop, 5s);
+    (void)co_await response.async_send(200, {}, bytes("late"));
+}
+
 auto routes() -> std::shared_ptr<http::router>
 {
     auto table = std::make_shared<http::router>();
     check(table->add(http::method_type::get, "/fast", fast).has_value(), "route");
     check(table->add(http::method_type::get, "/slow", slow).has_value(), "route");
+    check(table->add(http::method_type::get, "/hang", hang).has_value(), "route");
     return table;
 }
 
@@ -109,15 +118,17 @@ auto write_all(event_loop& loop, Stream& stream, std::string_view data) -> task<
 
 // Reads until text arrives; false if the connection closes first.
 template<typename Stream>
-auto read_until(event_loop& loop, Stream& stream, std::string_view text) -> task<bool>
+auto read_until(event_loop& loop, Stream& stream, std::string_view text,
+                std::string* received = nullptr) -> task<bool>
 {
     (void)loop;
-    std::string received;
+    std::string local;
+    auto& data = received != nullptr ? *received : local;
     std::array<std::byte, 1024> buffer {};
-    while (received.find(text) == std::string::npos) {
+    while (data.find(text) == std::string::npos) {
         const auto size = transferred(co_await stream.async_read_some(buffer));
         if (size == 0) co_return false;
-        received.append(reinterpret_cast<const char*>(buffer.data()), size);
+        data.append(reinterpret_cast<const char*>(buffer.data()), size);
     }
     co_return true;
 }
@@ -261,6 +272,91 @@ auto http2_silent(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_cont
     check_closed_after(closed - start, header_timeout, "HTTP/2 without a request");
 }
 
+// Drains the server and reports when every connection has closed.
+auto drain(event_loop& loop, task<void> draining, clock_type::time_point& done) -> task<void>
+{
+    (void)loop;
+    check(co_await std::move(draining) == task_result::success, "drain");
+    done = clock_type::now();
+}
+
+auto refused(event_loop& loop, std::uint16_t port) -> task<bool>
+{
+    auto owned = std::make_unique<tcp_stream>(loop, ip_endpoint::loopback_v4(port));
+    auto* peer = owned.get();
+    loop.add(std::move(owned));
+    const bool connected = static_cast<bool>(co_await peer->async_connect());
+    co_return !connected;
+}
+
+// An idle keep-alive connection closes at once; a request in progress gets
+// its response with connection: close; the listener stops accepting.
+auto plain_drain(event_loop& loop, http::server& server, std::uint16_t port) -> task<void>
+{
+    auto* idle = (co_await connect(loop, port)).value();
+    const auto sent = co_await write_all(loop, *idle, "GET /fast HTTP/1.1\r\nHost: a\r\n\r\n");
+    check(sent && *sent && (co_await read_until(loop, *idle, "\r\n\r\nok")).value_or(false),
+          "idle connection response");
+    auto* busy = (co_await connect(loop, port)).value();
+    const auto busy_sent = co_await write_all(loop, *busy, "GET /slow HTTP/1.1\r\nHost: a\r\n\r\n");
+    check(busy_sent && *busy_sent, "send slow request");
+    (void)co_await sleep_for(loop, 50ms);
+
+    const auto start = clock_type::now();
+    auto done = clock_type::time_point::max();
+    check(loop.spawn(drain(loop, server.async_drain(5s), done)) == task_spawn_result::accepted,
+          "spawn drain");
+    const auto idle_closed = (co_await read_until_closed(loop, *idle)).value();
+    check(idle_closed - start < 200ms, "drain closes an idle connection at once");
+    check((co_await refused(loop, port)).value_or(false), "drain stops accepting");
+    std::string response;
+    check((co_await read_until(loop, *busy, "\r\n\r\nok", &response)).value_or(false),
+          "request in progress completes");
+    check(response.find("connection: close\r\n") != std::string::npos,
+          "response in progress closes the connection");
+    (void)co_await read_until_closed(loop, *busy);
+    while (done == clock_type::time_point::max()) (void)co_await sleep_for(loop, 5ms);
+    check(done - start < 2s, "drain completes when the last request does");
+}
+
+// A request outlasting the grace is cancelled without a response.
+auto drain_grace(event_loop& loop, http::server& server, std::uint16_t port) -> task<void>
+{
+    auto* peer = (co_await connect(loop, port)).value();
+    const auto sent = co_await write_all(loop, *peer, "GET /hang HTTP/1.1\r\nHost: a\r\n\r\n");
+    check(sent && *sent, "send hanging request");
+    (void)co_await sleep_for(loop, 50ms);
+    const auto start = clock_type::now();
+    auto done = clock_type::time_point::max();
+    check(loop.spawn(drain(loop, server.async_drain(200ms), done)) == task_spawn_result::accepted,
+          "spawn drain");
+    std::string response;
+    check(!(co_await read_until(loop, *peer, "late", &response)).value_or(true) &&
+          response.empty(), "cancelled request sends nothing");
+    check_closed_after(clock_type::now() - start, 200ms, "drain grace");
+    while (done == clock_type::time_point::max()) (void)co_await sleep_for(loop, 5ms);
+}
+
+// HTTP/2: GOAWAY, then the response in progress, then a clean close.
+auto http2_drain(event_loop& loop, http::https_server& server, std::uint16_t port,
+                 std::shared_ptr<tls_context> context) -> task<void>
+{
+    auto* peer = (co_await connect_tls(loop, port, std::move(context), "h2")).value();
+    const auto sent = co_await write_all(loop, *peer, http2_request);
+    check(sent && *sent, "send h2 request");
+    (void)co_await sleep_for(loop, 50ms);
+    auto done = clock_type::time_point::max();
+    check(loop.spawn(drain(loop, server.async_drain(5s), done)) == task_spawn_result::accepted,
+          "spawn drain");
+    std::string received;
+    constexpr auto goaway = "\x00\x00\x08\x07\x00\x00\x00\x00\x00\x00\x00\x00\x01"sv;
+    check((co_await read_until(loop, *peer, goaway, &received)).value_or(false), "GOAWAY");
+    check((co_await read_until(loop, *peer, "ok", &received)).value_or(false),
+          "h2 request in progress completes");
+    (void)co_await read_until_closed(loop, *peer);
+    while (done == clock_type::time_point::max()) (void)co_await sleep_for(loop, 5ms);
+}
+
 auto port_of(const tcp_acceptor& listener) -> std::uint16_t
 {
     sockaddr_in address {};
@@ -287,7 +383,8 @@ auto run_case(event_loop& loop, std::unique_ptr<Server> listener, Client client)
     auto* server = listener.get();
     loop.add(std::move(listener));
     check(loop.spawn(server->run()) == task_spawn_result::accepted, "spawn server");
-    check(loop.spawn(stop_after(loop, client(port_of(*server)))) == task_spawn_result::accepted,
+    check(loop.spawn(stop_after(loop, client(*server, port_of(*server)))) ==
+              task_spawn_result::accepted,
           "spawn client");
     task_handle<void> timer;
     check(loop.spawn(watchdog(loop), timer) == task_spawn_result::accepted, "spawn watchdog");
@@ -304,11 +401,19 @@ auto main() -> int
     const auto plain = [](auto client) {
         event_loop loop;
         run_case(loop, std::make_unique<http::server>(loop, ip_endpoint::loopback_v4(0), options()),
-                 [&](std::uint16_t port) { return client(loop, port); });
+                 [&](http::server& server, std::uint16_t port) {
+                     if constexpr (std::is_invocable_v<decltype(client), event_loop&,
+                                                       http::server&, std::uint16_t>)
+                         return client(loop, server, port);
+                     else
+                         return client(loop, port);
+                 });
     };
     plain([](event_loop& loop, std::uint16_t port) { return silent(loop, port, "HTTP/1.1 silent"); });
     plain(trickle);
     plain(plain_keep_alive);
+    plain(plain_drain);
+    plain(drain_grace);
 
     const auto directory = std::filesystem::temp_directory_path() /
         ("eventloop-connections-" + std::to_string(::getpid()));
@@ -320,8 +425,14 @@ auto main() -> int
         event_loop loop;
         run_case(loop, std::make_unique<http::https_server>(loop, ip_endpoint::loopback_v4(0),
                      tls_context::make_server(certificate, key), options()),
-                 [&](std::uint16_t port) {
-                     return client(loop, port, tls_context::make_client(certificate));
+                 [&](http::https_server& server, std::uint16_t port) {
+                     auto context = tls_context::make_client(certificate);
+                     if constexpr (std::is_invocable_v<decltype(client), event_loop&,
+                                       http::https_server&, std::uint16_t,
+                                       std::shared_ptr<tls_context>>)
+                         return client(loop, server, port, std::move(context));
+                     else
+                         return client(loop, port, std::move(context));
                  });
     };
     secure([](event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context>) {
@@ -330,5 +441,6 @@ auto main() -> int
     secure(tls_keep_alive);
     secure(http2_silent);
     secure(http2_idle);
+    secure(http2_drain);
     std::filesystem::remove_all(directory);
 }

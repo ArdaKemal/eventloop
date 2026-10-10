@@ -23,6 +23,13 @@ socket without a response. Running handlers are not timed: bound body reads
 and response writes in the handler, for example with `with_timeout`.
 HTTP/3 connections use the QUIC idle timeout instead.
 
+`async_drain(grace)` on `server`/`https_server` stops accepting and closes the
+listener at once (the object may be destroyed). Connections waiting for a
+request close; others close after their request in progress, with
+`connection: close` on routed HTTP/1.1 responses and GOAWAY on HTTP/2.
+Connections open after `grace` are cancelled. The task completes once every
+connection has closed; then `event_loop::shutdown()` has none left to cut off.
+
 Connection tasks own sessions/I/O buffers and share document-root/router
 ownership with the listener. Small file reads/metadata calls are synchronous;
 large plain HTTP files use sendfile. Static-file opens reject symlinks in every
