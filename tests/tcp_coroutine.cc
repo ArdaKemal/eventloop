@@ -15,6 +15,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <cstdio>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -596,7 +597,10 @@ auto send_opened_file(event_loop& loop, tcp_stream& socket,
         const auto sent = co_await socket.async_send_file(
             header, std::move(*opened), 5, sizeof("payload") - 1);
         passed = sent.has_value() && ::lseek(position.get(), 0, SEEK_CUR) == 0;
-    }
+        std::fprintf(stderr, "DIAG send_file sent=%d error=%d lseek=%ld\n", sent.has_value() ? 1 : 0,
+                     !sent ? -1 : (*sent ? 0 : sent->error().value()),
+                     static_cast<long>(::lseek(position.get(), 0, SEEK_CUR)));
+    } else std::fprintf(stderr, "DIAG openat error=%d\n", opened.error().value());
     socket.close();
     stop_after_two(loop, completed);
 }
@@ -614,6 +618,7 @@ auto receive_opened_file(event_loop& loop, tcp_stream& socket,
         received += *result;
     }
     passed = received == buffer.size();
+    std::fprintf(stderr, "DIAG received=%zu\n", received);
     for (std::size_t i = 0; passed && i < buffer.size(); ++i)
         passed = std::to_integer<char>(buffer[i]) == expected[i];
     socket.close();

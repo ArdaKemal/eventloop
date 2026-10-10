@@ -216,9 +216,10 @@ auto udp_socket::receive_awaiter::cancel(
 {
     auto& self = *static_cast<receive_awaiter*>(node.operation);
     detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
-    if (detail::socket_operations::datagram_cancel(
-            self.socket_, self.operation_)) self.socket_.close();
-    else self.socket_.complete_receive(-ECANCELED);
+    // A submitted IOCP operation reports ECANCELED from its completion; the
+    // socket stays open, as on readiness backends.
+    if (!detail::socket_operations::datagram_cancel(self.socket_, self.operation_))
+        self.socket_.complete_receive(-ECANCELED);
 }
 
 udp_socket::send_awaiter::send_awaiter(
@@ -285,9 +286,10 @@ auto udp_socket::send_awaiter::cancel(
 {
     auto& self = *static_cast<send_awaiter*>(node.operation);
     detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
-    if (detail::socket_operations::datagram_cancel(
-            self.socket_, self.operation_)) self.socket_.close();
-    else self.socket_.complete_send(-ECANCELED);
+    // A submitted IOCP operation reports ECANCELED from its completion; the
+    // socket stays open, as on readiness backends.
+    if (!detail::socket_operations::datagram_cancel(self.socket_, self.operation_))
+        self.socket_.complete_send(-ECANCELED);
 }
 
 auto udp_socket::update_interest() -> void
