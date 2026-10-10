@@ -190,19 +190,13 @@ auto open_request(event_loop&, quic_connection& connection) -> task<std::uint64_
     co_return *id;
 }
 
-auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outcome& result)
+constexpr std::array<std::byte, 3> settings {std::byte {0}, std::byte {4}, std::byte {0}};
+
+// The scenarios are separate coroutines so each frame fits the loop's largest
+// frame class even with unoptimized compilers.
+auto stream_errors(event_loop& loop, quic_connection& connection, outcome& result)
     -> task<void>
 {
-    auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
-    if (!connected) { result.done = true; co_return; }
-    auto connection = std::move(*connected);
-    const auto control = flatten_result(co_await connection.async_open_stream(
-        quic_stream_direction::unidirectional));
-    const std::array<std::byte, 3> settings {std::byte {0}, std::byte {4}, std::byte {0}};
-    if (!control || !(co_await send(loop, connection, *control, settings, false)).value_or(false)) {
-        result.done = true;
-        co_return;
-    }
     std::error_code error;
 
     // 1. Uppercase field names make a request malformed: H3_MESSAGE_ERROR on
@@ -211,6 +205,8 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outco
     (void)co_await send(loop, connection, id, get("/hello.txt", {{"X-Upper", "1"}}), true);
     auto status = (co_await response_status(loop, connection, id, error)).value_or(0);
     result.malformed_reset = status == 0 && error == reset_error;
+    // Let the server retire the reset stream's request slot.
+    (void)co_await sleep_for(loop, 20ms);
 
     // 2. With one request slot, a request held open after its response keeps
     // the slot; the next request is rejected (H3_REQUEST_REJECTED).
@@ -222,6 +218,8 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outco
     error = {};
     const auto rejected = (co_await response_status(loop, connection, id, error)).value_or(0);
     result.rejected = status == 200 && rejected == 0 && error == reset_error;
+    std::fprintf(stderr, "DIAG held=%d rejected=%d error=%d %s\n", static_cast<int>(status),
+                 static_cast<int>(rejected), error.value(), error.message().c_str());
     (void)co_await send(loop, connection, held, {}, true);
     (void)co_await sleep_for(loop, 20ms);
 
@@ -232,11 +230,17 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outco
     (void)co_await send(loop, connection, id, frame(h3::data_frame, "ab"), false);
     result.content_length_stopped = status == 200 &&
         (co_await stopped_after(loop, connection, id)).value_or(false);
+}
+
+auto trailer_errors(event_loop& loop, quic_connection& connection, outcome& result)
+    -> task<void>
+{
+    std::error_code error;
 
     // 4. A pseudo-header in trailers.
-    id = (co_await open_request(loop, connection)).value_or(0);
+    auto id = (co_await open_request(loop, connection)).value_or(0);
     (void)co_await send(loop, connection, id, get("/hello.txt"), false);
-    status = (co_await response_status(loop, connection, id, error)).value_or(0);
+    auto status = (co_await response_status(loop, connection, id, error)).value_or(0);
     (void)co_await send(loop, connection, id, headers({{":path", "/"}}), false);
     result.trailers_stopped = status == 200 &&
         (co_await stopped_after(loop, connection, id)).value_or(false);
@@ -254,39 +258,61 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outco
     id = (co_await open_request(loop, connection)).value_or(0);
     (void)co_await send(loop, connection, id, get("/hello.txt"), true);
     result.survived = (co_await response_status(loop, connection, id, error)).value_or(0) == 200;
+}
 
+auto frame_order_error(event_loop& loop, quic_connection& connection, outcome& result)
+    -> task<void>
+{
     // 7. DATA before HEADERS is H3_FRAME_UNEXPECTED: the server closes the
     // connection with CONNECTION_CLOSE instead of leaving an idle timeout.
-    id = (co_await open_request(loop, connection)).value_or(0);
+    const auto id = (co_await open_request(loop, connection)).value_or(0);
     (void)co_await send(loop, connection, id, frame(h3::data_frame, "x"), true);
     const auto started = event_loop::clock::now();
-    error = {};
-    status = (co_await response_status(loop, connection, id, error)).value_or(0);
+    std::error_code error;
+    const auto status = (co_await response_status(loop, connection, id, error)).value_or(0);
     result.connection_closed = status == 0 && error && error != reset_error &&
         event_loop::clock::now() - started < 2s;
+}
 
+auto cancel_push_error(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
+                       outcome& result) -> task<void>
+{
     // 8. CANCEL_PUSH names an ID the server never promised: H3_ID_ERROR closes
     // this second connection, even though the ID is within MAX_PUSH_ID.
-    auto push_connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
-    if (!push_connected) { result.done = true; co_return; }
-    auto push_connection = std::move(*push_connected);
-    const auto push_control = flatten_result(co_await push_connection.async_open_stream(
+    auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
+    if (!connected) co_return;
+    auto connection = std::move(*connected);
+    const auto control = flatten_result(co_await connection.async_open_stream(
         quic_stream_direction::unidirectional));
-    if (!push_control) { result.done = true; co_return; }
-    if (!(co_await send(loop, push_connection, *push_control, settings, false)).value_or(false)) {
-        result.done = true;
+    if (!control || !(co_await send(loop, connection, *control, settings, false)).value_or(false))
         co_return;
-    }
     auto push_frames = frame(0x0d, "\x05"); // MAX_PUSH_ID 5
     const auto cancel = frame(0x03, "\x05"); // CANCEL_PUSH 5
     push_frames.insert(push_frames.end(), cancel.begin(), cancel.end());
-    const auto probe = (co_await open_request(loop, push_connection)).value_or(0);
+    const auto probe = (co_await open_request(loop, connection)).value_or(0);
     const auto control_sent =
-        (co_await send(loop, push_connection, *push_control, push_frames, false)).value_or(false);
-    error = {};
-    (void)co_await send(loop, push_connection, probe, get("/hello.txt"), true);
-    status = (co_await response_status(loop, push_connection, probe, error)).value_or(0);
+        (co_await send(loop, connection, *control, push_frames, false)).value_or(false);
+    std::error_code error;
+    (void)co_await send(loop, connection, probe, get("/hello.txt"), true);
+    const auto status = (co_await response_status(loop, connection, probe, error)).value_or(0);
     result.cancel_push_closed = control_sent && status == 0 && error && error != reset_error;
+}
+
+auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outcome& result)
+    -> task<void>
+{
+    auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
+    if (connected) {
+        auto connection = std::move(*connected);
+        const auto control = flatten_result(co_await connection.async_open_stream(
+            quic_stream_direction::unidirectional));
+        if (control && (co_await send(loop, connection, *control, settings, false)).value_or(false)) {
+            (void)co_await stream_errors(loop, connection, result);
+            (void)co_await trailer_errors(loop, connection, result);
+            (void)co_await frame_order_error(loop, connection, result);
+            (void)co_await cancel_push_error(loop, endpoint, server, result);
+        }
+    }
     result.done = true;
 }
 
@@ -328,6 +354,9 @@ auto main() -> int
         check(loop.spawn(watch(loop, server, endpoint, result)) ==
                   task_spawn_result::accepted, "spawn watch");
         (void)loop.run();
+        const auto stats = loop.coroutine_statistics();
+        std::fprintf(stderr, "DIAG frame allocation failures=%zu high=%zu\n",
+                     stats.allocation_failures, stats.high_watermark);
     }
     std::filesystem::remove_all(directory);
     check(result.malformed_reset, "malformed request resets only its stream");

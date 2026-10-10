@@ -299,7 +299,8 @@ auto duplicate_and_close() -> bool
         return false;
     }
     socket->close();
-    loop.stop();
+    // IOCP reports the cancelled receive later; run until every root retires.
+    loop.shutdown(event_loop::clock::duration::zero());
     (void)loop.run();
     return cancelled && rejected && closed_socket(descriptor) &&
            loop.coroutine_statistics().live == 0;

@@ -58,11 +58,13 @@ auto make_certificate(const std::filesystem::path& directory) -> bool
                             const_cast<char*>("DNS:localhost")), X509_EXTENSION_free};
     if (!san || X509_add_ext(certificate.get(), san.get(), -1) != 1) return false;
     if (X509_sign(certificate.get(), key.get(), EVP_sha256()) <= 0) return false;
-    struct closer { auto operator()(FILE* f) const noexcept -> void { std::fclose(f); } };
-    std::unique_ptr<FILE, closer> cert {std::fopen((directory / "cert.pem").string().c_str(), "wb")};
-    std::unique_ptr<FILE, closer> pkey {std::fopen((directory / "key.pem").string().c_str(), "wb")};
-    return cert && pkey && PEM_write_X509(cert.get(), certificate.get()) == 1 &&
-        PEM_write_PrivateKey(pkey.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1;
+    // OpenSSL file BIOs, not FILE*: a FILE* crossing into OpenSSL needs applink on Windows.
+    std::unique_ptr<BIO, decltype(&BIO_free)> cert {
+        BIO_new_file((directory / "cert.pem").string().c_str(), "wb"), BIO_free};
+    std::unique_ptr<BIO, decltype(&BIO_free)> pkey {
+        BIO_new_file((directory / "key.pem").string().c_str(), "wb"), BIO_free};
+    return cert && pkey && PEM_write_bio_X509(cert.get(), certificate.get()) == 1 &&
+        PEM_write_bio_PrivateKey(pkey.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1;
 }
 
 constexpr std::array<std::uint8_t, 2> alpn {'h', '3'};

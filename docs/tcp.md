@@ -17,7 +17,8 @@ Names below are in `eventloop`.
   inspection/close; pending connect failure or cancellation removes it.
   Check results or saved descriptors before retaining a pointer after failure.
 - `async_send_file(header, file, offset, size)` takes file ownership and sends
-  the borrowed header followed by the range without moving the file position.
+  the borrowed header followed by the range without moving the file position
+  (on Windows, `TransmitFile` advances a synchronously opened file's position).
   Keep the header valid through completion. It returns
   `task<expected<void, error_code>>`, requiring a frame and both result layers.
 
