@@ -159,7 +159,8 @@ private:
         -> task<std::expected<void, std::error_code>>;
 public:
     // Sends header, then size bytes of file starting at offset. Reads at the
-    // offset without moving the file position. Owns file through completion,
+    // offset without moving the file position (Windows advances a synchronous
+    // handle's position). Owns file through completion,
     // including cancellation. This task wraps the internal sendfile awaiter
     // and requires a coroutine frame.
     [[nodiscard]] auto async_send_file(std::span<const std::byte> header,

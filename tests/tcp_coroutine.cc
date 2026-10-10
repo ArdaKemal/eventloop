@@ -15,6 +15,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <cstdio>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -358,9 +359,8 @@ auto duplicate_accept_and_close() -> bool
         return false;
     }
     owner->close();
-    // Root frames completed by close() are retired when the loop next drains
-    // completed roots.
-    loop.stop();
+    // IOCP reports the cancelled accept later; run until every root retires.
+    loop.shutdown(0s);
     (void)loop.run();
     return pending == ECANCELED && duplicate == EBUSY &&
            closed_descriptor(descriptor) &&
@@ -462,7 +462,8 @@ auto duplicate_io_and_close() -> bool
         return false;
     }
     owner->close();
-    loop.stop();
+    // IOCP reports the cancelled read and write later; run until every root retires.
+    loop.shutdown(0s);
     (void)loop.run();
     return pending_read == ECANCELED && duplicate_read == EBUSY &&
            pending_write == ECANCELED && duplicate_write == EBUSY &&
@@ -595,8 +596,15 @@ auto send_opened_file(event_loop& loop, tcp_stream& socket,
         constexpr std::array<std::byte, 1> header {std::byte {'#'}};
         const auto sent = co_await socket.async_send_file(
             header, std::move(*opened), 5, sizeof("payload") - 1);
-        passed = sent.has_value() && ::lseek(position.get(), 0, SEEK_CUR) == 0;
-    }
+        passed = sent.has_value();
+#ifndef _WIN32
+        // TransmitFile advances a synchronous handle's position (tcp.md).
+        passed = passed && ::lseek(position.get(), 0, SEEK_CUR) == 0;
+#endif
+        std::fprintf(stderr, "DIAG send_file sent=%d error=%d lseek=%ld\n", sent.has_value() ? 1 : 0,
+                     !sent ? -1 : (*sent ? 0 : sent->error().value()),
+                     static_cast<long>(::lseek(position.get(), 0, SEEK_CUR)));
+    } else std::fprintf(stderr, "DIAG openat error=%d\n", opened.error().value());
     socket.close();
     stop_after_two(loop, completed);
 }
@@ -614,6 +622,7 @@ auto receive_opened_file(event_loop& loop, tcp_stream& socket,
         received += *result;
     }
     passed = received == buffer.size();
+    std::fprintf(stderr, "DIAG received=%zu\n", received);
     for (std::size_t i = 0; passed && i < buffer.size(); ++i)
         passed = std::to_integer<char>(buffer[i]) == expected[i];
     socket.close();

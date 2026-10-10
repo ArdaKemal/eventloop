@@ -372,6 +372,10 @@ auto socket_operations::prepare_datagram(native_socket socket,
                                          bool reuse_port) -> void
 {
     if (reuse_port) throw std::invalid_argument("SO_REUSEPORT is unavailable");
+    // Overlapped operations ignore this; try_send_to relies on it.
+    u_long nonblocking = 1;
+    if (::ioctlsocket(static_cast<SOCKET>(socket), FIONBIO, &nonblocking) ==
+        SOCKET_ERROR) throw std::system_error(last_error(), "FIONBIO");
     if (set_ipv6_only(socket, endpoint) == SOCKET_ERROR)
         throw std::system_error(last_error(), "IPV6_V6ONLY");
     const BOOL exclusive = TRUE;
@@ -596,29 +600,57 @@ auto socket_operations::start_receive_from(
         &operation.address_length, &operation.overlapped, nullptr), operation);
 }
 
+namespace {
+
+// With `overlapped` null the send completes now and posts no completion.
+auto send_datagram(native_socket socket, const void* buffer, std::size_t size,
+                   ip_endpoint destination, socket_operation& operation,
+                   OVERLAPPED* overlapped, DWORD* sent) noexcept -> int
+{
+    const std::size_t maximum_payload =
+        destination.address_family == ip_endpoint::family::ipv6 ? 65527 : 65507;
+    if (size > maximum_payload) return WSAEMSGSIZE;
+    if (destination.port == 0 || size > std::numeric_limits<ULONG>::max())
+        return WSAEINVAL;
+    const auto native = native_endpoint(destination);
+    operation.address = native.storage;
+    operation.address_length = native.length;
+    operation.buffer = {static_cast<ULONG>(size),
+                        const_cast<char*>(static_cast<const char*>(buffer))};
+    if (::WSASendTo(static_cast<SOCKET>(socket), &operation.buffer, 1, sent, 0,
+                    reinterpret_cast<const sockaddr*>(&operation.address),
+                    operation.address_length, overlapped, nullptr) == 0) return 0;
+    return ::WSAGetLastError();
+}
+
+} // namespace
+
 auto socket_operations::start_send_to(native_socket socket,
                                       const void* buffer, std::size_t size,
                                       ip_endpoint destination,
                                       socket_operation& operation) noexcept
     -> socket_result
 {
-    const std::size_t maximum_payload =
-        destination.address_family == ip_endpoint::family::ipv6 ? 65527 : 65507;
-    if (size > maximum_payload)
-        return {.error = {WSAEMSGSIZE, std::system_category()}};
-    if (destination.port == 0)
-        return {.error = {WSAEINVAL, std::system_category()}};
-    if (size > std::numeric_limits<ULONG>::max())
-        return {.error = std::make_error_code(std::errc::invalid_argument)};
-    const auto native = native_endpoint(destination);
-    operation.address = native.storage;
-    operation.address_length = native.length;
-    operation.buffer = {static_cast<ULONG>(size),
-                        const_cast<char*>(static_cast<const char*>(buffer))};
-    return submission_result(::WSASendTo(
-        static_cast<SOCKET>(socket), &operation.buffer, 1, nullptr, 0,
-        reinterpret_cast<const sockaddr*>(&operation.address),
-        operation.address_length, &operation.overlapped, nullptr), operation);
+    const int error = send_datagram(socket, buffer, size, destination, operation,
+                                    &operation.overlapped, nullptr);
+    if (error != 0 && error != WSA_IO_PENDING)
+        return {.error = {error, std::system_category()}};
+    operation.pending_completion = true;
+    return {.pending = true};
+}
+
+auto socket_operations::try_send_to(native_socket socket, const void* buffer,
+                                    std::size_t size,
+                                    ip_endpoint destination) noexcept
+    -> socket_result
+{
+    socket_operation operation;
+    DWORD sent = 0;
+    const int error = send_datagram(socket, buffer, size, destination, operation,
+                                    nullptr, &sent);
+    if (error == 0) return {.transferred = sent};
+    if (error == WSAEWOULDBLOCK) return {.pending = true};
+    return {.error = {error, std::system_category()}};
 }
 
 auto socket_operations::cancel(native_socket socket,

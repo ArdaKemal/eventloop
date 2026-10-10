@@ -151,6 +151,12 @@ public:
                                             ip_endpoint destination,
                                             socket_operation& operation) noexcept
         -> socket_result;
+    // Sends one datagram now, without an operation that outlives the call; a
+    // full send buffer reports pending.
+    [[nodiscard]] static auto try_send_to(native_socket socket,
+                                          const void* buffer, std::size_t size,
+                                          ip_endpoint destination) noexcept
+        -> socket_result;
     // UDP segmentation offload: submit `size` bytes as `segment`-sized
     // datagrams (the final segment may be shorter). Platforms without offload
     // report EINVAL/EOPNOTSUPP so the caller can fall back to per-segment sends.
@@ -166,6 +172,13 @@ public:
 };
 
 #ifndef _WIN32
+inline auto socket_operations::try_send_to(native_socket socket,
+    const void* buffer, std::size_t size, ip_endpoint destination) noexcept
+    -> socket_result
+{
+    socket_operation unused;
+    return start_send_to(socket, buffer, size, destination, unused);
+}
 inline auto socket_operations::accept_register(tcp_acceptor&, ip_endpoint) noexcept -> void {}
 inline auto socket_operations::accept_bind(tcp_acceptor::accept_awaiter&) noexcept -> void {}
 inline auto socket_operations::accept_start(tcp_acceptor& acceptor,
