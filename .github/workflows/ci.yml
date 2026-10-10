@@ -97,9 +97,6 @@ jobs:
   windows:
     name: Windows
     runs-on: windows-2022
-    # Windows runtime is not verified yet: 9 of 68 tests fail (QUIC crashes,
-    # timeouts, OpenSSL applink). Report results without blocking until fixed.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
