@@ -24,6 +24,12 @@ jobs:
             cxx: g++
           - compiler: clang
             cxx: clang++-20
+          - compiler: gcc ASan+UBSan
+            cxx: g++
+            flags: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+          - compiler: gcc TSan
+            cxx: g++
+            flags: -fsanitize=thread
     steps:
       - uses: actions/checkout@v4
 
@@ -49,10 +55,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build ${{ matrix.compiler == 'clang' && 'clang-20' || '' }}
 
+      # The runner's mmap randomization exceeds what TSan's shadow layout allows.
+      - name: Limit ASLR for TSan
+        if: contains(matrix.flags, 'thread')
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
           -DOPENSSL_ROOT_DIR="$HOME/openssl"
 
       # Repeat the errors after the full log so they are easy to find.
@@ -65,6 +77,8 @@ jobs:
       # Tests bind loopback ports and run serially. http3_server needs a curl
       # built with HTTP/3, which runner images do not provide.
       - name: Test
+        env:
+          TSAN_OPTIONS: halt_on_error=1
         run: ctest --test-dir build --output-on-failure --timeout 300 -E '^http3_server$'
 
   macos:
