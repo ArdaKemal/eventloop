@@ -218,6 +218,8 @@ auto stream_errors(event_loop& loop, quic_connection& connection, outcome& resul
     error = {};
     const auto rejected = (co_await response_status(loop, connection, id, error)).value_or(0);
     result.rejected = status == 200 && rejected == 0 && error == reset_error;
+    std::fprintf(stderr, "DIAG held=%d rejected=%d error=%d %s\n", static_cast<int>(status),
+                 static_cast<int>(rejected), error.value(), error.message().c_str());
     (void)co_await send(loop, connection, held, {}, true);
     (void)co_await sleep_for(loop, 20ms);
 
