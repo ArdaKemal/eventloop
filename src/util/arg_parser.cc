@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-#include <functional>
 
 namespace eventloop {
 
@@ -54,7 +53,7 @@ auto arg_parser::parse(int argc, char *argv[]) -> void
 
     for (std::size_t i = 0; i < args.size(); i++) {
         const auto it = std::find_if(options_.begin(), options_.end(),
-            std::bind_front(valid_argumnet, args[i]));
+            [&](const option& opt) { return valid_argumnet(args[i], opt); });
 
         if (it == options_.end()) {
             exit_with_usage();
