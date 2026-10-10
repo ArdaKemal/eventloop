@@ -59,7 +59,7 @@ only for measured paths, separately from startup and handshakes.
   HTTP/1.1's input-buffer exception above 256-byte request heads.
 - Preserve HTTP/2 closure-history/error distinctions in
   [HTTP/2](docs/http2.md#closed-streams-and-errors) and
-  `tests/http2_hardening.cc`. Do not add speculative idle, SETTINGS,
+  `tests/http2_hardening.cc`. Do not add speculative SETTINGS,
   write-stall, or flood limits without evidence.
 - WebSocket framing is bounded and shared across transports; failures close
   the stream. A full broadcast recipient drops that message without blocking

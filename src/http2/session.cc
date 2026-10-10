@@ -452,6 +452,15 @@ auto session::closed() const noexcept -> bool
                         [](const stream& value) { return value.active; });
 }
 
+auto session::idle() const noexcept -> bool
+{
+    // A stream counts once its request is routed or complete, so a partial
+    // header block or request body does not hold the connection open.
+    return std::none_of(streams_.begin(), streams_.end(), [](const stream& value) {
+        return value.active && (value.routed || value.request_ready);
+    });
+}
+
 auto session::consume_input(std::span<const std::byte> input) -> void
 {
     while (!input.empty() && !fatal_) {

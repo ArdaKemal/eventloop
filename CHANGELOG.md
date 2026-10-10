@@ -26,6 +26,12 @@ First versioned release.
 - Bounded WebSocket framing over TCP/TLS streams and HTTP/2 or HTTP/3
   Extended CONNECT.
 
+### HTTP server lifecycle
+
+- `server_options::header_timeout` (default 30 s) and `idle_timeout` (default
+  60 s) close HTTP/1.1 and HTTP/2 connections that are slow to send a request
+  head or idle between requests.
+
 ### Quality
 
 - CI on Linux (gcc, clang), macOS, and Windows (MSVC). On Linux, the full

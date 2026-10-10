@@ -23,8 +23,9 @@ With routes, SETTINGS_ENABLE_CONNECT_PROTOCOL enables RFC 8441
 
 Files stream from owned descriptors; Linux DATA can use `SSL_sendfile()` with
 transmit kTLS, otherwise bounded buffering. HPACK decoding is bounded;
-connection/stream DATA flow control is enforced. No idle, SETTINGS, write-stall,
-or flood limits are implemented.
+connection/stream DATA flow control is enforced. Connections close at the
+[shared deadlines](http.md#servers-and-ownership) without GOAWAY; no SETTINGS,
+write-stall, or flood limits are implemented.
 
 RFC 9218 scheduling uses request `priority`, replaced by PRIORITY_UPDATE.
 Lower urgency wins; within an urgency, non-incremental responses run in stream

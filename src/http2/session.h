@@ -127,6 +127,8 @@ public:
         return output_size_ != 0 || file_send_active_;
     }
     auto resume_input() -> void;
+    // No complete request is being answered.
+    [[nodiscard]] auto idle() const noexcept -> bool;
 
 private:
     enum class connect_state : std::uint8_t { none, unsupported, websocket, accepted };

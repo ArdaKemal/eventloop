@@ -13,6 +13,16 @@ neither throws `std::invalid_argument`. Unmatched paths serve static resources,
 or return 404 without a root. `redirect_server(loop, endpoint, hostname,
 https_port)` returns 308 for every request.
 
+TCP servers close connections that miss a deadline; zero disables either.
+`header_timeout` (default 30 s) bounds the TLS handshake plus the first
+request head from accept. `idle_timeout` (default 60 s) bounds the wait for
+the next HTTP/1.1 request head after a response, or for the next complete
+HTTP/2 request once none is in progress; partial header blocks and request
+bodies do not extend it. Expiry cancels the connection task and closes the
+socket without a response. Running handlers are not timed: bound body reads
+and response writes in the handler, for example with `with_timeout`.
+HTTP/3 connections use the QUIC idle timeout instead.
+
 Connection tasks own sessions/I/O buffers and share document-root/router
 ownership with the listener. Small file reads/metadata calls are synchronous;
 large plain HTTP files use sendfile. Static-file opens reject symlinks in every

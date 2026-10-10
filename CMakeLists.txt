@@ -797,6 +797,7 @@ add_library(eventloop
     src/http/parser.h
     src/http/parser.cc
     src/http/routing.cc
+    src/http/connection_deadline.h
     src/http/exchange.h
     src/http/http1_exchange.h
     src/http/session.h
@@ -1027,6 +1028,12 @@ if(BUILD_TESTING)
     target_compile_options(http_connection_lifetime_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http_connection_lifetime COMMAND http_connection_lifetime_test)
     set_tests_properties(http_connection_lifetime PROPERTIES TIMEOUT 15)
+
+    add_executable(http_server_connections_test tests/http_server_connections.cc)
+    target_link_libraries(http_server_connections_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(http_server_connections_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http_server_connections COMMAND http_server_connections_test)
+    set_tests_properties(http_server_connections PROPERTIES TIMEOUT 30)
 
     add_executable(https_default_capacity_test tests/https_default_capacity.cc)
     target_link_libraries(https_default_capacity_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
