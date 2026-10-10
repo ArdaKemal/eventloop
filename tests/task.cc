@@ -156,6 +156,72 @@ auto wrong_loop_awaiter_test() -> bool
 
 auto value_task(event_loop&) -> task<int> { co_return 42; }
 
+auto throw_after_yield(event_loop& loop) -> task<int>
+{
+    (void)co_await sleep_for(loop, std::chrono::milliseconds {1});
+    throw std::runtime_error("suspended");
+}
+
+auto throw_now(event_loop&) -> task<void> { throw std::runtime_error("immediate"); }
+
+// Rethrows the inner exception through a second directly awaited task.
+auto rethrow_through(event_loop& loop) -> task<void>
+{
+    (void)co_await throw_after_yield(loop);
+}
+
+auto catch_awaited(event_loop& loop, int& caught) -> task<void>
+{
+    try {
+        (void)co_await throw_now(loop);
+    } catch (const std::runtime_error& error) {
+        if (std::string_view {error.what()} == "immediate") ++caught;
+    }
+    try {
+        (void)co_await rethrow_through(loop);
+    } catch (const std::runtime_error& error) {
+        if (std::string_view {error.what()} == "suspended") ++caught;
+    }
+    const auto value = co_await value_task(loop);
+    if (value && *value == 42) ++caught;
+    loop.stop();
+}
+
+auto throwing_root(event_loop& loop) -> task<void>
+{
+    (void)co_await sleep_for(loop, std::chrono::milliseconds {1});
+    throw std::runtime_error("root");
+}
+
+// Directly awaited tasks pass exceptions to the awaiting task; a root that
+// throws still terminates.
+auto awaited_exception_test() -> bool
+{
+    {
+        event_loop loop;
+        int caught = 0;
+        if (loop.spawn(catch_awaited(loop, caught)) != task_spawn_result::accepted ||
+            loop.run() != event_loop_result::stopped || caught != 3) return false;
+    }
+#ifndef _WIN32
+    const pid_t child = ::fork();
+    if (child == -1) return false;
+    if (child == 0) {
+        std::set_terminate([] { std::_Exit(77); });
+        event_loop loop;
+        (void)loop.spawn(throwing_root(loop));
+        (void)loop.run();
+        std::_Exit(1);
+    }
+    int status = 0;
+    return ::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 77;
+#else
+    return true;
+#endif
+}
+
+
 auto value_result_test() -> bool
 {
     event_loop loop;
@@ -903,6 +969,10 @@ auto main(int argc, char** argv) -> int
     }
     if (!value_result_test()) {
         std::cerr << "task value result test failed\n";
+        return 1;
+    }
+    if (!awaited_exception_test()) {
+        std::cerr << "awaited task exception test failed\n";
         return 1;
     }
     if (!allocation_and_transfer_test()) {

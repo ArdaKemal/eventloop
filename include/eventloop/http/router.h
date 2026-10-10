@@ -15,7 +15,8 @@
 namespace eventloop::http {
 
 // A route handler. It is a free coroutine function: the event_loop& first
-// parameter selects the bounded coroutine frame pool.
+// parameter selects the bounded coroutine frame pool. An exception it throws
+// is handled like returning; see response.
 using handler = task<void> (*)(event_loop&, request&, response&);
 
 namespace detail { struct router_access; }

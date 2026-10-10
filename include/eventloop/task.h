@@ -71,6 +71,10 @@ namespace detail { struct composition_task_access; }
 
 namespace detail {
 
+// The exception leaving a directly awaited task, rethrown by the awaiter
+// before anything else runs on this thread.
+inline thread_local std::exception_ptr awaited_exception;
+
 struct task_promise_base {
     template<typename... Arguments>
     explicit task_promise_base(event_loop& loop, Arguments&&...) noexcept
@@ -127,9 +131,14 @@ struct task_promise_base {
         return {};
     }
 
-    [[noreturn]] static auto unhandled_exception() noexcept -> void
+    // A directly awaited task passes its exception to the awaiting task.
+    // Spawned, composed, and observed tasks terminate.
+    auto unhandled_exception() noexcept -> void
     {
-        std::terminate();
+        if (root_.owner != nullptr || completion_ != nullptr ||
+            completion_context_ == nullptr) std::terminate();
+        awaited_exception = std::current_exception();
+        failed_ = true;
     }
 
     [[nodiscard]] auto owner_loop() const noexcept -> event_loop* { return loop_; }
@@ -147,7 +156,18 @@ struct task_promise_base {
     void* completion_context_ {nullptr};
     std::coroutine_handle<> (*completion_)(void*) noexcept {nullptr};
     bool started_ {false};
+    bool failed_ {false};
 };
+
+// Destroys a completed, directly awaited task and rethrows its exception.
+template<typename Handle>
+auto finish_awaited(Handle& handle) -> void
+{
+    const bool failed = handle.promise().failed_;
+    handle.destroy();
+    handle = {};
+    if (failed) std::rethrow_exception(std::exchange(awaited_exception, {}));
+}
 
 template<typename Handle>
 [[nodiscard]] auto task_state_of(Handle handle, bool allocation_failed) noexcept
@@ -288,13 +308,10 @@ public:
             return detail::suspend_on_task(handle_, continuation);
         }
 
-        auto await_resume() noexcept -> task_result
+        auto await_resume() -> task_result
         {
             if (allocation_failed_) return task_result::frame_allocation_failure;
-            if (handle_ != nullptr) {
-                handle_.destroy();
-                handle_ = {};
-            }
+            if (handle_ != nullptr) detail::finish_awaited(handle_);
             return task_result::success;
         }
 
@@ -438,6 +455,7 @@ public:
             if (allocation_failed_ || handle_ == nullptr) {
                 return std::unexpected(task_result::frame_allocation_failure);
             }
+            if (handle_.promise().failed_) detail::finish_awaited(handle_);
             auto value = std::move(*handle_.promise().value_);
             handle_.destroy();
             handle_ = {};

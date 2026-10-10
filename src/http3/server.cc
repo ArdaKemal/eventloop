@@ -689,7 +689,11 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
     };
     detail::request_access::bind(exchange.request_, exchange, request, match.context);
     detail::request_access::bind(exchange.response_, exchange);
-    const auto handled = co_await match.function(loop, exchange.request_, exchange.response_);
+    // A handler that throws is treated as one that returned.
+    auto handled = task_result::success;
+    try {
+        handled = co_await match.function(loop, exchange.request_, exchange.response_);
+    } catch (...) {}
     if (handled == task_result::cancelled) co_return;
     if (!exchange.started_ && !exchange.broken_) {
         const unsigned status = exchange.too_large_ ? 413

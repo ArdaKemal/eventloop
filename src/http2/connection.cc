@@ -694,7 +694,11 @@ auto http2_exchange::send_file(unsigned status, std::span<const http::header> he
 // Runs one handler, then settles a response it did not finish.
 auto run_route(event_loop& loop, http2_exchange& self, http::handler function) -> task<void>
 {
-    const auto handled = co_await function(loop, self.request_, self.response_);
+    // A handler that throws is treated as one that returned.
+    auto handled = task_result::success;
+    try {
+        handled = co_await function(loop, self.request_, self.response_);
+    } catch (...) {}
     auto& state = self.owner->state;
     if (!self.owner->broken && !self.released) {
         if (handled == task_result::cancelled) {

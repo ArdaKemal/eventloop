@@ -23,6 +23,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -137,6 +138,14 @@ auto big(event_loop&, http::request&, http::response& response) -> task<void>
 auto silent(event_loop&, http::request&, http::response&) -> task<void>
 {
     co_return;
+}
+
+auto fail(event_loop&) -> task<int> { throw std::runtime_error("handler failure"); }
+
+// Throws from a task it awaits, before starting a response.
+auto throwing(event_loop& loop, http::request&, http::response&) -> task<void>
+{
+    (void)co_await fail(loop);
 }
 
 auto short_body(event_loop&, http::request&, http::response& response) -> task<void>
@@ -537,6 +546,7 @@ auto main() -> int
           routes->add(http::method_type::get, "/stream", stream).has_value() &&
           routes->add(http::method_type::get, "/big", big).has_value() &&
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
+          routes->add(http::method_type::get, "/throw", throwing).has_value() &&
           routes->add(http::method_type::get, "/short", short_body).has_value() &&
           routes->add(http::method_type::get, "/slow", slow).has_value() &&
           routes->add(http::method_type::post, "/timed", timed).has_value() &&
@@ -598,6 +608,7 @@ auto main() -> int
     auto partial_upload = request("POST", "/partial");
     partial_upload.body = std::vector<std::byte>(5000, std::byte {'p'});
     requests.push_back(std::move(partial_upload));
+    requests.push_back(request("GET", "/throw"));
 
     const auto results = serve(files,
         {.routes = routes, .document_root = directory.path() / "www",
@@ -636,6 +647,7 @@ auto main() -> int
     check(ok(results[15]).body == bytes("60000 " + std::to_string(large_sum)),
           "paused input resumes when the handler reads");
     check(ok(results[16]).body == bytes("partial"), "unread body stopped");
+    check(ok(results[17]).status == 500, "throwing handler answers 500");
 
     // Handlers on one connection run concurrently: /hello on stream 3 is
     // answered while /slow on stream 1 sleeps.

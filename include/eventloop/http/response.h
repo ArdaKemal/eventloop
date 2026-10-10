@@ -25,8 +25,8 @@ namespace eventloop::http {
 // Status 204 and 304 carry no body. A response to HEAD sends the same status
 // and fields, and body writes are accepted and discarded.
 //
-// If the handler returns before async_start, the server sends 500. If it
-// returns after async_start but before async_finish, the response is
+// If the handler returns or throws before async_start, the server sends 500.
+// If it does so after async_start but before async_finish, the response is
 // abandoned: HTTP/1.1 closes the connection.
 class response {
 public:

@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -110,6 +111,14 @@ auto stream(event_loop&, http::request&, http::response& response) -> task<void>
 auto silent(event_loop&, http::request&, http::response&) -> task<void>
 {
     co_return;
+}
+
+auto fail(event_loop&) -> task<int> { throw std::runtime_error("handler failure"); }
+
+// Throws from a task it awaits, before starting a response.
+auto throwing(event_loop& loop, http::request&, http::response&) -> task<void>
+{
+    (void)co_await fail(loop);
 }
 
 struct short_state {
@@ -409,6 +418,7 @@ auto main() -> int
           routes->add(http::method_type::post, "/partial", partial).has_value() &&
           routes->add(http::method_type::get, "/stream", stream).has_value() &&
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
+          routes->add(http::method_type::get, "/throw", throwing).has_value() &&
           routes->add(http::method_type::get, "/short", short_body, &truncated).has_value() &&
           routes->add(http::method_type::get, "/misuse", misuse).has_value() &&
           routes->add(http::method_type::get, "/file", file,
@@ -457,6 +467,8 @@ auto main() -> int
                 "Content-Length: 3\r\nConnection: close\r\n\r\n0\r\n\r\n",
             chunked_request("POST /index.html HTTP/1.1\r\n", "abc", 3),
             chunked_request("POST /hello HTTP/1.1\r\n", "abc", 3),
+            // Keep-alive continues after a handler throws.
+            "GET /throw HTTP/1.1\r\nHost: a\r\n\r\n" + request("GET /hello HTTP/1.1\r\n"),
         });
 
     const std::string hello_head =
@@ -503,6 +515,8 @@ auto main() -> int
     check(responses[23].starts_with("HTTP/1.1 405 ") &&
           responses[23].find("Connection: close") != std::string::npos,
           "chunked body on a path without a handler for the method");
+    check(responses[24].starts_with("HTTP/1.1 500 Internal Server Error\r\n") &&
+          responses[24].ends_with("\r\n\r\nhello"), "throwing handler answers 500");
 
     const auto cached = serve({.document_root = directory.path()},
         {

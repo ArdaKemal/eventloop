@@ -102,8 +102,11 @@ public:
         };
         request_access::bind(self.request_, self, fields, self.routing_.match.context);
         request_access::bind(self.response_, self);
-        const auto handled = co_await self.routing_.match.function(
-            loop, self.request_, self.response_);
+        // A handler that throws is treated as one that returned.
+        auto handled = task_result::success;
+        try {
+            handled = co_await self.routing_.match.function(loop, self.request_, self.response_);
+        } catch (...) {}
         const bool rejected = handled == task_result::frame_allocation_failure;
         if (handled == task_result::cancelled) co_return false;
         if (!self.started_ && !self.broken_) {

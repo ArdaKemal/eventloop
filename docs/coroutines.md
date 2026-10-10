@@ -56,8 +56,10 @@ frame exhaustion becomes `not_enough_memory`, cancellation `operation_canceled`.
 It supports `void` and move-only values without allocating. Pending cancelled
 I/O reports generic-category `ECANCELED`; this differs from
 `task_result::cancelled`. `task::result()` and `task_handle::take_result()`
-consume values once. Unhandled task exceptions terminate; return anticipated
-application errors as values.
+consume values once. An exception leaving a directly awaited task is rethrown
+from the `co_await` in the awaiting task. One leaving a spawned root, an
+observed task, or a `when_all`/`race`/`with_timeout` operand terminates.
+Return anticipated application errors as values.
 
 `event_loop_options` controls frame/queue limits; full pools/queues report
 failure rather than allocating replacements. Frame payload classes are

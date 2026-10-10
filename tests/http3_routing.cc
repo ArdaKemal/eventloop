@@ -20,6 +20,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -127,6 +128,14 @@ auto stream(event_loop&, http::request&, http::response& response) -> task<void>
 auto silent(event_loop&, http::request&, http::response&) -> task<void>
 {
     co_return;
+}
+
+auto fail(event_loop&) -> task<int> { throw std::runtime_error("handler failure"); }
+
+// Throws from a task it awaits, before starting a response.
+auto throwing(event_loop& loop, http::request&, http::response&) -> task<void>
+{
+    (void)co_await fail(loop);
 }
 
 auto short_body(event_loop&, http::request&, http::response& response) -> task<void>
@@ -400,6 +409,7 @@ auto main() -> int
           routes->add(http::method_type::post, "/partial", partial).has_value() &&
           routes->add(http::method_type::get, "/stream", stream).has_value() &&
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
+          routes->add(http::method_type::get, "/throw", throwing).has_value() &&
           routes->add(http::method_type::get, "/short", short_body).has_value() &&
           routes->add(http::method_type::get, "/file", file,
                       const_cast<std::string*>(&file_path)).has_value(),
@@ -441,6 +451,8 @@ auto main() -> int
                                            {"cookie", "b=2; c=3"}, {"cookie", "d=4"}}},
             {.path = "/cookies", .fields = {{"cookie", "single=1"}, {"x-test", "seen"}}},
             {.path = "/cookies", .fields = {{"x-test", "seen"}}},
+            {.path = "/throw"},
+            {.path = "/hello"},
         });
 
     const auto& hello_response = responses[0];
@@ -481,6 +493,8 @@ auto main() -> int
     check(responses[16].body == "a=1; b=2; c=3; d=4", "split Cookies joined in wire order");
     check(responses[17].body == "single=1", "single Cookie preserved");
     check(responses[18].body == "<none>", "absent Cookie preserved");
+    check(responses[19].status == 500 && responses[20].body == "hello",
+          "throwing handler answers 500");
 
     const auto uploads_before = upload_calls;
     const auto large_lengths = serve(directory.path(),

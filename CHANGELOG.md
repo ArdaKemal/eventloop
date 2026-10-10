@@ -31,6 +31,8 @@ First versioned release.
 - `server_options::header_timeout` (default 30 s) and `idle_timeout` (default
   60 s) close HTTP/1.1 and HTTP/2 connections that are slow to send a request
   head or idle between requests.
+- A route handler that throws answers 500 instead of terminating the process;
+  an exception leaving a directly awaited task is rethrown in the awaiting task.
 
 ### Quality
 

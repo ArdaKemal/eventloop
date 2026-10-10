@@ -84,6 +84,8 @@ Authentication/Origin policy belongs to the handler.
   Framing/trailers follow the protocol contract.
 - Returning before start answers 500; returning after start without finish
   abandons the response (connection close or stream reset per protocol).
+  A handler that throws, directly or from a task it awaits, is treated the
+  same way; the server keeps serving other requests.
 
 ## Static resources
 
