@@ -28,8 +28,10 @@ head -c 262144 /dev/zero | tr '\0' 'h' > "$work_dir/www/h2-large.bin"
     -keyout "$work_dir/key.pem" -out "$work_dir/cert.pem" \
     > /dev/null 2>&1
 
-http_port=$((20000 + $$ % 10000))
-https_port=$((http_port + 10000))
+# Stay below the Linux (32768+) and BSD/Windows (49152+) ephemeral ranges
+# so a client socket from a parallel test cannot hold a listener port.
+http_port=$((10000 + $$ % 7000 * 3))
+https_port=$((http_port + 1))
 
 "$server" \
     --root "$work_dir/www" \
@@ -114,7 +116,7 @@ kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
 server_pid=''
 
-plain_port=$((http_port + 1))
+plain_port=$((http_port + 2))
 "$server" \
     --root "$work_dir/www" \
     --http-only \
