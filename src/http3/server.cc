@@ -753,6 +753,100 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     co_return true;
 }
 
+// The static-file answer to a request without a route. Choosing it is plain
+// code, so its temporaries stay out of serve_request's frame (MSVC Debug
+// builds otherwise exceed the largest frame class).
+struct static_answer {
+    unsigned status {200};
+    http::detail::static_file file;
+    std::uint64_t size {0};
+    std::uint64_t offset {0};
+    std::string_view mime {"text/plain"};
+    std::vector<char> listing;
+    bool have_file {false};
+    bool have_listing {false};
+};
+
+// Fills `answer`, using s.headers for the joined If-None-Match values and
+// s.file_response for the selected range and validators.
+auto choose_static(stream_storage& s, std::span<const h3::field> request_fields,
+                   std::string_view method, std::string_view path, bool https,
+                   native_socket root, http::detail::open_file_cache* files,
+                   const request_settings& settings, static_answer& answer)
+    -> std::expected<void, h3::h3_error>
+{
+    std::size_t match_size = 0;
+    std::string_view if_modified_since, range;
+    bool duplicate_range = false;
+    for (const auto& field : request_fields) {
+        if (field.name == "if-none-match") {
+            const auto extra = field.value.size() + (match_size != 0 ? 1 : 0);
+            if (extra > s.headers.size() - match_size)
+                return std::unexpected(h3::h3_error::excessive_load);
+            auto* output = reinterpret_cast<char*>(s.headers.data());
+            if (match_size != 0) output[match_size++] = ',';
+            if (!field.value.empty())
+                std::memcpy(output + match_size, field.value.data(), field.value.size());
+            match_size += field.value.size();
+        }
+        else if (field.name == "if-modified-since") if_modified_since = field.value;
+        else if (field.name == "range") {
+            if (!range.empty()) duplicate_range = true;
+            else range = field.value;
+        }
+    }
+    const std::string_view if_none_match {
+        reinterpret_cast<const char*>(s.headers.data()), match_size};
+    auto& selected = s.file_response;
+    auto& [status, file, size, offset, mime, listing, have_file, have_listing] = answer;
+    // Plain CONNECT has no :scheme and is answered 405 below.
+    if (method != "CONNECT" && !https) status = 400;
+    else if (method == "OPTIONS") status = 204;
+    else if (method != "GET" && method != "HEAD") status = 405;
+    else {
+        auto opened = http::detail::open_static(root, files, path);
+        if (!opened) status = opened.error() == http::detail::resource_error::invalid_target ? 400
+            : opened.error() == http::detail::resource_error::target_too_long ? 414 : 404;
+        else {
+            file = std::move(opened->file);
+            const std::optional<http::detail::file_info> info = opened->info;
+            if (!info) status = 404;
+            else if (info->kind == http::detail::file_info::type::directory) {
+                auto index = http::detail::open_child(file.get(), "index.html", false);
+                auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
+                if (index_info && index_info->kind == http::detail::file_info::type::regular) {
+                    file = std::move(index);
+                    selected = detail::choose_file_response(*index_info,
+                        {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
+                    size = selected.length; offset = selected.offset; status = selected.status;
+                    have_file = true; mime = http::mime_type_from_path("index.html");
+                } else if (!settings.directory_listing) {
+                    status = 403;
+                } else {
+                    auto rendered = http::detail::render_directory_listing(file.take_owned());
+                    if (!rendered) {
+                        status = 500;
+                        mime = "text/plain";
+                        listing.assign(directory_listing_error_body.begin(),
+                                       directory_listing_error_body.end());
+                    } else {
+                        listing = std::move(*rendered);
+                        mime = "text/html; charset=utf-8";
+                    }
+                    size = listing.size();
+                    have_listing = true;
+                }
+            } else if (info->kind == http::detail::file_info::type::regular) {
+                selected = detail::choose_file_response(*info,
+                    {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
+                size = selected.length; offset = selected.offset; status = selected.status;
+                have_file = true; mime = http::mime_type_from_path(path);
+            } else status = 404;
+        }
+    }
+    return {};
+}
+
 auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
                    native_socket root, http::detail::open_file_cache* files,
                    stream_storage* storage,
@@ -800,84 +894,14 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         (co_await route_request(loop, connection, id, s, frames, pending, *head,
                                 request_fields, settings)).value_or(true))
         co_return;
-    std::size_t match_size = 0;
-    std::string_view if_modified_since, range;
-    bool duplicate_range = false;
-    for (const auto& field : request_fields) {
-        if (field.name == "if-none-match") {
-            const auto extra = field.value.size() + (match_size != 0 ? 1 : 0);
-            if (extra > s.headers.size() - match_size) {
-                fail(connection, id, h3::h3_error::excessive_load);
-                co_return;
-            }
-            auto* output = reinterpret_cast<char*>(s.headers.data());
-            if (match_size != 0) output[match_size++] = ',';
-            if (!field.value.empty())
-                std::memcpy(output + match_size, field.value.data(), field.value.size());
-            match_size += field.value.size();
-        }
-        else if (field.name == "if-modified-since") if_modified_since = field.value;
-        else if (field.name == "range") {
-            if (!range.empty()) duplicate_range = true;
-            else range = field.value;
-        }
+    static_answer answer;
+    if (const auto chosen = choose_static(s, request_fields, method, path, https, root,
+                                          files, settings, answer); !chosen) {
+        fail(connection, id, chosen.error());
+        co_return;
     }
-    const std::string_view if_none_match {
-        reinterpret_cast<const char*>(s.headers.data()), match_size};
-    unsigned status = 200;
-    http::detail::static_file file;
-    std::uint64_t size = 0;
-    std::uint64_t offset = 0;
-    auto& selected = s.file_response;
-    bool have_file = false;
-    bool have_listing = false;
-    std::vector<char> listing;
-    std::string_view mime = "text/plain";
-    // Plain CONNECT has no :scheme and is answered 405 below.
-    if (method != "CONNECT" && !https) status = 400;
-    else if (method == "OPTIONS") status = 204;
-    else if (method != "GET" && method != "HEAD") status = 405;
-    else {
-        auto opened = http::detail::open_static(root, files, path);
-        if (!opened) status = opened.error() == http::detail::resource_error::invalid_target ? 400
-            : opened.error() == http::detail::resource_error::target_too_long ? 414 : 404;
-        else {
-            file = std::move(opened->file);
-            const std::optional<http::detail::file_info> info = opened->info;
-            if (!info) status = 404;
-            else if (info->kind == http::detail::file_info::type::directory) {
-                auto index = http::detail::open_child(file.get(), "index.html", false);
-                auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
-                if (index_info && index_info->kind == http::detail::file_info::type::regular) {
-                    file = std::move(index);
-                    selected = detail::choose_file_response(*index_info,
-                        {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
-                    size = selected.length; offset = selected.offset; status = selected.status;
-                    have_file = true; mime = http::mime_type_from_path("index.html");
-                } else if (!settings.directory_listing) {
-                    status = 403;
-                } else {
-                    auto rendered = http::detail::render_directory_listing(file.take_owned());
-                    if (!rendered) {
-                        status = 500;
-                        mime = "text/plain";
-                        listing.assign(directory_listing_error_body.begin(),
-                                       directory_listing_error_body.end());
-                    } else {
-                        listing = std::move(*rendered);
-                        mime = "text/html; charset=utf-8";
-                    }
-                    size = listing.size();
-                    have_listing = true;
-                }
-            } else if (info->kind == http::detail::file_info::type::regular) {
-                selected = detail::choose_file_response(*info,
-                    {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
-                size = selected.length; offset = selected.offset; status = selected.status;
-                have_file = true; mime = http::mime_type_from_path(path);
-            } else status = 404;
-        }
-    }
+    auto& [status, file, size, offset, mime, listing, have_file, have_listing] = answer;
+    const auto& selected = s.file_response;
     const bool body_expected = have_listing || (have_file && (status == 200 || status == 206));
     const bool finish = !body_expected || method == "HEAD";
     // A failed write means the peer stopped or reset the stream, or the
