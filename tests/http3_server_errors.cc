@@ -354,6 +354,9 @@ auto main() -> int
         check(loop.spawn(watch(loop, server, endpoint, result)) ==
                   task_spawn_result::accepted, "spawn watch");
         (void)loop.run();
+        const auto stats = loop.coroutine_statistics();
+        std::fprintf(stderr, "DIAG frame allocation failures=%zu high=%zu\n",
+                     stats.allocation_failures, stats.high_watermark);
     }
     std::filesystem::remove_all(directory);
     check(result.malformed_reset, "malformed request resets only its stream");

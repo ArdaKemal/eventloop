@@ -596,7 +596,11 @@ auto send_opened_file(event_loop& loop, tcp_stream& socket,
         constexpr std::array<std::byte, 1> header {std::byte {'#'}};
         const auto sent = co_await socket.async_send_file(
             header, std::move(*opened), 5, sizeof("payload") - 1);
-        passed = sent.has_value() && ::lseek(position.get(), 0, SEEK_CUR) == 0;
+        passed = sent.has_value();
+#ifndef _WIN32
+        // TransmitFile advances a synchronous handle's position (tcp.md).
+        passed = passed && ::lseek(position.get(), 0, SEEK_CUR) == 0;
+#endif
         std::fprintf(stderr, "DIAG send_file sent=%d error=%d lseek=%ld\n", sent.has_value() ? 1 : 0,
                      !sent ? -1 : (*sent ? 0 : sent->error().value()),
                      static_cast<long>(::lseek(position.get(), 0, SEEK_CUR)));
