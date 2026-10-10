@@ -140,9 +140,8 @@ auto udp_socket::send_batch(std::span<const std::byte> buffer,
     std::size_t total = 0;
     for (std::size_t offset = 0; offset < buffer.size(); offset += segment_size) {
         const auto length = std::min(segment_size, buffer.size() - offset);
-        detail::socket_operation operation {};
-        const auto result = detail::socket_operations::start_send_to(
-            descriptor_.get(), buffer.data() + offset, length, destination, operation);
+        const auto result = detail::socket_operations::try_send_to(
+            descriptor_.get(), buffer.data() + offset, length, destination);
         if (result.error) return std::unexpected(result.error);
         if (result.pending)
             return std::unexpected(

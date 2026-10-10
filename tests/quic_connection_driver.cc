@@ -114,7 +114,9 @@ static auto notify_waiter(event_loop& loop,connection_driver& driver,
 static auto notification_scenario() -> void
 {
     event_loop loop;
-    udp_endpoint endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
+    // Endpoints hold large datagram buffers; keep them off the 1 MiB Windows stack.
+    auto owned_endpoint=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
+    auto& endpoint=*owned_endpoint;
     auto connection=std::make_unique<bounded_connection>(endpoint_role::client,connection_callbacks{});
     connection_driver driver(loop,endpoint,*connection,dcid,dcid,ip_endpoint::loopback_v4(12345),true);
     bool finished=false,completed=false,cancel_finished=false,cancel_completed=true;
@@ -193,7 +195,8 @@ static auto lost_close_scenario(contexts& context,std::uint32_t version) -> void
     auto* peer=owned.get();
     const auto address=peer->local_endpoint();
     loop.add(std::move(owned));
-    udp_endpoint endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    auto owned_endpoint=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    auto& endpoint=*owned_endpoint;
     connection_callbacks callbacks{nullptr,valid_parameters,nullptr};
     auto server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks,lifecycle_time_point::clock::now());
     auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks,lifecycle_time_point::clock::now());
@@ -370,8 +373,10 @@ int main()
     for (auto version : {version_1,version_2}) lost_close_scenario(context,version);
     for (auto version : {version_1,version_2}) {
         event_loop loop;
-        udp_endpoint client_endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
-        udp_endpoint server_endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+        auto owned_client=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
+        auto owned_server=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+        auto& client_endpoint=*owned_client;
+        auto& server_endpoint=*owned_server;
         connection_callbacks callbacks{nullptr,valid_parameters,nullptr};
         const auto now=lifecycle_time_point::clock::now();
         auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks,now);
