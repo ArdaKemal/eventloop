@@ -176,6 +176,9 @@ static auto lost_close(event_loop& loop,connection_driver& driver,bounded_connec
     check(first && first->size>=1200);
     const std::vector<std::byte> cached(input.begin(),input.begin()+static_cast<std::ptrdiff_t>(first->size));
     check(driver.run_active() && !driver.retired());
+    // On IOCP the peer can see the close before the driver's send completes;
+    // the closing period starts at that completion.
+    while (server.core().state()!=connection_state::closing) (void)co_await yield(loop);
     const auto pto=server.application_pto().value_or(1s);
     const auto deadline=server.core().next_deadline(pto);
     check(deadline && *deadline>lifecycle_time_point::clock::now());

@@ -205,6 +205,8 @@ auto stream_errors(event_loop& loop, quic_connection& connection, outcome& resul
     (void)co_await send(loop, connection, id, get("/hello.txt", {{"X-Upper", "1"}}), true);
     auto status = (co_await response_status(loop, connection, id, error)).value_or(0);
     result.malformed_reset = status == 0 && error == reset_error;
+    // Let the server retire the reset stream's request slot.
+    (void)co_await sleep_for(loop, 20ms);
 
     // 2. With one request slot, a request held open after its response keeps
     // the slot; the next request is rejected (H3_REQUEST_REJECTED).

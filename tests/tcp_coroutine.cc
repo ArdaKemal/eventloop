@@ -359,7 +359,7 @@ auto duplicate_accept_and_close() -> bool
     }
     owner->close();
     // IOCP reports the cancelled accept later; run until every root retires.
-    loop.shutdown(event_loop::clock::duration::zero());
+    loop.shutdown(0s);
     (void)loop.run();
     return pending == ECANCELED && duplicate == EBUSY &&
            closed_descriptor(descriptor) &&
@@ -461,7 +461,8 @@ auto duplicate_io_and_close() -> bool
         return false;
     }
     owner->close();
-    loop.stop();
+    // IOCP reports the cancelled read and write later; run until every root retires.
+    loop.shutdown(0s);
     (void)loop.run();
     return pending_read == ECANCELED && duplicate_read == EBUSY &&
            pending_write == ECANCELED && duplicate_write == EBUSY &&
