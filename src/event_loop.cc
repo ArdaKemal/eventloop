@@ -21,6 +21,11 @@
 #endif
 
 #include <algorithm>
+#ifdef _WIN32
+#include <cstdio>
+#include <stacktrace>
+#include <string>
+#endif
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -189,6 +194,15 @@ public:
             high_watermark_ = std::max(high_watermark_, live_);
             return reinterpret_cast<std::byte*>(block) + sizeof(block_header);
         }
+#ifdef _WIN32
+        // TEMPORARY: name oversized MSVC frames.
+        if (size > coroutine_frame_sizes.back()) {
+            std::fprintf(stderr, "DIAG oversized frame %zu\n", size);
+            const auto trace = std::stacktrace::current(0, 6);
+            for (const auto& entry : trace)
+                std::fprintf(stderr, "DIAG   %s\n", std::to_string(entry).c_str());
+        }
+#endif
         ++allocation_failures_;
         return nullptr;
     }

@@ -95,8 +95,12 @@ jobs:
         run: ctest --test-dir build --output-on-failure --timeout 300 -E '^http3_server$'
 
   windows:
-    name: Windows
+    name: Windows ${{ matrix.config }}
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, RelWithDebInfo]
     # Windows runtime is not verified yet: 9 of 68 tests fail (QUIC crashes,
     # timeouts, OpenSSL applink). Report results without blocking until fixed.
     continue-on-error: true
@@ -112,7 +116,7 @@ jobs:
         run: cmake -S . -B build -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
 
       - name: Build
-        run: cmake --build build --config Debug
+        run: cmake --build build --config ${{ matrix.config }}
 
       - name: Test
-        run: ctest --test-dir build -C Debug --output-on-failure --timeout 300
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --timeout 300
