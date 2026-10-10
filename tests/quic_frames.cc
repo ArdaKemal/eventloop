@@ -31,6 +31,8 @@ auto valid_forms() -> void
 {
     const auto simple = bytes({0x00, 0x01, 0x1e});
     check(decode_frame(simple)->encoded_size == 1, "PADDING");
+    const auto padding = bytes({0x00, 0x00, 0x00, 0x01});
+    check(decode_frame(padding)->encoded_size == 3, "PADDING run");
     check(decode_frame(std::span(simple).subspan(1))->type == 1, "PING");
     check(decode_frame(std::span(simple).subspan(2))->type == 0x1e,
           "HANDSHAKE_DONE");
