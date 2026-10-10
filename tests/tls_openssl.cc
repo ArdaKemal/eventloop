@@ -78,7 +78,7 @@ auto run(const std::filesystem::path& certificate, const std::filesystem::path& 
     unique_fd server_fd(::accept(listener.get(), nullptr, nullptr));
     if (!server_fd) return false;
     bool server_ok = false;
-    std::jthread server([&, descriptor = std::move(server_fd)] {
+    std::thread server([&, descriptor = std::move(server_fd)] {
         std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx {SSL_CTX_new(TLS_method()), SSL_CTX_free};
         if (!ctx || SSL_CTX_set_min_proto_version(ctx.get(), version) != 1 ||
             SSL_CTX_set_max_proto_version(ctx.get(), version) != 1 ||
@@ -107,7 +107,7 @@ auto run(const std::filesystem::path& certificate, const std::filesystem::path& 
     bool passed = false;
     allocation_count = allocation_bytes = largest_allocation = 0;
     if (loop.spawn(receive_records(loop, *peer, passed)) != task_spawn_result::accepted) {
-        peer->close(); return false;
+        peer->close(); server.join(); return false;
     }
     (void)loop.run();
     server.join();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "eventloop/detail/move_only_function.h"
 #include "eventloop/event_loop.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/task.h"
@@ -8,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -27,7 +27,7 @@ struct header {
 // captured descriptor or buffer must remain valid until task completion.
 // Sources are move-only and may own captured resources exclusively.
 using request_body_source =
-    std::move_only_function<std::expected<std::size_t, std::error_code>(std::span<std::byte>)>;
+    eventloop::detail::move_only_function<std::expected<std::size_t, std::error_code>(std::span<std::byte>)>;
 
 struct client_request {
     std::string method {"GET"};
@@ -47,12 +47,12 @@ struct client_response {
 
 // Called on the owning loop thread. The borrowed chunk is valid only during
 // the call. A nonzero error aborts the request and is returned to the caller.
-using response_sink = std::move_only_function<std::error_code(std::span<const std::byte>)>;
+using response_sink = eventloop::detail::move_only_function<std::error_code(std::span<const std::byte>)>;
 // Called once for each complete header block before subsequent DATA. Status
 // is 1xx for informational headers, the final status for final headers, and
 // zero for trailers. The fields span is valid only during the call.
 using response_header_sink =
-    std::move_only_function<std::error_code(unsigned, std::span<const header>)>;
+    eventloop::detail::move_only_function<std::error_code(unsigned, std::span<const header>)>;
 
 // Performs one request on one owned TLS connection. The numeric endpoint
 // is caller supplied; hostname selects certificate verification, SNI and the

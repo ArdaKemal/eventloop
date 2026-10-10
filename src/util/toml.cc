@@ -6,6 +6,15 @@
 #include <cmath>
 #include <limits>
 
+#ifndef __cpp_lib_to_chars
+#include <cerrno>
+#include <cstdlib>
+#include <locale.h>
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+#endif
+
 namespace eventloop::util {
 auto toml_value::find(std::string_view name) const noexcept -> const toml_value* {
     if (type != toml_type::table) return nullptr;
@@ -353,12 +362,24 @@ bool parser::scalar(toml_value* p, std::string_view s) {
     auto result = std::to_chars(normalized.data()+length, normalized.data()+normalized.size(), exponent);
     length = static_cast<std::size_t>(result.ptr-normalized.data());
     double number{};
-    auto converted = std::from_chars(normalized.data(), normalized.data()+length, number);
-    if (converted.ec == std::errc::result_out_of_range) {
+#ifdef __cpp_lib_to_chars
+    const auto ec = std::from_chars(normalized.data(), normalized.data()+length, number).ec;
+#else
+    // Apple's libc++ has no floating-point from_chars. strtod_l in the C
+    // locale rounds the same way; normalized is zero-filled, so terminated.
+    static const locale_t c_locale = newlocale(LC_ALL_MASK, "C", nullptr);
+    char* end = nullptr;
+    errno = 0;
+    number = strtod_l(normalized.data(), &end, c_locale);
+    const auto ec = end != normalized.data()+length ? std::errc::invalid_argument
+        : errno == ERANGE && (number == 0 || std::isinf(number)) ? std::errc::result_out_of_range
+        : std::errc{};
+#endif
+    if (ec == std::errc::result_out_of_range) {
         // Underflow preserves signed zero; finite spelling overflow is an error.
         if (exponent + static_cast<long long>(significant_count) < -323) number = negative ? -0.0 : 0.0;
         else return fail(toml_error_code::invalid_number);
-    } else if (converted.ec != std::errc{}) return fail(toml_error_code::invalid_number);
+    } else if (ec != std::errc{}) return fail(toml_error_code::invalid_number);
     p->type = toml_type::floating; p->floating = number; return true;
 }
 auto parser::run() -> std::expected<toml_document, toml_error> {
