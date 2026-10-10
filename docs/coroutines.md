@@ -30,6 +30,10 @@ under `eventloop/`. Platform readiness is private.
   starts with queued work, or ends on an owner stop, may skip that pass's
   zero-timeout readiness check; at most 8 are skipped in a row, so socket
   readiness, signals, and other-thread stops wait at most that many passes.
+- `run()` returns `interrupted` on SIGINT or SIGTERM sent to the process. On
+  macOS, kqueue does not report one sent only to the loop thread (`raise`,
+  `pthread_kill`); it stays pending and takes its default action when the
+  last loop on that thread restores the signal mask.
 - Destroy the loop only after every frame retires; the loop checks this before
   destroying worker/poller state.
 - POSIX loops block SIGPIPE on their constructing thread while any loop lives

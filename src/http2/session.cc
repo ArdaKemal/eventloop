@@ -1293,7 +1293,15 @@ auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
         if (release_hook_ != nullptr)
             release_hook_(release_context_, value.id, value.stream_finished);
     }
+    // Keep header string capacity for the slot's next stream, which
+    // allocate_stream clears: libc++ frees it when a fresh stream is
+    // move-assigned, so steady-state requests would allocate.
+    static constexpr std::string stream::* kept[] {&stream::method, &stream::target,
+        &stream::if_none_match, &stream::if_modified_since, &stream::range};
+    std::array<std::string, std::size(kept)> buffers;
+    for (std::size_t i = 0; i < buffers.size(); ++i) buffers[i] = std::move(value.*kept[i]);
     value = stream {};
+    for (std::size_t i = 0; i < buffers.size(); ++i) value.*kept[i] = std::move(buffers[i]);
 }
 
 // Routes a stream whose request headers were just validated. Returns false

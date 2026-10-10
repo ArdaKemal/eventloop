@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENSSL_VERSION: 3.5.4
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cxx: g++
+          - compiler: clang
+            cxx: clang++-20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu ships OpenSSL 3.0; the library requires 3.5+.
+      - name: Cache OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/openssl
+          key: openssl-${{ env.OPENSSL_VERSION }}-ubuntu-24.04
+
+      - name: Build OpenSSL
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" | tar xz
+          cd "openssl-$OPENSSL_VERSION"
+          ./Configure --prefix="$HOME/openssl" --libdir=lib no-tests no-docs
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ${{ matrix.compiler == 'clang' && 'clang-20' || '' }}
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DOPENSSL_ROOT_DIR="$HOME/openssl"
+
+      # Repeat the errors after the full log so they are easy to find.
+      - name: Build
+        run: |
+          set -o pipefail
+          cmake --build build -- -k 0 2>&1 | tee build.log ||
+            { grep -E 'FAILED:|error:' build.log; exit 1; }
+
+      # Tests bind loopback ports and run serially. http3_server needs a curl
+      # built with HTTP/3, which runner images do not provide.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 300 -E '^http3_server$'
+
+  macos:
+    name: macOS
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Test scripts call the openssl CLI; use Homebrew's, not LibreSSL.
+      - name: Install tools
+        run: |
+          brew install ninja openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+
+      # Repeat the errors after the full log so they are easy to find.
+      - name: Build
+        run: |
+          set -o pipefail
+          cmake --build build -- -k 0 2>&1 | tee build.log ||
+            { grep -E 'FAILED:|error:' build.log; exit 1; }
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 300 -E '^http3_server$'
+
+  windows:
+    name: Windows
+    runs-on: windows-2022
+    # Windows runtime is not verified yet: 9 of 68 tests fail (QUIC crashes,
+    # timeouts, OpenSSL applink). Report results without blocking until fixed.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL
+        run: choco install openssl -y --no-progress
+
+      - name: Configure
+        run: cmake -S . -B build -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL"
+
+      - name: Build
+        run: cmake --build build --config Debug
+
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure --timeout 300

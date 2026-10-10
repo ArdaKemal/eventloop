@@ -166,7 +166,7 @@ private:
 
     bounded_task_queue queue_;
     wake_semaphore ready_;
-    std::vector<std::jthread> workers_;
+    std::vector<std::thread> workers_;
     std::atomic<bool> accepting_ {true};
 };
 
