@@ -29,8 +29,10 @@ head -c 300000 /dev/zero | tr '\0' 'x' > "$work_dir/www/index.html"
     -keyout "$work_dir/key.pem" -out "$work_dir/cert.pem" \
     > /dev/null 2>&1
 
-http_port=$((20000 + $$ % 10000))
-https_port=$((http_port + 10000))
+# Stay below the Linux (32768+) and BSD/Windows (49152+) ephemeral ranges
+# so a client socket from a parallel test cannot hold a listener port.
+http_port=$((10000 + $$ % 7000 * 3))
+https_port=$((http_port + 1))
 
 "$server" --root "$work_dir/www" \
     --certificate "$work_dir/cert.pem" --private-key "$work_dir/key.pem" \

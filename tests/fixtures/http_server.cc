@@ -131,11 +131,15 @@ auto main(int argc, char* argv[]) -> int
         const auto https_port = valid_port(https_port_value);
         auto context = tls_context::make_server(
             certificate, private_key, key_password);
-        start_listener(loop, std::make_unique<http::redirect_server>(
-            loop, ip_endpoint::parse(address, http_port), hostname, https_port));
-        start_listener(loop, std::make_unique<http::https_server>(
+        // Bind both before spawning: a bind failure after one listener task
+        // starts would destroy the loop with that task's frame still live.
+        auto redirect = std::make_unique<http::redirect_server>(
+            loop, ip_endpoint::parse(address, http_port), hostname, https_port);
+        auto https = std::make_unique<http::https_server>(
             loop, ip_endpoint::parse(address, https_port), std::move(context),
-            server_options));
+            server_options);
+        start_listener(loop, std::move(redirect));
+        start_listener(loop, std::move(https));
         std::cout << "HTTP redirect listening on http://" << address << ':'
                   << http_port << '\n'
                   << "HTTPS server listening on https://" << address << ':'

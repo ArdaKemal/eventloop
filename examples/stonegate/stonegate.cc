@@ -344,40 +344,48 @@ auto main(int argc, char** argv) -> int
         eventloop::event_loop loop(loop_options);
         std::unique_ptr<eventloop::http::http3_server> http3;
         eventloop::task_handle<void> http3_run;
-        if (settings.mode == config::http_mode::serve) {
-            start<eventloop::http::server>(loop,
-                eventloop::ip_endpoint::parse(settings.bind, settings.http_port), options);
-            std::cout << "Serving HTTP/1.1 on " << settings.bind << ':' << settings.http_port << '\n';
-        }
-#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
-        if (!settings.certificate.empty()) {
-            auto context = eventloop::tls_context::make_server(
-                settings.certificate, settings.private_key, settings.key_password);
-            if (settings.mode == config::http_mode::redirect) {
-                start<eventloop::http::redirect_server>(loop,
-                    eventloop::ip_endpoint::parse(settings.bind, settings.http_port),
-                    settings.redirect_host, settings.https_port);
-                std::cout << "Redirecting HTTP on " << settings.bind << ':' << settings.http_port << '\n';
+        try {
+            if (settings.mode == config::http_mode::serve) {
+                start<eventloop::http::server>(loop,
+                    eventloop::ip_endpoint::parse(settings.bind, settings.http_port), options);
+                std::cout << "Serving HTTP/1.1 on " << settings.bind << ':' << settings.http_port << '\n';
             }
-            start<eventloop::http::https_server>(loop,
-                eventloop::ip_endpoint::parse(settings.bind, settings.https_port),
-                std::move(context), options);
-            std::cout << "Serving HTTPS (HTTP/1.1" << (settings.http2 ? ", HTTP/2" : "")
-                      << ") on " << settings.bind << ':' << settings.https_port << '\n';
-        }
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
+            if (!settings.certificate.empty()) {
+                auto context = eventloop::tls_context::make_server(
+                    settings.certificate, settings.private_key, settings.key_password);
+                if (settings.mode == config::http_mode::redirect) {
+                    start<eventloop::http::redirect_server>(loop,
+                        eventloop::ip_endpoint::parse(settings.bind, settings.http_port),
+                        settings.redirect_host, settings.https_port);
+                    std::cout << "Redirecting HTTP on " << settings.bind << ':' << settings.http_port << '\n';
+                }
+                start<eventloop::http::https_server>(loop,
+                    eventloop::ip_endpoint::parse(settings.bind, settings.https_port),
+                    std::move(context), options);
+                std::cout << "Serving HTTPS (HTTP/1.1" << (settings.http2 ? ", HTTP/2" : "")
+                          << ") on " << settings.bind << ':' << settings.https_port << '\n';
+            }
 #else
-        if (!settings.certificate.empty())
-            throw std::runtime_error("this eventloop build has no Windows TLS support");
+            if (!settings.certificate.empty())
+                throw std::runtime_error("this eventloop build has no Windows TLS support");
 #endif
-        if (settings.http3_port != 0) {
-            http3 = std::make_unique<eventloop::http::http3_server>(
-                loop, eventloop::ip_endpoint::parse(settings.bind, settings.http3_port),
-                settings.certificate, settings.private_key, options);
-            if (loop.spawn(http3->run(), http3_run) !=
-                eventloop::task_spawn_result::accepted)
-                throw std::runtime_error("HTTP/3 listener task capacity exhausted");
-            std::cout << "Serving HTTP/3 on UDP " << settings.bind << ':'
-                      << settings.http3_port << '\n';
+            if (settings.http3_port != 0) {
+                http3 = std::make_unique<eventloop::http::http3_server>(
+                    loop, eventloop::ip_endpoint::parse(settings.bind, settings.http3_port),
+                    settings.certificate, settings.private_key, options);
+                if (loop.spawn(http3->run(), http3_run) !=
+                    eventloop::task_spawn_result::accepted)
+                    throw std::runtime_error("HTTP/3 listener task capacity exhausted");
+                std::cout << "Serving HTTP/3 on UDP " << settings.bind << ':'
+                          << settings.http3_port << '\n';
+            }
+        } catch (...) {
+            // Listener tasks started before a failed bind hold coroutine
+            // frames, and the loop must retire them before destruction.
+            loop.shutdown(eventloop::event_loop::clock::duration::zero());
+            (void)loop.run();
+            throw;
         }
         std::cout.flush();
         run(loop, settings.shutdown_seconds, http3.get(), http3_run);
