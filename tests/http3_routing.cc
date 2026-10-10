@@ -235,13 +235,18 @@ auto parse_response(std::span<const std::byte> bytes, response_view& view) -> vo
 auto send_all(event_loop&, quic_connection& connection, std::uint64_t id,
               std::span<const std::byte> bytes, bool fin) -> task<bool>
 {
+    // A server may answer before reading the whole request and stop it with
+    // STOP_SENDING (RFC 9114 4.1.2). The response read decides the outcome.
+    const auto stopped = make_error_code(quic_errc::stream_reset);
     while (!bytes.empty()) {
         const auto sent = flatten_result(co_await connection.async_write(id, bytes, false));
-        if (!sent || *sent == 0) co_return false;
+        if (!sent) co_return sent.error() == stopped;
+        if (*sent == 0) co_return false;
         bytes = bytes.subspan(*sent);
     }
-    if (fin && !flatten_result(co_await connection.async_write(id, {}, true))) co_return false;
-    co_return true;
+    if (!fin) co_return true;
+    const auto finished = flatten_result(co_await connection.async_write(id, {}, true));
+    co_return finished || finished.error() == stopped;
 }
 
 auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::byte> request,
