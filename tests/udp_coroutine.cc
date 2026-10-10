@@ -109,6 +109,28 @@ auto shutdown_after(event_loop& loop, std::chrono::seconds delay) -> task<void>
     }
 }
 
+// Runs the loop, without cancelling anything, until every other root retires.
+// IOCP operations resume only after their aborted completions are dequeued.
+auto stop_when_retired(event_loop& loop) -> task<void>
+{
+    for (int attempt = 0; attempt < 1000 &&
+         loop.coroutine_statistics().active_roots > 1; ++attempt) {
+        (void)co_await sleep_for(loop, 1ms);
+    }
+    loop.stop();
+}
+
+auto run_until_retired(event_loop& loop) -> bool
+{
+    if (loop.spawn(stop_when_retired(loop)) != task_spawn_result::accepted)
+        return false;
+    (void)loop.run();
+    if (loop.coroutine_statistics().active_roots == 0) return true;
+    loop.shutdown(event_loop::clock::duration::zero());
+    (void)loop.run();
+    return false;
+}
+
 auto add_socket(event_loop& loop,
                 ip_endpoint endpoint = ip_endpoint::loopback_v4()) -> udp_socket*
 {
@@ -299,9 +321,8 @@ auto duplicate_and_close() -> bool
         return false;
     }
     socket->close();
-    loop.stop();
-    (void)loop.run();
-    return cancelled && rejected && closed_socket(descriptor) &&
+    const bool retired = run_until_retired(loop);
+    return retired && cancelled && rejected && closed_socket(descriptor) &&
            loop.coroutine_statistics().live == 0;
 }
 

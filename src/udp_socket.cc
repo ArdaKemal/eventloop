@@ -140,9 +140,8 @@ auto udp_socket::send_batch(std::span<const std::byte> buffer,
     std::size_t total = 0;
     for (std::size_t offset = 0; offset < buffer.size(); offset += segment_size) {
         const auto length = std::min(segment_size, buffer.size() - offset);
-        detail::socket_operation operation {};
-        const auto result = detail::socket_operations::start_send_to(
-            descriptor_.get(), buffer.data() + offset, length, destination, operation);
+        const auto result = detail::socket_operations::send_datagram_now(
+            descriptor_.get(), buffer.data() + offset, length, destination);
         if (result.error) return std::unexpected(result.error);
         if (result.pending)
             return std::unexpected(
@@ -217,9 +216,9 @@ auto udp_socket::receive_awaiter::cancel(
 {
     auto& self = *static_cast<receive_awaiter*>(node.operation);
     detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
-    if (detail::socket_operations::datagram_cancel(
-            self.socket_, self.operation_)) self.socket_.close();
-    else self.socket_.complete_receive(-ECANCELED);
+    // A kernel operation completes as cancelled; the socket stays open.
+    if (!detail::socket_operations::datagram_cancel(self.socket_, self.operation_))
+        self.socket_.complete_receive(-ECANCELED);
 }
 
 udp_socket::send_awaiter::send_awaiter(
@@ -286,9 +285,8 @@ auto udp_socket::send_awaiter::cancel(
 {
     auto& self = *static_cast<send_awaiter*>(node.operation);
     detail::coroutine_frame_access::detach_cancellation(self.cancellation_);
-    if (detail::socket_operations::datagram_cancel(
-            self.socket_, self.operation_)) self.socket_.close();
-    else self.socket_.complete_send(-ECANCELED);
+    if (!detail::socket_operations::datagram_cancel(self.socket_, self.operation_))
+        self.socket_.complete_send(-ECANCELED);
 }
 
 auto udp_socket::update_interest() -> void

@@ -75,8 +75,9 @@ public:
     { static_cast<notifiable&>(stream).pin(); }
     static auto stream_unpin(tcp_stream& stream) noexcept -> void
     { static_cast<notifiable&>(stream).unpin(); }
+    // Windows replaces file with a private reopened handle on first use.
     [[nodiscard]] static auto stream_send_file(tcp_stream& stream,
-                                               const unique_fd& file,
+                                               unique_fd& file,
                                                std::uint64_t offset,
                                                std::size_t size,
                                                socket_operation& operation) noexcept
@@ -151,6 +152,13 @@ public:
                                             ip_endpoint destination,
                                             socket_operation& operation) noexcept
         -> socket_result;
+    // Sends one datagram now without leaving a kernel operation in flight;
+    // `pending` means the socket would block.
+    [[nodiscard]] static auto send_datagram_now(native_socket socket,
+                                                const void* buffer,
+                                                std::size_t size,
+                                                ip_endpoint destination) noexcept
+        -> socket_result;
     // UDP segmentation offload: submit `size` bytes as `segment`-sized
     // datagrams (the final segment may be shorter). Platforms without offload
     // report EINVAL/EOPNOTSUPP so the caller can fall back to per-segment sends.
@@ -184,6 +192,15 @@ inline auto socket_operations::accept_retire(tcp_acceptor&,
     tcp_acceptor::accept_awaiter&) noexcept -> void {}
 inline auto socket_operations::accept_close(tcp_acceptor& acceptor) -> void
 { acceptor.loop_.remove(acceptor.descriptor_.get()); }
+
+// POSIX start_send_to is already a synchronous non-blocking send.
+inline auto socket_operations::send_datagram_now(native_socket socket,
+    const void* buffer, std::size_t size, ip_endpoint destination) noexcept
+    -> socket_result
+{
+    socket_operation operation {};
+    return start_send_to(socket, buffer, size, destination, operation);
+}
 
 inline auto socket_operations::datagram_register(udp_socket&) noexcept -> void {}
 inline auto socket_operations::datagram_bind(udp_socket::receive_awaiter&) noexcept -> void {}
@@ -229,7 +246,7 @@ inline auto socket_operations::stream_cancel(tcp_stream&,
 inline auto socket_operations::stream_close(tcp_stream& stream) -> void
 { stream.loop_.remove(stream.descriptor_.get()); }
 inline auto socket_operations::stream_send_file(tcp_stream& stream,
-                                         const unique_fd& file, std::uint64_t offset,
+                                         unique_fd& file, std::uint64_t offset,
                                          std::size_t size,
                                          socket_operation& operation) noexcept
     -> socket_result

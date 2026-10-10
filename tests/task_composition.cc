@@ -164,9 +164,10 @@ auto immediate_timeout_validation_test() -> bool
 }
 #endif
 auto blocking_child(event_loop& loop, std::atomic<bool>& release,
-                    bool& cancelled) -> task<int>
+                    bool& cancelled, std::atomic<bool>* entered = nullptr) -> task<int>
 {
-    auto result = co_await run_blocking(loop, [&release]() noexcept {
+    auto result = co_await run_blocking(loop, [&release, entered]() noexcept {
+        if (entered != nullptr) entered->store(true, std::memory_order_release);
         while (!release.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
@@ -229,10 +230,11 @@ auto worker_timeout_test() -> bool
     return passed && loop.coroutine_statistics().active_roots == 0;
 }
 auto cancelled_timeout_root(event_loop& loop, std::atomic<bool>& release,
-                            bool& cancelled, bool& reached) -> task<void>
+                            std::atomic<bool>& entered, bool& cancelled,
+                            bool& reached) -> task<void>
 {
     auto result = co_await with_timeout(
-        loop, blocking_child(loop, release, cancelled), 1h);
+        loop, blocking_child(loop, release, cancelled, &entered), 1h);
     reached = result && result->state == timeout_result<int>::outcome::cancelled &&
               cancelled && release.load(std::memory_order_acquire);
 }
@@ -242,10 +244,18 @@ auto timeout_shutdown_test() -> bool
     options.worker_count = 1;
     event_loop loop(options);
     std::atomic<bool> release {false};
+    std::atomic<bool> entered {false};
     bool cancelled = false;
     bool reached = false;
-    if (loop.spawn(cancelled_timeout_root(loop, release, cancelled, reached)) !=
+    if (loop.spawn(cancelled_timeout_root(loop, release, entered, cancelled, reached)) !=
         task_spawn_result::accepted) return false;
+    // Shut down only once the worker runs the function; work cancelled while
+    // still queued is skipped and never waits for release.
+    const auto entry_deadline = std::chrono::steady_clock::now() + 5s;
+    while (!entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < entry_deadline) {
+        std::this_thread::yield();
+    }
     std::thread worker_release([&release] {
         std::this_thread::sleep_for(5ms);
         release.store(true, std::memory_order_release);
@@ -387,7 +397,6 @@ int main(int argc, char** argv)
     bool m = timeout_shutdown_test();
     if (!a || !b || !c || !d || !e || !f || !g || !h || !i || !j || !k ||
         !l || !m) {
-        std::cerr << "task composition test failed\n";
-        return 1;
+        std::cerr << "task composition test failed\n";        return 1;
     }
 }

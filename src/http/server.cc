@@ -132,7 +132,7 @@ private:
 template<typename Stream>
 [[nodiscard]] auto serve_connection(event_loop& loop, unique_fd descriptor,
                                     std::shared_ptr<detail::document_root> root,
-                                    connection_options options,
+                                    std::shared_ptr<const connection_options> options,
                                     std::shared_ptr<tls_context> context)
     -> task<void>
 {
@@ -144,13 +144,13 @@ template<typename Stream>
         // Expiry cancels this task, so the pending read or handshake fails.
         auto deadline = std::make_unique<detail::connection_deadline>(
             loop, co_await detail::current_cancellation {});
-        deadline->start(options.header_timeout);
+        deadline->start(options->header_timeout);
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         if constexpr (std::is_same_v<Stream, tls_stream>) {
             socket = std::make_unique<tls_stream>(
                 loop, std::move(descriptor), std::move(context),
                 tls_server_options {.application_protocols =
-                    options.enable_http2
+                    options->enable_http2
                     ? std::vector<std::string> {"h2", "http/1.1"}
                     : std::vector<std::string> {"http/1.1"}
                 });
@@ -171,10 +171,10 @@ template<typename Stream>
                 peer->close();
                 co_return;
             }
-            if (options.enable_http2 && peer->application_protocol() == "h2") {
+            if (options->enable_http2 && peer->application_protocol() == "h2") {
                 const auto served = co_await http2::detail::serve(
-                    loop, *peer, root, options.directory_listing, options.routes,
-                    options.max_request_body, *deadline, options.idle_timeout);
+                    loop, *peer, root, options->directory_listing, options->routes,
+                    options->max_request_body, *deadline, options->idle_timeout);
                 if (served && *served) {
                     const auto closed = co_await peer->async_close();
                     (void)closed;
@@ -188,13 +188,13 @@ template<typename Stream>
         // The parser, routing state and I/O buffers live outside the bounded
         // coroutine frame, allocated once per connection.
         std::unique_ptr<detail::route_state> routing;
-        if (options.routes) {
+        if (options->routes) {
             routing = std::make_unique<detail::route_state>();
-            routing->routes = options.routes.get();
-            routing->max_request_body = options.max_request_body;
+            routing->routes = options->routes.get();
+            routing->max_request_body = options->max_request_body;
         }
         auto state = std::make_unique<detail::session>(root->descriptor.get(),
-            options.directory_listing, routing.get(), static_cast<bool>(root->descriptor),
+            options->directory_listing, routing.get(), static_cast<bool>(root->descriptor),
             root->cache.get());
         std::unique_ptr<detail::http1_exchange<Stream>> exchange;
         if (routing) {
@@ -211,7 +211,7 @@ template<typename Stream>
                     break;
                 }
                 // The deadline runs from accept, or restarts after a response.
-                if (!deadline->running()) deadline->start(options.idle_timeout);
+                if (!deadline->running()) deadline->start(options->idle_timeout);
                 auto received = operation_result(co_await peer->async_read_some(buffer));
                 if (!received || *received == 0) {
                     peer->close();
@@ -416,9 +416,12 @@ auto server::accept_loop(event_loop& loop, server& listener,
                          std::shared_ptr<detail::document_root> root,
                          server_options options) -> task<void>
 {
+    // Shared, not copied, so each connection frame stays in its size class.
+    const auto connection = std::make_shared<const connection_options>(
+        for_connection(options));
     while (auto accepted = co_await listener.async_accept()) {
         const auto result = loop.spawn(serve_connection<tcp_stream>(
-            loop, std::move(*accepted), root, for_connection(options), {}));
+            loop, std::move(*accepted), root, connection, {}));
         if (result != task_spawn_result::accepted) {
             // Frame allocation can fail before the descriptor is moved into
             // the task. Close it here in that case (and for any other
@@ -450,9 +453,11 @@ auto https_server::accept_loop(event_loop& loop, https_server& listener,
                                std::shared_ptr<tls_context> context,
                                server_options options) -> task<void>
 {
+    const auto connection = std::make_shared<const connection_options>(
+        for_connection(options));
     while (auto accepted = co_await listener.async_accept()) {
         const auto result = loop.spawn(serve_connection<tls_stream>(
-            loop, std::move(*accepted), root, for_connection(options), context));
+            loop, std::move(*accepted), root, connection, context));
         if (result != task_spawn_result::accepted) accepted->reset();
     }
 }

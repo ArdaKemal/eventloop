@@ -1,0 +1,4 @@
+# Scripts run under POSIX shells and Python on every platform, including
+# Windows checkouts used from WSL.
+*.sh text eol=lf
+*.py text eol=lf

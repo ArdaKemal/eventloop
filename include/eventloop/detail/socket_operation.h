@@ -35,6 +35,7 @@ struct socket_operation {
     bool pending_completion {false};
     bool cancelled {false};
     std::size_t file_requested {0};
+    bool file_reopened {false};
 #endif
 };
 

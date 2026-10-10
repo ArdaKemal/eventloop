@@ -114,9 +114,13 @@ static auto notify_waiter(event_loop& loop,connection_driver& driver,
 static auto notification_scenario() -> void
 {
     event_loop loop;
-    udp_endpoint endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
+    // Endpoints and drivers hold large packet buffers; keep them off the
+    // 1 MiB Windows main-thread stack.
+    auto endpoint_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
+    auto& endpoint=*endpoint_storage;
     auto connection=std::make_unique<bounded_connection>(endpoint_role::client,connection_callbacks{});
-    connection_driver driver(loop,endpoint,*connection,dcid,dcid,ip_endpoint::loopback_v4(12345),true);
+    auto driver_storage=std::make_unique<connection_driver>(loop,endpoint,*connection,dcid,dcid,ip_endpoint::loopback_v4(12345),true);
+    auto& driver=*driver_storage;
     bool finished=false,completed=false,cancel_finished=false,cancel_completed=true;
     task_handle<void> cancelled;
     check(loop.spawn(wait_for_notification(loop,driver,finished,completed))==task_spawn_result::accepted);
@@ -143,6 +147,10 @@ static auto lost_close(event_loop& loop,connection_driver& driver,bounded_connec
     auto first=co_await peer.async_receive_from(input);
     check(first && first->size>=1200);
     const std::vector<std::byte> cached(input.begin(),input.begin()+static_cast<std::ptrdiff_t>(first->size));
+    // The driver enters closing when its send completes. IOCP can deliver the
+    // peer's receive before that send completion.
+    for (int attempt=0; attempt<100 && server.core().state()!=connection_state::closing; ++attempt)
+        check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
     check(driver.run_active() && !driver.retired());
     const auto pto=server.application_pto().value_or(1s);
     const auto deadline=server.core().next_deadline(pto);
@@ -168,8 +176,7 @@ static auto lost_close(event_loop& loop,connection_driver& driver,bounded_connec
     auto throttled=co_await with_timeout(loop,receive_packet(loop,peer,input),10ms);
     check((throttled && throttled->state==timeout_result<
         std::expected<udp_datagram,std::error_code>>::outcome::timed_out));
-    auto third=co_await peer.async_receive_from(input);
-    check(third && std::ranges::equal(input.first(third->size),cached));
+    auto third=co_await peer.async_receive_from(input);    check(third && std::ranges::equal(input.first(third->size),cached));
     check(server.core().next_deadline(pto)==deadline);
     // Even a validated address cannot amplify unauthenticated closing traffic.
     std::array<std::byte,32> tiny {};
@@ -193,7 +200,8 @@ static auto lost_close_scenario(contexts& context,std::uint32_t version) -> void
     auto* peer=owned.get();
     const auto address=peer->local_endpoint();
     loop.add(std::move(owned));
-    udp_endpoint endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    auto endpoint_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    auto& endpoint=*endpoint_storage;
     connection_callbacks callbacks{nullptr,valid_parameters,nullptr};
     auto server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks,lifecycle_time_point::clock::now());
     auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks,lifecycle_time_point::clock::now());
@@ -370,8 +378,10 @@ int main()
     for (auto version : {version_1,version_2}) lost_close_scenario(context,version);
     for (auto version : {version_1,version_2}) {
         event_loop loop;
-        udp_endpoint client_endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
-        udp_endpoint server_endpoint(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+        auto client_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
+    auto& client_endpoint=*client_storage;
+        auto server_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    auto& server_endpoint=*server_storage;
         connection_callbacks callbacks{nullptr,valid_parameters,nullptr};
         const auto now=lifecycle_time_point::clock::now();
         auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks,now);

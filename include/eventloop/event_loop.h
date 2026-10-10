@@ -140,9 +140,10 @@ struct event_loop_options {
     // File operations are bounded independently of the existing post queue.
     std::size_t file_io_depth {128};
     // Per-loop maximum coroutine-frame slots by payload size class. Growth is
-    // bounded by these limits; a zero capacity disables a class. The 1 KiB
-    // class defaults to 10,240 slots so one loop can serve the 10k-connection
-    // target without reserving those slots at startup.
+    // bounded by these limits; a zero capacity disables a class. The fourth
+    // class (1 KiB, or 16 KiB on Windows) defaults to 10,240 slots so one
+    // loop can serve the 10k-connection target without reserving those slots
+    // at startup.
     std::array<std::size_t, 6> coroutine_frame_capacities {
         64, 32, 16, 10240, 4, 2,
     };
@@ -155,9 +156,19 @@ struct event_loop_options {
     // Frame-resident state must not require alignment beyond max_align_t.
 };
 
+#if defined(_WIN32)
+// MSVC gives every local and awaiter live in a coroutine its own frame slot,
+// so the same coroutines need roughly ten times the GCC/Clang frame size
+// (an HTTP/1.1 connection task is about 9.5 KiB in Release). Each Windows
+// class is 16 times larger so it holds the same coroutines as elsewhere.
+inline constexpr std::array<std::size_t, 6> coroutine_frame_sizes {
+    2048, 4096, 8192, 16384, 32768, 65536,
+};
+#else
 inline constexpr std::array<std::size_t, 6> coroutine_frame_sizes {
     128, 256, 512, 1024, 2048, 4096,
 };
+#endif
 
 struct coroutine_pool_statistics {
     // Configured hard limit and currently backed slots across all classes.

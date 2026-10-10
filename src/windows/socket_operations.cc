@@ -277,20 +277,31 @@ auto socket_operations::stream_close(tcp_stream& stream) -> void
 }
 
 auto socket_operations::stream_send_file(tcp_stream& stream,
-                                         const unique_fd& file, std::uint64_t offset,
+                                         unique_fd& file, std::uint64_t offset,
                                          std::size_t size,
                                          socket_operation& operation) noexcept
     -> socket_result
 {
-    native_socket native_file = file.get();
-    if (file.kind_ == unique_fd::kind::file) {
-        const auto handle = ::_get_osfhandle(static_cast<int>(file.get()));
-        if (handle == -1)
-            return {.error = {EBADF, std::generic_category()}};
-        native_file = static_cast<native_socket>(handle);
+    // TransmitFile advances the handle's file pointer, which duplicates and
+    // CRT descriptors share. Send from a private file object instead.
+    if (!operation.file_reopened) {
+        native_socket native_file = file.get();
+        if (file.kind_ == unique_fd::kind::file) {
+            const auto handle = ::_get_osfhandle(static_cast<int>(file.get()));
+            if (handle == -1)
+                return {.error = {EBADF, std::generic_category()}};
+            native_file = static_cast<native_socket>(handle);
+        }
+        const HANDLE reopened = ::ReOpenFile(reinterpret_cast<HANDLE>(native_file),
+            GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+        if (reopened == INVALID_HANDLE_VALUE)
+            return {.error = {static_cast<int>(::GetLastError()), std::system_category()}};
+        file = unique_fd(reinterpret_cast<native_socket>(reopened),
+                         unique_fd::kind::native_file);
+        operation.file_reopened = true;
     }
     operation.file_requested = size;
-    return start_send_file(stream.descriptor_.get(), native_file, offset, size, operation);
+    return start_send_file(stream.descriptor_.get(), file.get(), offset, size, operation);
 }
 
 namespace {
@@ -380,6 +391,10 @@ auto socket_operations::prepare_datagram(native_socket socket,
                      reinterpret_cast<const char*>(&exclusive),
                      sizeof(exclusive)) == SOCKET_ERROR)
         throw std::system_error(last_error(), "SO_EXCLUSIVEADDRUSE");
+    // send_datagram_now must not block; overlapped operations ignore FIONBIO.
+    u_long nonblocking = 1;
+    if (::ioctlsocket(static_cast<SOCKET>(socket), FIONBIO, &nonblocking) ==
+        SOCKET_ERROR) throw std::system_error(last_error(), "FIONBIO");
     const auto address = native_endpoint(endpoint);
     if (::bind(static_cast<SOCKET>(socket), address.address(),
                address.length) == SOCKET_ERROR)
@@ -619,6 +634,31 @@ auto socket_operations::start_send_to(native_socket socket,
         static_cast<SOCKET>(socket), &operation.buffer, 1, nullptr, 0,
         reinterpret_cast<const sockaddr*>(&operation.address),
         operation.address_length, &operation.overlapped, nullptr), operation);
+}
+
+// Without an OVERLAPPED, IOCP posts no completion that could outlive the
+// caller's stack.
+auto socket_operations::send_datagram_now(native_socket socket,
+                                          const void* buffer, std::size_t size,
+                                          ip_endpoint destination) noexcept
+    -> socket_result
+{
+    const std::size_t maximum_payload =
+        destination.address_family == ip_endpoint::family::ipv6 ? 65527 : 65507;
+    if (size > maximum_payload)
+        return {.error = {WSAEMSGSIZE, std::system_category()}};
+    if (destination.port == 0)
+        return {.error = {WSAEINVAL, std::system_category()}};
+    const auto native = native_endpoint(destination);
+    WSABUF data {static_cast<ULONG>(size),
+                 const_cast<char*>(static_cast<const char*>(buffer))};
+    DWORD sent = 0;
+    if (::WSASendTo(static_cast<SOCKET>(socket), &data, 1, &sent, 0,
+                    native.address(), native.length, nullptr, nullptr) == 0)
+        return {.transferred = sent};
+    const int error = ::WSAGetLastError();
+    if (error == WSAEWOULDBLOCK) return {.pending = true};
+    return {.error = {error, std::system_category()}};
 }
 
 auto socket_operations::cancel(native_socket socket,

@@ -162,6 +162,28 @@ auto shutdown_after(event_loop& loop, std::chrono::seconds delay) -> task<void>
     }
 }
 
+// Runs the loop, without cancelling anything, until every other root retires.
+// IOCP operations resume only after their aborted completions are dequeued.
+auto stop_when_retired(event_loop& loop) -> task<void>
+{
+    for (int attempt = 0; attempt < 1000 &&
+         loop.coroutine_statistics().active_roots > 1; ++attempt) {
+        (void)co_await sleep_for(loop, 1ms);
+    }
+    loop.stop();
+}
+
+auto run_until_retired(event_loop& loop) -> bool
+{
+    if (loop.spawn(stop_when_retired(loop)) != task_spawn_result::accepted)
+        return false;
+    (void)loop.run();
+    if (loop.coroutine_statistics().active_roots == 0) return true;
+    loop.shutdown(0s);
+    (void)loop.run();
+    return false;
+}
+
 auto server(event_loop& loop, tcp_acceptor& listener,
             int& completed, bool& passed, native_socket& accepted_descriptor)
     -> task<void>
@@ -358,11 +380,8 @@ auto duplicate_accept_and_close() -> bool
         return false;
     }
     owner->close();
-    // Root frames completed by close() are retired when the loop next drains
-    // completed roots.
-    loop.stop();
-    (void)loop.run();
-    return pending == ECANCELED && duplicate == EBUSY &&
+    const bool retired = run_until_retired(loop);
+    return retired && pending == ECANCELED && duplicate == EBUSY &&
            closed_descriptor(descriptor) &&
            loop.coroutine_statistics().live == 0;
 }
@@ -462,9 +481,8 @@ auto duplicate_io_and_close() -> bool
         return false;
     }
     owner->close();
-    loop.stop();
-    (void)loop.run();
-    return pending_read == ECANCELED && duplicate_read == EBUSY &&
+    const bool retired = run_until_retired(loop);
+    return retired && pending_read == ECANCELED && duplicate_read == EBUSY &&
            pending_write == ECANCELED && duplicate_write == EBUSY &&
            closed_descriptor(descriptor) &&
            loop.coroutine_statistics().live == 0;

@@ -193,7 +193,7 @@ auto aligned_frame(event_loop& loop, std::uintptr_t& address) -> task<void>
 
 auto oversized_frame(event_loop& loop, int& value) -> task<void>
 {
-    volatile std::byte storage[5000] {};
+    volatile std::byte storage[coroutine_frame_sizes.back() + 1] {};
     storage[0] = std::byte {1};
     const auto result = co_await noop(loop);
     if (result == task_result::success) {

@@ -44,6 +44,9 @@ struct stream_storage {
     std::array<std::byte, 4096> io {};
     std::array<http::header, h3::qpack_max_fields> request_headers {};
     std::array<std::byte, 8 * 1024> body {};
+    // Kept here, not in serve_request's frame, so that frame stays in its
+    // size class; its views point into strings.
+    h3::request_head head {};
     bool in_use {false};
 };
 
@@ -750,6 +753,17 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     co_return true;
 }
 
+// Validates outside serve_request, whose frame would otherwise hold the result.
+[[nodiscard]] auto store_request_head(stream_storage& s, std::span<const h3::field> fields,
+                                      bool extended_connect) noexcept
+    -> std::optional<h3::h3_error>
+{
+    const auto head = h3::validate_request(fields, extended_connect);
+    if (!head) return head.error();
+    s.head = *head;
+    return std::nullopt;
+}
+
 auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
                    native_socket root, http::detail::open_file_cache* files,
                    stream_storage* storage,
@@ -778,23 +792,22 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         co_return;
     }
     const auto request_fields = std::span<const h3::field>(s.fields).first(*decoded);
-    const auto head = h3::validate_request(request_fields, settings.routes != nullptr);
-    if (!head) {
-        fail(connection, id, head.error());
+    if (const auto invalid = store_request_head(s, request_fields, settings.routes != nullptr)) {
+        fail(connection, id, *invalid);
         co_return;
     }
-    frames.set_content_length(head->content_length, head->content_length_too_large);
-    const auto method = head->method;
-    const auto path = head->path;
-    const bool https = h3::ascii_equal(head->scheme, "https");
-    if (head->connect_protocol == "websocket" && !https) {
+    frames.set_content_length(s.head.content_length, s.head.content_length_too_large);
+    const auto method = s.head.method;
+    const auto path = s.head.path;
+    const bool https = h3::ascii_equal(s.head.scheme, "https");
+    if (s.head.connect_protocol == "websocket" && !https) {
         fail(connection, id, h3::h3_error::message_error);
         co_return;
     }
     // Routes see https requests; others keep the static answers below. The
     // routed path runs in its own frame so this one stays in its size class.
-    if (settings.routes != nullptr && (https || !head->connect_protocol.empty()) &&
-        (co_await route_request(loop, connection, id, s, frames, pending, *head,
+    if (settings.routes != nullptr && (https || !s.head.connect_protocol.empty()) &&
+        (co_await route_request(loop, connection, id, s, frames, pending, s.head,
                                 request_fields, settings)).value_or(true))
         co_return;
     std::size_t match_size = 0;
