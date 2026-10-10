@@ -33,8 +33,10 @@ head -c 1048576 /dev/zero | tr '\0' 'h' > "$work_dir/www/large.bin"
     -subj /CN=localhost -keyout "$work_dir/key.pem" \
     -out "$work_dir/cert.pem" > /dev/null 2>&1
 
-http_port=$((20000 + $$ % 10000))
-https_port=$((http_port + 10000))
+# Stay below the Linux (32768+) and BSD/Windows (49152+) ephemeral ranges
+# so a client socket from a parallel test cannot hold a listener port.
+http_port=$((10000 + $$ % 7000 * 3))
+https_port=$((http_port + 1))
 "$server" --root "$work_dir/www" --certificate "$work_dir/cert.pem" \
     --private-key "$work_dir/key.pem" --hostname localhost \
     --http-port "$http_port" --https-port "$https_port" \
@@ -128,7 +130,11 @@ for index in {1..6}; do
     cmp "$work_dir/www/file.txt" "$work_dir/parallel-$index.out"
 done
 cmp "$work_dir/www/large.bin" "$work_dir/parallel-large.out"
-grep -Eq 'Multiplexed connection|Using Stream ID' "$work_dir/parallel.trace" || \
-    fail 'curl did not report multiplexed HTTP/2 streams'
+# curl logs "Multiplexed connection found" only when it reuses a connection
+# while another stream is still open, which depends on timing. Count the
+# connections and opened streams instead.
+[[ $(grep -c 'Connected to' "$work_dir/parallel.trace") == 1 &&
+   $(grep -Ec 'OPENED stream|Using Stream ID' "$work_dir/parallel.trace") == 7 ]] ||
+    fail 'curl did not send all parallel requests as streams on one connection'
 
 echo 'HTTP/2 server integration: ALPN, methods, paths, security, flow control, and parallel streams passed'
