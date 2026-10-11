@@ -48,7 +48,7 @@ TCP and UDP may share a port number. `--bind` applies to every listener.
 | `--http2 on\|off` | TLS h2 advertisement; default on |
 | `--http3-port PORT` | HTTP/3; default off |
 | `--http3-connections N` | 1..256; default 8 |
-| `--http3-requests N` | 1..8192 scratch slots; default four per connection |
+| `--http3-requests N` | 0..8192 scratch slots; 0 selects four per connection |
 | `--http3-max-datagram N` | 1200..8192 bytes; default 1472 |
 | `--directory-listing`, `--no-directory-listing` | Listings without index.html |
 | `--reuse-port`, `--no-reuse-port` | TCP listener port reuse |
@@ -60,21 +60,63 @@ completion. Coroutine capacities scale with configured HTTP/3 capacity.
 
 ## Configuration file
 
-Copy [stonegate.conf.example](stonegate.conf.example), create its document
-root, and run `stonegate --config FILE`. An existing root is required.
-Config loads first regardless of CLI position; CLI settings apply in written
-order and override it.
+Copy [stonegate.toml.example](stonegate.toml.example) to `stonegate.toml`,
+create its document root, and validate before starting:
 
-- Nonblank lines are `key=value`; trim surrounding spaces/tabs. Leading `#`
-  marks comments. No quoting, escaping, or inline comments; `#`/`=` inside
-  values are literal.
-- Keys match value-taking CLI names without `--`, plus `directory-listing`
-  and `reuse-port`. The three boolean keys (`http2`, `directory-listing`,
-  `reuse-port`) accept on/off. HTTP/3 capacity/datagram keys are supported.
-  Duplicate/unknown keys, empty/bad values fail with line numbers.
-- File-relative root/certificate/key paths resolve beside the config;
-  CLI paths resolve from the working directory. `--no-*` overrides file flags.
-  Store key passwords in protected local config; diagnostics omit values.
+```sh
+stonegate --config stonegate.toml --check
+stonegate --config stonegate.toml
+```
+
+TOML provides quoted paths, comments, booleans, and integer values. Common
+settings live in `[defaults]`; named `[[server]]` blocks override individual
+fields, including nested `http`, `tls`, and `http3` tables. Each server listens
+on its own numeric address/port and owns its static document root.
+
+```toml
+include = ["sites/downloads.toml"]
+
+[runtime]
+shutdown_seconds = 5
+
+[defaults]
+bind = "0.0.0.0"
+directory_listing = false
+header_timeout_ms = 30_000
+idle_timeout_ms = 60_000
+
+[[server]]
+name = "website"
+root = "public"
+[server.http]
+port = 8080
+```
+
+`sites/downloads.toml` can contain:
+
+```toml
+[[server]]
+name = "downloads"
+root = "../downloads"
+directory_listing = true
+[server.http]
+port = 8081
+```
+
+Paths resolve beside the file defining them. Every server inherits the main
+file's defaults, including servers from included files. CLI options override
+the loaded configuration regardless of `--config` position; with multiple
+servers select the override target using `--server website`. Global flags
+such as `--check` and `--shutdown-seconds` apply to the entire process.
+
+`--check` validates settings and loads credentials without listening. Unknown
+keys, wrong types, invalid ranges, repeated/cyclic includes, duplicate names,
+and overlapping endpoints fail with diagnostics that omit setting values.
+Config input and server counts have explicit bounds.
+
+See the [configuration contract](configuration.md) for the full schema,
+include ordering, inheritance, limits, and migration. The old unquoted
+key=value format must be converted to TOML.
 
 ## Limits
 
@@ -89,7 +131,7 @@ bodies, 4 MiB queued inline bodies. No h2c/prior knowledge or ordinary CONNECT.
 The library supports route handlers and Extended CONNECT WebSockets;
 Stonegate exposes only its health route and static resources.
 
-No CLI support for custom routes, uploads, proxying, CGI, virtual hosts,
+No configuration support for custom routes, uploads, proxying, CGI, virtual hosts,
 access logs, compression, custom cache/error policies, or live reload.
 Credentials load before listening and require restart to rotate. General
 frame/queue limits remain bounded, without separate CLI tuning.
@@ -100,10 +142,20 @@ frame/queue limits remain bounded, without separate CLI tuning.
 bash examples/stonegate/smoke.sh /tmp/stonegate-build/stonegate
 ```
 
+For the configuration CTest, configure with `-DBUILD_TESTING=ON`, build the
+`stonegate` target, then run:
+
+```sh
+ctest --test-dir /tmp/stonegate-build -R '^stonegate_configuration$' --output-on-failure
+```
+
 The runner creates temporary roots/certificates and covers plain HTTP, redirect,
 TLS, ALPN disable, HEAD/OPTIONS, listings, traversal/symlink rejection, reuse,
 SIGINT/rebind, config precedence/relative paths/errors, and credential-value
-redaction. It checks validators, range forms, large transfers, same-size rewrites
+redaction. The `stonegate_configuration` CTest additionally covers includes,
+inheritance, multiple listeners, schema/capacity errors, check mode, timeouts,
+and partial startup cleanup on POSIX (Python3 and the OpenSSL CLI required).
+The smoke runner also checks validators, range forms, large transfers, same-size rewrites
 with restored mtime, and listing bytes/limits across available protocols.
 HTTP/2 and HTTP/3 require curl support; absent HTTP/3 reports SKIP, failed
 requests fail. HTTP/3 runs repeated GET/HEAD/OPTIONS/GET exchanges against one

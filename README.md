@@ -61,8 +61,9 @@ Standalone applications build from their own example directories:
 
 - [Wayfarer](examples/wayfarer/README.md): HTTP/1.1, HTTP/2, and HTTP/3 CLI
   client; redirects and file downloads.
-- [Stonegate](examples/stonegate/README.md): file server across all three
-  protocols, TLS, redirects, directory listings, and a `/healthz` route.
+- [Stonegate](examples/stonegate/README.md): file server with TOML defaults, includes, and
+  named servers across all three protocols; TLS, redirects, directory listings,
+  and a `/healthz` route.
 - [Parley](examples/parley/README.md): browser chat, uploads, routed APIs,
   HTTP/2 WebSockets, and event-stream fallback.
 - [Lantern](examples/lantern/README.md): resumable video uploads, ranged

@@ -1,8 +1,0 @@
-# Paths in this file are relative to its directory.
-root=public
-bind=127.0.0.1
-http-port=8080
-http-mode=serve
-directory-listing=off
-reuse-port=off
-shutdown-seconds=5

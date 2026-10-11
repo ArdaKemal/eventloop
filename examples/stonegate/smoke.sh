@@ -48,8 +48,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
 mkdir "$work/config"
 expect_config_error() {
     local expected=$1 contents=$2
-    printf '%s\n' "$contents" > "$work/config/invalid.conf"
-    if "$server" --config "$work/config/invalid.conf" >"$work/config-error.log" 2>&1; then
+    printf '%s\n' "$contents" > "$work/config/invalid.toml"
+    if "$server" --config "$work/config/invalid.toml" >"$work/config-error.log" 2>&1; then
         echo "config unexpectedly accepted: $expected" >&2
         exit 1
     fi
@@ -63,20 +63,19 @@ expect_config_error() {
         exit 1
     fi
 }
-expect_config_error 'duplicate config key on line 2' $'root=../root\nroot=../root'
-expect_config_error 'unknown setting' $'root=../root\nunknown=on'
-expect_config_error 'needs key=value' $'root=../root\nhttp-port'
-expect_config_error 'invalid key' $'root=../root\nhttp port=8080'
-expect_config_error 'http-port has an invalid value' $'root=../root\nhttp-port=abc'
-expect_config_error 'http2 must be on or off' $'root=../root\nhttp2=yes'
-expect_config_error 'key-password requires TLS credentials' $'root=../root\nkey-password=PRIVATE_SENTINEL_739'
-expect_config_error 'must be supplied together' $'root=../root\ncertificate=../cert.pem'
-expect_config_error 'requires --certificate and --private-key' $'root=../root\nhttp3-port=8444'
-expect_config_error 'http3-connections has an invalid value' $'root=../root\nhttp3-connections=257'
-expect_config_error 'http3-requests has an invalid value' $'root=../root\nhttp3-requests=8193'
-expect_config_error 'TLS credentials are required' $'root=../root\nhttp-mode=redirect'
-expect_config_error 'HTTP and HTTPS ports must differ' $'root=../root\ncertificate=../cert.pem\nprivate-key=../key.pem\nhttp-port=8443'
-if "$server" --config "$work/config/invalid.conf" --config "$work/config/invalid.conf" \
+expect_config_error 'duplicate key' $'[defaults]\nroot="../root"\nroot="../root"'
+expect_config_error 'unknown setting' $'[defaults]\nroot="../root"\nunknown=true'
+expect_config_error 'invalid syntax' $'[defaults]\nroot="../root"\nhttp-port'
+expect_config_error 'wrong TOML type' $'[defaults]\nroot="../root"\nhttp.port="abc"'
+expect_config_error 'wrong TOML type' $'[defaults]\nroot="../root"\ntls.http2="yes"'
+expect_config_error 'key-password requires TLS credentials' $'[defaults]\nroot="../root"\ntls.key_password="PRIVATE_SENTINEL_739"'
+expect_config_error 'must be supplied together' $'[defaults]\nroot="../root"\ntls.certificate="../cert.pem"'
+expect_config_error 'requires certificate and private-key' $'[defaults]\nroot="../root"\nhttp3.port=8444'
+expect_config_error 'http3-connections has an invalid value' $'[defaults]\nroot="../root"\nhttp3.connections=257'
+expect_config_error 'http3-requests has an invalid value' $'[defaults]\nroot="../root"\nhttp3.requests=8193'
+expect_config_error 'TLS credentials and a TLS port are required' $'[defaults]\nroot="../root"\nhttp.mode="redirect"'
+expect_config_error 'overlapping listening endpoints' $'[defaults]\nroot="../root"\ntls.certificate="../cert.pem"\ntls.private_key="../key.pem"\nhttp.port=8443'
+if "$server" --config "$work/config/invalid.toml" --config "$work/config/invalid.toml" \
     >"$work/config-error.log" 2>&1; then
     echo 'duplicate --config unexpectedly accepted' >&2; exit 1
 fi
@@ -407,17 +406,20 @@ else
 fi
 server_pid=
 
-cat > "$work/config/tls.conf" <<EOF
-root=../root
-bind=127.0.0.1
-http-mode=redirect
-http-port=$http_port
-https-port=$https_port
-certificate=../cert.pem
-private-key=../key.pem
-http2=on
+cat > "$work/config/tls.toml" <<EOF
+[defaults]
+root = "../root"
+bind = "127.0.0.1"
+[defaults.http]
+mode = "redirect"
+port = $http_port
+[defaults.tls]
+port = $https_port
+certificate = "../cert.pem"
+private_key = "../key.pem"
+http2 = true
 EOF
-"$server" --http2 off --config "$work/config/tls.conf" --http-mode off \
+"$server" --http2 off --config "$work/config/tls.toml" --http-mode off \
     >"$work/server2.log" 2>&1 &
 server_pid=$!
 ready=0
@@ -513,15 +515,17 @@ if ! kill -INT "$server_pid" || ! wait "$server_pid"; then
     cat "$work/server3.log" >&2; exit 1
 fi
 server_pid=
-cat > "$work/config/plain.conf" <<EOF
+cat > "$work/config/plain.toml" <<EOF
 # Plain server equivalent to the preceding CLI run.
-root = ../root
-bind = 127.0.0.1
-http-port = $http_port
-directory-listing = on
-reuse-port = on
+[defaults]
+root = "../root"
+bind = "127.0.0.1"
+directory_listing = true
+reuse_port = true
+[defaults.http]
+port = $http_port
 EOF
-"$server" --config "$work/config/plain.conf" >"$work/server4.log" 2>&1 &
+"$server" --config "$work/config/plain.toml" >"$work/server4.log" 2>&1 &
 server_pid=$!
 ready=0
 for _ in {1..100}; do
@@ -544,7 +548,7 @@ fi
 server_pid=
 mkdir "$work/other-root"
 printf 'override-ok\n' > "$work/other-root/index.html"
-"$server" --config "$work/config/plain.conf" --root "$work/other-root" \
+"$server" --config "$work/config/plain.toml" --root "$work/other-root" \
     --no-directory-listing --no-reuse-port >"$work/server5.log" 2>&1 &
 server_pid=$!
 ready=0
