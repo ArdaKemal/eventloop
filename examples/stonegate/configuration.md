@@ -42,10 +42,10 @@ Fields below are allowed under both `defaults` and each `server`.
 | `root` | string path | Required existing directory |
 | `bind` | string | `127.0.0.1`; numeric IPv4/IPv6, optional numeric IPv6 scope |
 | `directory_listing` | boolean | `false` |
-| `reuse_port` | boolean | `false`; TCP only |
+| `reuse_port` | boolean | `false`; every listener |
 | `open_file_cache_capacity` | integer | 0 (off); 0..65536 descriptors per serving listener |
-| `header_timeout_ms` | integer | 30000; 0..3600000, 0 disables; TCP only |
-| `idle_timeout_ms` | integer | 60000; 0..3600000, 0 disables; TCP only |
+| `header_timeout_ms` | integer | 30000; 0..3600000, 0 disables; TCP only, including redirect |
+| `idle_timeout_ms` | integer | 60000; 0..3600000, 0 disables; serving TCP only |
 | `http.mode` | string | `serve`; `serve`, `redirect`, `off` |
 | `http.port` | integer | 8080; 1..65535 |
 | `http.redirect_host` | string | `localhost`; hostname for HTTPS redirects |
@@ -66,9 +66,9 @@ HTTP-off requires an enabled TLS or HTTP/3 listener. HTTP/3 requires credentials
 and an unencrypted key. TCP HTTP and TLS cannot share an endpoint. TCP and UDP
 may share a port. Servers cannot overlap numeric addresses/ports within a
 transport, including wildcard/specific-address overlap; IPv6 is v6-only.
-`reuse_port` remains useful for separate Stonegate processes. Reuse and timeout
-settings apply to serving HTTP/HTTPS listeners; the library redirect listener
-uses its fixed behavior and exposes neither option.
+`reuse_port` lets separate Stonegate processes share listener ports. A
+redirect listener closes after one response, so only `header_timeout_ms`
+applies to it.
 
 ## Validation, bounds, and lifecycle
 

@@ -148,7 +148,7 @@ auto main(int argc, char** argv) -> int
                     if (settings.mode == server_config::http_mode::redirect) {
                         start<eventloop::http::redirect_server>(loop,
                             eventloop::ip_endpoint::parse(settings.bind, settings.http_port),
-                            settings.redirect_host, settings.https_port);
+                            settings.redirect_host, settings.https_port, options);
                         std::cout << settings.name << ": HTTP redirect on " << settings.bind << ':'
                                   << settings.http_port << '\n';
                     }
