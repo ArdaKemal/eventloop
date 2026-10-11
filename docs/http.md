@@ -11,7 +11,8 @@ options)`, and `http3_server(loop, endpoint, certificate_chain, private_key,
 options)` use `server_options`. Supply `routes`, `document_root`, or both;
 neither throws `std::invalid_argument`. Unmatched paths serve static resources,
 or return 404 without a root. `redirect_server(loop, endpoint, hostname,
-https_port)` returns 308 for every request.
+https_port, options)` returns 308 for every request and closes; it applies only
+`reuse_port` and `header_timeout` from `server_options`.
 
 Connection tasks own sessions/I/O buffers and share document-root/router
 ownership with the listener. Small file reads/metadata calls are synchronous;

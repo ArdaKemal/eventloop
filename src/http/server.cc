@@ -325,16 +325,23 @@ struct redirect_state {
 
 [[nodiscard]] auto serve_redirect(event_loop& loop, unique_fd descriptor,
                                   std::shared_ptr<const std::string> hostname,
-                                  std::uint16_t https_port) -> task<void>
+                                  std::uint16_t https_port,
+                                  std::chrono::milliseconds header_timeout) -> task<void>
 {
+    stream_pin pin;
     std::unique_ptr<tcp_stream> socket;
     tcp_stream* peer = nullptr;
     bool registered = false;
     try {
+        // Expiry cancels this task, so the pending read fails.
+        auto deadline = std::make_unique<detail::connection_deadline>(
+            loop, co_await detail::current_cancellation {});
+        deadline->start(header_timeout);
         socket = std::make_unique<tcp_stream>(loop, std::move(descriptor));
         peer = socket.get();
         loop.add(std::move(socket));
         registered = true;
+        pin.hold(*peer);
         auto state = std::make_unique<redirect_state>();
         constexpr std::string_view bad =
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
@@ -386,6 +393,7 @@ struct redirect_state {
             }
             state->input_size += *received;
         }
+        deadline->stop();
         while (!response.empty()) {
             auto written = co_await peer->async_write_some(response);
             if (!written || *written == 0) break;
@@ -464,8 +472,10 @@ auto https_server::accept_loop(event_loop& loop, https_server& listener,
 #endif
 
 redirect_server::redirect_server(event_loop& loop, ip_endpoint local,
-                                 std::string_view hostname, std::uint16_t https_port)
-    : tcp_acceptor(loop, local), https_port_(https_port)
+                                 std::string_view hostname, std::uint16_t https_port,
+                                 server_options options)
+    : tcp_acceptor(loop, local, options.reuse_port), https_port_(https_port),
+      header_timeout_(options.header_timeout)
 {
     validate_hostname(hostname);
     hostname_ = std::make_shared<const std::string>(hostname);
@@ -473,16 +483,17 @@ redirect_server::redirect_server(event_loop& loop, ip_endpoint local,
 
 auto redirect_server::run() -> task<void>
 {
-    return accept_loop(owner(), *this, hostname_, https_port_);
+    return accept_loop(owner(), *this, hostname_, https_port_, header_timeout_);
 }
 
 auto redirect_server::accept_loop(event_loop& loop, redirect_server& listener,
                                    std::shared_ptr<const std::string> hostname,
-                                   std::uint16_t https_port) -> task<void>
+                                   std::uint16_t https_port,
+                                   std::chrono::milliseconds header_timeout) -> task<void>
 {
     while (auto accepted = co_await listener.async_accept()) {
         const auto result = loop.spawn(serve_redirect(
-            loop, std::move(*accepted), hostname, https_port));
+            loop, std::move(*accepted), hostname, https_port, header_timeout));
         if (result != task_spawn_result::accepted) accepted->reset();
     }
 }

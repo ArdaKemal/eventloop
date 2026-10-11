@@ -29,11 +29,12 @@ struct server_options {
     std::size_t open_file_cache_capacity {0};
     // TCP servers only.
     bool reuse_port {false};
-    // TCP servers only; zero disables either. A connection is closed when its
-    // TLS handshake and first request head take longer than header_timeout
-    // from accept, or when the next request head does not arrive within
-    // idle_timeout of the previous response. Handlers bound their own body
-    // reads and response writes.
+    // TCP servers only; redirect_server uses header_timeout only. Zero
+    // disables either. A connection is closed when its TLS handshake and
+    // first request head take longer than header_timeout from accept, or when
+    // the next request head does not arrive within idle_timeout of the
+    // previous response. Handlers bound their own body reads and response
+    // writes.
     std::chrono::milliseconds header_timeout {std::chrono::seconds {30}};
     std::chrono::milliseconds idle_timeout {std::chrono::seconds {60}};
     // https_server only: advertise h2 next to http/1.1.

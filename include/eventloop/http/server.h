@@ -8,6 +8,7 @@
 #include "eventloop/tls_context.h"
 #endif
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -60,19 +61,23 @@ private:
 
 class redirect_server final : public tcp_acceptor {
 public:
-    // Answers every request with 308 to https://hostname[:https_port].
+    // Answers every request with 308 to https://hostname[:https_port], then
+    // closes. Only reuse_port and header_timeout apply from options.
     redirect_server(event_loop& loop, ip_endpoint local,
-                    std::string_view hostname, std::uint16_t https_port);
+                    std::string_view hostname, std::uint16_t https_port,
+                    server_options options = {});
 
     [[nodiscard]] auto run() -> task<void>;
 
 private:
     static auto accept_loop(event_loop& loop, redirect_server& listener,
                             std::shared_ptr<const std::string> hostname,
-                            std::uint16_t https_port) -> task<void>;
+                            std::uint16_t https_port,
+                            std::chrono::milliseconds header_timeout) -> task<void>;
 
     std::shared_ptr<const std::string> hostname_;
     std::uint16_t https_port_;
+    std::chrono::milliseconds header_timeout_;
 };
 
 } // namespace eventloop::http

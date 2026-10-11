@@ -1,6 +1,7 @@
 // Connection deadlines from server_options: silent and slow new clients are
 // closed after header_timeout, idle keep-alive connections after
-// idle_timeout, and a handler slower than both still answers.
+// idle_timeout, and a handler slower than both still answers. Redirect
+// listeners apply header_timeout and can share a port.
 #include "eventloop/event_loop.h"
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
@@ -180,7 +181,7 @@ auto silent(event_loop& loop, std::uint16_t port, std::string_view name) -> task
 
 // Trickling a request head does not extend its deadline. A raw socket keeps
 // the client independent of the loop removing a failed stream.
-auto trickle(event_loop& loop, std::uint16_t port) -> task<void>
+auto trickle(event_loop& loop, std::uint16_t port, std::string_view name) -> task<void>
 {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     check(fd != -1, "socket");
@@ -196,13 +197,12 @@ auto trickle(event_loop& loop, std::uint16_t port) -> task<void>
         (void)co_await sleep_for(loop, 20ms);
         char byte = 0;
         if (::recv(fd, &byte, 1, MSG_DONTWAIT) == 0 || ::send(fd, "x", 1, MSG_NOSIGNAL) != 1) {
-            check_closed_after(clock_type::now() - start, header_timeout,
-                               "HTTP/1.1 trickled head");
+            check_closed_after(clock_type::now() - start, header_timeout, name);
             ::close(fd);
             co_return;
         }
     }
-    check(false, "HTTP/1.1 trickled head: never closed");
+    check(false, std::string(name) + ": never closed");
 }
 
 // A slow handler answers; keep-alive survives a pause shorter than the idle
@@ -325,8 +325,30 @@ auto main() -> int
                  });
     };
     plain([](event_loop& loop, std::uint16_t port) { return silent(loop, port, "HTTP/1.1 silent"); });
-    plain(trickle);
+    plain([](event_loop& loop, std::uint16_t port) {
+        return trickle(loop, port, "HTTP/1.1 trickled head");
+    });
     plain(plain_keep_alive);
+
+    const auto redirect = [](auto client) {
+        event_loop loop;
+        auto options = ::options();
+        options.reuse_port = true;
+        auto listener = std::make_unique<http::redirect_server>(
+            loop, ip_endpoint::loopback_v4(0), "localhost", 443, options);
+        // A second listener with the same options binds the same port. It is
+        // closed before serving, since the kernel would hand it connections.
+        (void)http::redirect_server(
+            loop, ip_endpoint::loopback_v4(port_of(*listener)), "localhost", 443, options);
+        run_case(loop, std::move(listener),
+                 [&](http::redirect_server&, std::uint16_t port) { return client(loop, port); });
+    };
+    redirect([](event_loop& loop, std::uint16_t port) {
+        return silent(loop, port, "redirect silent");
+    });
+    redirect([](event_loop& loop, std::uint16_t port) {
+        return trickle(loop, port, "redirect trickled head");
+    });
 
     const auto directory = std::filesystem::temp_directory_path() /
         ("eventloop-connections-" + std::to_string(::getpid()));
