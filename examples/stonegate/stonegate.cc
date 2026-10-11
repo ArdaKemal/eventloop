@@ -4,6 +4,7 @@
 #include "eventloop/http/http3_server.h"
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
+#include "eventloop/quic.h"
 #include "eventloop/tls_context.h"
 
 #include <algorithm>
@@ -88,12 +89,16 @@ auto stop(eventloop::event_loop& loop, int seconds,
 
 using contexts_type =
     std::array<std::shared_ptr<eventloop::tls_context>, stonegate::max_servers>;
+// One group per HTTP/3 server, shared by that server's endpoint on every worker.
+using groups_type =
+    std::array<std::shared_ptr<eventloop::quic_worker_group>, stonegate::max_servers>;
 
 // Builds every configured listener on one worker's loop. Several workers
-// share each port with SO_REUSEPORT, and HTTP/3 connection IDs carry the
-// worker index. Only worker 0 reports listeners.
+// share each port with SO_REUSEPORT; HTTP/3 connection IDs carry the worker
+// index and the server's group forwards packets to their owner. Only worker 0
+// reports listeners.
 auto start_listeners(eventloop::event_loop& loop, const stonegate::configuration& configuration,
-                     const contexts_type& contexts,
+                     const contexts_type& contexts, const groups_type& groups,
                      const std::shared_ptr<const eventloop::http::router>& routes,
                      std::size_t worker, std::span<http3_listener> http3) -> void
 {
@@ -116,6 +121,7 @@ auto start_listeners(eventloop::event_loop& loop, const stonegate::configuration
             .worker_index = shared
                 ? std::optional<std::uint8_t> {static_cast<std::uint8_t>(worker)}
                 : std::nullopt,
+            .worker_group = groups[index],
         };
         if (settings.mode == server_config::http_mode::serve) {
             start<eventloop::http::server>(loop,
@@ -209,6 +215,7 @@ struct worker_group {
 struct worker_setup {
     const stonegate::configuration& configuration;
     const contexts_type& contexts;
+    groups_type groups;
     std::shared_ptr<const eventloop::http::router> routes;
     eventloop::event_loop_options loop_options;
 };
@@ -233,7 +240,8 @@ auto run_worker(worker_group& group, const worker_setup& setup, std::size_t inde
     started();
     std::array<http3_listener, stonegate::max_servers> http3;
     try {
-        start_listeners(*loop, setup.configuration, setup.contexts, setup.routes, index, http3);
+        start_listeners(*loop, setup.configuration, setup.contexts, setup.groups, setup.routes,
+                        index, http3);
         if (index == 0) std::cout.flush();
     } catch (const std::exception& error) {
         group.fail(error.what());
@@ -259,7 +267,14 @@ auto run_workers(const stonegate::configuration& configuration,
         requests += settings.http3_requests == 0 ? settings.http3_connections * 4
                                                : settings.http3_requests;
     }
-    worker_setup setup {configuration, contexts, make_routes(), {}};
+    worker_setup setup {configuration, contexts, {}, make_routes(), {}};
+    // Endpoints sharing a port forward packets for connections another
+    // worker owns, so a client whose address changes keeps its connection.
+    if (configuration.workers > 1)
+        for (std::size_t index = 0; index < configuration.servers.size(); ++index)
+            if (configuration.servers[index].http3_port != 0)
+                setup.groups[index] =
+                    std::make_shared<eventloop::quic_worker_group>(configuration.workers);
     for (auto& capacity : setup.loop_options.coroutine_frame_capacities)
         capacity = std::max(capacity, connections * 8);
     setup.loop_options.coroutine_frame_capacities[4] = std::max(

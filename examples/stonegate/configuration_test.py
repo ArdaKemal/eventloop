@@ -3,6 +3,7 @@
 import contextlib
 import http.client
 import pathlib
+import selectors
 import shutil
 import signal
 import socket
@@ -10,6 +11,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 SERVER = str(pathlib.Path(sys.argv[1]).resolve())
@@ -62,6 +64,46 @@ def listening(port, kind):
     state = "0A" if kind == "tcp" else "07"
     return sum(1 for line in table
                if int(line.split()[1].split(":")[1], 16) == port and line.split()[3] == state)
+
+
+class RebindingRelay(threading.Thread):
+    """Forwards UDP to a server, moving to a new source port every `every`
+    client datagrams, as a NAT that rebinds would."""
+
+    def __init__(self, server_port, every):
+        super().__init__(daemon=True)
+        self.server = ("127.0.0.1", server_port)
+        self.every = every
+        self.front = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.front.bind(("127.0.0.1", 0))
+        self.port = self.front.getsockname()[1]
+        self.rebinds = 0
+        self.stopping = threading.Event()
+
+    def run(self):
+        selector = selectors.DefaultSelector()
+        back = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        selector.register(self.front, selectors.EVENT_READ)
+        selector.register(back, selectors.EVENT_READ)
+        client, received = None, 0
+        while not self.stopping.is_set():
+            for key, _ in selector.select(0.05):
+                if key.fileobj.fileno() == -1:
+                    continue  # closed by a rebind earlier in this batch
+                data, source = key.fileobj.recvfrom(65535)
+                if key.fileobj is self.front:
+                    client, received = source, received + 1
+                    if received % self.every == 0:
+                        selector.unregister(back)
+                        back.close()
+                        back = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        selector.register(back, selectors.EVENT_READ)
+                        self.rebinds += 1
+                    back.sendto(data, self.server)
+                elif client is not None:
+                    self.front.sendto(data, client)
+        back.close()
+        self.front.close()
 
 
 def ready(process, port, tls=False):
@@ -289,6 +331,8 @@ port={two}
     print("Two TLS/HTTP3 listeners, credential validation and endpoint retirement: PASS")
 
     if sys.platform.startswith("linux"):
+        large_size = 8 << 20
+        (work / "public" / "large.bin").write_bytes(b"x" * large_size)
         with running(main_config, "--workers", "3") as process:
             ready(process, one, tls=True)
             ready(process, two, tls=True)
@@ -307,6 +351,24 @@ port={two}
                             str(work / "cert.pem"), "--resolve", f"localhost:{port}:127.0.0.1",
                             f"https://localhost:{port}/"], capture_output=True, timeout=5)
                         assert result.returncode == 0 and result.stdout == body, result.stderr
+            if curl_h3:
+                # Downloads survive client rebinding: packets that hash to a
+                # worker that does not own the connection are forwarded.
+                relay = RebindingRelay(one, every=150)
+                relay.start()
+                try:
+                    result = subprocess.run([curl, "--http3-only", "--silent", "--show-error",
+                        "--fail", "--max-time", "20", "--output", "/dev/null", "--write-out",
+                        "%{size_download}", "--cacert", str(work / "cert.pem"), "--resolve",
+                        f"localhost:{relay.port}:127.0.0.1",
+                        f"https://localhost:{relay.port}/large.bin"],
+                        capture_output=True, text=True, timeout=25)
+                finally:
+                    relay.stopping.set()
+                    relay.join()
+                assert result.returncode == 0, result.stderr
+                assert result.stdout == str(large_size), result.stdout
+                assert relay.rebinds >= 5, relay.rebinds
         print("Three workers share TLS and HTTP/3 listeners and stop on SIGINT: PASS")
 
     # A later bind failure must retire the earlier TCP/HTTP3 tasks, not abort.

@@ -91,12 +91,13 @@ All servers share one loop on its owning thread on Linux, macOS, and Windows.
 With `workers` above 1, each worker thread runs its own loop and opens every
 listener itself with SO_REUSEPORT, so the kernel spreads TCP connections and
 UDP datagrams across workers; the router and TLS contexts are shared. HTTP/3
-connection IDs carry the worker index. This needs the kernel to balance
-reuse-port groups, so `workers` above 1 is rejected outside Linux for now.
-HTTP/3 capacities and coroutine pools apply per worker. A worker's HTTP/3
-connection stalls if the client address changes (see the library's
-[QUIC port sharing](../../docs/quic.md#port-sharing)). The first startup error
-stops every worker.
+connection IDs carry the worker index, and each HTTP/3 server's endpoints form
+a worker group that forwards packets to the worker owning the connection, so a
+client whose address changes keeps its connection (see the library's
+[QUIC port sharing](../../docs/quic.md#port-sharing)). This needs the kernel to
+balance reuse-port groups, so `workers` above 1 is rejected outside Linux for
+now. HTTP/3 capacities and coroutine pools apply per worker. The first startup
+error stops every worker.
 Windows builds without TCP TLS support accept only plain HTTP in Stonegate.
 TCP listeners/sockets belong to the loop. HTTP/3 listeners and observed run
 handles stay in stable caller storage until endpoint/task retirement, including
