@@ -142,8 +142,9 @@ template<typename Stream>
     bool registered = false;
     try {
         // Expiry cancels this task, so the pending read or handshake fails.
-        auto deadline = std::make_unique<detail::connection_deadline>(
-            loop, co_await detail::current_cancellation {});
+        // Named first: GCC 15 types co_await in a template as an rvalue here.
+        auto& cancellation = co_await detail::current_cancellation {};
+        auto deadline = std::make_unique<detail::connection_deadline>(loop, cancellation);
         deadline->start(options->header_timeout);
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
         if constexpr (std::is_same_v<Stream, tls_stream>) {
@@ -334,8 +335,8 @@ struct redirect_state {
     bool registered = false;
     try {
         // Expiry cancels this task, so the pending read fails.
-        auto deadline = std::make_unique<detail::connection_deadline>(
-            loop, co_await detail::current_cancellation {});
+        auto& cancellation = co_await detail::current_cancellation {};
+        auto deadline = std::make_unique<detail::connection_deadline>(loop, cancellation);
         deadline->start(header_timeout);
         socket = std::make_unique<tcp_stream>(loop, std::move(descriptor));
         peer = socket.get();
