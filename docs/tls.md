@@ -15,6 +15,8 @@ Setup/inherited operations: [TCP](tcp.md). Names below are in `eventloop`.
   verification hostname (also SNI); `application_protocols` sets ALPN.
   Await inherited connect before handshake; unconnected handshake is `ENOTCONN`.
   Raw TCP send-file is hidden because it bypasses TLS framing.
+- A `tls_context` is immutable once created (session cache and tickets are
+  off), so streams on different loops and threads may share one.
 - Construction preallocates OpenSSL read/write record buffers, throwing
   `std::bad_alloc` on failure, and retains drained buffers. Other OpenSSL
   processing may allocate.

@@ -45,6 +45,7 @@ auto usage() -> void
         "  --reuse-port            allow multiple listeners to reuse a port\n"
         "  --no-reuse-port         disable port reuse\n"
         "  --shutdown-seconds N    shutdown deadline (default 5)\n"
+        "  --workers N             event-loop threads sharing every listener (1..256; default 1)\n"
         "  --open-file-cache-capacity N  cached file descriptors (0..65536)\n"
         "  --header-timeout-ms N    first head/TLS timeout (0..3600000)\n"
         "  --idle-timeout-ms N      next head timeout (0..3600000)\n"
@@ -270,10 +271,15 @@ private:
         if (const auto* table = root.find("runtime")) {
             require_type(*table, toml_type::table, "runtime");
             for (const auto& value : *table) {
-                if (value.key != "shutdown_seconds") throw std::invalid_argument("runtime: unknown setting");
-                require_type(value, toml_type::integer, "runtime.shutdown_seconds");
-                output_.shutdown_seconds = number<int>(std::to_string(value.integer),
-                    "runtime.shutdown_seconds", 0, 3600);
+                if (value.key == "shutdown_seconds") {
+                    require_type(value, toml_type::integer, "runtime.shutdown_seconds");
+                    output_.shutdown_seconds = number<int>(std::to_string(value.integer),
+                        "runtime.shutdown_seconds", 0, 3600);
+                } else if (value.key == "workers") {
+                    require_type(value, toml_type::integer, "runtime.workers");
+                    output_.workers = number<std::size_t>(std::to_string(value.integer),
+                        "runtime.workers", 1, max_workers);
+                } else throw std::invalid_argument("runtime: unknown setting");
             }
         }
         if (const auto* includes = root.find("include")) {
@@ -375,7 +381,7 @@ auto parse_configuration(int argc, char** argv) -> configuration
         }
         if (!argument.starts_with("--")) throw std::invalid_argument("unknown option");
         const auto key = argument.substr(2);
-        if (key != "config" && key != "server" && key != "shutdown-seconds" &&
+        if (key != "config" && key != "server" && key != "shutdown-seconds" && key != "workers" &&
             std::none_of(std::begin(schema), std::end(schema), [&](const auto& entry) { return entry.cli == key; }))
             throw std::invalid_argument("unknown option");
         if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -411,6 +417,10 @@ auto parse_configuration(int argc, char** argv) -> configuration
             output.shutdown_seconds = number<int>(entry.value, entry.key, 0, 3600);
             continue;
         }
+        if (entry.key == "workers") {
+            output.workers = number<std::size_t>(entry.value, entry.key, 1, max_workers);
+            continue;
+        }
         if (output.servers.size() > 1 && selected_server.empty())
             throw std::invalid_argument("server CLI overrides require --server NAME with multiple servers");
         apply(*target, entry.key, entry.value);
@@ -422,6 +432,8 @@ auto parse_configuration(int argc, char** argv) -> configuration
         }
     }
     validate_endpoints(output.servers);
+    if (output.workers > 1 && !kernel_balances_reuse_port)
+        throw std::invalid_argument("workers above 1 require Linux on this build");
     return output;
 }
 

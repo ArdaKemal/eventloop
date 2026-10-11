@@ -8,6 +8,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdint>
+#include <latch>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <vector>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -78,6 +85,206 @@ auto stop(eventloop::event_loop& loop, int seconds,
     // receivers and connection tasks. Owners/handles may now be destroyed.
 }
 
+
+using contexts_type =
+    std::array<std::shared_ptr<eventloop::tls_context>, stonegate::max_servers>;
+
+// Builds every configured listener on one worker's loop. Several workers
+// share each port with SO_REUSEPORT, and HTTP/3 connection IDs carry the
+// worker index. Only worker 0 reports listeners.
+auto start_listeners(eventloop::event_loop& loop, const stonegate::configuration& configuration,
+                     const contexts_type& contexts,
+                     const std::shared_ptr<const eventloop::http::router>& routes,
+                     std::size_t worker, std::span<http3_listener> http3) -> void
+{
+    const bool shared = configuration.workers > 1;
+    const bool report = worker == 0;
+    for (std::size_t index = 0; index < configuration.servers.size(); ++index) {
+        const auto& settings = configuration.servers[index];
+        const eventloop::http::server_options options {
+            .routes = routes,
+            .document_root = settings.root,
+            .directory_listing = settings.directory_listing,
+            .open_file_cache_capacity = settings.open_file_cache_capacity,
+            .reuse_port = settings.reuse_port || shared,
+            .header_timeout = std::chrono::milliseconds {settings.header_timeout_ms},
+            .idle_timeout = std::chrono::milliseconds {settings.idle_timeout_ms},
+            .enable_http2 = settings.http2,
+            .connection_capacity = settings.http3_connections,
+            .request_capacity = settings.http3_requests,
+            .max_udp_payload_size = settings.http3_max_datagram,
+            .worker_index = shared
+                ? std::optional<std::uint8_t> {static_cast<std::uint8_t>(worker)}
+                : std::nullopt,
+        };
+        if (settings.mode == server_config::http_mode::serve) {
+            start<eventloop::http::server>(loop,
+                eventloop::ip_endpoint::parse(settings.bind, settings.http_port), options);
+            if (report)
+                std::cout << settings.name << ": HTTP/1.1 on " << settings.bind << ':'
+                          << settings.http_port << '\n';
+        }
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
+        if (contexts[index] && settings.https_port != 0) {
+            if (settings.mode == server_config::http_mode::redirect) {
+                start<eventloop::http::redirect_server>(loop,
+                    eventloop::ip_endpoint::parse(settings.bind, settings.http_port),
+                    settings.redirect_host, settings.https_port, options);
+                if (report)
+                    std::cout << settings.name << ": HTTP redirect on " << settings.bind
+                              << ':' << settings.http_port << '\n';
+            }
+            start<eventloop::http::https_server>(loop,
+                eventloop::ip_endpoint::parse(settings.bind, settings.https_port),
+                contexts[index], options);
+            if (report)
+                std::cout << settings.name << ": HTTPS (HTTP/1.1"
+                          << (settings.http2 ? ", HTTP/2" : "") << ") on "
+                          << settings.bind << ':' << settings.https_port << '\n';
+        }
+#endif
+        if (settings.http3_port != 0) {
+            auto& listener = http3[index];
+            listener.server = std::make_unique<eventloop::http::http3_server>(
+                loop, eventloop::ip_endpoint::parse(settings.bind, settings.http3_port),
+                settings.certificate, settings.private_key, options);
+            if (loop.spawn(listener.server->run(), listener.running) !=
+                eventloop::task_spawn_result::accepted)
+                throw std::runtime_error("HTTP/3 listener task capacity exhausted");
+            if (report)
+                std::cout << settings.name << ": HTTP/3 on UDP " << settings.bind << ':'
+                          << settings.http3_port << '\n';
+        }
+    }
+}
+
+// One worker per event-loop thread. A loop that leaves run() (on a signal or
+// a startup failure) asks every other loop to stop through post(); the posted
+// task runs on its own loop and ignores a loop that is already stopping, so a
+// stop never cuts another loop's shutdown short. No loop is destroyed until
+// every worker has finished posting.
+struct worker {
+    eventloop::event_loop* loop {nullptr};
+    bool stopping {false}; // owner loop thread only
+};
+
+struct worker_group {
+    explicit worker_group(std::size_t count)
+        : workers(count), built(static_cast<std::ptrdiff_t>(count)),
+          finished(static_cast<std::ptrdiff_t>(count)) {}
+    std::vector<worker> workers;
+    std::latch built;
+    std::latch finished;
+    std::atomic<bool> failed {false};
+    std::mutex error_mutex;
+    std::string error;
+
+    auto fail(std::string message) -> void
+    {
+        const std::lock_guard lock {error_mutex};
+        if (error.empty()) error = std::move(message);
+        failed.store(true);
+    }
+    // Counts down for a worker that never runs a loop.
+    auto absent(std::ptrdiff_t count) -> void
+    {
+        built.count_down(count);
+        finished.count_down(count);
+    }
+    auto stop_others(std::size_t self) -> void
+    {
+        for (std::size_t index = 0; index < workers.size(); ++index) {
+            auto& target = workers[index];
+            if (index == self || target.loop == nullptr) continue;
+            // A full queue falls back to a direct stop, which could end
+            // that worker's shutdown early but cannot leave it running.
+            if (!target.loop->post([&target]() noexcept {
+                    if (!target.stopping) target.loop->stop();
+                }))
+                target.loop->stop();
+        }
+    }
+};
+
+struct worker_setup {
+    const stonegate::configuration& configuration;
+    const contexts_type& contexts;
+    std::shared_ptr<const eventloop::http::router> routes;
+    eventloop::event_loop_options loop_options;
+};
+
+// started() runs once the loop exists; worker 0 uses it to start the other
+// threads, which then inherit the signal mask that loop installed.
+template<typename Started>
+auto run_worker(worker_group& group, const worker_setup& setup, std::size_t index,
+                Started started) -> void
+{
+    std::optional<eventloop::event_loop> loop;
+    try {
+        loop.emplace(setup.loop_options);
+    } catch (const std::exception& error) {
+        group.fail(error.what());
+        started();
+        group.absent(1);
+        return;
+    }
+    auto& self = group.workers[index];
+    self.loop = &*loop;
+    started();
+    std::array<http3_listener, stonegate::max_servers> http3;
+    try {
+        start_listeners(*loop, setup.configuration, setup.contexts, setup.routes, index, http3);
+        if (index == 0) std::cout.flush();
+    } catch (const std::exception& error) {
+        group.fail(error.what());
+    }
+    group.built.arrive_and_wait();
+    if (!group.failed.load()) (void)loop->run();
+    self.stopping = true;
+    group.stop_others(index);
+    stop(*loop, group.failed.load() ? 0 : setup.configuration.shutdown_seconds, http3);
+    // Other workers may still post to this loop until they arrive here.
+    group.finished.arrive_and_wait();
+}
+
+// Returns the first startup error, or an empty string after a clean stop.
+auto run_workers(const stonegate::configuration& configuration,
+                 const contexts_type& contexts) -> std::string
+{
+    // Preserve the original per-server frame budget even with HTTP/3
+    // disabled, and sum it across servers for each loop's shared capacity.
+    std::size_t connections = 0, requests = 0;
+    for (const auto& settings : configuration.servers) {
+        connections += settings.http3_connections;
+        requests += settings.http3_requests == 0 ? settings.http3_connections * 4
+                                               : settings.http3_requests;
+    }
+    worker_setup setup {configuration, contexts, make_routes(), {}};
+    for (auto& capacity : setup.loop_options.coroutine_frame_capacities)
+        capacity = std::max(capacity, connections * 8);
+    setup.loop_options.coroutine_frame_capacities[4] = std::max(
+        setup.loop_options.coroutine_frame_capacities[4], requests);
+
+    worker_group group(configuration.workers);
+    std::vector<std::jthread> threads;
+    threads.reserve(configuration.workers - 1);
+    run_worker(group, setup, 0, [&] {
+        for (std::size_t index = 1; index < configuration.workers; ++index) {
+            try {
+                threads.emplace_back([&group, &setup, index] {
+                    run_worker(group, setup, index, [] {});
+                });
+            } catch (const std::exception& error) {
+                group.fail(error.what());
+                group.absent(static_cast<std::ptrdiff_t>(configuration.workers - index));
+                return;
+            }
+        }
+    });
+    threads.clear();
+    return group.error;
+}
+
 } // namespace
 
 auto main(int argc, char** argv) -> int
@@ -105,80 +312,12 @@ auto main(int argc, char** argv) -> int
             std::cout << "Configuration OK (" << configuration.servers.size() << " server(s))\n";
             return 0;
         }
-        // Preserve the original per-server frame budget even with HTTP/3
-        // disabled, and sum it across servers for shared-loop capacity.
-        std::size_t connections = 0, requests = 0;
-        for (const auto& settings : configuration.servers) {
-            connections += settings.http3_connections;
-            requests += settings.http3_requests == 0 ? settings.http3_connections * 4
-                                                   : settings.http3_requests;
-        }
-        eventloop::event_loop_options loop_options;
-        for (auto& capacity : loop_options.coroutine_frame_capacities)
-            capacity = std::max(capacity, connections * 8);
-        loop_options.coroutine_frame_capacities[4] = std::max(
-            loop_options.coroutine_frame_capacities[4], requests);
-        eventloop::event_loop loop(loop_options);
-        std::array<http3_listener, stonegate::max_servers> http3;
-        try {
-            const auto routes = make_routes();
-            for (std::size_t index = 0; index < configuration.servers.size(); ++index) {
-                const auto& settings = configuration.servers[index];
-                const eventloop::http::server_options options {
-                    .routes = routes,
-                    .document_root = settings.root,
-                    .directory_listing = settings.directory_listing,
-                    .open_file_cache_capacity = settings.open_file_cache_capacity,
-                    .reuse_port = settings.reuse_port,
-                    .header_timeout = std::chrono::milliseconds {settings.header_timeout_ms},
-                    .idle_timeout = std::chrono::milliseconds {settings.idle_timeout_ms},
-                    .enable_http2 = settings.http2,
-                    .connection_capacity = settings.http3_connections,
-                    .request_capacity = settings.http3_requests,
-                    .max_udp_payload_size = settings.http3_max_datagram,
-                };
-                if (settings.mode == server_config::http_mode::serve) {
-                    start<eventloop::http::server>(loop,
-                        eventloop::ip_endpoint::parse(settings.bind, settings.http_port), options);
-                    std::cout << settings.name << ": HTTP/1.1 on " << settings.bind << ':'
-                              << settings.http_port << '\n';
-                }
-#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
-                if (contexts[index] && settings.https_port != 0) {
-                    if (settings.mode == server_config::http_mode::redirect) {
-                        start<eventloop::http::redirect_server>(loop,
-                            eventloop::ip_endpoint::parse(settings.bind, settings.http_port),
-                            settings.redirect_host, settings.https_port, options);
-                        std::cout << settings.name << ": HTTP redirect on " << settings.bind << ':'
-                                  << settings.http_port << '\n';
-                    }
-                    start<eventloop::http::https_server>(loop,
-                        eventloop::ip_endpoint::parse(settings.bind, settings.https_port),
-                        contexts[index], options);
-                    std::cout << settings.name << ": HTTPS (HTTP/1.1"
-                              << (settings.http2 ? ", HTTP/2" : "") << ") on "
-                              << settings.bind << ':' << settings.https_port << '\n';
-                }
-#endif
-                if (settings.http3_port != 0) {
-                    auto& listener = http3[index];
-                    listener.server = std::make_unique<eventloop::http::http3_server>(
-                        loop, eventloop::ip_endpoint::parse(settings.bind, settings.http3_port),
-                        settings.certificate, settings.private_key, options);
-                    if (loop.spawn(listener.server->run(), listener.running) !=
-                        eventloop::task_spawn_result::accepted)
-                        throw std::runtime_error("HTTP/3 listener task capacity exhausted");
-                    std::cout << settings.name << ": HTTP/3 on UDP " << settings.bind << ':'
-                              << settings.http3_port << '\n';
-                }
-            }
+        if (configuration.workers > 1) {
+            std::cout << configuration.workers << " workers share every listener\n";
             std::cout.flush();
-            (void)loop.run();
-        } catch (...) {
-            stop(loop, 0, http3);
-            throw;
         }
-        stop(loop, configuration.shutdown_seconds, http3);
+        const auto failure = run_workers(configuration, contexts);
+        if (!failure.empty()) throw std::runtime_error(failure);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "stonegate: " << error.what() << '\n';

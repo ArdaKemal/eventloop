@@ -4,6 +4,7 @@
 
 [runtime]
 shutdown_seconds = 5
+workers = 1                 # Event-loop threads sharing every listener (Linux above 1).
 
 # Every server inherits these settings. Explicit server fields override them.
 [defaults]

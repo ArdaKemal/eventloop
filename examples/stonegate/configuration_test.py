@@ -56,6 +56,14 @@ def running(config, *arguments):
             assert code == 0, (code, output)
 
 
+def listening(port, kind):
+    """Counts this host's listening TCP or bound UDP IPv4 sockets on port."""
+    table = pathlib.Path(f"/proc/net/{kind}").read_text().splitlines()[1:]
+    state = "0A" if kind == "tcp" else "07"
+    return sum(1 for line in table
+               if int(line.split()[1].split(":")[1], 16) == port and line.split()[3] == state)
+
+
 def ready(process, port, tls=False):
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -121,6 +129,9 @@ def main(work):
         (base + '[[server]]\nname="one"\n[[server]]\nname="two"\n', "overlapping"),
         (base + '[runtime]\nshutdown_seconds = false\n', "wrong TOML type"),
         (base + '[runtime]\nshutdown_seconds = 3601\n', "invalid value"),
+        (base + '[runtime]\nworkers = 0\n', "invalid value"),
+        (base + '[runtime]\nworkers = 257\n', "invalid value"),
+        (base + '[runtime]\nworkers = "4"\n', "wrong TOML type"),
         ('include=["missing.toml"]\n' + base, "cannot open config"),
         ('include=["stonegate.toml"]\n' + base, "cyclic include"),
         (base + '[[server]]\nroot="missing"\n', "existing directory"),
@@ -131,6 +142,11 @@ def main(work):
         check(contents, error)
     check(base, "duplicate --config", "--config", str(main_config))
     check(base, "unknown --server", "--server", "missing")
+    check(base, "invalid value", "--workers", "0")
+    if sys.platform.startswith("linux"):
+        check(base + '[runtime]\nworkers = 256\n')
+    else:
+        check(base + '[runtime]\nworkers = 2\n', "require Linux")
     check(base + '[defaults.http3]\nrequests=0\nport=0\n')
     check(base + '[defaults.tls]\nport=0\n')
     check(base + 'tls=false\n', "defaults.tls: wrong TOML type")
@@ -272,6 +288,26 @@ port={two}
         ready(process, two, tls=True)
     print("Two TLS/HTTP3 listeners, credential validation and endpoint retirement: PASS")
 
+    if sys.platform.startswith("linux"):
+        with running(main_config, "--workers", "3") as process:
+            ready(process, one, tls=True)
+            ready(process, two, tls=True)
+            # Every worker owns its own TCP and UDP sockets on each port.
+            for port in (one, two):
+                assert listening(port, "tcp") == 3, ("tcp", port)
+                assert listening(port, "udp") == 3, ("udp", port)
+            for _ in range(12):
+                assert request(one, tls=True) == (200, b"website\n")
+                assert request(two, tls=True) == (200, b"downloads\n")
+            if curl_h3:
+                for port, body in [(one, b"website\n"), (two, b"downloads\n")]:
+                    for _ in range(6):
+                        result = subprocess.run([curl, "--http3-only", "--silent",
+                            "--show-error", "--fail", "--max-time", "4", "--cacert",
+                            str(work / "cert.pem"), "--resolve", f"localhost:{port}:127.0.0.1",
+                            f"https://localhost:{port}/"], capture_output=True, timeout=5)
+                        assert result.returncode == 0 and result.stdout == body, result.stderr
+        print("Three workers share TLS and HTTP/3 listeners and stop on SIGINT: PASS")
 
     # A later bind failure must retire the earlier TCP/HTTP3 tasks, not abort.
     with socket.socket() as occupied:
@@ -283,6 +319,14 @@ port={two}
     with running(main_config) as process:
         ready(process, one, tls=True)
         ready(process, two, tls=True)
+    if sys.platform.startswith("linux"):
+        # A failing worker stops the workers that already started.
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", two))
+            occupied.listen()
+            result = subprocess.run([SERVER, "--config", str(main_config), "--workers", "3"],
+                                    capture_output=True, text=True, timeout=5)
+            assert result.returncode == 1, (result.returncode, result.stderr)
     print("Partial startup failure retires earlier listener tasks: PASS")
 
 

@@ -60,12 +60,13 @@ Fields below are allowed under both `defaults` and each `server`.
 | `http3.max_datagram` | integer | 1472; 1200..8192 bytes |
 
 `server.name` is a nonempty string, at most 64 ASCII letters, digits, `_`, `-`
-or `.`. `[runtime]` accepts only `shutdown_seconds` (integer, default 5,
-0..3600). TLS credentials must be paired. Redirect requires TCP TLS;
-HTTP-off requires an enabled TLS or HTTP/3 listener. HTTP/3 requires credentials
-and an unencrypted key. TCP HTTP and TLS cannot share an endpoint. TCP and UDP
-may share a port. Servers cannot overlap numeric addresses/ports within a
-transport, including wildcard/specific-address overlap; IPv6 is v6-only.
+or `.`. `[runtime]` accepts `shutdown_seconds` (integer, default 5, 0..3600)
+and `workers` (integer, default 1, 1..256). TLS credentials must be paired.
+Redirect requires TCP TLS; HTTP-off requires an enabled TLS or HTTP/3
+listener. HTTP/3 requires credentials and an unencrypted key. TCP HTTP and TLS
+cannot share an endpoint. TCP and UDP may share a port. Servers cannot overlap
+numeric addresses/ports within a transport, including wildcard/specific-address
+overlap; IPv6 is v6-only.
 `reuse_port` lets separate Stonegate processes share listener ports. A
 redirect listener closes after one response, so only `header_timeout_ms`
 applies to it.
@@ -87,13 +88,22 @@ settings before parser buffers expire. Includes use ordinary filesystem access;
 only load trusted configuration files.
 
 All servers share one loop on its owning thread on Linux, macOS, and Windows.
+With `workers` above 1, each worker thread runs its own loop and opens every
+listener itself with SO_REUSEPORT, so the kernel spreads TCP connections and
+UDP datagrams across workers; the router and TLS contexts are shared. HTTP/3
+connection IDs carry the worker index. This needs the kernel to balance
+reuse-port groups, so `workers` above 1 is rejected outside Linux for now.
+HTTP/3 capacities and coroutine pools apply per worker. A worker's HTTP/3
+connection stalls if the client address changes (see the library's
+[QUIC port sharing](../../docs/quic.md#port-sharing)). The first startup error
+stops every worker.
 Windows builds without TCP TLS support accept only plain HTTP in Stonegate.
 TCP listeners/sockets belong to the loop. HTTP/3 listeners and observed run
 handles stay in stable caller storage until endpoint/task retirement, including
 partial startup failure. Aggregate HTTP/3 capacities size bounded coroutine
-pools; request buffers remain owned by library servers. SIGINT stops all
-listeners. Shutdown cancels roots immediately; the deadline does not drain
-responses. No per-request configuration parsing or storage is introduced.
+pools; request buffers remain owned by library servers. SIGINT or SIGTERM stops
+all listeners on every worker. Shutdown cancels roots immediately; the deadline
+does not drain responses. No per-request configuration parsing or storage is introduced.
 
 ## Migration from key=value
 

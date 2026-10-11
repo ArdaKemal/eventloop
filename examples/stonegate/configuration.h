@@ -8,6 +8,16 @@
 namespace stonegate {
 
 inline constexpr std::size_t max_servers = 16;
+// A worker index is one byte of an HTTP/3 connection ID.
+inline constexpr std::size_t max_workers = 256;
+// Whether the kernel spreads connections and datagrams across sockets that
+// share a port. Several workers need it until a single-listener hand-off
+// exists for other platforms.
+#ifdef __linux__
+inline constexpr bool kernel_balances_reuse_port = true;
+#else
+inline constexpr bool kernel_balances_reuse_port = false;
+#endif
 
 struct server_config {
     std::string name;
@@ -35,6 +45,7 @@ struct server_config {
 struct configuration {
     std::vector<server_config> servers;
     int shutdown_seconds = 5;
+    std::size_t workers = 1;
     bool check = false;
 };
 
