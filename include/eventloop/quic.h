@@ -76,6 +76,28 @@ struct quic_transport_limits {
     std::uint64_t max_udp_payload_size {1472};
 };
 
+namespace quic::detail { struct worker_group_access; }
+
+// Connects server endpoints on different loops that share a port, so each
+// forwards packets for connections another endpoint owns (see docs/quic.md).
+// Construct once and pass it to every endpoint; endpoints may use it from
+// any thread.
+class quic_worker_group {
+public:
+    // workers is 1..256; anything else throws std::invalid_argument.
+    explicit quic_worker_group(std::size_t workers);
+    ~quic_worker_group();
+    quic_worker_group(const quic_worker_group&) = delete;
+    auto operator=(const quic_worker_group&) -> quic_worker_group& = delete;
+
+    [[nodiscard]] auto workers() const noexcept -> std::size_t;
+
+private:
+    friend struct quic::detail::worker_group_access;
+    class implementation;
+    std::unique_ptr<implementation> implementation_;
+};
+
 struct quic_server_options {
     std::filesystem::path certificate_chain;
     std::filesystem::path private_key;
@@ -90,6 +112,9 @@ struct quic_server_options {
     // so a steering layer can find the owning endpoint. Unset keeps the
     // connection ID fully random.
     std::optional<std::uint8_t> worker_index {};
+    // Forwards misrouted packets between endpoints sharing the port. Requires
+    // worker_index below the group's size, unique among open endpoints.
+    std::shared_ptr<quic_worker_group> worker_group {};
 };
 
 struct quic_client_options {

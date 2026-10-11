@@ -2,10 +2,12 @@
 
 #include "eventloop/udp_socket.h"
 #include "quic/endpoint_router.h"
+#include "quic/worker_group.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 
 namespace eventloop::quic::detail {
@@ -29,7 +31,10 @@ public:
                  endpoint_accept_callback accept = {},
                  bool grease_quic_bit = true,
                  std::size_t connection_capacity = 16,
-                 bool reuse_port = false);
+                 bool reuse_port = false,
+                 std::shared_ptr<quic_worker_group> group = {},
+                 std::uint8_t worker_index = 0,
+                 std::size_t forward_size = 1200);
     ~udp_endpoint();
     udp_endpoint(const udp_endpoint&) = delete;
     auto operator=(const udp_endpoint&) -> udp_endpoint& = delete;
@@ -60,6 +65,9 @@ public:
     // Flush queued datagrams with one offload/syscall batch. Always clears the
     // pending batch, even on failure.
     [[nodiscard]] auto flush_send() -> std::error_code;
+    // Owner loop: a datagram another endpoint in the worker group received for
+    // a connection ID carrying this endpoint's index.
+    auto deliver_forwarded(std::span<const std::byte>, ip_endpoint source) noexcept -> void;
 
 private:
     static constexpr std::size_t send_batch_capacity = 32;
@@ -70,12 +78,19 @@ private:
         -> task<std::expected<std::size_t, std::error_code>>;
     static auto socket_destroyed(void*) noexcept -> void;
     auto check_owner() const noexcept -> void;
+    // True when the datagram belongs to another endpoint in the group; it is
+    // then forwarded or dropped.
+    [[nodiscard]] auto forward(std::span<const std::byte>, const packet_header&,
+                               ip_endpoint source) noexcept -> bool;
     event_loop& loop_;
     std::thread::id owner_ {std::this_thread::get_id()};
     udp_socket* socket_ {};
     ip_endpoint local_ {};
     endpoint_router router_;
     endpoint_accept_callback accept_;
+    std::shared_ptr<quic_worker_group> group_;
+    std::shared_ptr<worker_inbox> inbox_;
+    std::uint8_t worker_index_ {};
     std::array<std::byte, maximum_datagram_size> receive_buffer_ {};
     std::array<std::byte, 600> version_buffer_ {};
     std::array<std::byte, send_batch_capacity * send_segment_capacity> send_batch_bytes_ {};

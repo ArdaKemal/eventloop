@@ -2,11 +2,13 @@
 // for QUIC v1 and v2, exercising the handshake, bidirectional stream I/O, and
 // the RFC 9221 DATAGRAM extension, and application stream resets,
 // STOP_SENDING, and CONNECTION_CLOSE, and SO_REUSEPORT servers on separate
-// loops, and worker-indexed connection IDs from QUIC and HTTP/3 servers. The certificate is generated
+// loops, worker-indexed connection IDs from QUIC and HTTP/3 servers, and
+// connections that survive client rebinding across shared-port workers. The certificate is generated
 // in-process.
 #include "eventloop/quic.h"
 #include "eventloop/event_loop.h"
 #include "eventloop/http/http3_server.h"
+#include "eventloop/task_composition.h"
 #include "eventloop/udp_socket.h"
 
 #include <openssl/bio.h>
@@ -718,6 +720,235 @@ auto http3_worker_index_scenario(const std::filesystem::path& certificate) -> bo
     return true;
 }
 
+// NAT rebinding across workers: a relay moves the client's traffic to a new
+// source port every round, so the kernel may hash it to the worker that does
+// not own the connection. Every round must still complete an echo.
+constexpr std::size_t rebind_rounds = 10;
+
+struct rebind_relay {
+    udp_socket* front {};               // client-facing, fixed
+    udp_socket* back {};                // server-facing, replaced each round
+    ip_endpoint client {};
+    std::uint16_t server_port {};
+    bool rebind {false};
+    std::vector<std::vector<std::byte>> buffers;
+};
+
+auto rebind_back(event_loop&, rebind_relay& relay, udp_socket& socket,
+                 std::span<std::byte> buffer) -> task<void>
+{
+    for (;;) {
+        const auto received = co_await socket.async_receive_from(buffer);
+        if (!received) co_return; // closed by a rebind
+        (void)co_await relay.front->async_send_to(buffer.first(received->size), relay.client);
+    }
+}
+
+// The only sender on the back socket, so a rebind happens between sends.
+auto rebind_front(event_loop& loop, rebind_relay& relay) -> task<void>
+{
+    std::size_t generation = 0;
+    for (;;) {
+        const auto received = co_await relay.front->async_receive_from(relay.buffers[0]);
+        if (!received) co_return;
+        relay.client = received->source;
+        if (relay.rebind || relay.back == nullptr) {
+            relay.rebind = false;
+            if (relay.back) relay.back->close();
+            auto owned = std::make_unique<udp_socket>(loop, ip_endpoint::loopback_v4(0));
+            relay.back = owned.get();
+            loop.add(std::move(owned));
+            ++generation;
+            check(generation < relay.buffers.size(), "rebind buffers");
+            check(loop.spawn(rebind_back(loop, relay, *relay.back, relay.buffers[generation])) ==
+                      task_spawn_result::accepted, "spawn rebind back pump");
+        }
+        (void)co_await relay.back->async_send_to(
+            std::span(relay.buffers[0]).first(received->size),
+            ip_endpoint::loopback_v4(relay.server_port));
+    }
+}
+
+auto rebind_echo_server(event_loop&, quic_connection connection) -> task<void>
+{
+    for (;;) {
+        const auto stream = flatten_result(co_await connection.async_accept_stream());
+        if (!stream) co_return;
+        std::array<std::byte, 16> buffer {};
+        std::size_t size = 0;
+        for (;;) {
+            const auto count = flatten_result(co_await connection.async_read(
+                *stream, std::span(buffer).subspan(size)));
+            if (!count) co_return;
+            if (*count == 0) break;
+            size += *count;
+            if (size == buffer.size()) co_return;
+        }
+        (void)co_await connection.async_write(*stream, std::span(buffer).first(size), true);
+    }
+}
+
+auto rebind_accept(event_loop& loop, quic_endpoint& server) -> task<void>
+{
+    for (;;) {
+        auto accepted = flatten_result(co_await server.async_accept());
+        if (!accepted && accepted.error() == std::errc::operation_canceled) co_return;
+        if (!accepted) continue;
+        if (loop.spawn(rebind_echo_server(loop, std::move(*accepted))) !=
+            task_spawn_result::accepted) co_return;
+    }
+}
+
+auto rebind_round(event_loop&, quic_connection& connection) -> task<bool>
+{
+    const auto stream = flatten_result(co_await connection.async_open_stream(
+        quic_stream_direction::bidirectional));
+    if (!stream) co_return false;
+    const auto sent = flatten_result(co_await connection.async_write(*stream, ping, true));
+    if (!sent || *sent != ping.size()) co_return false;
+    std::array<std::byte, 16> buffer {};
+    std::size_t size = 0;
+    while (size < buffer.size()) {
+        const auto count = flatten_result(co_await connection.async_read(
+            *stream, std::span(buffer).subspan(size)));
+        if (!count) co_return false;
+        if (*count == 0) break;
+        size += *count;
+    }
+    co_return size == ping.size() && std::ranges::equal(std::span(buffer).first(size), ping);
+}
+
+auto rebind_client(event_loop& loop, quic_endpoint& client, rebind_relay& relay,
+                   std::size_t& completed) -> task<void>
+{
+    auto connected = flatten_result(co_await client.async_connect(
+        relay.front->local_endpoint(), "localhost"));
+    if (connected) {
+        auto connection = std::move(*connected);
+        for (std::size_t round = 0; round < rebind_rounds; ++round) {
+            // The first round confirms the handshake; RFC 9000 9 lets a
+            // server drop packets from a new address before that.
+            relay.rebind = round > 0;
+            auto attempt = co_await with_timeout(loop, rebind_round(loop, connection), 3s);
+            if (!(attempt && attempt->result && *attempt->result && **attempt->result)) break;
+            ++completed;
+        }
+        connection.close();
+    }
+    co_await client.async_close();
+    relay.front->close();
+    if (relay.back) relay.back->close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto rebind_scenario(const std::filesystem::path& certificate, std::size_t workers) -> bool
+{
+    std::atomic<std::uint16_t> port {0};
+    std::atomic<std::size_t> ready {0};
+    std::atomic<bool> failed {false};
+    std::atomic<bool> done {false};
+    const auto group = std::make_shared<quic_worker_group>(workers);
+    auto worker = [&](std::size_t index) {
+        try {
+            while (index != 0 && port.load() == 0 && !failed.load())
+                std::this_thread::yield();
+            if (failed.load()) return;
+            event_loop loop;
+            quic_server_options options;
+            options.certificate_chain = certificate / "cert.pem";
+            options.private_key = certificate / "key.pem";
+            options.alpn = protocol;
+            options.reuse_port = true;
+            options.worker_index = static_cast<std::uint8_t>(index);
+            options.worker_group = group;
+            quic_endpoint server(loop, ip_endpoint::loopback_v4(port.load()),
+                                 std::move(options));
+            port.store(server.local_endpoint().port);
+            (void)loop.spawn(rebind_accept(loop, server));
+            (void)loop.spawn(shared_port_stop(loop, server, done));
+            ready.fetch_add(1);
+            (void)loop.run();
+        } catch (...) {
+            failed.store(true);
+        }
+    };
+    std::vector<std::jthread> threads;
+    for (std::size_t index = 0; index < workers; ++index) threads.emplace_back(worker, index);
+    while (ready.load() < workers && !failed.load()) std::this_thread::yield();
+
+    std::size_t completed = 0;
+    if (!failed.load()) {
+        event_loop loop;
+        quic_client_options options;
+        options.alpn = protocol;
+        options.trusted_ca = certificate / "cert.pem";
+        quic_endpoint client(loop, ip_endpoint::loopback_v4(0), std::move(options));
+        rebind_relay relay;
+        relay.server_port = port.load();
+        relay.buffers.assign(rebind_rounds + 3, std::vector<std::byte>(65536));
+        auto front = std::make_unique<udp_socket>(loop, ip_endpoint::loopback_v4(0));
+        relay.front = front.get();
+        loop.add(std::move(front));
+        check(loop.spawn(rebind_front(loop, relay)) == task_spawn_result::accepted,
+              "spawn rebind front pump");
+        check(loop.spawn(rebind_client(loop, client, relay, completed)) ==
+                  task_spawn_result::accepted, "spawn rebind client");
+        (void)loop.run();
+    }
+    done.store(true);
+    threads.clear();
+    check(!failed.load(), "rebind servers bind");
+    std::fprintf(stderr, "rebind rounds with %zu workers: %zu of %zu\n", workers, completed,
+                 rebind_rounds);
+    check(completed == rebind_rounds, "connection survives rebinding across workers");
+    return true;
+}
+
+auto close_then_stop(event_loop& loop, quic_endpoint& endpoint) -> task<void>
+{
+    co_await endpoint.async_close();
+    loop.stop();
+}
+
+// Group sizes, missing or out-of-range indexes, and indexes held by an open
+// endpoint are rejected; closing an endpoint frees its index.
+auto worker_group_rules(const std::filesystem::path& certificate) -> bool
+{
+    const auto throws = [](auto&& make) {
+        try { make(); } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    check(throws([] { quic_worker_group group(0); }), "empty worker group");
+    check(throws([] { quic_worker_group group(257); }), "oversized worker group");
+    event_loop loop;
+    const auto group = std::make_shared<quic_worker_group>(2);
+    const auto options = [&](std::optional<std::uint8_t> index) {
+        quic_server_options result;
+        result.certificate_chain = certificate / "cert.pem";
+        result.private_key = certificate / "key.pem";
+        result.alpn = protocol;
+        result.worker_index = index;
+        result.worker_group = group;
+        return result;
+    };
+    const auto make = [&](std::optional<std::uint8_t> index) {
+        return std::make_unique<quic_endpoint>(loop, ip_endpoint::loopback_v4(0), options(index));
+    };
+    check(throws([&] { (void)make(std::nullopt); }), "worker group without an index");
+    check(throws([&] { (void)make(2); }), "worker index outside its group");
+    auto holder = make(1);
+    check(throws([&] { (void)make(1); }), "worker index already held");
+    check(loop.spawn(close_then_stop(loop, *holder)) == task_spawn_result::accepted,
+          "spawn worker close");
+    (void)loop.run();
+    holder.reset();
+    auto replacement = make(1);
+    check(loop.spawn(close_then_stop(loop, *replacement)) == task_spawn_result::accepted,
+          "spawn replacement close");
+    (void)loop.run();
+    return true;
+}
+
 auto scenario(quic_version version, const std::filesystem::path& certificate,
               bool small_windows = false) -> bool
 {
@@ -783,6 +1014,12 @@ auto main() -> int
     const bool shutdown = shutdown_scenario(directory);
     const bool indexed = worker_index_scenario(directory);
     const bool http3_indexed = http3_worker_index_scenario(directory);
+    const bool group_rules = worker_group_rules(directory);
+#ifdef __linux__
+    const bool rebind = rebind_scenario(directory, 1) && rebind_scenario(directory, 2);
+#else
+    const bool rebind = true; // relies on the kernel spreading the shared port
+#endif
 #ifndef _WIN32
     const bool shared_port = shared_port_scenario(directory);
 #else
@@ -800,6 +1037,8 @@ auto main() -> int
     check(shutdown, "QUIC endpoint close notifies peers");
     check(indexed, "QUIC worker index in connection IDs");
     check(http3_indexed, "HTTP/3 worker index in connection IDs");
+    check(rebind, "QUIC connection survives rebinding across workers");
+    check(group_rules, "QUIC worker group validation");
     check(shared_port, "QUIC endpoints share a port across loops");
     std::puts("QUIC public API tests passed (v1 and v2)");
     return 0;

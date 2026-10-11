@@ -12,8 +12,9 @@ owning the document-root descriptor when configured. `run()` accepts;
 Keep the server and observed run task alive through completion. Unmatched
 GET/HEAD/OPTIONS use shared static-resource traversal. `reuse_port` lets one
 server per loop share a port, with the delivery limits in
-[QUIC port sharing](quic.md#port-sharing); `worker_index` is encoded in
-connection IDs as described there.
+[QUIC port sharing](quic.md#port-sharing); `worker_index` and
+`worker_group` encode the owner in connection IDs and forward misrouted packets
+to it as described there.
 
 | Capacity | Default / limit |
 | --- | --- |

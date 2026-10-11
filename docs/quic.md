@@ -67,19 +67,40 @@ supported platforms.
 
 `quic_server_options::reuse_port` sets SO_REUSEPORT so several server
 endpoints, one per loop, bind one port. Each endpoint keeps its own
-connections, routes, and capacity; there is no cross-endpoint routing. Linux
-picks the socket by hashing the datagram's address pair, so a connection's
-packets reach its owner while the client address and the set of bound
-endpoints stay unchanged. After NAT rebinding or migration, or when an
-endpoint binds or closes, packets may reach an endpoint that does not know the
-connection ID; it drops them without a stateless reset, so the connection
-stalls until it recovers its path or idles out. Spreading is verified on
-Linux only; Windows rejects the option.
+connections, routes, and capacity. Linux picks the socket by hashing the
+datagram's address pair, so a connection's packets reach its owner while the
+client address and the set of bound endpoints stay unchanged. After NAT
+rebinding or migration, or when an endpoint binds or closes, packets may reach
+an endpoint that does not know the connection ID. Without a worker group (below)
+it drops them without a stateless reset, so the connection stalls until it
+recovers its path or idles out. Spreading is verified on Linux only; Windows
+rejects the option.
 
 `quic_server_options::worker_index` makes the first byte of every connection
 ID the endpoint issues equal to the index; the other seven bytes stay random.
 The endpoint issues one 8-byte ID per connection and no NEW_CONNECTION_ID
 frames. Packets after the server's first Initial carry that ID, so a steering
 layer can map them to the owner; the client's first Initial carries a
-client-chosen ID and cannot be steered this way. The library does not yet
-steer or forward by index; it only encodes it.
+client-chosen ID and cannot be steered this way.
+
+`quic_worker_group(workers)` (1..256) lets those endpoints forward misrouted
+packets to each other. Give every endpoint the same
+`quic_server_options::worker_group` and a distinct `worker_index` below
+`workers`; a group without an index, an index out of range, or an index
+another open endpoint holds throws `std::invalid_argument` at construction.
+An endpoint forwards a short-header or Handshake packet whose connection ID it
+does not know and whose first byte names another joined endpoint. The owner
+processes it on its own loop as if it had arrived there, including path
+validation after NAT rebinding, and replies from its own socket on the same
+address and port. Initial and 0-RTT packets are never forwarded: their
+connection ID can be client-chosen, so they follow the address hash as before.
+
+Each endpoint's inbox holds 64 datagrams of up to its `max_udp_payload_size`
+and is reserved at construction. A full inbox, a larger datagram, or an index
+with no open endpoint drops the datagram; QUIC recovers it like any loss.
+Forwarding copies the datagram once and wakes the owner through
+`event_loop::post()` with at most one wakeup pending per inbox; if `post()`
+fails the datagrams wait for the next forward. An endpoint leaves the group
+when it closes, dropping datagrams still queued for it. Every packet of a
+connection whose client address hashes to another endpoint is forwarded until
+the address changes again.

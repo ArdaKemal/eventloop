@@ -17,6 +17,7 @@
 #include <coroutine>
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace eventloop {
@@ -249,11 +250,22 @@ public:
         }
     };
 
+    // A worker group needs the index its connection IDs carry.
+    [[nodiscard]] static auto group_index(const quic_server_options& options) -> std::uint8_t
+    {
+        if (options.worker_group && !options.worker_index)
+            throw std::invalid_argument("QUIC worker group requires worker_index");
+        return options.worker_index.value_or(0);
+    }
+
     implementation(event_loop& loop, ip_endpoint local, quic_server_options options)
         : loop_(loop),
           endpoint_(loop, local, path_endpoint_role::server, short_cid_length,
                     endpoint_accept_callback {this, accept_initial}, true,
-                    options.connection_capacity, options.reuse_port),
+                    options.connection_capacity, options.reuse_port, options.worker_group,
+                    group_index(options),
+                    static_cast<std::size_t>(std::clamp<std::uint64_t>(
+                        options.limits.max_udp_payload_size, 1200, 8192))),
           server_options_(std::move(options)),
           slots_(server_options_.connection_capacity),
           waiters_(std::make_shared<waiter_state>(server_options_.connection_capacity))

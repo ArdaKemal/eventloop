@@ -8,16 +8,32 @@ namespace eventloop::quic::detail {
 
 udp_endpoint::udp_endpoint(event_loop& loop, ip_endpoint local, path_endpoint_role role,
     std::size_t short_cid_length, endpoint_accept_callback accept, bool grease_quic_bit,
-    std::size_t connection_capacity, bool reuse_port)
+    std::size_t connection_capacity, bool reuse_port,
+    std::shared_ptr<quic_worker_group> group, std::uint8_t worker_index,
+    std::size_t forward_size)
     : loop_(loop), router_(role, short_cid_length, grease_quic_bit,
-                          connection_capacity), accept_(accept)
+                          connection_capacity), accept_(accept),
+      group_(std::move(group)), worker_index_(worker_index)
 {
-    auto socket = std::make_unique<udp_socket>(loop, local, reuse_port);
-    local_ = socket->local_endpoint();
-    socket_ = socket.get();
-    socket->enable_receive_coalescing();
-    socket->set_lifetime_observer(this, socket_destroyed);
-    loop.add(std::move(socket));
+    // Join before the socket exists, so a refused index leaves nothing open.
+    if (group_) {
+        inbox_ = std::make_shared<worker_inbox>(loop, *this, forward_size);
+        worker_group_access::join(*group_, worker_index_, inbox_);
+    }
+    try {
+        auto socket = std::make_unique<udp_socket>(loop, local, reuse_port);
+        local_ = socket->local_endpoint();
+        socket_ = socket.get();
+        socket->enable_receive_coalescing();
+        socket->set_lifetime_observer(this, socket_destroyed);
+        loop.add(std::move(socket));
+    } catch (...) {
+        if (inbox_) {
+            inbox_->close();
+            worker_group_access::leave(*group_, worker_index_, *inbox_);
+        }
+        throw;
+    }
 }
 
 udp_endpoint::~udp_endpoint()
@@ -36,6 +52,11 @@ auto udp_endpoint::socket_destroyed(void* argument) noexcept -> void
 auto udp_endpoint::close() -> void
 {
     check_owner();
+    if (inbox_) {
+        inbox_->close();
+        worker_group_access::leave(*group_, worker_index_, *inbox_);
+        inbox_.reset();
+    }
     auto* socket = std::exchange(socket_, nullptr);
     if (socket) {
         socket->set_lifetime_observer(nullptr, nullptr);
@@ -214,6 +235,8 @@ auto udp_endpoint::receive_loop(event_loop&, udp_endpoint& endpoint) -> task<std
                         endpoint.accept_.initial) {
                         handled = !endpoint.accept_.initial(endpoint.accept_.argument,
                             endpoint.router_, *header, received->source);
+                    } else if (header) {
+                        handled = endpoint.forward(datagram, *header, received->source);
                     }
                 }
             }
@@ -222,6 +245,30 @@ auto udp_endpoint::receive_loop(event_loop&, udp_endpoint& endpoint) -> task<std
         } while (offset < total);
     }
     co_return std::error_code(ECANCELED, std::generic_category());
+}
+
+auto udp_endpoint::forward(std::span<const std::byte> datagram, const packet_header& header,
+                           ip_endpoint source) noexcept -> bool
+{
+    // Initial and 0-RTT may carry a client-chosen ID; only IDs this group
+    // issued (short header and Handshake) name an owner.
+    if (!inbox_ || (header.kind != packet_kind::short_header &&
+                    header.kind != packet_kind::handshake))
+        return false;
+    const auto cid = header.destination_cid;
+    if (cid.size() != router_.short_cid_length()) return false;
+    const auto index = std::to_integer<std::uint8_t>(cid[0]);
+    if (index == worker_index_ || router_.lookup(cid)) return false;
+    if (const auto owner = worker_group_access::find(*group_, index))
+        owner->push(datagram, source);
+    return true;
+}
+
+auto udp_endpoint::deliver_forwarded(std::span<const std::byte> datagram,
+                                     ip_endpoint source) noexcept -> void
+{
+    check_owner();
+    if (socket_) (void)router_.dispatch(datagram, source);
 }
 
 auto udp_endpoint::send(event_loop&, udp_endpoint& endpoint, endpoint_connection handle,

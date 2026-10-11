@@ -9,6 +9,8 @@
 #include <memory>
 #include <optional>
 
+namespace eventloop { class quic_worker_group; }
+
 namespace eventloop::http {
 
 // Options shared by server, https_server and http3_server. At least one of
@@ -49,8 +51,10 @@ struct server_options {
     std::size_t connection_capacity {8};
     std::size_t request_capacity {0};
     std::size_t max_udp_payload_size {1472};
-    // http3_server only: see quic_server_options::worker_index.
+    // http3_server only: see quic_server_options::worker_index and
+    // worker_group.
     std::optional<std::uint8_t> worker_index {};
+    std::shared_ptr<quic_worker_group> worker_group {};
 };
 
 } // namespace eventloop::http

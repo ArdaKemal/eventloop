@@ -44,6 +44,7 @@ if(WIN32)
         src/quic/protected_packet.cc
         src/quic/connection_core.cc
         src/quic/udp_endpoint.cc
+        src/quic/worker_group.cc
         src/quic/key_update.cc
         src/quic/retry_packet.cc
         src/quic/retry_token.cc
@@ -782,6 +783,7 @@ add_library(eventloop
     src/quic/protected_packet.cc
     src/quic/connection_core.cc
     src/quic/udp_endpoint.cc
+    src/quic/worker_group.cc
     src/quic/key_update.cc
     src/quic/retry_packet.cc
     src/quic/retry_token.cc
