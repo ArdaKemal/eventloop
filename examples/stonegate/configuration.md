@@ -60,8 +60,9 @@ Fields below are allowed under both `defaults` and each `server`.
 | `http3.max_datagram` | integer | 1472; 1200..8192 bytes |
 
 `server.name` is a nonempty string, at most 64 ASCII letters, digits, `_`, `-`
-or `.`. `[runtime]` accepts `shutdown_seconds` (integer, default 5, 0..3600)
-and `workers` (integer, default 1, 1..256). TLS credentials must be paired.
+or `.`. `[runtime]` accepts `shutdown_seconds` (integer, default 5, 0..3600),
+`workers` (integer, default 1, 1..256), and `worker_mode` (`auto`, `reuse_port`,
+or `handoff`; default `auto`). TLS credentials must be paired.
 Redirect requires TCP TLS; HTTP-off requires an enabled TLS or HTTP/3
 listener. HTTP/3 requires credentials and an unencrypted key. TCP HTTP and TLS
 cannot share an endpoint. TCP and UDP may share a port. Servers cannot overlap
@@ -88,16 +89,25 @@ settings before parser buffers expire. Includes use ordinary filesystem access;
 only load trusted configuration files.
 
 All servers share one loop on its owning thread on Linux, macOS, and Windows.
-With `workers` above 1, each worker thread runs its own loop and opens every
-listener itself with SO_REUSEPORT, so the kernel spreads TCP connections and
-UDP datagrams across workers; the router and TLS contexts are shared. HTTP/3
-connection IDs carry the worker index, and each HTTP/3 server's endpoints form
-a worker group that forwards packets to the worker owning the connection, so a
-client whose address changes keeps its connection (see the library's
-[QUIC port sharing](../../docs/quic.md#port-sharing)). This needs the kernel to
-balance reuse-port groups, so `workers` above 1 is rejected outside Linux for
-now. HTTP/3 capacities and coroutine pools apply per worker. The first startup
-error stops every worker.
+With `workers` above 1, each worker thread runs its own loop; the router and
+TLS contexts are shared, and HTTP/3 capacities and coroutine pools apply per
+worker. `worker_mode` picks how connections reach workers; `auto` is
+`reuse_port` on Linux and `handoff` elsewhere.
+
+- `reuse_port`: every worker opens every listener with SO_REUSEPORT, and the
+  kernel spreads TCP connections and UDP datagrams across workers. HTTP/3
+  connection IDs carry the worker index, and each HTTP/3 server's endpoints
+  form a worker group that forwards packets to the worker owning the
+  connection, so a client whose address changes keeps its connection (see the
+  library's [QUIC port sharing](../../docs/quic.md#port-sharing)). It needs a
+  kernel that balances shared ports, so it is rejected outside Linux.
+- `handoff`: worker 0 opens the only listeners and hands accepted TCP
+  connections to every worker in turn (the library's `serving_loops`); each
+  worker opens its own document-root descriptor and open-file cache. HTTP/3
+  runs on worker 0 alone. Accepting is slower than `reuse_port` but works on
+  every platform; it is verified on Linux.
+
+The first startup error stops every worker.
 Windows builds without TCP TLS support accept only plain HTTP in Stonegate.
 TCP listeners/sockets belong to the loop. HTTP/3 listeners and observed run
 handles stay in stable caller storage until endpoint/task retirement, including

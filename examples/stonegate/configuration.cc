@@ -45,11 +45,20 @@ auto usage() -> void
         "  --reuse-port            allow multiple listeners to reuse a port\n"
         "  --no-reuse-port         disable port reuse\n"
         "  --shutdown-seconds N    shutdown deadline (default 5)\n"
-        "  --workers N             event-loop threads sharing every listener (1..256; default 1)\n"
+        "  --workers N             event-loop threads serving every listener (1..256; default 1)\n"
+        "  --worker-mode MODE      auto, reuse_port, or handoff (default auto)\n"
         "  --open-file-cache-capacity N  cached file descriptors (0..65536)\n"
         "  --header-timeout-ms N    first head/TLS timeout (0..3600000)\n"
         "  --idle-timeout-ms N      next head timeout (0..3600000)\n"
         "  --help                  show this message\n";
+}
+
+auto parse_worker_mode(std::string_view value) -> worker_mode
+{
+    if (value == "auto") return worker_mode::automatic;
+    if (value == "reuse_port") return worker_mode::reuse_port;
+    if (value == "handoff") return worker_mode::handoff;
+    throw std::invalid_argument("worker_mode must be auto, reuse_port, or handoff");
 }
 
 template<typename T>
@@ -279,6 +288,9 @@ private:
                     require_type(value, toml_type::integer, "runtime.workers");
                     output_.workers = number<std::size_t>(std::to_string(value.integer),
                         "runtime.workers", 1, max_workers);
+                } else if (value.key == "worker_mode") {
+                    require_type(value, toml_type::string, "runtime.worker_mode");
+                    output_.mode = parse_worker_mode(text(value));
                 } else throw std::invalid_argument("runtime: unknown setting");
             }
         }
@@ -382,6 +394,7 @@ auto parse_configuration(int argc, char** argv) -> configuration
         if (!argument.starts_with("--")) throw std::invalid_argument("unknown option");
         const auto key = argument.substr(2);
         if (key != "config" && key != "server" && key != "shutdown-seconds" && key != "workers" &&
+            key != "worker-mode" &&
             std::none_of(std::begin(schema), std::end(schema), [&](const auto& entry) { return entry.cli == key; }))
             throw std::invalid_argument("unknown option");
         if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -421,6 +434,10 @@ auto parse_configuration(int argc, char** argv) -> configuration
             output.workers = number<std::size_t>(entry.value, entry.key, 1, max_workers);
             continue;
         }
+        if (entry.key == "worker-mode") {
+            output.mode = parse_worker_mode(entry.value);
+            continue;
+        }
         if (output.servers.size() > 1 && selected_server.empty())
             throw std::invalid_argument("server CLI overrides require --server NAME with multiple servers");
         apply(*target, entry.key, entry.value);
@@ -432,8 +449,12 @@ auto parse_configuration(int argc, char** argv) -> configuration
         }
     }
     validate_endpoints(output.servers);
-    if (output.workers > 1 && !kernel_balances_reuse_port)
-        throw std::invalid_argument("workers above 1 require Linux on this build");
+    if (output.mode == worker_mode::automatic)
+        output.mode = kernel_balances_reuse_port ? worker_mode::reuse_port : worker_mode::handoff;
+    if (output.workers > 1 && output.mode == worker_mode::reuse_port &&
+        !kernel_balances_reuse_port)
+        throw std::invalid_argument("worker_mode reuse_port needs a kernel that balances "
+                                    "shared ports (Linux); use handoff");
     return output;
 }
 

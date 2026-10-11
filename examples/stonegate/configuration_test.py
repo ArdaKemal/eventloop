@@ -185,10 +185,14 @@ def main(work):
     check(base, "duplicate --config", "--config", str(main_config))
     check(base, "unknown --server", "--server", "missing")
     check(base, "invalid value", "--workers", "0")
+    check(base + '[runtime]\nworker_mode = "fast"\n', "worker_mode must be")
+    check(base + '[runtime]\nworker_mode = 1\n', "wrong TOML type")
+    check(base + '[runtime]\nworkers = 256\nworker_mode = "handoff"\n')
+    check(base, "worker_mode must be", "--worker-mode", "fast")
     if sys.platform.startswith("linux"):
         check(base + '[runtime]\nworkers = 256\n')
     else:
-        check(base + '[runtime]\nworkers = 2\n', "require Linux")
+        check(base + '[runtime]\nworkers = 2\nworker_mode = "reuse_port"\n', "use handoff")
     check(base + '[defaults.http3]\nrequests=0\nport=0\n')
     check(base + '[defaults.tls]\nport=0\n')
     check(base + 'tls=false\n', "defaults.tls: wrong TOML type")
@@ -371,6 +375,27 @@ port={two}
                 assert relay.rebinds >= 5, relay.rebinds
         print("Three workers share TLS and HTTP/3 listeners and stop on SIGINT: PASS")
 
+    # Handoff, the mode for kernels that do not balance shared ports: worker 0
+    # owns the only listeners and hands TCP connections to every worker.
+    with running(main_config, "--workers", "3", "--worker-mode", "handoff") as process:
+        ready(process, one, tls=True)
+        ready(process, two, tls=True)
+        if sys.platform.startswith("linux"):
+            for port in (one, two):
+                assert listening(port, "tcp") == 1, ("tcp", port)
+                assert listening(port, "udp") == 1, ("udp", port)
+        for _ in range(12):
+            assert request(one, tls=True) == (200, b"website\n")
+            assert request(two, tls=True) == (200, b"downloads\n")
+        if curl_h3:
+            for port, body in [(one, b"website\n"), (two, b"downloads\n")]:
+                result = subprocess.run([curl, "--http3-only", "--silent", "--show-error",
+                    "--fail", "--max-time", "4", "--cacert", str(work / "cert.pem"),
+                    "--resolve", f"localhost:{port}:127.0.0.1", f"https://localhost:{port}/"],
+                    capture_output=True, timeout=5)
+                assert result.returncode == 0 and result.stdout == body, result.stderr
+    print("Three handoff workers serve TLS connections accepted by worker 0: PASS")
+
     # A later bind failure must retire the earlier TCP/HTTP3 tasks, not abort.
     with socket.socket() as occupied:
         occupied.bind(("127.0.0.1", two))
@@ -381,14 +406,15 @@ port={two}
     with running(main_config) as process:
         ready(process, one, tls=True)
         ready(process, two, tls=True)
-    if sys.platform.startswith("linux"):
-        # A failing worker stops the workers that already started.
+    # A failing worker stops the workers that already started.
+    for mode in (["reuse_port"] if sys.platform.startswith("linux") else []) + ["handoff"]:
         with socket.socket() as occupied:
             occupied.bind(("127.0.0.1", two))
             occupied.listen()
-            result = subprocess.run([SERVER, "--config", str(main_config), "--workers", "3"],
+            result = subprocess.run([SERVER, "--config", str(main_config), "--workers", "3",
+                                     "--worker-mode", mode],
                                     capture_output=True, text=True, timeout=5)
-            assert result.returncode == 1, (result.returncode, result.stderr)
+            assert result.returncode == 1, (mode, result.returncode, result.stderr)
     print("Partial startup failure retires earlier listener tasks: PASS")
 
 

@@ -53,7 +53,8 @@ TCP and UDP may share a port number. `--bind` applies to every listener.
 | `--directory-listing`, `--no-directory-listing` | Listings without index.html |
 | `--reuse-port`, `--no-reuse-port` | TCP listener port reuse |
 | `--shutdown-seconds N` | Loop grace deadline; default 5 |
-| `--workers N` | Event-loop threads sharing every listener; 1..256, default 1; above 1 needs Linux |
+| `--workers N` | Event-loop threads serving every listener; 1..256, default 1 |
+| `--worker-mode MODE` | `auto`, `reuse_port` (Linux), or `handoff`; default `auto` |
 
 See `--help` for remaining options. Ctrl-C closes/awaits HTTP/3 before loop
 shutdown. Shutdown cancels roots immediately; grace does not guarantee response
@@ -108,7 +109,8 @@ Paths resolve beside the file defining them. Every server inherits the main
 file's defaults, including servers from included files. CLI options override
 the loaded configuration regardless of `--config` position; with multiple
 servers select the override target using `--server website`. Global flags
-such as `--check`, `--shutdown-seconds`, and `--workers` apply to the entire process.
+such as `--check`, `--shutdown-seconds`, `--workers`, and `--worker-mode` apply to the
+entire process.
 
 `--check` validates settings and loads credentials without listening. Unknown
 keys, wrong types, invalid ranges, repeated/cyclic includes, duplicate names,

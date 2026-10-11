@@ -93,16 +93,19 @@ using contexts_type =
 using groups_type =
     std::array<std::shared_ptr<eventloop::quic_worker_group>, stonegate::max_servers>;
 
-// Builds every configured listener on one worker's loop. Several workers
-// share each port with SO_REUSEPORT; HTTP/3 connection IDs carry the worker
-// index and the server's group forwards packets to their owner. Only worker 0
-// reports listeners.
+// Builds every configured listener on one worker's loop. In reuse_port mode
+// several workers share each port with SO_REUSEPORT; HTTP/3 connection IDs
+// carry the worker index and the server's group forwards packets to their
+// owner. In handoff mode only worker 0 builds listeners, and its TCP servers
+// hand connections to every loop in serving. Only worker 0 reports listeners.
 auto start_listeners(eventloop::event_loop& loop, const stonegate::configuration& configuration,
                      const contexts_type& contexts, const groups_type& groups,
                      const std::shared_ptr<const eventloop::http::router>& routes,
-                     std::size_t worker, std::span<http3_listener> http3) -> void
+                     std::size_t worker, std::span<eventloop::event_loop* const> serving,
+                     std::span<http3_listener> http3) -> void
 {
-    const bool shared = configuration.workers > 1;
+    const bool shared = configuration.workers > 1 &&
+        configuration.mode == stonegate::worker_mode::reuse_port;
     const bool report = worker == 0;
     for (std::size_t index = 0; index < configuration.servers.size(); ++index) {
         const auto& settings = configuration.servers[index];
@@ -112,6 +115,7 @@ auto start_listeners(eventloop::event_loop& loop, const stonegate::configuration
             .directory_listing = settings.directory_listing,
             .open_file_cache_capacity = settings.open_file_cache_capacity,
             .reuse_port = settings.reuse_port || shared,
+            .serving_loops = {serving.begin(), serving.end()},
             .header_timeout = std::chrono::milliseconds {settings.header_timeout_ms},
             .idle_timeout = std::chrono::milliseconds {settings.idle_timeout_ms},
             .enable_http2 = settings.http2,
@@ -176,9 +180,11 @@ struct worker {
 
 struct worker_group {
     explicit worker_group(std::size_t count)
-        : workers(count), built(static_cast<std::ptrdiff_t>(count)),
+        : workers(count), created(static_cast<std::ptrdiff_t>(count)),
+          built(static_cast<std::ptrdiff_t>(count)),
           finished(static_cast<std::ptrdiff_t>(count)) {}
     std::vector<worker> workers;
+    std::latch created; // every loop exists, so handoff targets are known
     std::latch built;
     std::latch finished;
     std::atomic<bool> failed {false};
@@ -194,6 +200,7 @@ struct worker_group {
     // Counts down for a worker that never runs a loop.
     auto absent(std::ptrdiff_t count) -> void
     {
+        created.count_down(count);
         built.count_down(count);
         finished.count_down(count);
     }
@@ -238,13 +245,21 @@ auto run_worker(worker_group& group, const worker_setup& setup, std::size_t inde
     auto& self = group.workers[index];
     self.loop = &*loop;
     started();
+    group.created.arrive_and_wait();
+    const bool handoff = setup.configuration.workers > 1 &&
+        setup.configuration.mode == stonegate::worker_mode::handoff;
     std::array<http3_listener, stonegate::max_servers> http3;
-    try {
-        start_listeners(*loop, setup.configuration, setup.contexts, setup.groups, setup.routes,
-                        index, http3);
-        if (index == 0) std::cout.flush();
-    } catch (const std::exception& error) {
-        group.fail(error.what());
+    if (!group.failed.load() && (!handoff || index == 0)) {
+        try {
+            std::vector<eventloop::event_loop*> serving;
+            if (handoff)
+                for (const auto& other : group.workers) serving.push_back(other.loop);
+            start_listeners(*loop, setup.configuration, setup.contexts, setup.groups,
+                            setup.routes, index, serving, http3);
+            if (index == 0) std::cout.flush();
+        } catch (const std::exception& error) {
+            group.fail(error.what());
+        }
     }
     group.built.arrive_and_wait();
     if (!group.failed.load()) (void)loop->run();
@@ -270,7 +285,7 @@ auto run_workers(const stonegate::configuration& configuration,
     worker_setup setup {configuration, contexts, {}, make_routes(), {}};
     // Endpoints sharing a port forward packets for connections another
     // worker owns, so a client whose address changes keeps its connection.
-    if (configuration.workers > 1)
+    if (configuration.workers > 1 && configuration.mode == stonegate::worker_mode::reuse_port)
         for (std::size_t index = 0; index < configuration.servers.size(); ++index)
             if (configuration.servers[index].http3_port != 0)
                 setup.groups[index] =
@@ -328,7 +343,11 @@ auto main(int argc, char** argv) -> int
             return 0;
         }
         if (configuration.workers > 1) {
-            std::cout << configuration.workers << " workers share every listener\n";
+            if (configuration.mode == stonegate::worker_mode::reuse_port)
+                std::cout << configuration.workers << " workers share every listener\n";
+            else
+                std::cout << configuration.workers << " workers serve TCP connections "
+                             "accepted by worker 0; HTTP/3 runs on worker 0\n";
             std::cout.flush();
         }
         const auto failure = run_workers(configuration, contexts);
