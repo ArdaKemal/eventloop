@@ -407,95 +407,158 @@ struct redirect_state {
 
 } // namespace
 
-server::server(event_loop& loop, ip_endpoint local, server_options options)
-    : tcp_acceptor(loop, local, options.reuse_port),
-      root_descriptor_(open_document_root(options)), options_(std::move(options))
+namespace detail {
+
+// What a connection task needs on the loop that serves it. The document root
+// is per loop because its open-file cache is loop-affine.
+struct serving_loop {
+    event_loop* loop {nullptr};
+    std::shared_ptr<document_root> root;
+    std::shared_ptr<const connection_options> options;
+    std::shared_ptr<tls_context> context;            // https_server
+    std::shared_ptr<const std::string> hostname;     // redirect_server
+    std::uint16_t https_port {0};
+    std::chrono::milliseconds header_timeout {};
+};
+
+} // namespace detail
+
+namespace {
+
+// One serving_loop per entry of options.serving_loops, or for owner alone;
+// fill() completes each entry.
+template<typename Fill>
+[[nodiscard]] auto make_serving(event_loop& owner, const server_options& options, Fill fill)
+    -> detail::serving_set
 {
+    detail::serving_set serving;
+    const auto add = [&](event_loop* loop) {
+        if (loop == nullptr) throw std::invalid_argument("serving loop is null");
+        auto entry = std::make_shared<detail::serving_loop>();
+        entry->loop = loop;
+        fill(*entry);
+        serving.push_back(std::move(entry));
+    };
+    if (options.serving_loops.empty()) add(&owner);
+    for (auto* loop : options.serving_loops) add(loop);
+    return serving;
+}
+
+using serve_function = task<void> (*)(event_loop&, unique_fd, const detail::serving_loop&);
+
+// Accepts until the listener closes, handing connections to the serving loops
+// in turn. Another loop serves its connection from a posted task.
+[[nodiscard]] auto accept_connections(event_loop& loop, tcp_acceptor& listener,
+                                      detail::serving_set serving, serve_function serve)
+    -> task<void>
+{
+    std::size_t next = 0;
+    while (auto accepted = co_await listener.async_accept()) {
+        auto target = serving[next++ % serving.size()];
+        if (target->loop == &loop) {
+            // Frame allocation can fail before the descriptor is moved into
+            // the task. Close it here in that case (and for any other
+            // rejected spawn).
+            if (loop.spawn(serve(loop, std::move(*accepted), *target)) !=
+                task_spawn_result::accepted)
+                accepted->reset();
+            continue;
+        }
+        // A full queue destroys the task, closing the connection; a rejected
+        // spawn there leaves the descriptor in the task, which closes it.
+        auto* destination = target->loop;
+        (void)destination->post([target = std::move(target), serve,
+                                 descriptor = std::move(*accepted)]() mutable noexcept {
+            (void)target->loop->spawn(serve(*target->loop, std::move(descriptor), *target));
+        });
+    }
+}
+
+// Each copies what it needs out of the entry; the task does not borrow it.
+auto serve_plain(event_loop& loop, unique_fd descriptor, const detail::serving_loop& entry)
+    -> task<void>
+{
+    return serve_connection<tcp_stream>(loop, std::move(descriptor), entry.root,
+                                        entry.options, {});
+}
+
+#if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
+auto serve_tls(event_loop& loop, unique_fd descriptor, const detail::serving_loop& entry)
+    -> task<void>
+{
+    return serve_connection<tls_stream>(loop, std::move(descriptor), entry.root,
+                                        entry.options, entry.context);
+}
+#endif
+
+auto serve_redirect_entry(event_loop& loop, unique_fd descriptor,
+                          const detail::serving_loop& entry) -> task<void>
+{
+    return serve_redirect(loop, std::move(descriptor), entry.hostname, entry.https_port,
+                          entry.header_timeout);
+}
+
+} // namespace
+
+server::server(event_loop& loop, ip_endpoint local, server_options options)
+    : tcp_acceptor(loop, local, options.reuse_port)
+{
+    // Shared, not copied, so each connection frame stays in its size class.
+    const auto connection = std::make_shared<const connection_options>(for_connection(options));
+    serving_ = make_serving(loop, options, [&](detail::serving_loop& entry) {
+        entry.root = open_document_root(options);
+        entry.options = connection;
+    });
 }
 
 server::~server() = default;
 
 auto server::run() -> task<void>
 {
-    return accept_loop(owner(), *this, root_descriptor_, options_);
-}
-
-auto server::accept_loop(event_loop& loop, server& listener,
-                         std::shared_ptr<detail::document_root> root,
-                         server_options options) -> task<void>
-{
-    // Shared, not copied, so each connection frame stays in its size class.
-    const auto connection = std::make_shared<const connection_options>(
-        for_connection(options));
-    while (auto accepted = co_await listener.async_accept()) {
-        const auto result = loop.spawn(serve_connection<tcp_stream>(
-            loop, std::move(*accepted), root, connection, {}));
-        if (result != task_spawn_result::accepted) {
-            // Frame allocation can fail before the descriptor is moved into
-            // the task. Close it here in that case (and for any other
-            // rejected spawn).
-            accepted->reset();
-        }
-    }
+    return accept_connections(owner(), *this, serving_, serve_plain);
 }
 
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
 https_server::https_server(event_loop& loop, ip_endpoint local,
                            std::shared_ptr<tls_context> context, server_options options)
-    : tcp_acceptor(loop, local, options.reuse_port),
-      root_descriptor_(open_document_root(options)),
-      context_(std::move(context)), options_(std::move(options))
+    : tcp_acceptor(loop, local, options.reuse_port)
 {
-    if (!context_) throw std::invalid_argument("HTTPS context is required");
+    if (!context) throw std::invalid_argument("HTTPS context is required");
+    const auto connection = std::make_shared<const connection_options>(for_connection(options));
+    serving_ = make_serving(loop, options, [&](detail::serving_loop& entry) {
+        entry.root = open_document_root(options);
+        entry.options = connection;
+        entry.context = context;
+    });
 }
 
 https_server::~https_server() = default;
 
 auto https_server::run() -> task<void>
 {
-    return accept_loop(owner(), *this, root_descriptor_, context_, options_);
-}
-
-auto https_server::accept_loop(event_loop& loop, https_server& listener,
-                               std::shared_ptr<detail::document_root> root,
-                               std::shared_ptr<tls_context> context,
-                               server_options options) -> task<void>
-{
-    const auto connection = std::make_shared<const connection_options>(
-        for_connection(options));
-    while (auto accepted = co_await listener.async_accept()) {
-        const auto result = loop.spawn(serve_connection<tls_stream>(
-            loop, std::move(*accepted), root, connection, context));
-        if (result != task_spawn_result::accepted) accepted->reset();
-    }
+    return accept_connections(owner(), *this, serving_, serve_tls);
 }
 #endif
 
 redirect_server::redirect_server(event_loop& loop, ip_endpoint local,
                                  std::string_view hostname, std::uint16_t https_port,
                                  server_options options)
-    : tcp_acceptor(loop, local, options.reuse_port), https_port_(https_port),
-      header_timeout_(options.header_timeout)
+    : tcp_acceptor(loop, local, options.reuse_port)
 {
     validate_hostname(hostname);
-    hostname_ = std::make_shared<const std::string>(hostname);
+    const auto name = std::make_shared<const std::string>(hostname);
+    serving_ = make_serving(loop, options, [&](detail::serving_loop& entry) {
+        entry.hostname = name;
+        entry.https_port = https_port;
+        entry.header_timeout = options.header_timeout;
+    });
 }
+
+redirect_server::~redirect_server() = default;
 
 auto redirect_server::run() -> task<void>
 {
-    return accept_loop(owner(), *this, hostname_, https_port_, header_timeout_);
-}
-
-auto redirect_server::accept_loop(event_loop& loop, redirect_server& listener,
-                                   std::shared_ptr<const std::string> hostname,
-                                   std::uint16_t https_port,
-                                   std::chrono::milliseconds header_timeout) -> task<void>
-{
-    while (auto accepted = co_await listener.async_accept()) {
-        const auto result = loop.spawn(serve_redirect(
-            loop, std::move(*accepted), hostname, https_port, header_timeout));
-        if (result != task_spawn_result::accepted) accepted->reset();
-    }
+    return accept_connections(owner(), *this, serving_, serve_redirect_entry);
 }
 
 } // namespace eventloop::http

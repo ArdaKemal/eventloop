@@ -8,16 +8,19 @@
 #include "eventloop/tls_context.h"
 #endif
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace eventloop { class tls_context; }
 
 namespace eventloop::http {
-namespace detail { struct document_root; }
+namespace detail {
+struct serving_loop;
+using serving_set = std::vector<std::shared_ptr<const serving_loop>>;
+}
 
 // Cleartext HTTP/1.1 server. It owns its listening socket and document-root
 // descriptor; run() accepts until the listener closes.
@@ -29,12 +32,7 @@ public:
     [[nodiscard]] auto run() -> task<void>;
 
 private:
-    static auto accept_loop(event_loop& loop, server& listener,
-                            std::shared_ptr<detail::document_root> root,
-                            server_options options) -> task<void>;
-
-    std::shared_ptr<detail::document_root> root_descriptor_;
-    server_options options_;
+    detail::serving_set serving_;
 };
 
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
@@ -48,36 +46,24 @@ public:
     [[nodiscard]] auto run() -> task<void>;
 
 private:
-    static auto accept_loop(event_loop& loop, https_server& listener,
-                            std::shared_ptr<detail::document_root> root,
-                            std::shared_ptr<tls_context> context,
-                            server_options options) -> task<void>;
-
-    std::shared_ptr<detail::document_root> root_descriptor_;
-    std::shared_ptr<tls_context> context_;
-    server_options options_;
+    detail::serving_set serving_;
 };
 #endif
 
 class redirect_server final : public tcp_acceptor {
 public:
     // Answers every request with 308 to https://hostname[:https_port], then
-    // closes. Only reuse_port and header_timeout apply from options.
+    // closes. Only reuse_port, header_timeout, and serving_loops apply from
+    // options.
     redirect_server(event_loop& loop, ip_endpoint local,
                     std::string_view hostname, std::uint16_t https_port,
                     server_options options = {});
+    ~redirect_server() override;
 
     [[nodiscard]] auto run() -> task<void>;
 
 private:
-    static auto accept_loop(event_loop& loop, redirect_server& listener,
-                            std::shared_ptr<const std::string> hostname,
-                            std::uint16_t https_port,
-                            std::chrono::milliseconds header_timeout) -> task<void>;
-
-    std::shared_ptr<const std::string> hostname_;
-    std::uint16_t https_port_;
-    std::chrono::milliseconds header_timeout_;
+    detail::serving_set serving_;
 };
 
 } // namespace eventloop::http

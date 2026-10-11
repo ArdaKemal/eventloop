@@ -12,7 +12,21 @@ options)` use `server_options`. Supply `routes`, `document_root`, or both;
 neither throws `std::invalid_argument`. Unmatched paths serve static resources,
 or return 404 without a root. `redirect_server(loop, endpoint, hostname,
 https_port, options)` returns 308 for every request and closes; it applies only
-`reuse_port` and `header_timeout` from `server_options`.
+`reuse_port`, `header_timeout`, and `serving_loops` from `server_options`.
+
+### Serving accepted connections on other loops
+
+Where the kernel does not spread a shared port across listeners (macOS,
+Windows), one TCP listener can feed several loops. `server`, `https_server`,
+and `redirect_server` hand accepted connections to the loops in
+`server_options::serving_loops` in turn; empty means the listener's own loop,
+which may also appear in the list. A connection for another loop is posted to
+it with `event_loop::post()` and served entirely there. Each serving loop gets
+its own document-root descriptor and open-file cache (the capacity applies per
+serving loop); the router and TLS context are shared. A null entry throws
+`std::invalid_argument`. If a loop's post queue is full the connection is
+closed; if it is shutting down or out of frames, its spawn fails and closes the
+connection. Every serving loop must outlive the listener's `run()` task.
 
 Connection tasks own sessions/I/O buffers and share document-root/router
 ownership with the listener. Small file reads/metadata calls are synchronous;

@@ -8,8 +8,9 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <vector>
 
-namespace eventloop { class quic_worker_group; }
+namespace eventloop { class event_loop; class quic_worker_group; }
 
 namespace eventloop::http {
 
@@ -33,6 +34,10 @@ struct server_options {
     // SO_REUSEPORT, so one server per loop can share a port. For HTTP/3, see
     // docs/quic.md for how datagrams reach the owning server.
     bool reuse_port {false};
+    // TCP servers only: the loops that serve accepted connections in turn;
+    // empty means the listener's loop. Each must outlive the listener's run()
+    // task. See docs/http.md.
+    std::vector<event_loop*> serving_loops {};
     // TCP servers only; redirect_server uses header_timeout only. Zero
     // disables either. A connection is closed when its TLS handshake and
     // first request head take longer than header_timeout from accept, or when

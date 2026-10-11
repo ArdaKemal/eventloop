@@ -1,7 +1,8 @@
 // Connection deadlines from server_options: silent and slow new clients are
 // closed after header_timeout, idle keep-alive connections after
 // idle_timeout, and a handler slower than both still answers. Redirect
-// listeners apply header_timeout and can share a port.
+// listeners apply header_timeout and can share a port. One listener can hand
+// its connections to other loops (serving_loops).
 #include "eventloop/event_loop.h"
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
@@ -12,14 +13,19 @@
 #include "tls_test_certificate.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <latch>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 
 #include <arpa/inet.h>
@@ -309,6 +315,129 @@ auto run_case(event_loop& loop, std::unique_ptr<Server> listener, Client client)
     (void)loop.run();
 }
 
+// serving_loops: listeners on one loop hand connections to it and two other
+// loops in turn; the route records which thread served each request.
+struct served_threads {
+    std::mutex mutex;
+    std::set<std::thread::id> ids;
+};
+
+auto where(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    auto& seen = *static_cast<served_threads*>(request.route_context());
+    {
+        const std::lock_guard lock {seen.mutex};
+        seen.ids.insert(std::this_thread::get_id());
+    }
+    (void)co_await response.async_send(200, {}, bytes("here"));
+}
+
+template<typename Stream>
+auto handoff_requests(event_loop& loop, std::size_t count, std::uint16_t port,
+                      std::shared_ptr<tls_context> context, std::string_view request,
+                      std::string_view expected, std::string_view name) -> task<void>
+{
+    for (std::size_t index = 0; index < count; ++index) {
+        // Awaited results are named first: GCC rejects (co_await ...).value()
+        // inside this template.
+        Stream* peer = nullptr;
+        if constexpr (std::is_same_v<Stream, tls_stream>) {
+            auto connected = co_await connect_tls(loop, port, context, "http/1.1");
+            peer = connected.value();
+        } else {
+            auto connected = co_await connect(loop, port);
+            peer = connected.value();
+        }
+        const auto sent = co_await write_all(loop, *peer, request);
+        check(sent && *sent, std::string(name) + ": send");
+        std::string received;
+        const auto answered = co_await read_until(loop, *peer, expected, &received);
+        check(answered && *answered, std::string(name) + ": response " + received);
+        (void)co_await read_until_closed(loop, *peer);
+    }
+}
+
+auto handoff_client(event_loop& loop, std::uint16_t plain, std::uint16_t secure,
+                    std::uint16_t redirect, std::shared_ptr<tls_context> context) -> task<void>
+{
+    constexpr auto request = "GET /where HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"sv;
+    co_await handoff_requests<tcp_stream>(loop, 9, plain, {}, request, "here",
+                                          "hand-off HTTP/1.1");
+    co_await handoff_requests<tls_stream>(loop, 6, secure, context, request, "here",
+                                          "hand-off HTTPS");
+    co_await handoff_requests<tcp_stream>(loop, 2, redirect, {},
+                                          "GET /x HTTP/1.1\r\nHost: a\r\n\r\n"sv,
+                                          "Location: https://localhost/x", "hand-off redirect");
+}
+
+auto handoff_case(const std::filesystem::path& certificate, const std::filesystem::path& key)
+    -> void
+{
+    std::array<event_loop*, 2> others {};
+    std::latch ready {2};
+    std::vector<std::jthread> threads;
+    for (std::size_t index = 0; index < others.size(); ++index) {
+        threads.emplace_back([&, index] {
+            event_loop serving;
+            others[index] = &serving;
+            ready.count_down();
+            (void)serving.run(); // until the listener loop is done with it
+            serving.shutdown(0ms);
+            (void)serving.run();
+        });
+    }
+    ready.wait();
+
+    served_threads plain_seen, secure_seen;
+    {
+        event_loop loop;
+        const auto table = [](served_threads& seen) {
+            auto result = std::make_shared<http::router>();
+            check(result->add(http::method_type::get, "/where", where, &seen).has_value(),
+                  "route");
+            return result;
+        };
+        const auto options = [&](served_threads& seen) {
+            return http::server_options {.routes = table(seen),
+                                         .serving_loops = {&loop, others[0], others[1]}};
+        };
+        auto plain = std::make_unique<http::server>(loop, ip_endpoint::loopback_v4(0),
+                                                    options(plain_seen));
+        auto secure = std::make_unique<http::https_server>(loop, ip_endpoint::loopback_v4(0),
+            tls_context::make_server(certificate, key), options(secure_seen));
+        auto redirect = std::make_unique<http::redirect_server>(loop,
+            ip_endpoint::loopback_v4(0), "localhost", 443,
+            http::server_options {.serving_loops = {others[1]}});
+        const auto ports = std::array {port_of(*plain), port_of(*secure), port_of(*redirect)};
+        auto* plain_server = plain.get();
+        auto* secure_server = secure.get();
+        auto* redirect_server = redirect.get();
+        loop.add(std::move(plain));
+        loop.add(std::move(secure));
+        loop.add(std::move(redirect));
+        check(loop.spawn(plain_server->run()) == task_spawn_result::accepted, "spawn plain");
+        check(loop.spawn(secure_server->run()) == task_spawn_result::accepted, "spawn TLS");
+        check(loop.spawn(redirect_server->run()) == task_spawn_result::accepted,
+              "spawn redirect");
+        check(loop.spawn(stop_after(loop, handoff_client(loop, ports[0], ports[1], ports[2],
+                  tls_context::make_client(certificate)))) == task_spawn_result::accepted,
+              "spawn hand-off client");
+        task_handle<void> timer;
+        check(loop.spawn(watchdog(loop), timer) == task_spawn_result::accepted,
+              "spawn watchdog");
+        (void)loop.run();
+        if (!timer.done()) (void)timer.cancel();
+        loop.shutdown(0ms);
+        (void)loop.run();
+    }
+    // The listeners are gone, so nothing posts to the serving loops any more.
+    for (auto* other : others) other->stop();
+    threads.clear();
+    check(plain_seen.ids.size() == 3, "HTTP/1.1 connections served on all three loops");
+    check(secure_seen.ids.size() == 3, "HTTPS connections served on all three loops");
+    std::cerr << "hand-off: HTTP/1.1, HTTPS, and redirect served across loops\n";
+}
+
 } // namespace
 
 auto main() -> int
@@ -376,5 +505,6 @@ auto main() -> int
     secure(tls_keep_alive);
     secure(http2_silent);
     secure(http2_idle);
+    handoff_case(certificate, key);
     std::filesystem::remove_all(directory);
 }
