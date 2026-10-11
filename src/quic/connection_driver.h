@@ -46,6 +46,12 @@ public:
     // (10.2.3). The first close requested wins.
     auto stop_with_application_error(std::uint64_t error) noexcept -> void
     { check_owner(); if (!close_frame_) close_frame_={0x1d,error}; stop(); }
+    // True while the route is held through the closing or draining period.
+    [[nodiscard]] auto retaining() const noexcept -> bool { return retaining_ && retain_close_; }
+    // Releases the route early for new connections (RFC 9000 10.2 permits
+    // dropping this state; a late packet then draws a stateless reset).
+    auto end_retention() noexcept -> void
+    { check_owner(); retain_close_=false; notify(); }
     // New packets or application send/receive credit can interrupt an idle
     // retry. Resumption remains a timer-loop action, outside router dispatch.
     auto notify() noexcept -> void
@@ -405,7 +411,7 @@ private:
         if (self.running_) co_return std::unexpected(connection_error::invalid_state);
         self.running_=true;
         self.started_=true;
-        struct reset { bool& flag; ~reset(){flag=false;} } guard{self.running_};
+        struct reset { bool& flag; bool& retaining; ~reset(){flag=false; retaining=false;} } guard{self.running_,self.retaining_};
         auto outcome=co_await pump_loop(loop,self);
         // Event-loop shutdown cancels this task too, so its sends would fail.
         const bool cancelled=!outcome && outcome.error()==task_result::cancelled;
@@ -419,10 +425,13 @@ private:
         } else if (self.close_frame_) {
             (void)co_await send_close(loop,self,self.close_frame_->first,self.close_frame_->second);
         }
-        if (self.progress_) self.progress_(self.progress_argument_);
-        if (!cancelled && self.retain_close_ &&
+        // The owner sees retaining() in the progress callback and may end the
+        // period at once to free this or an older route.
+        self.retaining_=!cancelled && self.retain_close_ &&
             (self.connection_.core().state()==connection_state::closing ||
-             self.connection_.core().state()==connection_state::draining))
+             self.connection_.core().state()==connection_state::draining);
+        if (self.progress_) self.progress_(self.progress_argument_);
+        if (self.retaining_ && self.retain_close_)
             (void)co_await retain_close(loop,self);
         co_return result;
     }
@@ -621,6 +630,7 @@ private:
     std::size_t close_size_{},close_credit_{};
     lifecycle_time_point close_reply_due_{};
     bool retain_close_{true};
+    bool retaining_{};
     void* progress_argument_{};
     idle_wait* idle_ {};
     void (*progress_)(void*) noexcept {};

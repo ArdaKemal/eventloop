@@ -130,6 +130,7 @@ struct outcome {
     bool survived {false};
     bool connection_closed {false};
     bool cancel_push_closed {false};
+    bool reclaimed {false};
     bool done {false};
 };
 
@@ -188,6 +189,25 @@ auto open_request(event_loop&, quic_connection& connection) -> task<std::uint64_
         quic_stream_direction::bidirectional));
     check(id.has_value(), "open request stream");
     co_return *id;
+}
+
+// Both server slots are closed connections in their closing period. A new
+// connection reclaims one at once instead of waiting out three PTOs.
+auto reclaims_closed_slot(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
+                          std::span<const std::byte> settings, outcome& result) -> task<void>
+{
+    const auto started = event_loop::clock::now();
+    auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
+    if (!connected) co_return;
+    const auto control = flatten_result(co_await connected->async_open_stream(
+        quic_stream_direction::unidirectional));
+    const auto id = (co_await open_request(loop, *connected)).value_or(0);
+    std::error_code error;
+    if (control && (co_await send(loop, *connected, *control, settings, false)).value_or(false) &&
+        (co_await send(loop, *connected, id, get("/hello.txt"), true)).value_or(false))
+        result.reclaimed =
+            (co_await response_status(loop, *connected, id, error)).value_or(0) == 200 &&
+            event_loop::clock::now() - started < 500ms;
 }
 
 auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outcome& result)
@@ -287,6 +307,8 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outco
     (void)co_await send(loop, push_connection, probe, get("/hello.txt"), true);
     status = (co_await response_status(loop, push_connection, probe, error)).value_or(0);
     result.cancel_push_closed = control_sent && status == 0 && error && error != reset_error;
+
+    co_await reclaims_closed_slot(loop, endpoint, server, settings, result);
     result.done = true;
 }
 
@@ -338,5 +360,6 @@ auto main() -> int
     check(result.survived, "connection survives stream errors");
     check(result.connection_closed, "frame-sequence error closes the connection");
     check(result.cancel_push_closed, "unpromised CANCEL_PUSH closes the connection");
+    check(result.reclaimed, "full pool of closed connections admits a new one at once");
     std::puts("HTTP/3 server error scoping tests passed");
 }

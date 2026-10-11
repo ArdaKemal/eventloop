@@ -207,6 +207,8 @@ public:
         bool accepted {false};
         bool closing {false};
         bool driver_finished {false};
+        // Retention was cut short; the driver is retiring and frees the slot.
+        bool reclaiming {false};
         std::uint32_t generation {0};
         // Retained after clear() until this slot receives a new generation.
         std::error_code terminal_error {};
@@ -237,6 +239,7 @@ public:
             accepted = false;
             closing = false;
             driver_finished = false;
+            reclaiming = false;
             original_dcid_size = 0;
             retry_used = retry_pending = false;
             retry_scid_size = retry_token_size = 0;
@@ -608,6 +611,24 @@ private:
         // The pumping driver is still running. Retired slots are reaped by
         // drive(), connection acceptance, and endpoint close instead.
         self.wake_connection(index);
+        if (!self.client_mode_) self.keep_slot_free();
+    }
+
+    // Closed connections hold their slot through the closing or draining
+    // period. When none is free, end the oldest such period so a new Initial
+    // is not dropped until a client retransmission (RFC 9000 10.2).
+    auto keep_slot_free() noexcept -> void
+    {
+        slot* oldest = nullptr;
+        for (auto& entry : slots_) {
+            if (!entry.occupied || entry.reclaiming) return;
+            if (entry.accepted && entry.driver && entry.driver->retaining() &&
+                (oldest == nullptr || entry.generation < oldest->generation))
+                oldest = &entry;
+        }
+        if (oldest == nullptr) return;
+        oldest->reclaiming = true;
+        oldest->driver->end_retention();
     }
 
     static auto validate_peer(void* argument, std::span<const std::uint8_t> bytes) noexcept -> bool

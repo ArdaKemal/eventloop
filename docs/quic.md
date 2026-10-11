@@ -52,7 +52,10 @@ for three current PTOs. Application operations finish promptly. Closing only
 resends the cached close on incoming packets, at most once/PTO and <=3 times
 received bytes; draining discards without sending. Both reuse driver storage
 and its frame-local timer. Deadlines saturate; packets do not extend retention.
-Capacity exhaustion has the same result during retention as while active.
+A server endpoint keeps one slot free: when a connection enters retention and
+no slot is free, the oldest retained connection's period ends early (RFC 9000
+10.2 permits this; a late packet for it draws a stateless reset). Live
+connections are never reclaimed, so capacity exhaustion by them is unchanged.
 
 Endpoint close keeps UDP open until running connections send close and retire,
 then closes it; it may shorten retention (RFC 9000 10.2). UDP failure/loop
