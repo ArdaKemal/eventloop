@@ -62,3 +62,24 @@ then closes it; it may shorten retention (RFC 9000 10.2). UDP failure/loop
 cancellation retires immediately. Handles/tasks/borrowed buffers retain shared
 ownership rules; delayed close processing stays on the owner loop on all
 supported platforms.
+
+## Port sharing
+
+`quic_server_options::reuse_port` sets SO_REUSEPORT so several server
+endpoints, one per loop, bind one port. Each endpoint keeps its own
+connections, routes, and capacity; there is no cross-endpoint routing. Linux
+picks the socket by hashing the datagram's address pair, so a connection's
+packets reach its owner while the client address and the set of bound
+endpoints stay unchanged. After NAT rebinding or migration, or when an
+endpoint binds or closes, packets may reach an endpoint that does not know the
+connection ID; it drops them without a stateless reset, so the connection
+stalls until it recovers its path or idles out. Spreading is verified on
+Linux only; Windows rejects the option.
+
+`quic_server_options::worker_index` makes the first byte of every connection
+ID the endpoint issues equal to the index; the other seven bytes stay random.
+The endpoint issues one 8-byte ID per connection and no NEW_CONNECTION_ID
+frames. Packets after the server's first Initial carry that ID, so a steering
+layer can map them to the owner; the client's first Initial carries a
+client-chosen ID and cannot be steered this way. The library does not yet
+steer or forward by index; it only encodes it.

@@ -1,9 +1,13 @@
 // Public QUIC API end-to-end test: in-house client and server over loopback
 // for QUIC v1 and v2, exercising the handshake, bidirectional stream I/O, and
 // the RFC 9221 DATAGRAM extension, and application stream resets,
-// STOP_SENDING, and CONNECTION_CLOSE. The certificate is generated in-process.
+// STOP_SENDING, and CONNECTION_CLOSE, and SO_REUSEPORT servers on separate
+// loops, and worker-indexed connection IDs from QUIC and HTTP/3 servers. The certificate is generated
+// in-process.
 #include "eventloop/quic.h"
 #include "eventloop/event_loop.h"
+#include "eventloop/http/http3_server.h"
+#include "eventloop/udp_socket.h"
 
 #include <openssl/bio.h>
 #include <openssl/evp.h>
@@ -11,6 +15,7 @@
 #include <openssl/x509v3.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +26,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -430,6 +437,287 @@ auto shutdown_scenario(const std::filesystem::path& certificate) -> bool
     return true;
 }
 
+// Two server endpoints on separate loop threads share one port. Each client
+// connection must be served end to end by whichever endpoint owns it.
+constexpr std::size_t shared_port_clients = 12;
+constexpr std::array<std::byte, 4> ping {std::byte {'p'}, std::byte {'i'},
+                                         std::byte {'n'}, std::byte {'g'}};
+
+auto shared_port_echo(event_loop&, quic_connection connection, std::atomic<std::size_t>& served)
+    -> task<void>
+{
+    const auto stream = flatten_result(co_await connection.async_accept_stream());
+    if (!stream) co_return;
+    std::array<std::byte, 16> buffer {};
+    std::size_t size = 0;
+    for (;;) {
+        const auto count = flatten_result(co_await connection.async_read(
+            *stream, std::span(buffer).subspan(size)));
+        if (!count) co_return;
+        if (*count == 0) break;
+        size += *count;
+        if (size == buffer.size()) co_return;
+    }
+    const auto sent = flatten_result(co_await connection.async_write(
+        *stream, std::span(buffer).first(size), true));
+    if (sent && *sent == size) served.fetch_add(1);
+    // Hold the connection until the client closes it.
+    (void)co_await connection.async_accept_stream();
+}
+
+auto shared_port_accept(event_loop& loop, quic_endpoint& server,
+                        std::atomic<std::size_t>& served) -> task<void>
+{
+    for (;;) {
+        auto accepted = flatten_result(co_await server.async_accept());
+        if (!accepted && accepted.error() == std::errc::operation_canceled) co_return;
+        if (!accepted) continue;
+        if (loop.spawn(shared_port_echo(loop, std::move(*accepted), served)) !=
+            task_spawn_result::accepted) co_return;
+    }
+}
+
+auto shared_port_stop(event_loop& loop, quic_endpoint& server,
+                      const std::atomic<bool>& done) -> task<void>
+{
+    while (!done.load()) (void)co_await sleep_for(loop, 5ms);
+    co_await server.async_close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto shared_port_client(event_loop&, quic_endpoint& client, ip_endpoint server,
+                        std::size_t& completed) -> task<void>
+{
+    auto connected = flatten_result(co_await client.async_connect(server, "localhost"));
+    if (!connected) co_return;
+    auto connection = std::move(*connected);
+    const auto stream = flatten_result(co_await connection.async_open_stream(
+        quic_stream_direction::bidirectional));
+    if (!stream) { connection.close(); co_return; }
+    const auto sent = flatten_result(co_await connection.async_write(*stream, ping, true));
+    std::array<std::byte, 16> buffer {};
+    std::size_t size = 0;
+    while (sent && *sent == ping.size() && size < buffer.size()) {
+        const auto count = flatten_result(co_await connection.async_read(
+            *stream, std::span(buffer).subspan(size)));
+        if (!count || *count == 0) break;
+        size += *count;
+    }
+    if (size == ping.size() && std::ranges::equal(std::span(buffer).first(size), ping))
+        ++completed;
+    connection.close();
+}
+
+auto shared_port_watch(event_loop& loop,
+                       std::array<std::unique_ptr<quic_endpoint>, shared_port_clients>& clients,
+                       const std::size_t& completed) -> task<void>
+{
+    for (int i = 0; i < 1000 && completed < shared_port_clients; ++i)
+        (void)co_await sleep_for(loop, 5ms);
+    for (auto& client : clients) co_await client->async_close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto shared_port_scenario(const std::filesystem::path& certificate) -> bool
+{
+    std::atomic<std::uint16_t> port {0};
+    std::atomic<std::size_t> ready {0};
+    std::atomic<bool> failed {false};
+    std::atomic<bool> done {false};
+    std::array<std::atomic<std::size_t>, 2> served {};
+    auto worker = [&](std::size_t index) {
+        try {
+            while (index != 0 && port.load() == 0 && !failed.load())
+                std::this_thread::yield();
+            if (failed.load()) return;
+            event_loop loop;
+            quic_server_options options;
+            options.certificate_chain = certificate / "cert.pem";
+            options.private_key = certificate / "key.pem";
+            options.alpn = protocol;
+            options.connection_capacity = 2 * shared_port_clients;
+            options.reuse_port = true;
+            quic_endpoint server(loop, ip_endpoint::loopback_v4(port.load()),
+                                 std::move(options));
+            port.store(server.local_endpoint().port);
+            (void)loop.spawn(shared_port_accept(loop, server, served[index]));
+            (void)loop.spawn(shared_port_stop(loop, server, done));
+            ready.fetch_add(1);
+            (void)loop.run();
+        } catch (...) {
+            failed.store(true);
+        }
+    };
+    std::jthread first(worker, 0);
+    std::jthread second(worker, 1);
+    while (ready.load() < 2 && !failed.load()) std::this_thread::yield();
+
+    std::size_t completed = 0;
+    if (!failed.load()) {
+        event_loop loop;
+        std::array<std::unique_ptr<quic_endpoint>, shared_port_clients> clients;
+        for (auto& client : clients) {
+            quic_client_options options;
+            options.alpn = protocol;
+            options.trusted_ca = certificate / "cert.pem";
+            client = std::make_unique<quic_endpoint>(
+                loop, ip_endpoint::loopback_v4(0), std::move(options));
+            (void)loop.spawn(shared_port_client(
+                loop, *client, ip_endpoint::loopback_v4(port.load()), completed));
+        }
+        (void)loop.spawn(shared_port_watch(loop, clients, completed));
+        (void)loop.run();
+    }
+    done.store(true);
+    first.join();
+    second.join();
+    check(!failed.load(), "shared-port servers bind");
+    check(completed == shared_port_clients, "every shared-port client is served");
+    check(served[0].load() + served[1].load() == shared_port_clients,
+          "each shared-port connection is served once");
+#ifdef __linux__
+    // Linux hashes the client addresses across both sockets.
+    check(served[0].load() != 0 && served[1].load() != 0,
+          "shared-port connections spread across servers");
+#endif
+    return true;
+}
+
+// A relay between client and server reads the source connection ID of every
+// server long-header packet; each must start with the worker index.
+constexpr std::uint8_t worker_index = 0xa7;
+
+struct relay_outcome {
+    std::size_t server_ids {0};
+    bool all_indexed {true};
+    bool served {false};
+};
+
+auto relay(event_loop&, udp_socket& socket, std::span<std::byte> buffer,
+           std::uint16_t server_port, relay_outcome& result) -> task<void>
+{
+    ip_endpoint client {};
+    for (;;) {
+        const auto received = co_await socket.async_receive_from(buffer);
+        if (!received) co_return;
+        const auto datagram = buffer.first(received->size);
+        const bool from_server = received->source.port == server_port;
+        if (!from_server) client = received->source;
+        // Long header: flags, version, DCID length + DCID, SCID length + SCID.
+        if (from_server && datagram.size() > 6 &&
+            (std::to_integer<unsigned>(datagram[0]) & 0x80U) != 0) {
+            const auto dcid = std::to_integer<std::size_t>(datagram[5]);
+            const auto scid_at = 6 + dcid;
+            if (datagram.size() > scid_at + 1 &&
+                std::to_integer<std::size_t>(datagram[scid_at]) != 0) {
+                ++result.server_ids;
+                result.all_indexed = result.all_indexed &&
+                    std::to_integer<std::uint8_t>(datagram[scid_at + 1]) == worker_index;
+            }
+        }
+        (void)co_await socket.async_send_to(
+            datagram, from_server ? client : ip_endpoint::loopback_v4(server_port));
+    }
+}
+
+auto indexed_server(event_loop& loop, quic_endpoint& server, relay_outcome& result)
+    -> task<void>
+{
+    auto accepted = flatten_result(co_await server.async_accept());
+    if (!accepted) co_return;
+    std::atomic<std::size_t> served {0};
+    co_await shared_port_echo(loop, std::move(*accepted), served);
+    result.served = served.load() == 1;
+}
+
+template<typename Server>
+auto indexed_watch(event_loop& loop, Server& server, quic_endpoint& client,
+                   udp_socket& socket, const std::size_t& completed) -> task<void>
+{
+    for (int i = 0; i < 1000 && completed == 0; ++i)
+        (void)co_await sleep_for(loop, 5ms);
+    co_await client.async_close();
+    co_await server.async_close();
+    socket.close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto worker_index_scenario(const std::filesystem::path& certificate) -> bool
+{
+    event_loop loop;
+    quic_server_options server_options;
+    server_options.certificate_chain = certificate / "cert.pem";
+    server_options.private_key = certificate / "key.pem";
+    server_options.alpn = protocol;
+    server_options.worker_index = worker_index;
+    quic_client_options client_options;
+    client_options.alpn = protocol;
+    client_options.trusted_ca = certificate / "cert.pem";
+    quic_endpoint server(loop, ip_endpoint::loopback_v4(0), std::move(server_options));
+    quic_endpoint client(loop, ip_endpoint::loopback_v4(0), std::move(client_options));
+    auto owned = std::make_unique<udp_socket>(loop, ip_endpoint::loopback_v4(0));
+    auto& socket = *owned;
+    const auto relay_address = socket.local_endpoint();
+    loop.add(std::move(owned));
+    relay_outcome result;
+    std::size_t completed = 0;
+    std::vector<std::byte> buffer(65536);
+    check(loop.spawn(relay(loop, socket, buffer, server.local_endpoint().port, result)) ==
+              task_spawn_result::accepted, "spawn relay");
+    check(loop.spawn(indexed_server(loop, server, result)) == task_spawn_result::accepted,
+          "spawn indexed server");
+    check(loop.spawn(shared_port_client(loop, client, relay_address, completed)) ==
+              task_spawn_result::accepted, "spawn indexed client");
+    check(loop.spawn(indexed_watch(loop, server, client, socket, completed)) ==
+              task_spawn_result::accepted, "spawn indexed watch");
+    (void)loop.run();
+    check(completed == 1 && result.served, "indexed connection is served");
+    check(result.server_ids != 0, "relay saw server connection IDs");
+    check(result.all_indexed, "server connection IDs start with the worker index");
+    return true;
+}
+
+auto h3_connect(event_loop&, quic_endpoint& client, ip_endpoint server,
+                std::size_t& completed) -> task<void>
+{
+    auto connected = flatten_result(co_await client.async_connect(server, "localhost"));
+    if (!connected) co_return;
+    ++completed;
+    connected->close();
+}
+
+auto http3_worker_index_scenario(const std::filesystem::path& certificate) -> bool
+{
+    static constexpr std::array<std::uint8_t, 2> h3 {'h', '3'};
+    event_loop loop;
+    http::http3_server server(loop, ip_endpoint::loopback_v4(0),
+        certificate / "cert.pem", certificate / "key.pem",
+        http::server_options {.document_root = certificate, .worker_index = worker_index});
+    quic_client_options client_options;
+    client_options.alpn = h3;
+    client_options.trusted_ca = certificate / "cert.pem";
+    quic_endpoint client(loop, ip_endpoint::loopback_v4(0), std::move(client_options));
+    auto owned = std::make_unique<udp_socket>(loop, ip_endpoint::loopback_v4(0));
+    auto& socket = *owned;
+    const auto relay_address = socket.local_endpoint();
+    loop.add(std::move(owned));
+    relay_outcome result;
+    std::size_t completed = 0;
+    std::vector<std::byte> buffer(65536);
+    check(loop.spawn(relay(loop, socket, buffer, server.local_endpoint().port, result)) ==
+              task_spawn_result::accepted, "spawn HTTP/3 relay");
+    check(loop.spawn(server.run()) == task_spawn_result::accepted, "spawn HTTP/3 server");
+    check(loop.spawn(h3_connect(loop, client, relay_address, completed)) ==
+              task_spawn_result::accepted, "spawn HTTP/3 client");
+    check(loop.spawn(indexed_watch(loop, server, client, socket, completed)) ==
+              task_spawn_result::accepted, "spawn HTTP/3 watch");
+    (void)loop.run();
+    check(completed == 1, "HTTP/3 indexed connection completes");
+    check(result.server_ids != 0, "relay saw HTTP/3 server connection IDs");
+    check(result.all_indexed, "HTTP/3 server connection IDs start with the worker index");
+    return true;
+}
+
 auto scenario(quic_version version, const std::filesystem::path& certificate,
               bool small_windows = false) -> bool
 {
@@ -493,6 +781,13 @@ auto main() -> int
     const bool small_v2 = scenario(quic_version::v2, directory, true);
     const bool control = control_scenario(directory);
     const bool shutdown = shutdown_scenario(directory);
+    const bool indexed = worker_index_scenario(directory);
+    const bool http3_indexed = http3_worker_index_scenario(directory);
+#ifndef _WIN32
+    const bool shared_port = shared_port_scenario(directory);
+#else
+    const bool shared_port = true; // SO_REUSEPORT is unavailable
+#endif
     std::filesystem::remove_all(directory);
 #ifdef _WIN32
     (void)WSACleanup();
@@ -503,6 +798,9 @@ auto main() -> int
     check(small_v2, "QUIC v2 small receive windows");
     check(control, "QUIC stream control and application close");
     check(shutdown, "QUIC endpoint close notifies peers");
+    check(indexed, "QUIC worker index in connection IDs");
+    check(http3_indexed, "HTTP/3 worker index in connection IDs");
+    check(shared_port, "QUIC endpoints share a port across loops");
     std::puts("QUIC public API tests passed (v1 and v2)");
     return 0;
 }

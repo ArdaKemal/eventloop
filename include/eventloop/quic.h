@@ -8,6 +8,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -82,6 +83,13 @@ struct quic_server_options {
     quic_transport_limits limits {};
     // Reserved at endpoint construction; 1..256. Exhaustion rejects a new connection.
     std::size_t connection_capacity {8};
+    // SO_REUSEPORT, so one endpoint per loop can share a port. Delivery to the
+    // owning endpoint relies on the kernel's address hash; see docs/quic.md.
+    bool reuse_port {false};
+    // When set, the first byte of every connection ID this endpoint issues,
+    // so a steering layer can find the owning endpoint. Unset keeps the
+    // connection ID fully random.
+    std::optional<std::uint8_t> worker_index {};
 };
 
 struct quic_client_options {

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace eventloop::http {
 
@@ -27,7 +28,8 @@ struct server_options {
     // HTTP/1.1 bodies of 11 KiB or more are sent with sendfile from a
     // duplicate descriptor. See docs/api-contract.md.
     std::size_t open_file_cache_capacity {0};
-    // TCP servers only.
+    // SO_REUSEPORT, so one server per loop can share a port. For HTTP/3, see
+    // docs/quic.md for how datagrams reach the owning server.
     bool reuse_port {false};
     // TCP servers only; redirect_server uses header_timeout only. Zero
     // disables either. A connection is closed when its TLS handshake and
@@ -47,6 +49,8 @@ struct server_options {
     std::size_t connection_capacity {8};
     std::size_t request_capacity {0};
     std::size_t max_udp_payload_size {1472};
+    // http3_server only: see quic_server_options::worker_index.
+    std::optional<std::uint8_t> worker_index {};
 };
 
 } // namespace eventloop::http

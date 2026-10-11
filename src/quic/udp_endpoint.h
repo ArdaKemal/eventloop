@@ -28,7 +28,8 @@ public:
                  std::size_t short_cid_length = 8,
                  endpoint_accept_callback accept = {},
                  bool grease_quic_bit = true,
-                 std::size_t connection_capacity = 16);
+                 std::size_t connection_capacity = 16,
+                 bool reuse_port = false);
     ~udp_endpoint();
     udp_endpoint(const udp_endpoint&) = delete;
     auto operator=(const udp_endpoint&) -> udp_endpoint& = delete;

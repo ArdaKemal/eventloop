@@ -253,7 +253,7 @@ public:
         : loop_(loop),
           endpoint_(loop, local, path_endpoint_role::server, short_cid_length,
                     endpoint_accept_callback {this, accept_initial}, true,
-                    options.connection_capacity),
+                    options.connection_capacity, options.reuse_port),
           server_options_(std::move(options)),
           slots_(server_options_.connection_capacity),
           waiters_(std::make_shared<waiter_state>(server_options_.connection_capacity))
@@ -550,6 +550,8 @@ private:
             entry->clear();
             return false;
         }
+        if (self.server_options_.worker_index)
+            entry->local_cid[0] = static_cast<std::byte>(*self.server_options_.worker_index);
         const auto original = header.destination_cid;
         entry->original_dcid_size = std::min(original.size(), entry->original_dcid.size());
         std::copy_n(original.begin(), entry->original_dcid_size, entry->original_dcid.begin());
