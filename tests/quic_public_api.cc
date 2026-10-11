@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -473,7 +474,12 @@ auto shared_port_accept(event_loop& loop, quic_endpoint& server,
     for (;;) {
         auto accepted = flatten_result(co_await server.async_accept());
         if (!accepted && accepted.error() == std::errc::operation_canceled) co_return;
-        if (!accepted) continue;
+        if (!accepted) {
+            // A connection's own failure; pause so a persistent error fails
+            // the scenario's checks instead of spinning here.
+            (void)co_await sleep_for(loop, 1ms);
+            continue;
+        }
         if (loop.spawn(shared_port_echo(loop, std::move(*accepted), served)) !=
             task_spawn_result::accepted) co_return;
     }
@@ -793,7 +799,12 @@ auto rebind_accept(event_loop& loop, quic_endpoint& server) -> task<void>
     for (;;) {
         auto accepted = flatten_result(co_await server.async_accept());
         if (!accepted && accepted.error() == std::errc::operation_canceled) co_return;
-        if (!accepted) continue;
+        if (!accepted) {
+            // A connection's own failure; pause so a persistent error fails
+            // the scenario's checks instead of spinning here.
+            (void)co_await sleep_for(loop, 1ms);
+            continue;
+        }
         if (loop.spawn(rebind_echo_server(loop, std::move(*accepted))) !=
             task_spawn_result::accepted) co_return;
     }
@@ -998,9 +1009,9 @@ auto main() -> int
     WSADATA data {};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
 #endif
+    // Unique per process: concurrent runs must not delete each other's files.
     const auto directory = std::filesystem::temp_directory_path() /
-        ("eventloop-quic-public-" + std::to_string(
-            static_cast<unsigned long long>(std::rand())));
+        ("eventloop-quic-public-" + std::to_string(std::random_device {}()));
     std::filesystem::create_directories(directory);
     if (!make_certificate(directory)) {
         std::fprintf(stderr, "certificate generation failed\n");
