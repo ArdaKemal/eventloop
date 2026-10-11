@@ -1,8 +1,10 @@
 #include "quic/udp_endpoint.h"
+#include "eventloop/udp_socket.h"
 
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 
 using namespace eventloop;
 using namespace eventloop::quic::detail;
@@ -60,6 +62,60 @@ auto roundtrip() -> void
     server.close();
     client.close();
 }
+
+// Worker group forwarding: short-header packets for a connection owned by
+// worker 0 arrive at worker 1, once with the QUIC bit set and once greased
+// (RFC 9287); worker 0 must receive both.
+auto short_packet(void* argument, std::span<const std::byte>, const packet_header& header,
+                  ip_endpoint) noexcept -> bool
+{
+    if (header.kind != packet_kind::short_header) return false;
+    ++*static_cast<int*>(argument);
+    return true;
+}
+auto misroute(event_loop& loop, udp_socket& sender, ip_endpoint other, int& packets)
+    -> task<void>
+{
+    for (const auto first : {std::byte {0x41}, std::byte {0x01}}) {
+        std::array<std::byte, 24> datagram {};
+        datagram[0] = first;            // short header; 0x40 is the QUIC bit
+        datagram[1] = std::byte {0};    // connection ID: worker 0's index...
+        datagram[2] = std::byte {7};    // ...then the rest of the ID
+        (void)co_await sender.async_send_to(datagram, other);
+    }
+    for (unsigned i = 0; i != 200 && packets < 2; ++i)
+        if (co_await sleep_for(loop, 1ms) != timer_wait_result::expired) co_return;
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+auto receive_quietly(event_loop&, udp_endpoint& endpoint) -> task<void>
+{
+    (void)co_await endpoint.run();
+}
+auto forwarding() -> void
+{
+    event_loop loop;
+    const auto group = std::make_shared<quic_worker_group>(2);
+    udp_endpoint owner(loop, ip_endpoint::loopback_v4(), path_endpoint_role::server, 2, {},
+                       true, 16, false, group, 0);
+    udp_endpoint other(loop, ip_endpoint::loopback_v4(), path_endpoint_role::server, 2, {},
+                       true, 16, false, group, 1);
+    auto owned = std::make_unique<udp_socket>(loop, ip_endpoint::loopback_v4());
+    auto& sender = *owned;
+    const auto source = sender.local_endpoint();
+    loop.add(std::move(owned));
+    constexpr std::array cid {std::byte {0}, std::byte {7}};
+    int packets = 0;
+    check(owner.router().add(cid, source, {&packets, short_packet}).has_value());
+    check(loop.spawn(receive_quietly(loop, owner)) == task_spawn_result::accepted);
+    check(loop.spawn(receive_quietly(loop, other)) == task_spawn_result::accepted);
+    check(loop.spawn(misroute(loop, sender, other.local_endpoint(), packets)) ==
+          task_spawn_result::accepted);
+    check(loop.spawn(watchdog(loop)) == task_spawn_result::accepted);
+    (void)loop.run();
+    check(packets == 2);
+    owner.close();
+    other.close();
+}
 }
 int main()
 {
@@ -68,6 +124,7 @@ int main()
     check(WSAStartup(MAKEWORD(2, 2), &data) == 0);
 #endif
     roundtrip();
+    forwarding();
 #ifdef _WIN32
     (void)WSACleanup();
 #endif

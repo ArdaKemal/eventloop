@@ -235,8 +235,14 @@ auto udp_endpoint::receive_loop(event_loop&, udp_endpoint& endpoint) -> task<std
                         endpoint.accept_.initial) {
                         handled = !endpoint.accept_.initial(endpoint.accept_.argument,
                             endpoint.router_, *header, received->source);
-                    } else if (header) {
-                        handled = endpoint.forward(datagram, *header, received->source);
+                    } else if (endpoint.inbox_) {
+                        // Parse as the router does: a peer that negotiated
+                        // greasing clears the QUIC bit (RFC 9287).
+                        const auto routed = parse_packet_header(datagram, 0,
+                            endpoint.router_.short_cid_length(),
+                            endpoint.router_.grease_quic_bit());
+                        if (routed)
+                            handled = endpoint.forward(datagram, *routed, received->source);
                     }
                 }
             }

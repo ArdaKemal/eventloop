@@ -315,6 +315,7 @@ public:
 
     [[nodiscard]] auto short_cid_length() const noexcept -> std::size_t
     { return short_cid_length_; }
+    [[nodiscard]] auto grease_quic_bit() const noexcept -> bool { return grease_quic_bit_; }
     [[nodiscard]] auto role() const noexcept -> path_endpoint_role { return role_; }
 
 private:
