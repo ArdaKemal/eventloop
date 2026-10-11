@@ -98,6 +98,7 @@ private:
     static auto parameters(SSL*, const unsigned char*, std::size_t, void*)
         noexcept -> int;
     static auto send_alert(SSL*, unsigned char, void*) noexcept -> int;
+    static auto check_client_hello(SSL*, int*, void*) noexcept -> int;
     static auto select_alpn(SSL*, const unsigned char**, unsigned char*,
                             const unsigned char*, unsigned int, void*)
         noexcept -> int;

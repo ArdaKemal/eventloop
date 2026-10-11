@@ -363,6 +363,12 @@ auto connection_core::build(protected_packet_fields fields,
     ++encrypted_packets_[index(*level)];
     return *result;
 }
+auto connection_core::unbuild(tls_level level) noexcept -> void
+{
+    check_owner();
+    --next_packet_number_[index(level)];
+    --encrypted_packets_[index(level)];
+}
 
 auto connection_core::dispatch(tls_level level, packet_kind kind,
     std::span<const std::byte> payload, lifecycle_time_point now, lifecycle_duration pto)
@@ -473,19 +479,14 @@ auto connection_core::receive(std::span<const std::uint8_t> datagram, std::size_
                 short_cid_length, version_, candidate ? *candidate : *key_update_.receive_keys(receive_key_slot::current),
                 numbers.largest_received(), packet_scratch, plaintext, auth_scratch,
                 local_grease_quic_bit_);
-            if (attempt && candidate) authenticated_slot = slot;
+            if ((attempt || attempt.error() == protected_packet_error::reserved_bits) &&
+                candidate) authenticated_slot = slot;
         }
         const auto selected = authenticated_slot.value_or(receive_key_slot::current);
         selected_slot = selected;
         opened = open_protected_packet(protection_, datagram, offset,
             short_cid_length, version_, *key_update_.receive_keys(selected), numbers.largest_received(),
             packet_scratch, plaintext, auth_scratch, local_grease_quic_bit_);
-        if (!opened) {
-            if (opened.error() == protected_packet_error::authentication_failed &&
-                ++failed_authentications_ >= (std::uint64_t {1} << 52))
-                return fail(connection_error::aead_limit_reached);
-            return std::unexpected(packet_error(opened.error()));
-        }
     } else {
         opened = open_protected_packet(protection_, datagram, offset,
             short_cid_length, version_, *keys_[index(*level)][0], numbers.largest_received(),
@@ -493,6 +494,8 @@ auto connection_core::receive(std::span<const std::uint8_t> datagram, std::size_
     }
     // Unauthenticated garbage never poisons the connection.
     if (!opened) {
+        if (opened.error() == protected_packet_error::reserved_bits)
+            return fail(connection_error::protocol_violation);
         if (*level != tls_level::initial && opened.error() == protected_packet_error::authentication_failed &&
             ++failed_authentications_ >= (std::uint64_t {1} << 52))
             return fail(connection_error::aead_limit_reached);

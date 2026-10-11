@@ -146,6 +146,23 @@ int main()
         check(client.tls.advance().has_value() && server.tls.advance().has_value());
     }
     {
+        // A key share the server does not prefer forces a HelloRetryRequest;
+        // the second ClientHello repeats identical transport parameters.
+        contexts retry;
+        check(SSL_CTX_set1_groups_list(retry.client.get(), "P-384:X25519") == 1);
+        check(SSL_CTX_set1_groups_list(retry.server.get(), "X25519") == 1);
+        endpoint client, server;
+        initialize(client, server, retry);
+        bool complete = false;
+        for (int step = 0; step < 20 && !complete; ++step) {
+            const auto c = client.tls.advance(), s = server.tls.advance();
+            check(c.has_value() && s.has_value());
+            complete = *c == tls_progress::complete && *s == tls_progress::complete;
+        }
+        check(complete);
+        check(std::ranges::equal(server.tls.peer_transport_parameters(), advertised_client_parameters));
+    }
+    {
         auto client_storage=std::make_unique<endpoint>(), server_storage=std::make_unique<endpoint>();
         auto& client=*client_storage;
         auto& server=*server_storage;

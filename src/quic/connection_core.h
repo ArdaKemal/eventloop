@@ -96,6 +96,9 @@ public:
     [[nodiscard]] auto build(protected_packet_fields fields,
         std::span<const std::uint8_t> payload, std::span<std::uint8_t> output,
         std::span<std::uint8_t> scratch) -> std::expected<std::size_t, connection_error>;
+    // Returns the PN of the immediately preceding build() at this level when
+    // its packet is discarded before transmission, so no PN gap is created.
+    auto unbuild(tls_level) noexcept -> void;
     [[nodiscard]] auto receive(std::span<const std::uint8_t> datagram, std::size_t offset,
         std::size_t short_cid_length, std::span<std::uint8_t> packet_scratch,
         std::span<std::uint8_t> plaintext, std::span<std::uint8_t> auth_scratch,

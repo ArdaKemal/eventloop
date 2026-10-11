@@ -13,6 +13,7 @@ tls_provider::~tls_provider() { SSL_free(ssl_); }
 auto tls_provider::configure_server_context(SSL_CTX* context) noexcept -> void
 {
     SSL_CTX_set_alpn_select_cb(context, select_alpn, nullptr);
+    SSL_CTX_set_client_hello_cb(context, check_client_hello, nullptr);
 }
 
 auto tls_provider::initialize(SSL_CTX* context, const tls_options& options)
@@ -151,7 +152,10 @@ auto tls_provider::advance() -> std::expected<tls_progress, tls_error>
         return std::unexpected(*failure_);
     }
     if (SSL_is_init_finished(ssl_)) {
-        if (!got_parameters_) fail(tls_error::missing_transport_parameters);
+        if (!got_parameters_) {
+            alert_ = SSL_AD_MISSING_EXTENSION; // RFC 9001 Section 8.2
+            fail(tls_error::missing_transport_parameters);
+        }
         if (negotiated_alpn().empty()) fail(tls_error::missing_alpn);
         if (failure_) return std::unexpected(*failure_);
         complete_ = true;
@@ -246,7 +250,11 @@ auto tls_provider::parameters(SSL*, const unsigned char* data, std::size_t size,
                               void* argument) noexcept -> int
 {
     auto& self = *static_cast<tls_provider*>(argument);
-    if (self.got_parameters_) return self.fail(tls_error::invalid_crypto_data);
+    // After HelloRetryRequest the second ClientHello repeats the parameters.
+    if (self.got_parameters_)
+        return std::ranges::equal(std::span {data, size},
+                                  self.peer_transport_parameters())
+            ? 1 : self.fail(tls_error::invalid_crypto_data);
     if (size > self.peer_parameters_.size()) return self.fail(tls_error::capacity_exceeded);
     std::copy_n(data, size, self.peer_parameters_.begin());
     self.peer_parameters_size_ = size;
@@ -259,6 +267,19 @@ auto tls_provider::send_alert(SSL*, unsigned char code, void* argument) noexcept
     auto& self = *static_cast<tls_provider*>(argument);
     self.alert_ = code;
     return self.fail(tls_error::provider_failure);
+}
+
+// RFC 9001 Section 8.2: reject before answering, because the server's
+// EncryptedExtensions only carry parameters when the client offered them.
+auto tls_provider::check_client_hello(SSL* ssl, int* alert, void*) noexcept -> int
+{
+    const unsigned char* data {};
+    std::size_t size {0};
+    if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_quic_transport_parameters,
+                                  &data, &size) == 1)
+        return SSL_CLIENT_HELLO_SUCCESS;
+    *alert = SSL_AD_MISSING_EXTENSION;
+    return SSL_CLIENT_HELLO_ERROR;
 }
 
 auto tls_provider::select_alpn(SSL* ssl, const unsigned char** output,

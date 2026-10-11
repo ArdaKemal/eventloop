@@ -361,5 +361,25 @@ int main()
         }
         check(send(*server,*client,incoming,outgoing,tls_level::application));
         for (const auto stream_id : selected) check(client->stream(stream_id)->send.complete());
+        // A packet that preflight refuses (full window or sent history) must
+        // not consume its packet number: each gap permanently uses one
+        // sent-range slot, so repeated refusals would exhaust them and stall.
+        auto* history=client->recovery().history(packet_number_space::application_data);
+        while (history->size()<bounded_connection::packet_capacity)
+            check(send(*client,*server,outgoing,incoming,tls_level::application,false,true));
+        const auto fin_only=client->open_stream(stream_direction::bidirectional);
+        check(fin_only.has_value() && client->stream(*fin_only)->send.close().has_value());
+        const auto blocked_number=client->core().next_packet_number(tls_level::application);
+        protected_packet_fields blocked_fields; blocked_fields.destination_cid=dcid;
+        for (int i=0;i<200;++i) {
+            const auto blocked=outgoing.prepare(tls_level::application,blocked_fields,now,
+                buffer.encoded,buffer.build_scratch);
+            check(!blocked && blocked.error()==connection_error::capacity_exceeded);
+        }
+        check(client->core().next_packet_number(tls_level::application)==blocked_number);
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        check(send(*client,*server,outgoing,incoming,tls_level::application));
+        check(outgoing.packet_number()==*blocked_number);
+        check(server->stream(*fin_only)!=nullptr);
     }
 }

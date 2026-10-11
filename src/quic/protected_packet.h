@@ -20,6 +20,9 @@ enum class protected_packet_error {
     malformed_packet,
     authentication_failed,
     provider_failure,
+    // Authenticated, but reserved header bits are nonzero: RFC 9000
+    // Section 17 makes this a PROTOCOL_VIOLATION connection error.
+    reserved_bits,
 };
 
 struct protected_packet_fields {

@@ -259,9 +259,7 @@ public:
         auto histories = histories_;
         histories[*index] = history;
         prune_events(events, event_count, histories);
-        if (event_count > events_.size())
-            return std::unexpected(recovery_error {
-                recovery_error_kind::capacity_exhausted});
+        bound_events(events, event_count);
         histories_[*index] = history;
         congestion_ = controller;
         rtt_ = estimator;
@@ -340,9 +338,7 @@ public:
              *endpoint > *last_persistent_endpoint_);
         if (persistent) controller.on_persistent_congestion();
         prune_events(events, event_count, histories);
-        if (event_count > events_.size())
-            return std::unexpected(recovery_error {
-                recovery_error_kind::capacity_exhausted});
+        bound_events(events, event_count);
         histories_ = histories;
         congestion_ = controller;
         if (persistent) last_persistent_endpoint_ = endpoint;
@@ -449,6 +445,7 @@ private:
         return controller;
     }
 
+    static constexpr std::size_t event_capacity = 3 * Capacity;
     struct persistent_event {
         packet_number_space space {};
         sent_packet packet {};
@@ -562,6 +559,32 @@ private:
         count = kept;
     }
 
+    // While an old packet stays outstanding, pruning retains every later
+    // event, which is not bounded by history capacity. Overflow keeps the
+    // latest-sent events and replaces the rest with one acknowledged barrier
+    // at the latest dropped send time. Every gap between kept events is
+    // still fully recorded, and a loss period starting at or before the cut
+    // is treated as broken, so persistent congestion may be missed but is
+    // never declared falsely.
+    static constexpr auto bound_events(std::span<persistent_event> events,
+                                       std::size_t& count) noexcept -> void
+    {
+        if (count <= event_capacity) return;
+        const auto end = events.begin() + static_cast<std::ptrdiff_t>(count);
+        std::sort(events.begin(), end, [](const auto& left, const auto& right) {
+            return left.packet.sent_time < right.packet.sent_time;
+        });
+        auto first_kept = end - static_cast<std::ptrdiff_t>(event_capacity - 1);
+        const auto barrier = *(first_kept - 1);
+        // The barrier blocks only later sends, so drop events sent with it.
+        while (first_kept != end &&
+               first_kept->packet.sent_time == barrier.packet.sent_time)
+            ++first_kept;
+        events[0] = {barrier.space, barrier.packet, true, false};
+        count = 1 + static_cast<std::size_t>(
+            std::copy(first_kept, end, events.begin() + 1) - (events.begin() + 1));
+    }
+
     [[nodiscard]] static constexpr auto space_index(packet_number_space space)
         noexcept -> std::optional<std::size_t>
     {
@@ -636,7 +659,7 @@ private:
     newreno_congestion_controller congestion_ {};
     rtt_estimator rtt_ {};
     std::array<std::optional<recovery_time_point>, 3> loss_deadlines_ {};
-    std::array<persistent_event, 3 * Capacity> events_ {};
+    std::array<persistent_event, event_capacity> events_ {};
     std::size_t event_count_ {0};
     std::optional<std::array<std::optional<std::uint64_t>, 3>>
         first_sample_highest_sent_ {};

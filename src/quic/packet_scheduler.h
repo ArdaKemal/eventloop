@@ -186,7 +186,11 @@ public:
         if (!size) return std::unexpected(size.error());
         packet_ = {*number,now,eliciting,eliciting || level == tls_level::initial,*size};
         const auto preview = connection_.preflight_sent(level, packet_, probe);
-        if (!preview) return std::unexpected(preview.error());
+        if (!preview) {
+            // A refused packet is never sent; reuse its PN for the next one.
+            connection_.core().unbuild(level);
+            return std::unexpected(preview.error());
+        }
         pending_ = true; level_ = level; probe_ = probe;
         return *size;
     }

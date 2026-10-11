@@ -222,7 +222,7 @@ auto open_protected_packet(
     }
     const auto short_header = parsed->kind == packet_kind::short_header;
     if ((packet[0] & (short_header ? 0x18 : 0x0c)) != 0) {
-        return std::unexpected(protected_packet_error::malformed_packet);
+        return std::unexpected(protected_packet_error::reserved_bits);
     }
     return opened_protected_packet {
         parsed->kind, expected_version, *packet_number,

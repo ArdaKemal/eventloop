@@ -106,7 +106,27 @@ auto grease_quic_bit_packets() -> void
     CHECK(apply_aes_header_protection(context, *keys, std::span(packet).first(size), 1, false));
     const auto reserved = open_protected_packet(context, std::span(packet).first(size),
         0, 0, version_1, *keys, {}, scratch, plaintext, auth, true);
-    CHECK(!reserved && reserved.error() == protected_packet_error::malformed_packet);
+    CHECK(!reserved && reserved.error() == protected_packet_error::reserved_bits);
+    // Long-header reserved bits are checked only after authentication too.
+    for (const bool authentic : {true, false}) {
+        packet[0] = 0xe4; // Handshake, reserved bits 01, one-byte PN
+        packet[1] = packet[2] = packet[3] = 0; packet[4] = 1; // version 1
+        packet[5] = packet[6] = 0; // empty connection IDs
+        packet[7] = 0x40; packet[8] = static_cast<std::uint8_t>(1 + ping.size() + 16);
+        packet[9] = 7;
+        const auto long_sealed = seal_payload(context, *keys, 7,
+            std::span(packet).first(10), ping, std::span(packet).subspan(10, ping.size() + 16));
+        CHECK(long_sealed);
+        const auto long_size = 10 + *long_sealed;
+        if (!authentic) packet[long_size - 1] ^= 1;
+        CHECK(apply_aes_header_protection(context, *keys, std::span(packet).first(long_size), 9, false));
+        const auto long_reserved = open_protected_packet(context,
+            std::span(packet).first(long_size), 0, std::nullopt, version_1, *keys, {},
+            scratch, plaintext, auth, true);
+        CHECK(!long_reserved && long_reserved.error() == (authentic
+            ? protected_packet_error::reserved_bits
+            : protected_packet_error::authentication_failed));
+    }
 }
 
 int main()

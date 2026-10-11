@@ -551,10 +551,14 @@ private:
         if ((state!=connection_state::active && state!=connection_state::handshake) ||
             self.scheduler_.pending())
             co_return;
+        // build() needs both 1-RTT directions; a server has the 1-RTT write
+        // key before the client's Finished supplies the read key.
         std::optional<tls_level> level;
         for (const auto candidate : {tls_level::application,tls_level::handshake,tls_level::initial})
             if (!core.level_discarded(candidate) &&
-                core.keys_available(candidate,tls_direction::write)) { level=candidate; break; }
+                core.keys_available(candidate,tls_direction::write) &&
+                (candidate!=tls_level::application ||
+                 core.keys_available(candidate,tls_direction::read))) { level=candidate; break; }
         if (!level) co_return;
         decoded_frame frame; frame.type=type; frame.error_code=code;
         if (*level!=tls_level::application && type==0x1d) {

@@ -283,43 +283,41 @@ auto persistent_congestion_edges() -> void
           "late ACK of a lost packet breaks the loss period");
 }
 
-auto event_capacity_is_atomic() -> void
+auto event_overflow_keeps_recent_events() -> void
 {
-    recovery_orchestration<2> recovery;
-    std::array<retired_packet, 6> output {};
-    check(recovery.record(packet_number_space::initial,
-                          packet(0, 0ms)).has_value() &&
-          recovery.record(packet_number_space::handshake,
-                          packet(0, 0ms)).has_value() &&
-          recovery.on_ack(packet_number_space::handshake, ack(0),
-                          at(100ms), 0us, output)->retired == 1,
-          "retain a cross-space outstanding packet");
-    for (std::uint64_t pair = 0; pair < 2; ++pair) {
-        const auto start = std::chrono::milliseconds {101 + 1000 * pair};
-        check(recovery.record(packet_number_space::handshake,
-                              packet(2 * pair + 1, start)).has_value() &&
-              recovery.record(packet_number_space::handshake,
-                              packet(2 * pair + 2, start + 800ms, false))
-                  .has_value() &&
-              recovery.on_ack(packet_number_space::handshake,
-                              ack(2 * pair + 2), at(start + 801ms),
-                              0us, output)->retired == 2,
-              "fill bounded persistent-congestion event history");
+    // An old outstanding packet keeps every later event; four rounds of
+    // three losses and one ACK exceed the 3 * Capacity event history.
+    recovery_orchestration<4> recovery;
+    std::array<retired_packet, 16> output {};
+    const auto space = packet_number_space::handshake;
+    check(recovery.record(space, packet(0, 0ms)).has_value() &&
+          recovery.on_ack(space, ack(0), at(100ms), 0us, output)->retired == 1 &&
+          recovery.record(packet_number_space::initial,
+                          packet(0, 101ms)).has_value(),
+          "retain an eligible cross-space outstanding packet");
+    std::uint64_t number = 1;
+    for (std::uint64_t round = 0; round < 4; ++round) {
+        const auto start = std::chrono::milliseconds {200 + 1000 * round};
+        for (std::uint64_t i = 0; i < 3; ++i)
+            check(recovery.record(space, packet(number++, start +
+                      std::chrono::milliseconds {i}), true).has_value(),
+                  "record loss candidates");
+        check(recovery.record(space, packet(number, start + 800ms, false), true)
+                  .has_value(), "record ACK target");
+        const auto result = recovery.on_ack(space, ack(number++),
+                                            at(start + 801ms), 0us, output);
+        check(result && result->retired == 4 && !result->persistent_congestion,
+              "event overflow keeps the connection usable");
     }
-    check(recovery.record(packet_number_space::handshake,
-                          packet(5, 2101ms)).has_value() &&
-          recovery.record(packet_number_space::handshake,
-                          packet(6, 2901ms, false)).has_value(),
-          "record packets at event capacity");
-    const auto flight = recovery.congestion().bytes_in_flight();
-    const auto failed = recovery.on_ack(packet_number_space::handshake,
-                                        ack(6), at(2902ms), 0us, output);
-    check(!failed &&
-          failed.error().kind == recovery_error_kind::capacity_exhausted &&
-          recovery.congestion().bytes_in_flight() == flight &&
-          recovery.history(packet_number_space::handshake)->size() == 2 &&
-          recovery.rtt().smoothed_rtt() == 100ms,
-          "event overflow preserves flight, history, and RTT");
+    // The dropped ACKs separated the outstanding packet from the kept
+    // losses; their replacement barrier must still block the period.
+    check(recovery.record(packet_number_space::initial,
+                          packet(1, 4200ms), true).has_value(),
+          "record ACK target after overflow");
+    const auto old = recovery.on_ack(packet_number_space::initial, ack(1),
+                                     at(4201ms), 0us, output);
+    check(old && old->retired == 2 && !old->persistent_congestion,
+          "dropped events never create persistent congestion");
 }
 
 auto loss_precedes_ack_window_growth() -> void
@@ -474,7 +472,7 @@ auto main() -> int
     pto_and_bounds();
     lower_ack_keeps_loss_threshold();
     persistent_congestion_edges();
-    event_capacity_is_atomic();
+    event_overflow_keeps_recent_events();
     loss_precedes_ack_window_growth();
     loss_timer_has_absolute_priority();
     discard_resets_backoff();

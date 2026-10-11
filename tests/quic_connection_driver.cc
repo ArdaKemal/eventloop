@@ -216,6 +216,89 @@ static auto lost_close_scenario(contexts& context,std::uint32_t version) -> void
     (void)loop.run();
     check(done && clean && loop.coroutine_statistics().live==0);
 }
+static auto receive_raw(event_loop& loop,udp_socket& peer,std::span<std::byte> input)
+    -> task<std::size_t>
+{
+    auto received=co_await with_timeout(loop,receive_packet(loop,peer,input),500ms);
+    if (!received || received->state!=timeout_result<
+            std::expected<udp_datagram,std::error_code>>::outcome::completed ||
+        !received->result || !*received->result || !**received->result) co_return 0;
+    co_return (**received->result)->size;
+}
+// A server close raised after its 1-RTT write key exists but before the
+// client's Finished supplies the 1-RTT read key must still be sent, at the
+// Handshake level (RFC 9000 10.2.3).
+static auto handshake_close(event_loop& loop,connection_driver& driver,
+    bounded_connection& server,bounded_connection& client,udp_endpoint& endpoint,udp_socket& peer,buffers& storage,
+    bool& closed) -> task<void>
+{
+    auto input=std::as_writable_bytes(std::span(storage.plaintext));
+    std::array<std::uint8_t,2048> datagram {};
+    const auto deliver=[&](std::size_t size) {
+        for (std::size_t offset=0;offset<size;) {
+            const auto opened=client.receive(std::span(datagram).first(size),offset,dcid.size(),
+                storage.packet_scratch,storage.auth_scratch,storage.build_scratch,
+                lifecycle_time_point::clock::now(),10ms);
+            if (!opened) break;
+            if (client.core().state()==connection_state::draining)
+                closed=opened->kind==packet_kind::handshake;
+            offset=opened->packet_end_offset;
+        }
+    };
+    check(client.core().advance(lifecycle_time_point::clock::now()).has_value());
+    const auto scheduler_storage=std::make_unique<packet_scheduler>(client);
+    auto& scheduler=*scheduler_storage;
+    for (;;) {
+        protected_packet_fields fields; fields.destination_cid=dcid; fields.source_cid=dcid;
+        const auto now=lifecycle_time_point::clock::now();
+        const auto size=scheduler.prepare(tls_level::initial,fields,now,
+            storage.encoded,storage.build_scratch);
+        if (!size) break;
+        check(scheduler.complete(true,now).has_value());
+        check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*size)),
+                                          endpoint.local_endpoint())).has_value());
+    }
+    while (!client.core().keys_available(tls_level::handshake,tls_direction::write)) {
+        const auto size=co_await receive_raw(loop,peer,input);
+        check(size && *size!=0);
+        std::memcpy(datagram.data(),input.data(),*size);
+        deliver(*size);
+    }
+    check(server.core().keys_available(tls_level::application,tls_direction::write) &&
+          !server.core().keys_available(tls_level::application,tls_direction::read));
+    // Below 1-RTT the application close becomes APPLICATION_ERROR (0x0c).
+    driver.stop_with_application_error(0x123);
+    while (!closed) {
+        const auto size=co_await receive_raw(loop,peer,input);
+        if (!size || *size==0) break;
+        std::memcpy(datagram.data(),input.data(),*size);
+        deliver(*size);
+    }
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+static auto handshake_close_scenario(contexts& context) -> void
+{
+    event_loop loop;
+    auto owned=std::make_unique<udp_socket>(loop,ip_endpoint::loopback_v4());
+    auto* peer=owned.get();
+    const auto address=peer->local_endpoint();
+    loop.add(std::move(owned));
+    auto endpoint_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    auto& endpoint=*endpoint_storage;
+    connection_callbacks callbacks{nullptr,valid_parameters,nullptr};
+    auto server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks,lifecycle_time_point::clock::now());
+    auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks,lifecycle_time_point::clock::now());
+    check(server->initialize(context.server.get(),{true,{},protocol,parameters},version_1,dcid).has_value());
+    check(client->initialize(context.client.get(),{false,"localhost",protocol,parameters},version_1,dcid).has_value());
+    auto driver=std::make_unique<connection_driver>(loop,endpoint,*server,dcid,dcid,address,true);
+    auto storage=std::make_unique<buffers>();
+    bool closed=false,clean=false;
+    check(loop.spawn(receiver(loop,endpoint))==task_spawn_result::accepted);
+    check(loop.spawn(drive(loop,*driver,clean))==task_spawn_result::accepted);
+    check(loop.spawn(handshake_close(loop,*driver,*server,*client,endpoint,*peer,*storage,closed))==task_spawn_result::accepted);
+    (void)loop.run();
+    check(closed);
+}
 static auto queue_peer_close(bounded_connection& server,udp_endpoint& client_endpoint,
     ip_endpoint server_peer,bool trailing_ping=true) -> void
 {
@@ -376,6 +459,7 @@ int main()
     contexts context;
     notification_scenario();
     for (auto version : {version_1,version_2}) lost_close_scenario(context,version);
+    handshake_close_scenario(context);
     for (auto version : {version_1,version_2}) {
         event_loop loop;
         auto client_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);
