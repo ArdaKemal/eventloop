@@ -315,6 +315,15 @@ auto extended_connect() -> void
     {
         session state(false, &routes, 32);
         connect(state);
+        auto unrouted = valid;
+        unrouted[2].value = "/other";
+        send(state, 1, unrouted);
+        check(error_of(state, 3, 1) == 0, "unrouted CONNECT ends its stream with NO_ERROR");
+        check(error_of(state, 3, 0) == ~0u, "unrouted CONNECT resets no stream 0");
+    }
+    {
+        session state(false, &routes, 32);
+        connect(state);
         for (std::uint32_t i = 0; i < 9; ++i) send(state, 2 * i + 1, valid);
         check(error_of(state, 3, 17) == 7, "bounded tunnel slots refuse ninth stream");
         eventloop::http2::detail::routed_request routed;
