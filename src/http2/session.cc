@@ -1324,9 +1324,11 @@ auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
     std::erase(requests_, value.id);
     if (value.body_slot != no_slot) slot_used_[value.body_slot] = false;
     if (value.routed) {
-        std::erase_if(routed_, [&value](const routed_request& pending) {
-            return pending.stream_id == value.id;
-        });
+        routed_.erase(std::remove_if(routed_.begin() + static_cast<std::ptrdiff_t>(routed_next_),
+                                     routed_.end(), [&value](const routed_request& pending) {
+                                         return pending.stream_id == value.id;
+                                     }),
+                      routed_.end());
         if (release_hook_ != nullptr)
             release_hook_(release_context_, value.id, value.stream_finished);
     }
@@ -1419,9 +1421,12 @@ auto session::recycle_fields(std::vector<field>&& fields) noexcept -> void
 
 auto session::pop_routed(routed_request& value) -> bool
 {
-    if (routed_.empty()) return false;
-    value = std::move(routed_.front());
-    routed_.erase(routed_.begin());
+    if (routed_next_ == routed_.size()) {
+        routed_.clear();
+        routed_next_ = 0;
+        return false;
+    }
+    value = std::move(routed_[routed_next_++]);
     return true;
 }
 

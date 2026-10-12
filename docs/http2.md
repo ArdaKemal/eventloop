@@ -14,7 +14,7 @@ With routes, SETTINGS_ENABLE_CONNECT_PROTOCOL enables RFC 8441
 
 | Per connection | Bound |
 | --- | --- |
-| Active streams / handler slots | 32 |
+| Active streams / handler slots | 100 (SETTINGS_MAX_CONCURRENT_STREAMS) |
 | Request header blocks/lists | 64 KiB |
 | Discarded static request body | 1 MiB |
 | Queued inline response bodies | 4 MiB |
