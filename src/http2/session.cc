@@ -375,7 +375,7 @@ auto session::complete_file_send(http::detail::static_file file) -> void
     }
     // A nonfinal frame returns its owner to the active response. A final
     // frame (or a reset stream) closes it here, after transport completion.
-    auto& value = streams_[file_send_index_];
+    auto& value = *streams_[file_send_index_];
     if (value.active && value.id == file_send_stream_)
         value.response_file = std::move(file);
     file_send_active_ = false;
@@ -448,15 +448,14 @@ auto session::closed() const noexcept -> bool
     if (output_size_ != 0 || file_send_active_) return false;
     if (fatal_) return true;
     if (!peer_goaway_) return false;
-    return std::none_of(streams_.begin(), streams_.end(),
-                        [](const stream& value) { return value.active; });
+    return std::ranges::none_of(streams(), [](const stream& value) { return value.active; });
 }
 
 auto session::idle() const noexcept -> bool
 {
     // A stream counts once its request is routed or complete, so a partial
     // header block or request body does not hold the connection open.
-    return std::none_of(streams_.begin(), streams_.end(), [](const stream& value) {
+    return std::ranges::none_of(streams(), [](const stream& value) {
         return value.active && (value.routed || value.request_ready);
     });
 }
@@ -961,7 +960,7 @@ auto session::dispatch_settings() -> void
             const auto delta = static_cast<std::int64_t>(value) -
                                static_cast<std::int64_t>(peer_initial_window_);
             peer_initial_window_ = value;
-            for (auto& stream_value : streams_) {
+            for (auto& stream_value : streams()) {
                 if (!stream_value.active) continue;
                 stream_value.send_window += delta;
                 if (stream_value.send_window > max_window_size) {
@@ -1266,18 +1265,28 @@ auto session::validate_trailers(std::span<const field> fields) const -> bool
     return true;
 }
 
-auto session::find_stream(std::uint32_t id) noexcept -> stream*
+auto session::find_stream(std::uint32_t id) const noexcept -> stream*
 {
-    const auto found = std::find_if(streams_.begin(), streams_.end(),
-        [id](const stream& value) { return value.active && value.id == id; });
-    return found == streams_.end() ? nullptr : &*found;
+    for (auto& value : streams())
+        if (value.active && value.id == id) return &value;
+    return nullptr;
 }
 
 auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
 {
-    const auto found = std::find_if(streams_.begin(), streams_.end(),
-        [](const stream& value) { return !value.active; });
-    if (found == streams_.end()) return nullptr;
+    stream* found = nullptr;
+    for (auto& value : streams()) {
+        if (!value.active) {
+            found = &value;
+            break;
+        }
+    }
+    if (found == nullptr) {
+        if (stream_count_ == streams_.size()) return nullptr;
+        streams_[stream_count_].reset(new (std::nothrow) stream);
+        if (!streams_[stream_count_]) return nullptr;
+        found = streams_[stream_count_++].get();
+    }
     found->id = id;
     found->receive_window = 65535;
     found->send_window = peer_initial_window_;
@@ -1301,7 +1310,7 @@ auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
     found->response_started = false;
     found->urgency = 3;
     found->incremental = false;
-    return &*found;
+    return found;
 }
 
 auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
@@ -1466,9 +1475,8 @@ auto session::queue_chunk(std::uint32_t stream_id, std::span<const std::byte> da
 
 auto session::chunk_pending(std::uint32_t stream_id) const noexcept -> bool
 {
-    const auto found = std::find_if(streams_.begin(), streams_.end(),
-        [stream_id](const stream& value) { return value.active && value.id == stream_id; });
-    return found != streams_.end() && !found->chunk.empty() && !fatal_;
+    const auto* found = find_stream(stream_id);
+    return found != nullptr && !found->chunk.empty() && !fatal_;
 }
 
 auto session::finish_streamed(std::uint32_t stream_id, std::span<const http::header> trailers)
@@ -1507,15 +1515,13 @@ auto session::send_streamed_file(std::uint32_t stream_id, unique_fd file,
 
 auto session::stream_open(std::uint32_t stream_id) const noexcept -> bool
 {
-    return !fatal_ && std::any_of(streams_.begin(), streams_.end(),
-        [stream_id](const stream& value) { return value.active && value.id == stream_id; });
+    return !fatal_ && find_stream(stream_id) != nullptr;
 }
 
 auto session::body_ready(std::uint32_t stream_id) const noexcept -> bool
 {
-    const auto found = std::find_if(streams_.begin(), streams_.end(),
-        [stream_id](const stream& value) { return value.active && value.id == stream_id; });
-    return found == streams_.end() || fatal_ || found->too_large ||
+    const auto* found = find_stream(stream_id);
+    return found == nullptr || fatal_ || found->too_large ||
            found->body_end != found->body_begin || found->body_ended;
 }
 
@@ -1725,9 +1731,9 @@ auto session::next_response() const noexcept -> std::optional<std::size_t>
     std::optional<std::size_t> sequential;
     std::optional<std::size_t> incremental;
     std::uint8_t urgency = 8;
-    for (std::size_t step = 0; step < streams_.size(); ++step) {
-        const auto index = (response_cursor_ + step) % streams_.size();
-        const auto& value = streams_[index];
+    for (std::size_t step = 0; step < stream_count_; ++step) {
+        const auto index = (response_cursor_ + step) % stream_count_;
+        const auto& value = *streams_[index];
         if (!sendable(value) || value.urgency > urgency) continue;
         if (value.urgency < urgency) {
             urgency = value.urgency;
@@ -1736,7 +1742,7 @@ auto session::next_response() const noexcept -> std::optional<std::size_t>
         }
         if (value.incremental) {
             if (!incremental) incremental = index;
-        } else if (!sequential || value.id < streams_[*sequential].id) {
+        } else if (!sequential || value.id < streams_[*sequential]->id) {
             sequential = index;
         }
     }
@@ -1748,7 +1754,7 @@ auto session::pump_responses() -> void
     if (fatal_ || file_send_active_) return;
     while (const auto next = next_response()) {
         const auto index = *next;
-        auto& value = streams_[index];
+        auto& value = *streams_[index];
         if (value.streaming) {
             // A handler's borrowed chunk; finish_streamed() ends the stream.
             const auto count = static_cast<std::size_t>(std::min<std::uint64_t>({
@@ -1795,7 +1801,7 @@ auto session::pump_responses() -> void
             value.response_offset += count;
             connection_send_window_ -= static_cast<std::int64_t>(count);
             value.send_window -= static_cast<std::int64_t>(count);
-            response_cursor_ = (index + 1) % streams_.size();
+            response_cursor_ = (index + 1) % stream_count_;
             if (last) {
                 if (value.routed) {
                     value.stream_finished = true;
@@ -1825,7 +1831,7 @@ auto session::pump_responses() -> void
             // pumping after the transport drains it.
             return;
         }
-        response_cursor_ = (index + 1) % streams_.size();
+        response_cursor_ = (index + 1) % stream_count_;
         value.response_offset += count;
         connection_send_window_ -= static_cast<std::int64_t>(count);
         value.send_window -= static_cast<std::int64_t>(count);

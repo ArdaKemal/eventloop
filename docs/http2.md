@@ -37,7 +37,9 @@ validity checks but do not affect scheduling.
 ## Handlers, flow control, and cancellation
 
 One handler runs per stream, alongside a reader task and the connection writer.
-Session, 32 slots, and request views allocate once per connection. A 16 KiB
+The session allocates once per connection. Stream and handler slots allocate
+when concurrency first needs them and are kept; a stream beyond the limit, or
+whose slot cannot be allocated, is refused with REFUSED_STREAM. A 16 KiB
 frame buffer allocates the first time a frame payload spans reads or arrives
 while reading is paused, and is kept; failing that allocation is a connection
 INTERNAL_ERROR. `async_write`

@@ -17,6 +17,8 @@
 #include <coroutine>
 #include <expected>
 #include <limits>
+#include <memory>
+#include <new>
 #include <span>
 #include <string>
 #include <string_view>
@@ -343,6 +345,12 @@ public:
     bool too_large {false};
 };
 
+// A routed stream's exchange and the handler task that borrows it.
+struct handler_slot {
+    http2_exchange exchange;
+    std::optional<task_handle<void>> handler;
+};
+
 // Stops the connection deadline while a request is in progress and restarts
 // it with the idle timeout after the last one; until the first request, the
 // deadline from accept keeps running.
@@ -382,7 +390,11 @@ struct connection_state {
         : loop(loop), peer(peer), state(state), routes(routes), root(root), files(files),
           directory_listing(directory_listing), deadline(deadline)
     {
-        for (auto& exchange : exchanges) exchange.owner = this;
+    }
+
+    [[nodiscard]] auto used_slots() noexcept -> std::span<std::unique_ptr<handler_slot>>
+    {
+        return std::span(slots).first(slot_count);
     }
 
     // Resumes parked tasks whose condition holds; reentrant calls repeat the
@@ -402,7 +414,8 @@ struct connection_state {
                 if (handle && !handle.done()) handle.resume();
             };
             if (reader_waiter && (broken || !state.input_paused())) wake(reader_waiter);
-            for (auto& exchange : exchanges) {
+            for (auto& slot : used_slots()) {
+                auto& exchange = slot->exchange;
                 if (exchange.read_waiter && exchange.read_ready()) wake(exchange.read_waiter);
                 if (exchange.write_waiter && exchange.write_ready()) wake(exchange.write_waiter);
             }
@@ -419,7 +432,8 @@ struct connection_state {
         -> void
     {
         auto& self = *static_cast<connection_state*>(context);
-        for (auto& exchange : self.exchanges) {
+        for (auto& slot : self.used_slots()) {
+            auto& exchange = slot->exchange;
             if (!exchange.in_use || exchange.id != stream_id) continue;
             exchange.released = true;
             exchange.completed = completed;
@@ -434,8 +448,9 @@ struct connection_state {
     http::detail::open_file_cache* files;
     bool directory_listing;
     idle_deadline deadline;
-    std::array<http2_exchange, max_concurrent_streams> exchanges {};
-    std::array<std::optional<task_handle<void>>, max_concurrent_streams> handlers {};
+    // Slots are allocated when concurrency first needs them, then kept.
+    std::array<std::unique_ptr<handler_slot>, max_concurrent_streams> slots {};
+    std::size_t slot_count {0};
     std::coroutine_handle<> reader_waiter;
     std::coroutine_handle<> writer_waiter;
     bool broken {false};
@@ -719,15 +734,23 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
 {
     auto& state = connection.state;
     std::size_t index = 0;
-    for (; index < connection.exchanges.size(); ++index) {
-        const auto& handle = connection.handlers[index];
-        if (!connection.exchanges[index].in_use && (!handle || handle->done())) break;
+    for (; index < connection.slot_count; ++index) {
+        const auto& slot = *connection.slots[index];
+        if (!slot.exchange.in_use && (!slot.handler || slot.handler->done())) break;
     }
-    if (index == connection.exchanges.size()) {
+    if (index == connection.slot_count && index < connection.slots.size()) {
+        auto& slot = connection.slots[index];
+        slot.reset(new (std::nothrow) handler_slot);
+        if (slot) {
+            slot->exchange.owner = &connection;
+            ++connection.slot_count;
+        }
+    }
+    if (index == connection.slot_count) {
         state.abandon(routed.stream_id, refused_stream_error);
         return;
     }
-    auto& exchange = connection.exchanges[index];
+    auto& exchange = connection.slots[index]->exchange;
     exchange.reset(routed.stream_id);
     // The slot's previous fields go back to the decoder with their strings.
     auto previous = std::move(exchange.routed.fields);
@@ -764,7 +787,7 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
     http::detail::request_access::bind(exchange.request_, exchange, fields,
                                        exchange.routed.match.context);
     http::detail::request_access::bind(exchange.response_, exchange);
-    auto& slot = connection.handlers[index];
+    auto& slot = connection.slots[index]->handler;
     slot.reset();
     slot.emplace();
     if (connection.loop.spawn(run_route(connection.loop, exchange, exchange.routed.match.function),
@@ -815,7 +838,8 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
                   const http::router& routes,
                   std::uint64_t max_request_body, idle_deadline deadline) -> task<bool>
 {
-    // Session, task slots and exchanges are allocated once per connection.
+    // The session and connection state are allocated once per connection;
+    // stream and handler slots as concurrency first needs them.
     auto state = std::make_unique<session>(peer.kernel_sendfile_available(), &routes,
                                            max_request_body);
     auto connection = std::make_unique<connection_state>(loop, peer, *state, routes, root,
@@ -860,7 +884,8 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
     connection->drain();
     if (!reader.done()) (void)reader.cancel();
     (void)co_await reader;
-    for (auto& handler : connection->handlers) {
+    for (auto& slot : connection->used_slots()) {
+        auto& handler = slot->handler;
         if (!handler) continue;
         if (!handler->done()) (void)handler->cancel();
         connection->drain();

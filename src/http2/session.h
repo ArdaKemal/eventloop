@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -195,7 +196,15 @@ private:
     [[nodiscard]] auto validate_initial_headers(stream& value,
         std::span<const field> fields) -> bool;
     [[nodiscard]] auto validate_trailers(std::span<const field> fields) const -> bool;
-    [[nodiscard]] auto find_stream(std::uint32_t id) noexcept -> stream*;
+    // The allocated slots, active or not.
+    [[nodiscard]] auto streams() const noexcept
+    {
+        return std::span(streams_).first(stream_count_) |
+               std::views::transform([](const std::unique_ptr<stream>& slot) -> stream& {
+                   return *slot;
+               });
+    }
+    [[nodiscard]] auto find_stream(std::uint32_t id) const noexcept -> stream*;
     [[nodiscard]] auto allocate_stream(std::uint32_t id) noexcept -> stream*;
     // How a stream ended decides the RFC 9113 section 5.1 response to frames
     // that arrive afterwards.
@@ -290,7 +299,9 @@ private:
     void* release_context_ = nullptr;
     std::unique_ptr<std::byte[]> body_arena_;
     std::array<bool, route_body_slots> slot_used_ {};
-    std::array<stream, max_concurrent_streams> streams_ {};
+    // Slots are allocated when concurrency first needs them, then kept.
+    std::array<std::unique_ptr<stream>, max_concurrent_streams> streams_ {};
+    std::size_t stream_count_ = 0;
     std::array<closed_stream, closed_history> closed_streams_ {};
     std::size_t closed_next_ = 0;
     std::uint32_t closed_floor_ = 0;
