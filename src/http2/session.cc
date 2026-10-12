@@ -1363,9 +1363,11 @@ auto session::route_stream(stream& value) -> bool
         std::array<char, 96> allow {};
         const auto count = http::detail::format_allow(match.allowed, allow);
         const std::array<http::header, 1> headers {{{"allow", {allow.data(), count}}}};
-        (void)respond(value.id, match.allowed == 0 ? 404 : 405,
+        // The response ends and releases the stream, clearing value.
+        const auto id = value.id;
+        (void)respond(id, match.allowed == 0 ? 404 : 405,
             match.allowed == 0 ? std::span<const http::header> {} : std::span<const http::header>(headers), {});
-        stream_error(value.id, 0);
+        stream_error(id, 0);
         return true;
     }
     value.routed = true;
