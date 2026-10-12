@@ -13,6 +13,7 @@
 #include <charconv>
 #include <cstring>
 #include <optional>
+#include <ranges>
 #include <ctime>
 #include <coroutine>
 #include <expected>
@@ -310,7 +311,6 @@ public:
     auto reset(std::uint32_t stream_id) noexcept -> void
     {
         id = stream_id;
-        in_use = true;
         headers.clear();
         read_waiter = write_waiter = {};
         declared.reset();
@@ -323,7 +323,8 @@ public:
 
     connection_state* owner {nullptr};
     std::uint32_t id {0};
-    bool in_use {false};
+    // Index in connection_state::slots.
+    std::uint8_t slot {0};
     routed_request routed {};
     std::vector<http::header> headers;
     http::request request_ = http::detail::request_access::make_request();
@@ -397,6 +398,45 @@ struct connection_state {
         return std::span(slots).first(slot_count);
     }
 
+    // Exchanges in use; only these can have parked tasks.
+    [[nodiscard]] auto busy_exchanges() noexcept
+    {
+        return std::span(slot_order).first(busy_count) |
+               std::views::transform([this](std::uint8_t index) -> http2_exchange& {
+                   return slots[index]->exchange;
+               });
+    }
+
+    // Takes a free slot whose handler has finished, allocating one when
+    // none is. Null when the limit is reached or allocation fails.
+    [[nodiscard]] auto acquire() noexcept -> http2_exchange*
+    {
+        auto position = busy_count;
+        while (position < slot_count) {
+            const auto& handler = slots[slot_order[position]]->handler;
+            if (!handler || handler->done()) break;
+            ++position;
+        }
+        if (position == slot_count) {
+            if (slot_count == slots.size()) return nullptr;
+            auto& slot = slots[slot_count];
+            slot.reset(new (std::nothrow) handler_slot);
+            if (!slot) return nullptr;
+            slot->exchange.owner = this;
+            slot->exchange.slot = static_cast<std::uint8_t>(slot_count);
+            slot_order[slot_count++] = slot->exchange.slot;
+        }
+        std::swap(slot_order[position], slot_order[busy_count]);
+        return &slots[slot_order[busy_count++]]->exchange;
+    }
+
+    auto release(http2_exchange& exchange) noexcept -> void
+    {
+        const auto busy = std::span(slot_order).first(busy_count);
+        std::swap(*std::ranges::find(busy, exchange.slot), busy.back());
+        --busy_count;
+    }
+
     // Resumes parked tasks whose condition holds; reentrant calls repeat the
     // pass instead of nesting.
     auto drain() -> void
@@ -414,8 +454,7 @@ struct connection_state {
                 if (handle && !handle.done()) handle.resume();
             };
             if (reader_waiter && (broken || !state.input_paused())) wake(reader_waiter);
-            for (auto& slot : used_slots()) {
-                auto& exchange = slot->exchange;
+            for (auto& exchange : busy_exchanges()) {
                 if (exchange.read_waiter && exchange.read_ready()) wake(exchange.read_waiter);
                 if (exchange.write_waiter && exchange.write_ready()) wake(exchange.write_waiter);
             }
@@ -432,9 +471,8 @@ struct connection_state {
         -> void
     {
         auto& self = *static_cast<connection_state*>(context);
-        for (auto& slot : self.used_slots()) {
-            auto& exchange = slot->exchange;
-            if (!exchange.in_use || exchange.id != stream_id) continue;
+        for (auto& exchange : self.busy_exchanges()) {
+            if (exchange.id != stream_id) continue;
             exchange.released = true;
             exchange.completed = completed;
         }
@@ -448,9 +486,12 @@ struct connection_state {
     http::detail::open_file_cache* files;
     bool directory_listing;
     idle_deadline deadline;
-    // Slots are allocated when concurrency first needs them, then kept.
+    // Slots are allocated when concurrency first needs them, then kept. The
+    // first busy_count entries of slot_order are in use, the rest are free.
     std::array<std::unique_ptr<handler_slot>, max_concurrent_streams> slots {};
+    std::array<std::uint8_t, max_concurrent_streams> slot_order {};
     std::size_t slot_count {0};
+    std::size_t busy_count {0};
     std::coroutine_handle<> reader_waiter;
     std::coroutine_handle<> writer_waiter;
     bool broken {false};
@@ -726,31 +767,19 @@ auto run_route(event_loop& loop, http2_exchange& self, http::handler function) -
             state.abandon(self.id, internal_error);
         }
     }
-    self.in_use = false;
+    self.owner->release(self);
     self.owner->drain();
 }
 
 auto dispatch_routed(connection_state& connection, routed_request routed) -> void
 {
     auto& state = connection.state;
-    std::size_t index = 0;
-    for (; index < connection.slot_count; ++index) {
-        const auto& slot = *connection.slots[index];
-        if (!slot.exchange.in_use && (!slot.handler || slot.handler->done())) break;
-    }
-    if (index == connection.slot_count && index < connection.slots.size()) {
-        auto& slot = connection.slots[index];
-        slot.reset(new (std::nothrow) handler_slot);
-        if (slot) {
-            slot->exchange.owner = &connection;
-            ++connection.slot_count;
-        }
-    }
-    if (index == connection.slot_count) {
+    auto* acquired = connection.acquire();
+    if (acquired == nullptr) {
         state.abandon(routed.stream_id, refused_stream_error);
         return;
     }
-    auto& exchange = connection.slots[index]->exchange;
+    auto& exchange = *acquired;
     exchange.reset(routed.stream_id);
     // The slot's previous fields go back to the decoder with their strings.
     auto previous = std::move(exchange.routed.fields);
@@ -758,7 +787,7 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
     state.recycle_fields(std::move(previous));
     if (exchange.routed.too_large) {
         exchange.respond_status(413);
-        exchange.in_use = false;
+        connection.release(exchange);
         return;
     }
     std::string_view method, target, authority, host, connect_protocol;
@@ -787,14 +816,14 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
     http::detail::request_access::bind(exchange.request_, exchange, fields,
                                        exchange.routed.match.context);
     http::detail::request_access::bind(exchange.response_, exchange);
-    auto& slot = connection.slots[index]->handler;
+    auto& slot = connection.slots[exchange.slot]->handler;
     slot.reset();
     slot.emplace();
     if (connection.loop.spawn(run_route(connection.loop, exchange, exchange.routed.match.function),
                               *slot) != task_spawn_result::accepted) {
         slot.reset();
         exchange.respond_status(503);
-        exchange.in_use = false;
+        connection.release(exchange);
     }
 }
 

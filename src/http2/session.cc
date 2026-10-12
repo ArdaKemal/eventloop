@@ -448,15 +448,15 @@ auto session::closed() const noexcept -> bool
     if (output_size_ != 0 || file_send_active_) return false;
     if (fatal_) return true;
     if (!peer_goaway_) return false;
-    return std::ranges::none_of(streams(), [](const stream& value) { return value.active; });
+    return active_count_ == 0;
 }
 
 auto session::idle() const noexcept -> bool
 {
     // A stream counts once its request is routed or complete, so a partial
     // header block or request body does not hold the connection open.
-    return std::ranges::none_of(streams(), [](const stream& value) {
-        return value.active && (value.routed || value.request_ready);
+    return std::ranges::none_of(active_streams(), [](const stream& value) {
+        return value.routed || value.request_ready;
     });
 }
 
@@ -960,8 +960,8 @@ auto session::dispatch_settings() -> void
             const auto delta = static_cast<std::int64_t>(value) -
                                static_cast<std::int64_t>(peer_initial_window_);
             peer_initial_window_ = value;
-            for (auto& stream_value : streams()) {
-                if (!stream_value.active) continue;
+            for (const auto slot : std::span(slot_order_).first(active_count_)) {
+                auto& stream_value = *streams_[slot];
                 stream_value.send_window += delta;
                 if (stream_value.send_window > max_window_size) {
                     connection_error(flow_control_error);
@@ -1265,28 +1265,30 @@ auto session::validate_trailers(std::span<const field> fields) const -> bool
     return true;
 }
 
-auto session::find_stream(std::uint32_t id) const noexcept -> stream*
+auto session::find_stream(std::uint32_t id) noexcept -> stream*
 {
-    for (auto& value : streams())
-        if (value.active && value.id == id) return &value;
-    return nullptr;
+    return const_cast<stream*>(std::as_const(*this).find_stream(id));
 }
 
+auto session::find_stream(std::uint32_t id) const noexcept -> const stream*
+{
+    const auto active = active_streams();
+    const auto found = std::ranges::lower_bound(active, id, {}, &stream::id);
+    return found == active.end() || (*found).id != id ? nullptr : &*found;
+}
+
+// id must exceed every active id, as it does for a newly opened stream.
 auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
 {
-    stream* found = nullptr;
-    for (auto& value : streams()) {
-        if (!value.active) {
-            found = &value;
-            break;
-        }
-    }
-    if (found == nullptr) {
+    if (active_count_ == stream_count_) {
         if (stream_count_ == streams_.size()) return nullptr;
         streams_[stream_count_].reset(new (std::nothrow) stream);
         if (!streams_[stream_count_]) return nullptr;
-        found = streams_[stream_count_++].get();
+        streams_[stream_count_]->slot = static_cast<std::uint8_t>(stream_count_);
+        slot_order_[stream_count_] = static_cast<std::uint8_t>(stream_count_);
+        ++stream_count_;
     }
+    auto* found = streams_[slot_order_[active_count_++]].get();
     found->id = id;
     found->receive_window = 65535;
     found->send_window = peer_initial_window_;
@@ -1315,6 +1317,7 @@ auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
 
 auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
 {
+    if (!value.active) return;
     record_closed(value.id, reason);
     if (value.response_accounted <= inline_response_bytes_) {
         inline_response_bytes_ -= value.response_accounted;
@@ -1323,6 +1326,17 @@ auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
     }
     std::erase(requests_, value.id);
     if (value.body_slot != no_slot) slot_used_[value.body_slot] = false;
+    // Keep the active order sorted and move the slot to the free ones.
+    const auto active = std::span(slot_order_).first(active_count_);
+    const auto position = std::ranges::lower_bound(active, value.id, {},
+        [this](std::uint8_t slot) { return streams_[slot]->id; });
+    std::rotate(position, position + 1, active.end());
+    --active_count_;
+    if (value.response_started) {
+        auto* entry = std::ranges::find(responding_.data(),
+                                        responding_.data() + responding_count_, value.slot);
+        *entry = responding_[--responding_count_];
+    }
     if (value.routed) {
         routed_.erase(std::remove_if(routed_.begin() + static_cast<std::ptrdiff_t>(routed_next_),
                                      routed_.end(), [&value](const routed_request& pending) {
@@ -1332,7 +1346,9 @@ auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
         if (release_hook_ != nullptr)
             release_hook_(release_context_, value.id, value.stream_finished);
     }
+    const auto slot = value.slot;
     value = stream {};
+    value.slot = slot;
 }
 
 // Routes a stream whose request headers were just validated. Returns false
@@ -1671,6 +1687,7 @@ auto session::append_response_headers(stream& value, unsigned status,
                                       bool end_stream) -> bool
 {
     if (!append_header_block(value, status, headers, extra, end_stream)) return false;
+    if (!value.response_started) responding_[responding_count_++] = value.slot;
     value.response_started = true;
     return true;
 }
@@ -1736,8 +1753,11 @@ auto session::next_response() const noexcept -> std::optional<std::size_t>
     std::optional<std::size_t> sequential;
     std::optional<std::size_t> incremental;
     std::uint8_t urgency = 8;
-    for (std::size_t step = 0; step < stream_count_; ++step) {
-        const auto index = (response_cursor_ + step) % stream_count_;
+    // Incremental responses take turns in slot order from response_cursor_.
+    const auto turn = [this](std::size_t index) {
+        return (index + stream_count_ - response_cursor_) % stream_count_;
+    };
+    for (const auto index : std::span(responding_).first(responding_count_)) {
         const auto& value = *streams_[index];
         if (!sendable(value) || value.urgency > urgency) continue;
         if (value.urgency < urgency) {
@@ -1746,7 +1766,7 @@ auto session::next_response() const noexcept -> std::optional<std::size_t>
             incremental.reset();
         }
         if (value.incremental) {
-            if (!incremental) incremental = index;
+            if (!incremental || turn(index) < turn(*incremental)) incremental = index;
         } else if (!sequential || value.id < streams_[*sequential]->id) {
             sequential = index;
         }
