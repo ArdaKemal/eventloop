@@ -18,7 +18,7 @@
 namespace eventloop::http2::detail {
 
 inline constexpr std::size_t max_frame_payload = 16 * 1024;
-inline constexpr std::size_t max_concurrent_streams = 32;
+inline constexpr std::size_t max_concurrent_streams = 100;
 inline constexpr std::size_t max_request_body = 1024 * 1024;
 inline constexpr std::size_t max_queued_response_body = 4 * 1024 * 1024;
 // Routed request bodies are buffered per stream in a pool allocated the
@@ -213,7 +213,8 @@ private:
         std::uint32_t id = 0;
         closed_reason reason = closed_reason::local_reset;
     };
-    static constexpr std::size_t closed_history = 64;
+    // Twice the stream limit, so a burst of closures keeps every reason.
+    static constexpr std::size_t closed_history = 2 * max_concurrent_streams;
     auto reset_stream(stream& value,
                       closed_reason reason = closed_reason::ended) noexcept -> void;
     auto record_closed(std::uint32_t id, closed_reason reason) noexcept -> void;
@@ -309,7 +310,9 @@ private:
 
     // Streams whose static request is complete, in arrival order.
     std::vector<std::uint32_t> requests_;
+    // Routed requests from routed_next_ on are undelivered, in arrival order.
     std::vector<routed_request> routed_;
+    std::size_t routed_next_ = 0;
     std::vector<std::byte> header_block_;
     std::vector<std::byte> output_;
     std::vector<field> decoded_fields_;

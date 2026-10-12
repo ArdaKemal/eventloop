@@ -22,6 +22,7 @@ namespace {
 constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 constexpr std::uint32_t protocol_error = 1;
 constexpr std::uint32_t stream_closed_error = 5;
+constexpr std::uint32_t refused_stream_error = 7;
 
 auto check(bool condition, std::string_view message) -> void
 {
@@ -101,6 +102,56 @@ auto error_of(session& state, std::uint8_t type, std::uint32_t stream) -> std::u
         out = out.subspan(9 + length);
     }
     return ~0u;
+}
+
+// The advertised SETTINGS_MAX_CONCURRENT_STREAMS, or ~0u when absent.
+auto advertised_stream_limit(std::span<const std::byte> out) -> std::uint32_t
+{
+    check(out.size() >= 9 && std::to_integer<std::uint8_t>(out[3]) == 4, "server SETTINGS");
+    const auto length = (std::to_integer<std::size_t>(out[1]) << 8) |
+                        std::to_integer<std::size_t>(out[2]);
+    for (std::size_t offset = 9; offset + 6 <= 9 + length; offset += 6)
+        if (std::to_integer<std::uint8_t>(out[offset + 1]) == 3)
+            return u32(out.subspan(offset + 2, 4));
+    return ~0u;
+}
+
+auto stream_limit_refuses_excess_streams() -> void
+{
+    session state;
+    check(advertised_stream_limit(state.output()) == 100, "advertise 100 streams");
+    connect(state);
+    // Open streams wait for their END_STREAM, so each holds a slot.
+    for (std::uint32_t stream = 1; stream <= 199; stream += 2) get(state, stream, 4);
+    check(error_of(state, 3, 199) == ~0u, "100th stream accepted");
+    get(state, 201, 4);
+    check(error_of(state, 3, 201) == refused_stream_error, "101st stream refused");
+    drain(state);
+    std::vector<std::byte> input;
+    const std::array<std::byte, 4> cancel {std::byte {0}, std::byte {0}, std::byte {0},
+                                           std::byte {8}};
+    frame(input, 3, 0, 1, cancel);
+    feed(state, input);
+    get(state, 203);
+    check(error_of(state, 3, 203) == ~0u, "released slot reused");
+    request incoming;
+    check(state.pop_request(incoming) && incoming.stream_id == 203, "reused slot serves");
+}
+
+// Closing a full set of concurrent streams keeps each one's closure reason.
+auto closed_history_covers_stream_limit() -> void
+{
+    session state;
+    connect(state);
+    request incoming;
+    for (std::uint32_t stream = 1; stream <= 199; stream += 2) get(state, stream);
+    while (state.pop_request(incoming)) check(state.respond(incoming.stream_id, 200, {}, {}), "respond");
+    drain(state);
+    std::vector<std::byte> input;
+    const std::array<std::byte, 1> body {};
+    frame(input, 0, 0, 1, body);
+    feed(state, input);
+    check(error_of(state, 7, 0) == stream_closed_error, "DATA on the oldest ended stream");
 }
 
 auto data_after_end_stream_is_connection_error() -> void
@@ -263,6 +314,8 @@ auto extended_connect() -> void
 
 int main()
 {
+    stream_limit_refuses_excess_streams();
+    closed_history_covers_stream_limit();
     data_after_end_stream_is_connection_error();
     frames_after_peer_reset_are_stream_errors();
     frames_racing_local_reset_are_discarded();
