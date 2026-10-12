@@ -17,9 +17,11 @@ Setup/inherited operations: [TCP](tcp.md). Names below are in `eventloop`.
   Raw TCP send-file is hidden because it bypasses TLS framing.
 - A `tls_context` is immutable once created (session cache and tickets are
   off), so streams on different loops and threads may share one.
-- Construction preallocates OpenSSL read/write record buffers, throwing
-  `std::bad_alloc` on failure, and retains drained buffers. Other OpenSSL
-  processing may allocate.
+- OpenSSL allocates a read or write record buffer (about 16.5 KiB each) while
+  a record is in flight and frees it once drained, so an idle stream holds
+  none. A failed allocation fails the operation with `ENOMEM` and closes the
+  stream. Other OpenSSL processing may allocate. On Linux the stream keeps no
+  buffers of its own; OpenSSL reads and writes the socket directly.
 
 ## kTLS file sending
 

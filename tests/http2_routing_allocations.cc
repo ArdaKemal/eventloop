@@ -4,7 +4,9 @@
 // TLS, and the loop. Requests carry header values longer than the small-string
 // buffer, as browsers do, so HPACK decoding must reuse string capacity.
 // OpenSSL's own allocations are counted separately through its allocator
-// hook. Steady-state requests must not allocate in either.
+// hook. Steady-state requests must not allocate in either, except OpenSSL's
+// record buffers, which it frees while a connection is idle: at most two
+// read buffers and one write buffer per request on each end.
 #include "eventloop/event_loop.h"
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
@@ -132,6 +134,8 @@ struct measurement {
     std::size_t static_files {0};
     std::size_t routed_openssl {0};
     std::size_t static_openssl {0};
+    std::size_t routed_records {0};
+    std::size_t static_records {0};
     std::size_t requests {0};
     bool done {false};
 };
@@ -218,10 +222,12 @@ auto client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> c
     for (int phase = 0; phase < 2; ++phase) {
         std::size_t before = 0;
         std::size_t openssl_before = 0;
+        std::size_t records_before = 0;
         for (std::size_t index = 0; index < warmup + measured; ++index) {
             if (index == warmup) {
                 before = allocations.load();
                 openssl_before = test::openssl_allocations.load();
+                records_before = test::openssl_record_buffers.load();
             }
             const auto& request = phase == 1 ? requests[2] : requests[index % 2];
             check((co_await round_trip(loop, *peer, request, stream_id, *buffers)).value_or(false),
@@ -229,8 +235,10 @@ auto client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> c
             stream_id += 2;
         }
         (phase == 0 ? result.routed : result.static_files) = allocations.load() - before;
+        const auto records = test::openssl_record_buffers.load() - records_before;
+        (phase == 0 ? result.routed_records : result.static_records) = records;
         (phase == 0 ? result.routed_openssl : result.static_openssl) =
-            test::openssl_allocations.load() - openssl_before;
+            test::openssl_allocations.load() - openssl_before - records;
     }
     result.requests = measured;
     result.done = true;
@@ -310,10 +318,16 @@ auto main() -> int
         std::cout << "HTTP/2 allocations over " << result->requests << " requests"
                   << (result == &cached ? " with the open-file cache" : "") << ": routed "
                   << result->routed << ", static " << result->static_files << "; OpenSSL routed "
-                  << result->routed_openssl << ", static " << result->static_openssl << '\n';
+                  << result->routed_openssl << ", static " << result->static_openssl
+                  << "; OpenSSL record buffers routed " << result->routed_records
+                  << ", static " << result->static_records << '\n';
     }
     for (const auto* result : {&uncached, &cached})
         check(result->routed == 0 && result->static_files == 0 &&
               result->routed_openssl == 0 && result->static_openssl == 0,
               "steady-state requests allocate");
+    for (const auto* result : {&uncached, &cached})
+        check(result->routed_records <= 6 * result->requests &&
+              result->static_records <= 6 * result->requests,
+              "more than three record buffers per request and end");
 }

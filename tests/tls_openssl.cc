@@ -19,19 +19,29 @@ thread_local bool count_allocations = false;
 thread_local std::size_t allocation_count = 0;
 thread_local std::size_t allocation_bytes = 0;
 thread_local std::size_t largest_allocation = 0;
+thread_local std::size_t record_buffers = 0;
+constexpr std::size_t record_size = 16384;
+auto track(std::size_t size) -> void
+{
+    if (!count_allocations) return;
+    ++allocation_count;
+    allocation_bytes += size;
+    // Record buffers are freed once drained and allocated for the next record.
+    if (size >= record_size) ++record_buffers;
+    else largest_allocation = std::max(largest_allocation, size);
+}
 auto tracked_malloc(std::size_t size, const char*, int) -> void*
 {
-    if (count_allocations) { ++allocation_count; allocation_bytes += size; largest_allocation = std::max(largest_allocation, size); }
+    track(size);
     return std::malloc(size);
 }
 auto tracked_realloc(void* pointer, std::size_t size, const char*, int) -> void*
 {
-    if (count_allocations) { ++allocation_count; allocation_bytes += size; largest_allocation = std::max(largest_allocation, size); }
+    track(size);
     return std::realloc(pointer, size);
 }
 auto tracked_free(void* pointer, const char*, int) -> void { std::free(pointer); }
 constexpr std::size_t rounds = 32;
-constexpr std::size_t record_size = 16384;
 
 auto receive_records(event_loop& loop, tls_stream& peer, bool& passed) -> task<void>
 {
@@ -105,7 +115,7 @@ auto run(const std::filesystem::path& certificate, const std::filesystem::path& 
     auto* peer = stream.get();
     loop.add(std::move(stream));
     bool passed = false;
-    allocation_count = allocation_bytes = largest_allocation = 0;
+    allocation_count = allocation_bytes = largest_allocation = record_buffers = 0;
     if (loop.spawn(receive_records(loop, *peer, passed)) != task_spawn_result::accepted) {
         peer->close(); return false;
     }
@@ -113,11 +123,15 @@ auto run(const std::filesystem::path& certificate, const std::filesystem::path& 
     server.join();
     std::cout << (version == TLS1_2_VERSION ? "TLS 1.2" : "TLS 1.3")
               << ": " << allocation_count << " OpenSSL allocations (" << allocation_bytes
-              << " bytes, largest " << largest_allocation << " bytes) over " << rounds - 1 << " warm record exchanges\n";
-    // OpenSSL packet metadata may allocate, but record-sized buffers must not
-    // be allocated again after warm-up. In OpenSSL 3.5 these are 40-byte
-    // WPACKET subpacket objects, observed through the allocator hooks above.
-    return passed && server_ok && largest_allocation < 4096 &&
+              << " bytes, " << record_buffers << " record buffers, largest other "
+              << largest_allocation << " bytes) over " << rounds - 1 << " warm record exchanges\n";
+    // Each exchange allocates at most two read buffers (one for the peer's
+    // record, one for the read that follows it) and one write buffer for the
+    // acknowledgement. Other OpenSSL packet metadata
+    // may allocate; in OpenSSL 3.5 these are 40-byte WPACKET subpacket
+    // objects, observed through the allocator hooks above.
+    return passed && server_ok && record_buffers <= 3 * (rounds - 1) &&
+           largest_allocation < 4096 &&
            loop.coroutine_statistics().live == 0;
 }
 } // namespace

@@ -175,8 +175,9 @@ public:
 #ifdef __linux__
         SSL_CTX_set_options(context.get(), SSL_OP_ENABLE_KTLS);
 #endif
-        // Keep record buffers for the connection, avoiding release/reallocate on each read.
-        SSL_CTX_clear_mode(context.get(), SSL_MODE_RELEASE_BUFFERS);
+        // Idle connections hold no record buffers; OpenSSL allocates them
+        // while records are in flight and frees them once drained.
+        SSL_CTX_set_mode(context.get(), SSL_MODE_RELEASE_BUFFERS);
         SSL_CTX_set_mode(context.get(), SSL_MODE_AUTO_RETRY);
         require_ssl(SSL_CTX_set_max_send_fragment(context.get(),
                         max_record_plaintext), "TLS send fragment limit");
@@ -258,8 +259,15 @@ auto make_error_code(tls_errc error) noexcept -> std::error_code
 
 class tls_stream::implementation : public tls_callbacks {
 public:
+#ifdef __linux__
+    // Linux gives OpenSSL the socket before any TLS I/O, so the memory BIO
+    // below never carries data and needs no buffers.
+    static constexpr std::size_t encrypted_capacity = 0;
+    static constexpr std::size_t input_capacity = 0;
+#else
     static constexpr std::size_t encrypted_capacity = 64 * 1024;
     static constexpr std::size_t input_capacity = 4096;
+#endif
     implementation(std::shared_ptr<tls_context> context, tls_client_options options)
         : context_(std::move(context)), ssl_(nullptr, SSL_free)
     {
@@ -275,17 +283,16 @@ public:
             require_ssl(SSL_set_tlsext_host_name(ssl_.get(), options.hostname.c_str()), "TLS SNI");
         }
         // ALPN's on-wire length is bounded by the TLS extension length.
-        auto* protocols = reinterpret_cast<unsigned char*>(encrypted_.data());
         constexpr std::size_t protocol_capacity = 65535;
-        std::size_t size = 0;
+        std::basic_string<unsigned char> protocols;
         for (const auto& protocol : options.application_protocols) {
-            if (protocol.empty() || protocol.size() > 255 || protocol.size() + 1 > protocol_capacity - size)
+            if (protocol.empty() || protocol.size() > 255 || protocol.size() + 1 > protocol_capacity - protocols.size())
                 throw std::invalid_argument("TLS ALPN list exceeds wire limits");
-            protocols[size++] = static_cast<unsigned char>(protocol.size());
-            std::memcpy(protocols + size, protocol.data(), protocol.size());
-            size += protocol.size();
+            protocols.push_back(static_cast<unsigned char>(protocol.size()));
+            protocols.append(reinterpret_cast<const unsigned char*>(protocol.data()), protocol.size());
         }
-        if (size != 0 && SSL_set_alpn_protos(ssl_.get(), protocols, static_cast<unsigned int>(size)) != 0)
+        if (!protocols.empty() &&
+            SSL_set_alpn_protos(ssl_.get(), protocols.data(), static_cast<unsigned int>(protocols.size())) != 0)
             throw std::bad_alloc();
     }
     implementation(std::shared_ptr<tls_context> context, tls_server_options options)
@@ -315,11 +322,6 @@ public:
         });
         if (role == context_role::client) SSL_set_connect_state(ssl_.get());
         else SSL_set_accept_state(ssl_.get());
-        // Setting the connection role resets the record layer; preallocate after it.
-        if (SSL_alloc_buffers(ssl_.get()) != 1) {
-            ERR_clear_error();
-            throw std::bad_alloc();
-        }
     }
     static auto bio_method() -> const BIO_METHOD*
     {
