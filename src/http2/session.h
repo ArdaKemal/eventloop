@@ -220,6 +220,8 @@ private:
     // Unfilled payload of the current frame when it is large enough to be
     // the next read target; empty otherwise.
     [[nodiscard]] auto payload_read_space() noexcept -> std::span<std::byte>;
+    // frame_payload_, allocated on first use; null if allocation fails.
+    [[nodiscard]] auto frame_storage() noexcept -> std::byte*;
     auto append_frame(std::uint8_t type, std::uint8_t flags,
                       std::uint32_t stream_id,
                       std::span<const std::byte> payload = {},
@@ -250,9 +252,11 @@ private:
     bool file_sendfile_ = false;
     std::array<std::byte, 4096> read_buffer_ {};
     std::array<std::byte, 9> frame_header_ {};
-    std::array<std::byte, max_frame_payload> frame_payload_ {};
+    // Holds a payload that spans reads or waits while input is paused.
+    // Allocated the first time a connection needs it, then kept.
+    std::unique_ptr<std::byte[]> frame_payload_;
     // The payload being dispatched: frame_payload_, or input it lies in.
-    const std::byte* frame_data_ = frame_payload_.data();
+    const std::byte* frame_data_ = nullptr;
     std::size_t frame_header_size_ = 0;
     std::size_t frame_payload_size_ = 0;
     std::size_t expected_payload_size_ = 0;

@@ -527,17 +527,27 @@ auto session::consume_input(std::span<const std::byte> input) -> void
             dispatch_frame();
             if (stalled_) {
                 // read_buffer_ moves while paused; keep the frame for redispatch.
-                std::memcpy(frame_payload_.data(), frame_data_, frame_payload_size_);
+                auto* storage = frame_storage();
+                if (storage == nullptr) {
+                    connection_error(internal_error);
+                    return;
+                }
+                std::memcpy(storage, frame_data_, frame_payload_size_);
+                frame_data_ = storage;
             } else {
                 clear_frame_state();
             }
-            frame_data_ = frame_payload_.data();
             continue;
         }
         const auto count = std::min(input.size(), remaining);
         if (count != 0) {
-            std::memcpy(frame_payload_.data() + frame_payload_size_,
-                        input.data(), count);
+            auto* storage = frame_storage();
+            if (storage == nullptr) {
+                connection_error(internal_error);
+                return;
+            }
+            frame_data_ = storage;
+            std::memcpy(storage + frame_payload_size_, input.data(), count);
             frame_payload_size_ += count;
             input = input.subspan(count);
         }
@@ -566,7 +576,16 @@ auto session::payload_read_space() noexcept -> std::span<std::byte>
     const auto remaining = expected_payload_size_ - frame_payload_size_;
     // Smaller remainders share one read with the frames that follow.
     if (remaining < read_buffer_.size()) return {};
-    return std::span {frame_payload_}.subspan(frame_payload_size_, remaining);
+    auto* storage = frame_storage();
+    if (storage == nullptr) return {};
+    frame_data_ = storage;
+    return {storage + frame_payload_size_, remaining};
+}
+
+auto session::frame_storage() noexcept -> std::byte*
+{
+    if (!frame_payload_) frame_payload_.reset(new (std::nothrow) std::byte[max_frame_payload]);
+    return frame_payload_.get();
 }
 
 auto session::record_closed(std::uint32_t id, closed_reason reason) noexcept -> void

@@ -37,7 +37,10 @@ validity checks but do not affect scheduling.
 ## Handlers, flow control, and cancellation
 
 One handler runs per stream, alongside a reader task and the connection writer.
-Session, 32 slots, and request views allocate once per connection. `async_write`
+Session, 32 slots, and request views allocate once per connection. A 16 KiB
+frame buffer allocates the first time a frame payload spans reads or arrives
+while reading is paused, and is kept; failing that allocation is a connection
+INTERNAL_ERROR. `async_write`
 completes when bytes enter the output queue under flow control/priority;
 `async_send_file` completes when its last range is queued.
 
