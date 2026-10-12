@@ -136,6 +136,20 @@ auto stream_limit_refuses_excess_streams() -> void
     check(error_of(state, 3, 203) == ~0u, "released slot reused");
     request incoming;
     check(state.pop_request(incoming) && incoming.stream_id == 203, "reused slot serves");
+    // Streams opened before and after the reused slot are still found.
+    for (const std::uint32_t stream : {101u, 3u, 199u}) {
+        input.clear();
+        frame(input, 0, 1, stream);
+        feed(state, input);
+        check(state.pop_request(incoming) && incoming.stream_id == stream, "open stream found");
+    }
+    // Resetting a stream between open ones keeps its neighbours.
+    input.clear();
+    frame(input, 3, 0, 51, cancel);
+    for (const std::uint32_t stream : {49u, 53u}) frame(input, 0, 1, stream);
+    feed(state, input);
+    for (const std::uint32_t stream : {49u, 53u})
+        check(state.pop_request(incoming) && incoming.stream_id == stream, "neighbour found");
 }
 
 // Closing a full set of concurrent streams keeps each one's closure reason.

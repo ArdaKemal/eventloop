@@ -171,6 +171,8 @@ private:
         // RFC 9218 priority; the defaults apply when the client sends none.
         std::uint8_t urgency = 3;
         bool incremental = false;
+        // Index in streams_; kept when the stream is reset.
+        std::uint8_t slot = 0;
     };
 
     static constexpr std::uint8_t no_slot = 0xff;
@@ -196,15 +198,16 @@ private:
     [[nodiscard]] auto validate_initial_headers(stream& value,
         std::span<const field> fields) -> bool;
     [[nodiscard]] auto validate_trailers(std::span<const field> fields) const -> bool;
-    // The allocated slots, active or not.
-    [[nodiscard]] auto streams() const noexcept
+    // The active streams in ascending id order.
+    [[nodiscard]] auto active_streams() const noexcept
     {
-        return std::span(streams_).first(stream_count_) |
-               std::views::transform([](const std::unique_ptr<stream>& slot) -> stream& {
-                   return *slot;
+        return std::span(slot_order_).first(active_count_) |
+               std::views::transform([this](std::uint8_t slot) -> const stream& {
+                   return *streams_[slot];
                });
     }
-    [[nodiscard]] auto find_stream(std::uint32_t id) const noexcept -> stream*;
+    [[nodiscard]] auto find_stream(std::uint32_t id) noexcept -> stream*;
+    [[nodiscard]] auto find_stream(std::uint32_t id) const noexcept -> const stream*;
     [[nodiscard]] auto allocate_stream(std::uint32_t id) noexcept -> stream*;
     // How a stream ended decides the RFC 9113 section 5.1 response to frames
     // that arrive afterwards.
@@ -303,6 +306,15 @@ private:
     // Slots are allocated when concurrency first needs them, then kept.
     std::array<std::unique_ptr<stream>, max_concurrent_streams> streams_ {};
     std::size_t stream_count_ = 0;
+    static_assert(max_concurrent_streams <= 0xff, "slot indices are bytes");
+    // Allocated slots: the first active_count_ hold active streams sorted by
+    // id (clients open streams in ascending id order), the rest are free.
+    std::array<std::uint8_t, max_concurrent_streams> slot_order_ {};
+    std::size_t active_count_ = 0;
+    // Slots of streams whose response has started, the only streams the
+    // response scheduler considers; unordered.
+    std::array<std::uint8_t, max_concurrent_streams> responding_ {};
+    std::size_t responding_count_ = 0;
     std::array<closed_stream, closed_history> closed_streams_ {};
     std::size_t closed_next_ = 0;
     std::uint32_t closed_floor_ = 0;
