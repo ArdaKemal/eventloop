@@ -1,6 +1,7 @@
 #include "http2/hpack.h"
 #include "http2/session.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -335,8 +336,63 @@ auto extended_connect() -> void
 
 } // namespace
 
+// The transport borrows output() until consume_output(); frames queued
+// meanwhile must not move the borrowed bytes.
+auto queue_growth_keeps_borrowed_output() -> void
+{
+    session state;
+    connect(state);
+    const std::array<std::byte, 8> opaque {std::byte {1}};
+    std::vector<std::byte> ping;
+    frame(ping, 6, 0, 0, opaque);
+    feed(state, ping);
+    const auto borrowed = state.output();
+    const std::vector<std::byte> sent(borrowed.begin(), borrowed.end());
+    check(!sent.empty(), "PING ACK queued");
+    std::vector<std::byte> pings;
+    for (int i = 0; i < 512; ++i) frame(pings, 6, 0, 0, opaque);
+    feed(state, pings);
+    check(std::ranges::equal(borrowed, sent), "queue growth moved borrowed output");
+    state.consume_output(borrowed.size());
+    check(state.output().size() == 512 * 17 && !state.closed(), "queued PING ACKs");
+}
+
+auto upload_handler(eventloop::event_loop&, eventloop::http::request&,
+                    eventloop::http::response&) -> eventloop::task<void>
+{
+    co_return;
+}
+
+// After the client acknowledges SETTINGS, routed streams have the advertised
+// 16 KiB window; DATA beyond it is a stream error, not a pause.
+auto acknowledged_window_is_enforced() -> void
+{
+    eventloop::http::router routes;
+    check(routes.add(eventloop::http::method_type::post, "/", upload_handler).has_value(),
+          "route");
+    for (const bool headers_first : {false, true}) {
+        session state(false, &routes, 1024 * 1024);
+        connect(state);
+        std::vector<std::byte> block;
+        const std::array<field, 4> fields {{{":method", "POST"}, {":scheme", "https"},
+            {":path", "/"}, {":authority", "localhost"}}};
+        check(hpack_encode(fields, block) == hpack_error::none, "encode request");
+        std::vector<std::byte> input;
+        if (headers_first) frame(input, 1, 4, 1, block);
+        frame(input, 4, 1, 0);
+        if (!headers_first) frame(input, 1, 4, 1, block);
+        frame(input, 0, 0, 1, std::vector<std::byte>(16 * 1024));
+        frame(input, 0, 0, 1, std::vector<std::byte>(1));
+        feed(state, input);
+        check(!state.input_paused(), "DATA beyond the acknowledged window paused input");
+        check(error_of(state, 3, 1) == 3, "DATA beyond the acknowledged window");
+    }
+}
+
 int main()
 {
+    queue_growth_keeps_borrowed_output();
+    acknowledged_window_is_enforced();
     stream_limit_refuses_excess_streams();
     closed_history_covers_stream_limit();
     data_after_end_stream_is_connection_error();

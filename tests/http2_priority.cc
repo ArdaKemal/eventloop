@@ -101,8 +101,16 @@ auto open_windows(session& state) -> void
     frame(state, 4, 0, 0, settings_payload(4, 65535));
 }
 
-auto request(session& state, unsigned stream, std::initializer_list<std::string_view> priority)
-    -> void
+auto silent(eventloop::event_loop&, eventloop::http::request&, eventloop::http::response&)
+    -> eventloop::task<void>
+{
+    co_return;
+}
+
+// A static request answered with a two-frame body, or a routed one left to
+// the caller.
+auto request(session& state, unsigned stream, std::initializer_list<std::string_view> priority,
+             bool respond = true) -> void
 {
     std::vector<field> fields {{":method", "GET"}, {":scheme", "https"}, {":path", "/"},
                                {":authority", "localhost"}};
@@ -110,6 +118,11 @@ auto request(session& state, unsigned stream, std::initializer_list<std::string_
     std::vector<std::byte> block;
     check(hpack_encode(fields, block) == hpack_error::none, "request encoding");
     frame(state, 1, 5, stream, block);
+    if (!respond) {
+        routed_request routed;
+        check(state.pop_routed(routed) && routed.stream_id == stream, "routed delivery");
+        return;
+    }
     eventloop::http2::detail::request incoming;
     check(state.pop_request(incoming) && incoming.stream_id == stream, "request delivery");
     // Two DATA frames per response make interleaving visible.
@@ -162,6 +175,19 @@ auto scheduling() -> void
         request(state, 1, {"i"});
         request(state, 3, {"u=3, i=?1"});
         check(data_order(state) == order {1, 3, 1, 3}, "incremental responses interleave");
+    }
+    {
+        eventloop::http::router routes;
+        check(routes.add(eventloop::http::method_type::get, "/", silent).has_value(), "route");
+        session state(false, &routes, 0);
+        initialize(state);
+        const std::vector<std::byte> chunk(max_frame_payload + 1);
+        for (const unsigned stream : {1u, 3u}) {
+            request(state, stream, {"i"}, false);
+            check(state.start_streamed(stream, 200, {}) &&
+                  state.queue_chunk(stream, chunk), "streamed response");
+        }
+        check(data_order(state) == order {1, 3, 1, 3}, "streamed incremental responses interleave");
     }
     {
         session state;

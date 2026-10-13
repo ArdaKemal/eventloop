@@ -311,6 +311,38 @@ auto shutdown_frames(const certificate_files& files) -> void
           "RST_STREAM with a wrong length");
 }
 
+// RFC 9113 section 4.1: undefined flags and the reserved stream-id bit are
+// ignored on receipt.
+auto frame_header_bits(const certificate_files& files) -> void
+{
+    const auto reserved = [](std::string& out, unsigned type, unsigned flags,
+                             std::string_view payload) {
+        append_frame(out, type, flags, type == 0 || type == 1 ? 1 : 0, payload);
+        out[out.size() - payload.size() - 4] |= static_cast<char>(0x80);
+    };
+    std::string script;
+    reserved(script, 4, 0x02, {});
+    reserved(script, 8, 0x80, std::string_view("\x80\0\0\1", 4));
+    reserved(script, 1, end_headers | 0x40, literal(":status", "200"));
+    reserved(script, 0, end_stream | 0x10, "ok");
+    const auto ignored = exchange(files, get(), script);
+    check(ignored && ignored->status == 200 && ignored->body == bytes("ok"),
+          "undefined flags and reserved bits are ignored");
+}
+
+// RFC 9113 section 6.5.2: a server must not enable push.
+auto server_push_setting(const certificate_files& files) -> void
+{
+    std::string push;
+    append_frame(push, 4, 0, 0, std::string_view("\0\2\0\0\0\1", 6));
+    check(fails_with(exchange(files, get(), push + response("200", {}, true)),
+                     std::errc::protocol_error), "server SETTINGS_ENABLE_PUSH=1");
+    std::string disabled;
+    append_frame(disabled, 4, 0, 0, std::string_view("\0\2\0\0\0\0", 6));
+    check(exchange(files, get(), disabled + response("200", {}, true)).has_value(),
+          "server SETTINGS_ENABLE_PUSH=0");
+}
+
 auto requests(const certificate_files& files) -> void
 {
     auto declared = [](std::string_view value) {
@@ -390,5 +422,7 @@ auto main() -> int
     test::make_localhost_certificate(files.certificate, files.key);
     responses(files);
     shutdown_frames(files);
+    frame_header_bits(files);
+    server_push_setting(files);
     requests(files);
 }

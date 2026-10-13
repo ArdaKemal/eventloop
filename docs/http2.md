@@ -49,9 +49,11 @@ completes when bytes enter the output queue under flow control/priority;
 - Body slots allocate on the first routed body. With routes, initial stream
   window is 16 KiB and handler reads return credit. All eight slots busy:
   RST_STREAM REFUSED_STREAM (retryable).
-- Before applying SETTINGS, clients may use the default 65535-byte window.
+- Before acknowledging SETTINGS, clients may use the default 65535-byte window.
   DATA that cannot fit pauses connection reading until the handler reads,
-  delaying other streams. A non-reading handler's stream ends on response.
+  delaying other streams. The acknowledgement shrinks open streams' windows
+  to 16 KiB; DATA beyond a window is then a FLOW_CONTROL_ERROR, not a pause.
+  A non-reading handler's stream ends on response.
 - Cancelling a waiting handler read/write returns `operation_canceled`;
   cancelled writes/file sends also reset with CANCEL to release borrowed data.
   Loss resumes waiters with `connection_reset`; release the connection only
@@ -91,8 +93,12 @@ current test results.
 
 [http2_routing_allocations](../tests/http2_routing_allocations.cc) checks warmed
 routed/static-file requests, counting general-heap and OpenSSL allocations.
-The target is zero in these paths, except OpenSSL's record buffers, which it
-allocates while records are in flight and frees when the connection is idle. Request fields reuse existing strings;
+The general heap target is zero in these paths. With Linux transmit kTLS,
+OpenSSL's is too, except its record buffers, which it allocates while records
+are in flight and frees when the connection is idle. Userspace TLS, the only
+transport on Windows and macOS, also makes about 8 small OpenSSL allocations
+per request in record writes; the test bounds that path separately.
+Request fields reuse existing strings;
 HPACK's dynamic table uses a 4 KiB ring allocated with its first entry;
 response fields encode from views into reused storage. Longer-than-warmed
 header values may allocate. TLS handshake key exchange/transcript/key schedule
@@ -133,8 +139,9 @@ source overrun/short EOF. Supplying both body/source, connection-specific
 request fields, or TE other than `trailers` is also invalid.
 
 Malformed responses return `protocol_error`: connection-specific fields or any
-TE, nonnumeric/conflicting Content-Length, mismatched DATA totals, or DATA
-content on HEAD/204/304. Bodyless Content-Length is not compared. Request-stream
+TE, nonnumeric/conflicting Content-Length, mismatched DATA totals, DATA
+content on HEAD/204/304, or SETTINGS_ENABLE_PUSH=1. Bodyless Content-Length is
+not compared. Request-stream
 RST_STREAM or GOAWAY with last stream 0 returns `connection_reset`; other GOAWAY
 permits completion. Malformed RST_STREAM/GOAWAY is `protocol_error`.
 Limits return `message_size`; TLS errors pass through. Cancellation closes the

@@ -388,8 +388,9 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
              std::size_t(std::to_integer<unsigned char>(header_bytes[2]));
         const auto type = std::to_integer<unsigned char>(header_bytes[3]);
         const auto flags = std::to_integer<unsigned char>(header_bytes[4]);
-        const auto id = u32(header_bytes.data() + 5);
-        if (length > max_frame || (id & 0x80000000u) != 0) {
+        // RFC 9113 section 4.1: the reserved bit and undefined flags are ignored.
+        const auto id = u32(header_bytes.data() + 5) & 0x7fffffffu;
+        if (length > max_frame) {
             error = failure(std::errc::message_size); break;
         }
         if (!first_settings && (type != 4 || id != 0 || (flags & 1) != 0)) {
@@ -403,7 +404,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
         if (!read) { error = read.error(); break; }
         auto data = std::span(*payload).first(length);
         if (type == 4) {
-            if (id != 0 || (flags & ~1u) || ((flags & 1u) ? length != 0 : length % 6 != 0)) {
+            if (id != 0 || ((flags & 1u) ? length != 0 : length % 6 != 0)) {
                 error = failure(std::errc::protocol_error); break;
             }
             first_settings = true;
@@ -412,7 +413,8 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                     const auto key = (unsigned(std::to_integer<unsigned char>(data[i])) << 8) |
                         unsigned(std::to_integer<unsigned char>(data[i + 1]));
                     const auto value = u32(data.data() + i + 2);
-                    if ((key == 2 && value > 1) ||
+                    // RFC 9113 section 6.5.2: a server must not enable push.
+                    if ((key == 2 && value != 0) ||
                         (key == 4 && value > 0x7fffffffu) ||
                         (key == 5 && (value < 16384 || value > 16777215))) {
                         error = failure(std::errc::protocol_error); break;
@@ -433,9 +435,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
             }
         } else if (type == 1 || type == 9) {
             if (id != 1 || (type == 9 && !continuation) ||
-                (type == 1 && initial_headers && !(flags & 1u)) ||
-                (type == 1 && (flags & ~0x2du)) ||
-                (type == 9 && (flags & ~4u))) {
+                (type == 1 && initial_headers && !(flags & 1u))) {
                 error = failure(std::errc::protocol_error); break;
             }
             std::size_t start = 0;
@@ -495,7 +495,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 if (end_stream_on_headers) finished = true;
             }
         } else if (type == 0) {
-            if (id != 1 || !initial_headers || (flags & ~0x9u)) {
+            if (id != 1 || !initial_headers) {
                 error = failure(std::errc::protocol_error); break;
             }
             std::size_t padding = 0;
@@ -549,11 +549,11 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 if (!written) error = written.error();
             }
         } else if (type == 8) {
-            if (length != 4 || flags != 0 || (id != 0 && id != 1)) {
+            if (length != 4 || (id != 0 && id != 1)) {
                 error = failure(std::errc::protocol_error); break;
             }
-            const auto increment = u32(data.data());
-            if (increment == 0 || increment > 0x7fffffffu) {
+            const auto increment = u32(data.data()) & 0x7fffffffu;
+            if (increment == 0) {
                 error = failure(std::errc::protocol_error); break;
             }
             auto& window = id == 0 ? connection_send_window : stream_send_window;
