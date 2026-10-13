@@ -37,7 +37,7 @@ class session {
 public:
     session(native_socket root_descriptor, bool directory_listing = false,
             route_state* routing = nullptr, bool static_files = true,
-            open_file_cache* files = nullptr) noexcept;
+            open_file_cache* files = nullptr, std::string_view alt_svc = {}) noexcept;
     ~session() = default;
 
     session(const session&) = delete;
@@ -92,6 +92,7 @@ private:
     std::unique_ptr<char[]> file_output_;
     std::size_t file_output_size_ {0};
     std::string_view static_response_;
+    std::string_view alt_svc_; // borrowed from the connection's options
     unique_fd file_;
     std::size_t file_size_ {0};
     std::uint64_t file_offset_ {0};

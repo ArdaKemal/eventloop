@@ -41,6 +41,8 @@ curl --http2 -k https://localhost:8443/
 Add `--http3-port 8444` for UDP HTTP/3 and test with
 `curl --http3-only -k https://localhost:8444/`. HTTP/3 needs an unencrypted key;
 TCP and UDP may share a port number. `--bind` applies to every listener.
+HTTPS static file responses then carry `Alt-Svc: h3=":8444"; ma=86400` so
+browsers switch to HTTP/3; in production both usually use port 443.
 
 | Option | Behavior |
 | --- | --- |

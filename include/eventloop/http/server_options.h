@@ -48,6 +48,10 @@ struct server_options {
     std::chrono::milliseconds idle_timeout {std::chrono::seconds {60}};
     // https_server only: advertise h2 next to http/1.1.
     bool enable_http2 {true};
+    // https_server only: static file responses carry
+    // `Alt-Svc: h3=":<port>"; ma=86400`; 0 (default) sends none. The caller
+    // runs the http3_server on that UDP port.
+    std::uint16_t advertise_http3_port {0};
     // A routed request declaring a larger body answers 413.
     std::uint64_t max_request_body {std::uint64_t {1} << 20};
     // http3_server only. Connection capacity is 1..256; request capacity is

@@ -363,7 +363,8 @@ auto h2_request_client(event_loop& loop, tls_stream& peer,
 
 [[nodiscard]] auto send_h2_request(const std::filesystem::path& root,
                                    const std::filesystem::path& certificate,
-                                   const std::filesystem::path& key)
+                                   const std::filesystem::path& key,
+                                   std::uint16_t http3_port = 0)
     -> std::pair<std::string, std::string>
 {
     auto server_context = tls_context::make_server(certificate, key);
@@ -371,7 +372,8 @@ auto h2_request_client(event_loop& loop, tls_stream& peer,
     event_loop loop;
     auto listener = std::make_unique<http::https_server>(
         loop, ip_endpoint::loopback_v4(0), std::move(server_context),
-        http::server_options {.document_root = root, .enable_http2 = true});
+        http::server_options {.document_root = root, .enable_http2 = true,
+                              .advertise_http3_port = http3_port});
     auto* server = listener.get();
     const auto port = listener_port(*server);
     auto client = std::make_unique<tls_stream>(
@@ -450,7 +452,8 @@ auto check_h2_response(std::string_view response, std::string_view expected_body
 [[nodiscard]] auto send_secure_request(const std::filesystem::path& root,
                                        const std::filesystem::path& certificate,
                                        const std::filesystem::path& key,
-                                       std::string_view request)
+                                       std::string_view request,
+                                       std::uint16_t http3_port = 0)
     -> std::pair<std::string, std::string>
 {
     auto server_context = tls_context::make_server(certificate, key);
@@ -458,7 +461,8 @@ auto check_h2_response(std::string_view response, std::string_view expected_body
     event_loop loop;
     auto listener = std::make_unique<http::https_server>(
         loop, ip_endpoint::loopback_v4(0), std::move(server_context),
-        http::server_options {.document_root = root, .enable_http2 = false});
+        http::server_options {.document_root = root, .enable_http2 = false,
+                              .advertise_http3_port = http3_port});
     auto* server = listener.get();
     const auto port = listener_port(*server);
     auto client = std::make_unique<tls_stream>(
@@ -581,11 +585,46 @@ auto main() -> int
         check_response(secure_large_response, "HTTP/1.1 200 OK", large);
         require(secure_large_response.find("Content-Length: 71680\r\n") !=
                     std::string::npos, "HTTPS large response length");
+        require(secure_large_response.find("Alt-Svc") == std::string::npos,
+                "HTTPS advertised HTTP/3 without a port");
+
+        // Alt-Svc rides static file responses: buffered, sendfile, and 304.
+        constexpr std::string_view alt_svc = "\r\nAlt-Svc: h3=\":8444\"; ma=86400\r\n";
+        for (const std::string_view target : {"/small.txt", "/large.bin"}) {
+            const auto [advertised, advertised_protocol] = send_secure_request(
+                root.path(), certificate, key,
+                "GET " + std::string(target) + " HTTP/1.1\r\nHost: localhost\r\n"
+                "Connection: close\r\n\r\n", 8444);
+            require(advertised_protocol == "http/1.1", "Alt-Svc ALPN protocol");
+            require(advertised.find(alt_svc) < advertised.find("\r\n\r\n"),
+                    "HTTPS static Alt-Svc");
+        }
+        const auto etag_start = secure_response.find("ETag: ") + 6;
+        const auto etag = secure_response.substr(etag_start,
+            secure_response.find("\r\n", etag_start) - etag_start);
+        const auto [not_modified, not_modified_protocol] = send_secure_request(
+            root.path(), certificate, key,
+            "GET /small.txt HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: " + etag +
+            "\r\nConnection: close\r\n\r\n", 8444);
+        require(not_modified.starts_with("HTTP/1.1 304 "), "HTTPS conditional status");
+        require(not_modified.find(alt_svc) != std::string::npos, "HTTPS 304 Alt-Svc");
+        require(send_request(root.path(),
+            "GET /small.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            http::server_options {.advertise_http3_port = 8444})
+                .find("Alt-Svc") == std::string::npos, "plain HTTP advertised HTTP/3");
 
         const auto [h2_response, h2_protocol] = send_h2_request(
             root.path(), certificate, key);
         require(h2_protocol == "h2", "HTTP/2 ALPN protocol");
         check_h2_response(h2_response, large);
+        require(h2_response.find("alt-svc") == std::string::npos,
+                "HTTP/2 advertised HTTP/3 without a port");
+        const auto [h2_advertised, h2_advertised_protocol] = send_h2_request(
+            root.path(), certificate, key, 8444);
+        require(h2_advertised_protocol == "h2", "HTTP/2 Alt-Svc ALPN protocol");
+        check_h2_response(h2_advertised, large);
+        require(h2_advertised.find("\x07" "alt-svc\x14h3=\":8444\"; ma=86400") !=
+                    std::string::npos, "HTTP/2 static Alt-Svc");
 #endif
     } catch (const std::exception& error) {
         std::cerr << "HTTP API test failed: " << error.what() << '\n';

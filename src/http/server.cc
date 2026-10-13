@@ -25,6 +25,8 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -46,12 +48,16 @@ struct connection_options {
     std::chrono::milliseconds idle_timeout {};
     bool directory_listing {false};
     bool enable_http2 {false};
+    std::string alt_svc; // field value for static file responses over TLS
 };
 
 [[nodiscard]] auto for_connection(const server_options& options) -> connection_options
 {
-    return {options.routes, options.max_request_body, options.header_timeout,
-            options.idle_timeout, options.directory_listing, options.enable_http2};
+    connection_options result {options.routes, options.max_request_body, options.header_timeout,
+        options.idle_timeout, options.directory_listing, options.enable_http2, {}};
+    if (options.advertise_http3_port != 0)
+        result.alt_svc = "h3=\":" + std::to_string(options.advertise_http3_port) + "\"; ma=86400";
+    return result;
 }
 
 // An empty document root means routes only; static requests answer 404.
@@ -207,7 +213,8 @@ template<typename Stream>
             if (options->enable_http2 && peer->application_protocol() == "h2") {
                 const auto served = co_await http2::detail::serve(
                     loop, *peer, root, options->directory_listing, options->routes,
-                    options->max_request_body, *deadline, options->idle_timeout);
+                    options->max_request_body, *deadline, options->idle_timeout,
+                    options->alt_svc);
                 if (served && *served) {
                     const auto closed = co_await peer->async_close();
                     (void)closed;
@@ -228,7 +235,8 @@ template<typename Stream>
         }
         auto state = std::make_unique<detail::session>(root->descriptor.get(),
             options->directory_listing, routing.get(), static_cast<bool>(root->descriptor),
-            root->cache.get());
+            root->cache.get(),
+            std::is_same_v<Stream, tcp_stream> ? std::string_view {} : options->alt_svc);
         std::unique_ptr<detail::http1_exchange<Stream>> exchange;
         if (routing) {
             exchange = std::make_unique<detail::http1_exchange<Stream>>(

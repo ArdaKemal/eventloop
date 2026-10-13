@@ -119,6 +119,7 @@ auto start_listeners(eventloop::event_loop& loop, const stonegate::configuration
             .header_timeout = std::chrono::milliseconds {settings.header_timeout_ms},
             .idle_timeout = std::chrono::milliseconds {settings.idle_timeout_ms},
             .enable_http2 = settings.http2,
+            .advertise_http3_port = settings.http3_port,
             .connection_capacity = settings.http3_connections,
             .request_capacity = settings.http3_requests,
             .max_udp_payload_size = settings.http3_max_datagram,

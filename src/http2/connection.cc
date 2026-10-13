@@ -55,12 +55,13 @@ auto respond_empty(session& state, std::uint32_t stream_id,
 
 auto respond_static_file(session& state, const request& incoming,
                          http::detail::static_file descriptor,
-                         const http::detail::file_info& info, std::string_view path) -> void
+                         const http::detail::file_info& info, std::string_view path,
+                         std::string_view alt_svc) -> void
 {
     const auto selected = http::detail::choose_file_response(info, {
         incoming.if_none_match, incoming.if_modified_since, incoming.range});
     const length_text length(selected.length);
-    const std::array<http::header, 6> headers {{
+    std::array<http::header, 7> headers {{
         {"content-length", length.view()},
         {"content-type", http::mime_type_from_path(path)},
         {"etag", {selected.etag.data(), selected.etag_size}},
@@ -68,7 +69,8 @@ auto respond_static_file(session& state, const request& incoming,
         {"accept-ranges", "bytes"},
         {"content-range", {selected.content_range.data(), selected.content_range_size}},
     }};
-    const auto count = selected.content_range_size == 0 ? 5 : 6;
+    std::size_t count = selected.content_range_size == 0 ? 5 : 6;
+    if (!alt_svc.empty()) headers[count++] = {"alt-svc", alt_svc};
     (void)state.respond_file(incoming.stream_id, selected.status,
         std::span(headers).first(count), std::move(descriptor), selected.length,
         !incoming.method.empty() && incoming.method == "GET" &&
@@ -95,7 +97,7 @@ auto respond_static_file(session& state, const request& incoming,
 
 auto serve_request(session& state, const request& incoming, native_socket root,
                    http::detail::open_file_cache* files, bool directory_listing,
-                   const http::router* routes) -> void
+                   std::string_view alt_svc, const http::router* routes) -> void
 {
     // A routed path reaches here only without a handler for the method.
     if (routes != nullptr) {
@@ -141,7 +143,8 @@ auto serve_request(session& state, const request& incoming, native_socket root,
     }
 
     if (info.kind == http::detail::file_info::type::regular) {
-        respond_static_file(state, incoming, std::move(descriptor), info, incoming.target);
+        respond_static_file(state, incoming, std::move(descriptor), info, incoming.target,
+                            alt_svc);
         return;
     }
 
@@ -157,7 +160,8 @@ auto serve_request(session& state, const request& incoming, native_socket root,
     unique_fd index = http::detail::open_child(descriptor.get(), "index.html", false);
     auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
     if (index_info && index_info->kind == http::detail::file_info::type::regular) {
-        respond_static_file(state, incoming, std::move(index), *index_info, "index.html");
+        respond_static_file(state, incoming, std::move(index), *index_info, "index.html",
+                            alt_svc);
         return;
     }
 
@@ -391,9 +395,9 @@ struct connection_state {
     connection_state(event_loop& loop, tls_stream& peer, session& state,
                      const http::router& routes, native_socket root,
                      http::detail::open_file_cache* files, bool directory_listing,
-                     idle_deadline deadline)
+                     std::string_view alt_svc, idle_deadline deadline)
         : loop(loop), peer(peer), state(state), routes(routes), root(root), files(files),
-          directory_listing(directory_listing), deadline(deadline)
+          directory_listing(directory_listing), alt_svc(alt_svc), deadline(deadline)
     {
     }
 
@@ -489,6 +493,7 @@ struct connection_state {
     native_socket root;
     http::detail::open_file_cache* files;
     bool directory_listing;
+    std::string_view alt_svc;
     idle_deadline deadline;
     // Slots are allocated when concurrency first needs them, then kept. The
     // first busy_count entries of slot_order are in use, the rest are free.
@@ -843,7 +848,7 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
         connection.batching = true;
         while (state.pop_request(incoming))
             serve_request(state, incoming, connection.root, connection.files,
-                          connection.directory_listing, &connection.routes);
+                          connection.directory_listing, connection.alt_svc, &connection.routes);
         routed_request routed;
         while (state.pop_routed(routed)) dispatch_routed(connection, std::move(routed));
         connection.batching = false;
@@ -868,7 +873,7 @@ auto read_loop(event_loop& loop, connection_state& connection) -> task<void>
 
 auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
                   http::detail::open_file_cache* files, bool directory_listing,
-                  const http::router& routes,
+                  std::string_view alt_svc, const http::router& routes,
                   std::uint64_t max_request_body, idle_deadline deadline) -> task<bool>
 {
     // The session and connection state are allocated once per connection;
@@ -876,7 +881,8 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
     auto state = std::make_unique<session>(peer.kernel_sendfile_available(), &routes,
                                            max_request_body);
     auto connection = std::make_unique<connection_state>(loop, peer, *state, routes, root,
-                                                         files, directory_listing, deadline);
+                                                         files, directory_listing, alt_svc,
+                                                         deadline);
     state->set_release_hook(&connection_state::released, connection.get());
     task_handle<void> reader;
     if (loop.spawn(read_loop(loop, *connection), reader) != task_spawn_result::accepted)
@@ -942,13 +948,13 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
            std::shared_ptr<http::detail::document_root> document_root,
            bool directory_listing, std::shared_ptr<const http::router> routes,
            std::uint64_t max_request_body, http::detail::connection_deadline& deadline,
-           std::chrono::milliseconds idle_timeout) -> task<bool>
+           std::chrono::milliseconds idle_timeout, std::string_view alt_svc) -> task<bool>
 {
     if (routes) {
         try {
             co_return (co_await serve_routed(loop, peer, document_root->descriptor.get(),
                                              document_root->cache.get(), directory_listing,
-                                             *routes, max_request_body,
+                                             alt_svc, *routes, max_request_body,
                                              idle_deadline {deadline, idle_timeout}))
                 .value_or(false);
         } catch (...) {
@@ -963,7 +969,8 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
         for (;;) {
             while (state->pop_request(incoming)) {
                 serve_request(*state, incoming, document_root->descriptor.get(),
-                              document_root->cache.get(), directory_listing, nullptr);
+                              document_root->cache.get(), directory_listing, alt_svc,
+                              nullptr);
             }
 
             for (;;) {

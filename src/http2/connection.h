@@ -8,13 +8,15 @@
 #include "../http/open_file_cache.h"
 
 #include <memory>
+#include <string_view>
 
 namespace eventloop::http2::detail {
 
 // Serves one TLS HTTP/2 connection. With routes, handlers run as tasks on
-// loop beside a reader task; the document root and routes stay alive in the
-// caller for the connection's lifetime. The deadline, owned by the caller's
-// task, keeps running while no request is in progress, and restarts with
+// loop beside a reader task; the document root, routes, and alt_svc (an
+// Alt-Svc value for static file responses, or empty) stay alive in the caller
+// for the connection's lifetime. The deadline, owned by the caller's task,
+// keeps running while no request is in progress, and restarts with
 // idle_timeout once one has been served.
 [[nodiscard]] auto serve(event_loop& loop, tls_stream& peer,
                          std::shared_ptr<http::detail::document_root> document_root,
@@ -22,6 +24,7 @@ namespace eventloop::http2::detail {
                          std::shared_ptr<const http::router> routes,
                          std::uint64_t max_request_body,
                          http::detail::connection_deadline& deadline,
-                         std::chrono::milliseconds idle_timeout) -> task<bool>;
+                         std::chrono::milliseconds idle_timeout,
+                         std::string_view alt_svc) -> task<bool>;
 
 } // namespace eventloop::http2::detail

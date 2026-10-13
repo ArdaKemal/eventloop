@@ -53,9 +53,10 @@ constexpr std::size_t sendfile_min_size = 11 * 1024;
 } // namespace
 
 session::session(native_socket root_descriptor, bool directory_listing,
-                 route_state* routing, bool static_files, open_file_cache* files) noexcept
+                 route_state* routing, bool static_files, open_file_cache* files,
+                 std::string_view alt_svc) noexcept
     : root_descriptor_(root_descriptor), files_(files), routing_(routing),
-      directory_listing_(directory_listing), static_files_(static_files)
+      alt_svc_(alt_svc), directory_listing_(directory_listing), static_files_(static_files)
 {
 }
 
@@ -324,7 +325,7 @@ auto session::serve_file(const parsed_request& parsed, static_file descriptor, c
         header.data(), header.size(),
         "HTTP/1.1 %s\r\nDate: %.*s\r\nLast-Modified: %.*s\r\n"
         "ETag: %.*s\r\nAccept-Ranges: bytes\r\n"
-        "Content-Length: %llu\r\nContent-Type: %.*s\r\n%s%.*s%s"
+        "Content-Length: %llu\r\nContent-Type: %.*s\r\n%s%.*s%s%s%.*s%s"
         "Connection: %s\r\n\r\n",
         status_text,
         static_cast<int>(date_size), date.data(),
@@ -335,6 +336,9 @@ auto session::serve_file(const parsed_request& parsed, static_file descriptor, c
         selection.content_range_size == 0 ? "" : "Content-Range: ",
         static_cast<int>(selection.content_range_size), selection.content_range.data(),
         selection.content_range_size == 0 ? "" : "\r\n",
+        alt_svc_.empty() ? "" : "Alt-Svc: ",
+        static_cast<int>(alt_svc_.size()), alt_svc_.data(),
+        alt_svc_.empty() ? "" : "\r\n",
         close_after_response_ ? "close" : "keep-alive");
     if (header_size < 0 || static_cast<std::size_t>(header_size) >= header.size()) {
         descriptor.reset();

@@ -100,6 +100,11 @@ unsatisfiable ranges return 416 with `bytes */<full-size>` and no body.
 Malformed/multiple ranges receive full 200. Conditions precede range evaluation.
 HEAD preserves GET status/headers without body. Listings/redirects are unaffected.
 
+With a nonzero `advertise_http3_port`, `https_server` file responses (200,
+206, 304, 416; HTTP/1.1 and HTTP/2) include `Alt-Svc: h3=":<port>"; ma=86400`.
+Plain `server`, routed handlers, listings, errors, and redirects send none;
+handlers add their own field. The caller runs the `http3_server` on that port.
+
 With `directory_listing`, directories without regular `index.html` list their
 children, including dot names but excluding `.`/`..`, in stable byte-wise name
 order. Text is HTML-escaped, hrefs percent-encoded, directories suffixed `/`.
