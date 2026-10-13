@@ -164,7 +164,7 @@ private:
     crypto_receive_buffer initial_ {input_bytes_[0], coverage_[0]};
     crypto_receive_buffer handshake_ {input_bytes_[1], coverage_[1]};
     crypto_receive_buffer application_ {input_bytes_[2], coverage_[2]};
-    std::array<crypto_send_buffer<crypto_capacity>, 3> output_ {};
+    std::array<crypto_send_buffer<crypto_capacity>, 3> output_;
     std::array<received_packet_ranges<receive_range_capacity>, 3> received_ {};
     std::array<std::array<std::optional<aes_128_gcm_keys>, 2>, 3> keys_ {};
     std::array<std::uint64_t, 3> next_packet_number_ {};

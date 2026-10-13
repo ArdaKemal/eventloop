@@ -31,7 +31,7 @@ struct server_config {
     std::uint16_t http3_port = 0;
     std::size_t http3_connections = 8;
     std::size_t http3_requests = 0;
-    std::size_t http3_max_datagram = 1472;
+    std::size_t http3_max_datagram = 8192;
     std::size_t open_file_cache_capacity = 0;
     int header_timeout_ms = 30000;
     int idle_timeout_ms = 60000;

@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <latch>
 #include <memory>
@@ -438,6 +439,71 @@ auto handoff_case(const std::filesystem::path& certificate, const std::filesyste
     std::cerr << "hand-off: HTTP/1.1, HTTPS, and redirect served across loops\n";
 }
 
+// Sends two keep-alive GETs for /file.bin, the second closing; counts the
+// response bytes until the server closes, then stops this client loop.
+auto fetch_file(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
+                std::size_t& received) -> task<void>
+{
+    auto* peer = (co_await connect_tls(loop, port, std::move(context), "http/1.1")).value();
+    const auto sent = co_await write_all(loop, *peer,
+        "GET /file.bin HTTP/1.1\r\nHost: a\r\n\r\n"
+        "GET /file.bin HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    check(sent && *sent, "send file requests");
+    std::array<std::byte, 1024> buffer {};
+    while (const auto size = transferred(co_await peer->async_read_some(buffer)))
+        received += size;
+    loop.stop();
+}
+
+// An HTTPS connection holds its connection frame for its lifetime, so the
+// frame must fit the 1 KiB class, whose default 10,240 slots size a loop for
+// 10k connections; larger classes have only a few. This server loop has none
+// above 1 KiB. A client on its own loop fetches a static file twice over one
+// connection, which also exercises the userspace TLS file path.
+auto https_frame_class_case(const std::filesystem::path& directory,
+                            const std::filesystem::path& certificate,
+                            const std::filesystem::path& key) -> void
+{
+    const auto root = directory / "root";
+    std::filesystem::create_directories(root);
+    constexpr std::size_t file_size = 100 * 1024;
+    {
+        std::ofstream file(root / "file.bin", std::ios::binary);
+        file << std::string(file_size, 'x');
+    }
+    event_loop_options loop_options;
+    loop_options.coroutine_frame_capacities[4] = 0;
+    loop_options.coroutine_frame_capacities[5] = 0;
+    event_loop loop(loop_options);
+    auto server_options = options();
+    server_options.document_root = root;
+    auto listener = std::make_unique<http::https_server>(loop, ip_endpoint::loopback_v4(0),
+        tls_context::make_server(certificate, key), server_options);
+    const auto port = port_of(*listener);
+    std::size_t received = 0;
+    std::jthread client_thread([&] {
+        event_loop client;
+        check(client.spawn(fetch_file(client, port, tls_context::make_client(certificate),
+                                 received)) == task_spawn_result::accepted, "spawn file client");
+        (void)client.run();
+        client.shutdown(0ms);
+        (void)client.run();
+        loop.stop();
+    });
+    auto* server = listener.get();
+    loop.add(std::move(listener));
+    check(loop.spawn(server->run()) == task_spawn_result::accepted, "spawn server");
+    task_handle<void> timer;
+    check(loop.spawn(watchdog(loop), timer) == task_spawn_result::accepted, "spawn watchdog");
+    (void)loop.run();
+    client_thread.join();
+    if (!timer.done()) (void)timer.cancel();
+    loop.shutdown(0ms);
+    (void)loop.run();
+    check(received > 2 * file_size, "HTTPS keep-alive file responses within 1 KiB frames");
+    std::cerr << "HTTPS keep-alive file responses within 1 KiB frames\n";
+}
+
 } // namespace
 
 auto main() -> int
@@ -506,5 +572,6 @@ auto main() -> int
     secure(http2_silent);
     secure(http2_idle);
     handoff_case(certificate, key);
+    https_frame_class_case(directory, certificate, key);
     std::filesystem::remove_all(directory);
 }

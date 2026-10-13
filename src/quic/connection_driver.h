@@ -16,6 +16,7 @@ public:
     static constexpr std::size_t queue_capacity = 16;
     static_assert(queue_capacity >= 2 * udp_endpoint::receive_burst);
     static constexpr std::size_t packet_capacity = bounded_connection::datagram_buffer_size;
+    static constexpr std::array<std::uint8_t,12> v4_mapped_prefix{0,0,0,0,0,0,0,0,0,0,0xff,0xff};
     connection_driver(event_loop& loop, udp_endpoint& endpoint, bounded_connection& connection,
         std::span<const std::uint8_t> local_cid, std::span<const std::uint8_t> peer_cid,
         ip_endpoint peer, bool validated = false)
@@ -29,6 +30,12 @@ public:
             {this,enqueue,authenticate_changed_peer,stateless_reset},validated);
         if (!route) throw std::runtime_error("QUIC driver route capacity");
         route_=*route;
+        // Start from a 1500-byte MTU and probe upward only when datagrams
+        // cannot be fragmented; IPv6 headers are 20 bytes longer.
+        mtu_search_=dont_fragment_=endpoint_.dont_fragment();
+        const bool v6=peer.address_family==ip_endpoint::family::ipv6 &&
+            !std::equal(peer.address.begin(),peer.address.begin()+12,v4_mapped_prefix.begin());
+        connection_.set_datagram_base(mtu_search_ && v6 ? 1452 : 1472);
     }
     ~connection_driver()
     {
@@ -311,6 +318,7 @@ private:
                     eliciting|=frame->type!=0 && frame->type!=2 && frame->type!=3 && frame->type!=0x1c && frame->type!=0x1d;
                 }
                 if (eliciting) scheduler_.request_ack(level);
+                reply_due_|=eliciting && level==tls_level::application;
                 if (received->kind==packet_kind::handshake) (void)endpoint_.router().validate_peer(route_);
             }
             if (!connection_.core().poll(now,std::chrono::seconds(1))) return std::unexpected(connection_error::invalid_state);
@@ -436,6 +444,7 @@ private:
             .value_or(lifecycle_time_point::max());
         if (const auto alarm=connection_.recovery().next_alarm()) deadline=std::min(deadline,alarm->deadline);
         if (candidate_challenge_active_) deadline=std::min(deadline,candidate_probe_due_);
+        if (mtu_search_&&connection_.core().handshake_confirmed()) deadline=std::min(deadline,mtu_probe_due_);
         const auto soon=now+std::chrono::milliseconds(1);
         if (retry) deadline=std::min(deadline,soon);
         // A deadline that passed yet stays armed degrades to polling, not spinning.
@@ -495,6 +504,80 @@ private:
         const auto retry=self.connection_.application_pto().value_or(std::chrono::seconds(1));
         self.candidate_probe_due_=now+(*sent?retry:std::chrono::milliseconds(25));
         if (*sent) ++self.candidate_attempts_;
+        co_return std::expected<void,connection_error>{};
+    }
+    // The path MTU fell below the datagram size (the kernel learned it from
+    // ICMP): the batch is lost and recovered as usual at the QUIC minimum.
+    auto path_shrank(int error) noexcept -> bool
+    {
+        if (error!=EMSGSIZE||!dont_fragment_) return false;
+        connection_.lower_datagram_size();
+        mtu_search_=false;
+        return true;
+    }
+    // Path MTU search: one PING padded to the probed size, outside congestion
+    // control (RFC 9000 14.4), sent up to three times a PTO apart. The
+    // negotiated ceiling goes first; after a failure the search halves the
+    // gap to the current size until it is under 64 bytes. An ACK raises the
+    // datagram size; EMSGSIZE or three losses lower the upper bound.
+    static auto send_mtu_probe(event_loop& loop,connection_driver& self,
+                               lifecycle_time_point now)
+        -> task<std::expected<void,connection_error>>
+    {
+        if (&loop!=&self.loop_) co_return std::unexpected(connection_error::invalid_state);
+        auto& connection=self.connection_;
+        if (!self.mtu_search_||now<self.mtu_probe_due_||self.scheduler_.pending()||
+            !connection.core().handshake_confirmed())
+            co_return std::expected<void,connection_error>{};
+        const auto low=connection.send_datagram_size();
+        if (self.mtu_target_!=0&&(low>=self.mtu_target_||self.mtu_attempts_>=3)) {
+            if (low<self.mtu_target_) self.mtu_high_=self.mtu_target_-1;
+            self.mtu_target_=0; self.mtu_attempts_=0;
+        }
+        if (self.mtu_target_==0) {
+            const bool first=self.mtu_high_==0;
+            if (first) self.mtu_high_=connection.datagram_ceiling();
+            if (self.mtu_high_<low+64) {
+                self.mtu_search_=false;
+                co_return std::expected<void,connection_error>{};
+            }
+            self.mtu_target_=first ? self.mtu_high_ : low+(self.mtu_high_-low+1)/2;
+        }
+        const auto size=self.mtu_target_;
+        protected_packet_fields fields; fields.kind=packet_kind::short_header;
+        fields.destination_cid={self.peer_.data(),self.peer_size_};
+        fields.packet_number_length=connection.core().packet_number_length(tls_level::application);
+        // Short header, then the AEAD tag.
+        const auto overhead=1+self.peer_size_+fields.packet_number_length+16;
+        const auto payload=std::span(self.packet_scratch_).first(size-overhead);
+        std::fill(payload.begin(),payload.end(),std::uint8_t{0});
+        payload[0]=0x01; // PING; the rest is PADDING
+        const auto number=connection.core().next_packet_number(tls_level::application);
+        if (!number) co_return std::unexpected(connection_error::unavailable_keys);
+        const auto built=connection.core().build(fields,payload,self.output_,self.build_scratch_);
+        if (!built) co_return std::unexpected(built.error());
+        if (*built!=size) {
+            connection.core().unbuild(tls_level::application);
+            self.mtu_search_=false;
+            co_return std::expected<void,connection_error>{};
+        }
+        const auto sent=co_await self.endpoint_.async_send(self.route_,
+            std::as_bytes(std::span(self.output_).first(*built)));
+        if (!sent) co_return std::unexpected(connection_error::provider_failure);
+        if (!*sent) {
+            const auto value=sent->error().value();
+            if (value==EMSGSIZE) { self.mtu_high_=size-1; self.mtu_target_=0; self.mtu_attempts_=0; }
+            else if (value==EAGAIN||value==EBUSY||value==EWOULDBLOCK)
+                self.mtu_probe_due_=now+std::chrono::milliseconds(25);
+            else co_return std::unexpected(connection_error::provider_failure);
+            co_return std::expected<void,connection_error>{};
+        }
+        const sent_packet packet{*number,now,true,false,*built};
+        if (!connection.record_sent(tls_level::application,packet,{}))
+            co_return std::unexpected(connection_error::invalid_state);
+        connection.mtu_probe_sent(*number,size);
+        ++self.mtu_attempts_;
+        self.mtu_probe_due_=now+connection.application_pto().value_or(std::chrono::seconds(1));
         co_return std::expected<void,connection_error>{};
     }
     // Application work ends before the route's closing/draining retention.
@@ -578,14 +661,26 @@ private:
             co_return std::unexpected(start.error());
         if (const auto synchronized=self.connection_.synchronize_discarded_spaces(); !synchronized)
             co_return std::unexpected(synchronized.error());
+        bool replied=false;
         while (!self.stopped_) {
             const auto now=lifecycle_time_point::clock::now();
             self.work_pending_=false;
             if (const auto result=self.tick(now); !result) co_return std::unexpected(result.error());
             if (self.stopped_) break;
+            // Packets that want an ACK usually wake the application. Give it
+            // one turn to queue replies first, so the ACK rides on them
+            // instead of going in a packet of its own.
+            if (std::exchange(self.reply_due_,false) && !std::exchange(replied,true) &&
+                self.progress_ && self.connection_.core().state()==connection_state::active) {
+                self.progress_(self.progress_argument_);
+                if (co_await yield(loop)) continue;
+            }
+            replied=false;
             if (const auto result=unwrap_task(co_await send_pending_path_responses(loop,self,now)); !result)
                 co_return std::unexpected(result.error());
             if (const auto result=unwrap_task(co_await send_candidate_probe(loop,self,now)); !result)
+                co_return std::unexpected(result.error());
+            if (const auto result=unwrap_task(co_await send_mtu_probe(loop,self,now)); !result)
                 co_return std::unexpected(result.error());
             // Drain a bounded burst rather than charging every packet a
             // timer tick. Per-packet preflight still enforces congestion,
@@ -631,7 +726,8 @@ private:
                     const auto error=reserved_error?reserved_error:committed_error;
                     if (error) {
                         const auto value=error.value();
-                        if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY)
+                        if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY &&
+                            !self.path_shrank(value))
                             co_return std::unexpected(connection_error::provider_failure);
                         stop_sending=retry=true;
                         break;
@@ -640,7 +736,7 @@ private:
             }
             if (const auto flushed=self.endpoint_.flush_send(); flushed) {
                 const auto value=flushed.value();
-                if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY)
+                if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY && !self.path_shrank(value))
                     co_return std::unexpected(connection_error::provider_failure);
                 retry=true;
             }
@@ -728,6 +824,10 @@ private:
     ip_endpoint candidate_peer_{};
     lifecycle_time_point candidate_probe_due_{};
     std::uint8_t candidate_attempts_{};
+    lifecycle_time_point mtu_probe_due_{};
+    std::uint8_t mtu_attempts_{};
+    std::size_t mtu_target_{},mtu_high_{};
+    bool mtu_search_{},dont_fragment_{};
     tls_level probe_level_{};
     std::uint8_t probes_{};
     std::uint8_t client_probe_keyed_{};
@@ -749,6 +849,7 @@ private:
     bool reset_detected_{};
     std::optional<stateless_reset_token> router_reset_token_{};
     bool work_pending_ {};
+    bool reply_due_ {}; // a received 1-RTT packet asked for an ACK
     bool running_{},stopped_{},started_{},handshake_done_{},candidate_challenge_active_{};
 };
 } // namespace eventloop::quic::detail

@@ -69,7 +69,7 @@ auto udp_socket::local_endpoint() const -> ip_endpoint
     return detail::socket_operations::local_endpoint(descriptor_.get());
 }
 
-auto udp_socket::enable_receive_coalescing() noexcept -> void
+auto udp_socket::prepare_quic(bool ipv6) noexcept -> bool
 {
 #if defined(__linux__)
     // Opt-in UDP_GRO for the QUIC endpoint only; the public API keeps one
@@ -77,6 +77,25 @@ auto udp_socket::enable_receive_coalescing() noexcept -> void
     const int enabled = 1;
     (void)::setsockopt(descriptor_.get(), IPPROTO_UDP, UDP_GRO,
                        &enabled, sizeof(enabled));
+    // A burst of handshakes overflowed the 208 KiB default and the dropped
+    // packets left clients at minimum congestion windows. The kernel caps
+    // the request at net.core.rmem_max.
+    const int receive_buffer = 2 * 1024 * 1024;
+    (void)::setsockopt(descriptor_.get(), SOL_SOCKET, SO_RCVBUF,
+                       &receive_buffer, sizeof(receive_buffer));
+    // QUIC must not be fragmented (RFC 9000 14). With DF the kernel refuses a
+    // datagram above the known path MTU (EMSGSIZE), so a probe can find it.
+    // An IPv6 socket sets both, for IPv4-mapped peers.
+    const int discover = IP_PMTUDISC_DO;
+    const int discover6 = IPV6_PMTUDISC_DO;
+    const bool v4 = ::setsockopt(descriptor_.get(), IPPROTO_IP, IP_MTU_DISCOVER,
+                                 &discover, sizeof(discover)) == 0;
+    const bool v6 = ::setsockopt(descriptor_.get(), IPPROTO_IPV6, IPV6_MTU_DISCOVER,
+                                 &discover6, sizeof(discover6)) == 0;
+    return v4 && (v6 || !ipv6);
+#else
+    (void)ipv6;
+    return false;
 #endif
 }
 

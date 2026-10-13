@@ -279,7 +279,7 @@ auto run_workers(const stonegate::configuration& configuration,
     std::size_t connections = 0, requests = 0;
     for (const auto& settings : configuration.servers) {
         connections += settings.http3_connections;
-        requests += settings.http3_requests == 0 ? settings.http3_connections * 4
+        requests += settings.http3_requests == 0 ? settings.http3_connections * 10
                                                : settings.http3_requests;
     }
     worker_setup setup {configuration, contexts, {}, make_routes(), {}};

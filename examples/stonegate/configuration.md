@@ -56,8 +56,8 @@ Fields below are allowed under both `defaults` and each `server`.
 | `tls.http2` | boolean | `true`; ALPN advertisement |
 | `http3.port` | integer | 0 (off); 0..65535, UDP |
 | `http3.connections` | integer | 8; 1..256 per server |
-| `http3.requests` | integer | 0 (four per connection); 0..8192 per server |
-| `http3.max_datagram` | integer | 1472; 1200..8192 bytes |
+| `http3.requests` | integer | 0 (ten per connection); 0..8192 per server |
+| `http3.max_datagram` | integer | 8192; 1200..8192 bytes, reached by path MTU probing |
 
 `server.name` is a nonempty string, at most 64 ASCII letters, digits, `_`, `-`
 or `.`. `[runtime]` accepts `shutdown_seconds` (integer, default 5, 0..3600),

@@ -123,7 +123,7 @@ auto get(std::string_view path, std::vector<h3::field> extra = {}) -> std::vecto
 
 struct outcome {
     bool malformed_reset {false};
-    bool rejected {false};
+    bool queued {false};
     bool content_length_stopped {false};
     bool trailers_stopped {false};
     bool valid_trailers {false};
@@ -233,17 +233,17 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outco
     result.malformed_reset = status == 0 && error == reset_error;
 
     // 2. With one request slot, a request held open after its response keeps
-    // the slot; the next request is rejected (H3_REQUEST_REJECTED).
+    // the slot; the next request waits for it instead of being rejected.
     const auto held = (co_await open_request(loop, connection)).value_or(0);
     (void)co_await send(loop, connection, held, get("/hello.txt"), false);
     status = (co_await response_status(loop, connection, held, error)).value_or(0);
     id = (co_await open_request(loop, connection)).value_or(0);
     (void)co_await send(loop, connection, id, get("/hello.txt"), true);
-    error = {};
-    const auto rejected = (co_await response_status(loop, connection, id, error)).value_or(0);
-    result.rejected = status == 200 && rejected == 0 && error == reset_error;
-    (void)co_await send(loop, connection, held, {}, true);
     (void)co_await sleep_for(loop, 20ms);
+    (void)co_await send(loop, connection, held, {}, true);
+    error = {};
+    const auto queued = (co_await response_status(loop, connection, id, error)).value_or(0);
+    result.queued = status == 200 && queued == 200;
 
     // 3. DATA beyond Content-Length, received after the response.
     id = (co_await open_request(loop, connection)).value_or(0);
@@ -353,7 +353,7 @@ auto main() -> int
     }
     std::filesystem::remove_all(directory);
     check(result.malformed_reset, "malformed request resets only its stream");
-    check(result.rejected, "exhausted request storage rejects the stream");
+    check(result.queued, "exhausted request storage queues the stream");
     check(result.content_length_stopped, "DATA beyond Content-Length stops the body");
     check(result.trailers_stopped, "pseudo-header trailers stop the body");
     check(result.valid_trailers, "valid body and trailers");

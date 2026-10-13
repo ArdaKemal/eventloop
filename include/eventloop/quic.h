@@ -60,7 +60,8 @@ namespace eventloop {
 // Active streams are capped to 32 bidirectional and 8 unidirectional streams
 // per initiator. Local opens also obey the peer's cumulative MAX_STREAMS grant.
 // Completed streams release storage after final ACK and receive completion;
-// the endpoint sends new MAX_STREAMS credit for retired peer streams.
+// the endpoint sends new MAX_STREAMS credit for retired peer streams once the
+// peer has used half of the previous grant.
 // Unset datagram size (0) disables RFC 9221 DATAGRAM negotiation.
 struct quic_transport_limits {
     std::uint64_t max_idle_timeout_ms {30000};
@@ -70,11 +71,12 @@ struct quic_transport_limits {
     std::uint64_t max_streams_uni {8};
     std::uint64_t max_datagram_frame_size {0};
     // Maximum UDP payload advertised and used for application packets, clamped
-    // to 1200..8192 and negotiated down to the peer's advertised limit. The
-    // default is the standard Ethernet payload (1500 MTU) because path MTU
-    // discovery is not implemented; constrained paths may lower it. Handshake
-    // packets remain bounded at 1200 so anti-amplification is unaffected.
-    std::uint64_t max_udp_payload_size {1472};
+    // to 1200..8192 and negotiated down to the peer's advertised limit.
+    // Application packets start at the Ethernet payload (1472, or 1452 over
+    // IPv6) and, on Linux, rise toward this limit as path MTU probes are
+    // acknowledged. Handshake packets remain bounded at 1200 so
+    // anti-amplification is unaffected.
+    std::uint64_t max_udp_payload_size {8192};
 };
 
 namespace quic::detail { struct worker_group_access; }

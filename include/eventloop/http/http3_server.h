@@ -16,10 +16,9 @@ namespace eventloop::http {
 // listener owns its UDP endpoint and document-root descriptor. The caller
 // keeps the listener alive until run() and async_close() finish. Connection
 // and request pools reserve storage at construction. A connection beyond
-// capacity is closed; a request without free storage is refused with
-// H3_REQUEST_REJECTED on its stream. Path MTU discovery is not implemented,
-// so max_udp_payload_size defaults to the standard Ethernet payload and is
-// negotiated down to the peer's advertised limit.
+// capacity is closed; a request without free storage waits for a buffer
+// another request returns. Packets grow from the Ethernet payload toward
+// max_udp_payload_size by path MTU probing; see quic_transport_limits.
 class http3_server final {
 public:
     http3_server(event_loop& loop, ip_endpoint local,

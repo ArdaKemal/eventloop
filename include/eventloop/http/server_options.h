@@ -51,11 +51,11 @@ struct server_options {
     // A routed request declaring a larger body answers 413.
     std::uint64_t max_request_body {std::uint64_t {1} << 20};
     // http3_server only. Connection capacity is 1..256; request capacity is
-    // 1..8192, or four per connection when zero. The UDP payload size is
+    // 1..8192, or ten per connection when zero. The UDP payload size is
     // clamped to 1200..8192.
     std::size_t connection_capacity {8};
     std::size_t request_capacity {0};
-    std::size_t max_udp_payload_size {1472};
+    std::size_t max_udp_payload_size {8192};
     // http3_server only: see quic_server_options::worker_index and
     // worker_group.
     std::optional<std::uint8_t> worker_index {};

@@ -148,9 +148,10 @@ private:
 
     auto set_lifetime_observer(void* context,
         void (*observer)(void*) noexcept) noexcept -> void;
-    // Enable kernel receive coalescing (UDP_GRO). Internal: only the QUIC
-    // endpoint opts in, so the public receive API stays datagram-atomic.
-    auto enable_receive_coalescing() noexcept -> void;
+    // Enable kernel receive coalescing (UDP_GRO), a larger receive buffer
+    // and the don't-fragment bit; true when the bit is set. Internal: only the
+    // QUIC endpoint opts in, so the public receive API stays datagram-atomic.
+    auto prepare_quic(bool ipv6) noexcept -> bool;
 
     [[nodiscard]] auto initial_read_interest() const noexcept -> bool override
     {

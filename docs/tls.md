@@ -36,5 +36,5 @@ The native-descriptor overload borrows without duplicating/closing the file;
 keep it open through completion, including cancellation. Its optional prefix
 span is borrowed unchanged for the same period and sent before the range under
 the same write operation. All other rules match the owning overload. HTTPS
-HTTP/1.1 file responses use kTLS when available, otherwise a bounded 4 KiB
-read/write buffer.
+HTTP/1.1 file responses use kTLS when available, otherwise a 16 KiB buffer,
+allocated only while the body is sent, so each write is one full record.

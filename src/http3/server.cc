@@ -1,6 +1,7 @@
 #include "eventloop/http/http3_server.h"
 
 #include "eventloop/event_loop.h"
+#include "eventloop/semaphore.h"
 #include "eventloop/http/mime_types.h"
 #include "eventloop/unique_fd.h"
 #include "../http/exchange.h"
@@ -37,21 +38,33 @@ using stream_handlers = std::array<std::optional<task_handle<void>>, max_streams
 // request_headers; headers then holds trailer blocks (first half) and their
 // decoded strings (second half), and body holds encoded response HEADERS,
 // trailers and file DATA.
+// The arrays are scratch that every request writes before reading, as a
+// reused slot already holds an earlier request's data; they are left
+// uninitialized so a reserved slot touches only its first page until used.
+template<typename T, std::size_t N>
+union scratch_array {
+    scratch_array() noexcept {}
+    std::array<T, N> items;
+};
 struct stream_storage {
-    std::array<std::byte, header_limit> headers {};
-    std::array<char, header_limit> strings {};
-    std::array<h3::field, h3::qpack_max_fields> fields {};
-    std::array<std::byte, 4096> io {};
-    std::array<http::header, h3::qpack_max_fields> request_headers {};
-    std::array<std::byte, 8 * 1024> body {};
+    stream_storage() noexcept {}
+    bool in_use {false};
+    // Returned after in_use clears, so a waiting connection finds this slot.
+    semaphore::permit permit;
     // Kept here, not in serve_request's frame, so that frame stays in its
     // size class; its views point into strings.
     h3::request_head head {};
-    bool in_use {false};
+    scratch_array<h3::field, h3::qpack_max_fields> fields;
+    scratch_array<http::header, h3::qpack_max_fields> request_headers;
+    std::array<std::byte, header_limit> headers;
+    std::array<char, header_limit> strings;
+    std::array<std::byte, 4096> io;
+    std::array<std::byte, 8 * 1024> body;
 };
 
 struct storage_pool {
-    explicit storage_pool(std::size_t capacity) : slots(checked_capacity(capacity)) {}
+    storage_pool(event_loop& loop, std::size_t capacity)
+        : permits(loop, checked_capacity(capacity)), slots(capacity) {}
     [[nodiscard]] static auto checked_capacity(std::size_t capacity) -> std::size_t
     {
         if (capacity == 0 || capacity > 8192)
@@ -66,6 +79,9 @@ struct storage_pool {
         }
         return nullptr;
     }
+    // One permit per slot. Connections wait for one before accepting a
+    // request stream, so a full pool delays requests instead of refusing them.
+    semaphore permits;
     std::vector<stream_storage> slots;
 };
 
@@ -194,9 +210,9 @@ auto finish_request(event_loop& loop, quic_connection& connection, std::uint64_t
             input_area, pending, error)).value_or(read_outcome::transport_failure);
         switch (outcome) {
         case read_outcome::block: {
-            const auto decoded = h3::qpack_decode(frames.block(), s.fields, s.strings);
+            const auto decoded = h3::qpack_decode(frames.block(), s.fields.items, s.strings);
             if (!decoded) { fail(connection, id, h3::qpack_failure(decoded.error())); co_return; }
-            if (const auto valid = h3::validate_trailers(std::span(s.fields).first(*decoded)); !valid) {
+            if (const auto valid = h3::validate_trailers(std::span(s.fields.items).first(*decoded)); !valid) {
                 fail(connection, id, valid.error());
                 co_return;
             }
@@ -328,7 +344,7 @@ public:
         const auto status_end = std::to_chars(status_text.data(), status_text.data() + 3, status).ptr;
         std::array<char, 24> length_text {};
         std::array<char, 64> date {};
-        auto fields = std::span(self.storage_.fields).first(response_fields);
+        auto fields = std::span(self.storage_.fields.items).first(response_fields);
         std::size_t count = 0;
         fields[count++] = {":status", {status_text.data(), status_end}};
         for (const auto& field : headers) fields[count++] = {field.name, field.value};
@@ -382,7 +398,7 @@ private:
     {
         auto strings = std::span(reinterpret_cast<char*>(storage_.headers.data()) + trailer_block,
                                  header_limit - trailer_block);
-        auto fields = std::span(storage_.fields).subspan(response_fields);
+        auto fields = std::span(storage_.fields.items).subspan(response_fields);
         const auto decoded = h3::qpack_decode(frames_.block(), fields, strings);
         if (!decoded) return std::unexpected(h3::qpack_failure(decoded.error()));
         return h3::validate_trailers(fields.first(*decoded));
@@ -543,7 +559,7 @@ private:
         busy writing(self.writing_);
         bool written = false;
         if (!trailers.empty() && !self.head_only_) {
-            auto fields = std::span(self.storage_.fields).first(response_fields);
+            auto fields = std::span(self.storage_.fields.items).first(response_fields);
             for (std::size_t index = 0; index < trailers.size(); ++index)
                 fields[index] = {trailers[index].name, trailers[index].value};
             written = (co_await write_section(loop, self, fields.first(trailers.size()), true))
@@ -657,8 +673,8 @@ auto prepare_request_headers(stream_storage& s, std::span<const h3::field> field
         if (field.name == "cookie" && cookies > 1) {
             if (copied_cookie) continue;
             copied_cookie = true;
-            s.request_headers[count++] = {field.name, joined};
-        } else s.request_headers[count++] = {field.name, field.value};
+            s.request_headers.items[count++] = {field.name, joined};
+        } else s.request_headers.items[count++] = {field.name, field.value};
     }
     return true;
 }
@@ -678,7 +694,7 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
     http3_exchange exchange(loop, connection, id, s, frames, pending, max_request_body,
                             head.method == "HEAD");
     const detail::request_fields request {
-        .headers = std::span<const header>(s.request_headers).first(count),
+        .headers = std::span<const header>(s.request_headers.items).first(count),
         .method_name = head.method,
         .target = head.path,
         .authority = head.authority,
@@ -772,7 +788,11 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
 {
     struct release_storage {
         stream_storage* storage;
-        ~release_storage() { storage->in_use = false; }
+        ~release_storage()
+        {
+            storage->in_use = false;
+            storage->permit.release();
+        }
     } release {storage};
     auto& s = *storage;
     // The parser copies HEADERS payloads into s.headers. Once the request
@@ -786,12 +806,12 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         input_area, pending, error)).value_or(read_outcome::transport_failure);
     if (outcome == read_outcome::failure) fail(connection, id, error);
     if (outcome != read_outcome::block) co_return;
-    const auto decoded = h3::qpack_decode(frames.block(), s.fields, s.strings);
+    const auto decoded = h3::qpack_decode(frames.block(), s.fields.items, s.strings);
     if (!decoded) {
         fail(connection, id, h3::qpack_failure(decoded.error()));
         co_return;
     }
-    const auto request_fields = std::span<const h3::field>(s.fields).first(*decoded);
+    const auto request_fields = std::span<const h3::field>(s.fields.items).first(*decoded);
     if (const auto invalid = store_request_head(s, request_fields, settings.routes != nullptr)) {
         fail(connection, id, *invalid);
         co_return;
@@ -1007,6 +1027,14 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
         if (!accepted) break;
         const auto id = *accepted;
         const bool request = (id & 3u) == 0u;
+        // A request waits for a free slot, and later streams wait behind it
+        // in QUIC's bounded buffers, instead of being refused.
+        semaphore::permit permit;
+        if (request) {
+            auto acquired = co_await pool.permits.async_acquire();
+            if (!acquired) break;
+            permit = std::move(*acquired);
+        }
         // Handler slots cover every stream QUIC admits (32 bidirectional and
         // 8 unidirectional), so exhaustion here is a capacity bug.
         auto slot = std::find_if(handlers.begin(), handlers.end(),
@@ -1014,6 +1042,7 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
         stream_storage* storage = request ? pool.acquire() : nullptr;
         auto spawned = task_spawn_result::invalid_task;
         if (slot != handlers.end() && (!request || storage)) {
+            if (storage) storage->permit = std::move(permit);
             slot->reset();
             slot->emplace();
             spawned = request
@@ -1023,8 +1052,11 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
             if (spawned != task_spawn_result::accepted) slot->reset();
         }
         if (spawned == task_spawn_result::accepted) continue;
-        if (storage) storage->in_use = false;
-        // Without request storage or a frame, refuse only this request; it
+        if (storage) {
+            storage->in_use = false;
+            storage->permit.release();
+        }
+        // Without a frame, refuse only this request; it
         // was not processed and may be retried (RFC 9114 8.1). A peer
         // unidirectional stream may be critical, so the connection ends.
         if (request) fail(connection, id, h3::h3_error::request_rejected);
@@ -1085,7 +1117,7 @@ public:
           routes_(options.routes),
           settings_ {routes_.get(), options.max_request_body, options.directory_listing},
           connections_(options.connection_capacity),
-          request_storage_(options.request_capacity == 0 ? options.connection_capacity * 4
+          request_storage_(loop, options.request_capacity == 0 ? options.connection_capacity * 10
                                                          : options.request_capacity) {}
 
     event_loop& loop_;

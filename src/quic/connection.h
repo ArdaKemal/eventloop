@@ -48,10 +48,8 @@ public:
     };
     struct stream_slot {
         std::uint64_t id {};
-        std::array<std::byte, stream_bytes> bytes {};
         std::array<std::byte, stream_bytes / 8> coverage {};
         std::optional<stream_receive_buffer> receive;
-        stream_send_buffer<send_bytes> send;
         stream_state state;
         std::uint64_t sent_highest {}, receive_window {}, receive_limit {}, consumed {};
         // Application codes carried by queued RESET_STREAM and STOP_SENDING.
@@ -66,6 +64,10 @@ public:
         // Ranges of this stream in occupied sent records; the slot cannot
         // retire while any are outstanding.
         std::size_t in_flight {0};
+        // Byte storage last, so a reserved connection touches only the state
+        // above; received bytes are read only where coverage marks them.
+        stream_send_buffer<send_bytes> send;
+        std::array<std::byte, stream_bytes> bytes;
     };
 
     explicit bounded_connection(endpoint_role role, connection_callbacks callbacks,
@@ -105,6 +107,7 @@ public:
         if (!registry_.set_local_limit(stream_direction::bidirectional, local_.bidi) ||
             !registry_.set_local_limit(stream_direction::unidirectional, local_.uni))
             return std::unexpected(connection_error::invalid_configuration);
+        advertised_streams_ = {local_.bidi, local_.uni};
         flow_ = *flow_control<stream_capacity>::create(0, local_.data);
         datagrams_.reset(local_.datagram);
         return core_.initialize(context, options, version, dcid);
@@ -131,6 +134,18 @@ public:
     { check_owner(); return role_; }
     [[nodiscard]] auto send_datagram_size() const noexcept -> std::size_t
     { check_owner(); return send_datagram_size_; }
+    // Path MTU search (RFC 9000 14.3). Application packets start at the base
+    // size the owner sets for the path; an acknowledged probe raises them to
+    // its size, up to the negotiated ceiling, and EMSGSIZE drops them to the
+    // QUIC minimum.
+    [[nodiscard]] auto datagram_ceiling() const noexcept -> std::size_t
+    { check_owner(); return datagram_ceiling_; }
+    auto set_datagram_base(std::size_t size) noexcept -> void
+    { check_owner(); datagram_base_ = std::clamp<std::size_t>(size, 1200, datagram_buffer_size); }
+    auto mtu_probe_sent(std::uint64_t number, std::size_t size) noexcept -> void
+    { check_owner(); mtu_probe_ = number; mtu_probe_size_ = size; }
+    auto lower_datagram_size() noexcept -> void
+    { check_owner(); send_datagram_size_ = 1200; datagram_ceiling_ = 1200; mtu_probe_.reset(); }
     [[nodiscard]] auto recovery() noexcept -> recovery_orchestration<packet_capacity>&
     { check_owner(); return recovery_; }
     [[nodiscard]] auto peer_ids() noexcept -> peer_connection_id_registry<8>&
@@ -241,7 +256,10 @@ public:
             !s->receive->extend_flow_limit(*stream_limit))
             return std::unexpected(connection_error::invalid_state);
         data_credit_pending_ |= *data_limit > flow_.receive_max_data();
-        s->credit_pending |= *stream_limit > s->receive_limit;
+        // Stream credit matters only before the final size is known (RFC 9000
+        // 3.2); peers count later MAX_STREAM_DATA as misbehavior.
+        s->credit_pending |= *stream_limit > s->receive_limit &&
+            s->state.receiving() == stream_receive_state::receive;
         if (s->credit_pending) stream_control_pending_ = true;
         s->receive_limit = *stream_limit;
         s->consumed += size;
@@ -357,6 +375,10 @@ public:
         }
         if (data_credit_pending_) { frame.type = 0x10; frame.limit = flow_.receive_max_data(); return frame; }
         for (auto* active : active_slots()) if (auto& s = *active; s.credit_pending) {
+            if (s.state.receiving() != stream_receive_state::receive) {
+                s.credit_pending = false;
+                continue;
+            }
             frame.type = 0x11; frame.stream_id = s.id; frame.limit = s.receive_limit; return frame;
         }
         stream_control_pending_ = false;
@@ -374,8 +396,10 @@ public:
         check_owner();
         if (frame.type == 0x19) (void)peer_ids_.mark_retirement_queued(frame.sequence_number);
         else if (frame.type == 0x10) data_credit_pending_ = false;
-        else if (frame.type == 0x12 || frame.type == 0x13)
+        else if (frame.type == 0x12 || frame.type == 0x13) {
             stream_credit_pending_[frame.type == 0x12 ? 0 : 1] = false;
+            advertised_streams_[frame.type == 0x12 ? 0 : 1] = frame.limit;
+        }
         else if (auto* s = stream(frame.stream_id)) {
             if (frame.type == 4) s->reset_pending = false;
             if (frame.type == 5) s->stop_sending_pending = false;
@@ -592,7 +616,8 @@ private:
         const auto buffer_cap = static_cast<std::uint64_t>(datagram_buffer_size);
         const auto local_cap = std::clamp<std::uint64_t>(self.local_.udp_payload, 1200, buffer_cap);
         const auto peer_cap = std::clamp<std::uint64_t>(self.peer_.udp_payload, 1200, buffer_cap);
-        self.send_datagram_size_ = static_cast<std::size_t>(std::min(local_cap, peer_cap));
+        self.datagram_ceiling_ = static_cast<std::size_t>(std::min(local_cap, peer_cap));
+        self.send_datagram_size_ = std::min(self.datagram_ceiling_, self.datagram_base_);
         if (!self.recovery_.increase_max_datagram_size(self.send_datagram_size_)) return false;
         self.outgoing_datagrams_.reset(self.peer_.datagram);
         self.recovery_.set_max_ack_delay(std::chrono::milliseconds(self.peer_.ack_delay));
@@ -678,7 +703,13 @@ private:
             if (peer && registry_.local_limit(direction) < max_stream_count) {
                 (void)registry_.set_local_limit(direction,
                     registry_.local_limit(direction) + 1);
-                stream_credit_pending_[direction == stream_direction::bidirectional ? 0 : 1] = true;
+                // Advertise once the peer has used half its credit rather
+                // than in a packet per retired stream. Every opened stream
+                // retires, so a peer that runs out still gets new credit.
+                const auto type = direction == stream_direction::bidirectional ? 0 : 1;
+                const auto window = type == 0 ? local_.bidi : local_.uni;
+                if (registry_.peer_opened(direction) + window / 2 >= advertised_streams_[type])
+                    stream_credit_pending_[type] = true;
             }
         }
     }
@@ -703,6 +734,13 @@ private:
                         static_cast<tls_level>(record.space), record.number,
                         retirement_reason::discarded);
                     continue;
+                }
+                if (retired.reason == retirement_reason::acknowledged &&
+                    record.space == packet_number_space::application_data &&
+                    mtu_probe_ == record.number) {
+                    mtu_probe_.reset();
+                    send_datagram_size_ = std::clamp(mtu_probe_size_, send_datagram_size_, datagram_ceiling_);
+                    if (!recovery_.increase_max_datagram_size(send_datagram_size_)) return false;
                 }
                 if (retired.reason == retirement_reason::acknowledged &&
                     record.space == packet_number_space::application_data) {
@@ -825,10 +863,16 @@ private:
     bool data_credit_pending_ {false};
     bool stream_control_pending_ {false};
     std::array<bool, 2> stream_credit_pending_ {};
+    // Last MAX_STREAMS values queued for bidirectional and unidirectional.
+    std::array<std::uint64_t, 2> advertised_streams_ {};
     void* retirement_argument_ {};
     retirement_callback retirement_callback_ {};
     parameter_limits local_, peer_;
     std::size_t send_datagram_size_ {1200};
+    std::size_t datagram_ceiling_ {1200};
+    std::size_t datagram_base_ {1472};
+    std::optional<std::uint64_t> mtu_probe_;
+    std::size_t mtu_probe_size_ {0};
     stream_registry<stream_capacity> registry_;
     flow_control<stream_capacity> flow_;
     std::array<stream_slot, stream_capacity> slots_;

@@ -48,8 +48,8 @@ TCP and UDP may share a port number. `--bind` applies to every listener.
 | `--http2 on\|off` | TLS h2 advertisement; default on |
 | `--http3-port PORT` | HTTP/3; default off |
 | `--http3-connections N` | 1..256; default 8 |
-| `--http3-requests N` | 0..8192 scratch slots; 0 selects four per connection |
-| `--http3-max-datagram N` | 1200..8192 bytes; default 1472 |
+| `--http3-requests N` | 0..8192 scratch slots; 0 selects ten per connection |
+| `--http3-max-datagram N` | 1200..8192 bytes; default 8192, reached by path MTU probing |
 | `--directory-listing`, `--no-directory-listing` | Listings without index.html |
 | `--reuse-port`, `--no-reuse-port` | TCP listener port reuse |
 | `--shutdown-seconds N` | Loop grace deadline; default 5 |
@@ -58,7 +58,8 @@ TCP and UDP may share a port number. `--bind` applies to every listener.
 
 See `--help` for remaining options. Ctrl-C closes/awaits HTTP/3 before loop
 shutdown. Shutdown cancels roots immediately; grace does not guarantee response
-completion. Coroutine capacities scale with configured HTTP/3 capacity.
+completion. Coroutine capacities scale with configured HTTP/3 capacity; TCP
+and TLS connections use the library defaults, about 10k per worker.
 
 ## Configuration file
 

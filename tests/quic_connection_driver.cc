@@ -653,6 +653,12 @@ int main()
         // than one packet of progress before the pump retries on a timer.
         // This checks scheduling behavior without a wall-clock threshold.
         check(progress.largest_step>packet_scheduler::maximum_packet);
+#if defined(__linux__)
+        // Loopback carries the negotiated ceiling, so both probes succeed.
+        check(server->datagram_ceiling()>1472 && client->datagram_ceiling()>1472);
+        check(server->send_datagram_size()==server->datagram_ceiling());
+        check(client->send_datagram_size()==client->datagram_ceiling());
+#endif
     }
 #ifdef _WIN32
     (void)WSACleanup();

@@ -39,17 +39,18 @@ class crypto_send_buffer {
     static_assert(Capacity > 0);
     static constexpr std::size_t max_ranges = Capacity < 64 ? Capacity : 64;
 
+    // Entries past size_ stay unwritten, so reserved buffers are not touched.
     struct offset_range {
-        std::uint64_t begin {0};
-        std::uint64_t end {0};
+        std::uint64_t begin;
+        std::uint64_t end;
     };
 
     // Sorted, non-overlapping, non-adjacent half-open intervals [begin, end).
     // Capacity is bounded by the tracked window; more than `max_ranges` holes
     // is reported as crypto_send_error::capacity_exceeded rather than corrupting.
     struct range_set {
-        std::array<offset_range, max_ranges> ranges_ {};
         std::size_t size_ {0};
+        std::array<offset_range, max_ranges> ranges_;
 
         constexpr auto clear() noexcept -> void { size_ = 0; }
         [[nodiscard]] constexpr auto empty() const noexcept -> bool { return size_ == 0; }
@@ -397,12 +398,13 @@ private:
         return offset <= end_ && length <= end_ - offset;
     }
 
-    std::array<std::byte, Capacity> bytes_ {};
-    range_set sent_ {};
-    range_set acked_ {};
-    range_set lost_ {};
+    range_set sent_;
+    range_set acked_;
+    range_set lost_;
     std::uint64_t base_ {0};
     std::uint64_t end_ {0};
+    // Last and uninitialized: only queued bytes are read.
+    std::array<std::byte, Capacity> bytes_;
 };
 
 } // namespace eventloop::quic::detail

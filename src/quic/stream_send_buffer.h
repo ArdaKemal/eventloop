@@ -275,12 +275,12 @@ private:
                    : stream_send_error::invalid_range;
     }
 
-    crypto_send_buffer<Capacity> bytes_ {};
     std::uint64_t flow_limit_ {0};
     std::optional<std::uint64_t> final_size_ {};
     bool fin_pending_ {false};
     bool fin_sent_ {false};
     bool fin_acked_ {false};
+    crypto_send_buffer<Capacity> bytes_;
 };
 
 } // namespace eventloop::quic::detail

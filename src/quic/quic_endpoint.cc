@@ -226,6 +226,9 @@ public:
     };
 
     struct slot {
+        // User-provided, so the slot vector does not zero-fill every reserved
+        // connection; each connection's storage is touched when it is used.
+        slot() noexcept {}
         implementation* owner {nullptr};
         bool occupied {false};
         bool accepted {false};
@@ -951,13 +954,17 @@ auto accept_stream(event_loop&, quic_endpoint::implementation& impl,
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         const auto peer_role = impl.client_mode()
             ? stream_role::server : stream_role::client;
-        for (auto* candidate_ptr : slot.connection->active_slots()) {
-            auto& candidate = *candidate_ptr;
-            if (!candidate.occupied || stream_initiator(candidate.id) != peer_role)
-                continue;
-            if (candidate.accepted) continue;
-            candidate.accepted = true;
-            co_return candidate.id;
+        // Oldest stream first: reused low slots must not overtake streams
+        // the peer opened earlier.
+        quic::detail::bounded_connection::stream_slot* oldest = nullptr;
+        for (auto* candidate : slot.connection->active_slots()) {
+            if (!candidate->occupied || candidate->accepted ||
+                stream_initiator(candidate->id) != peer_role) continue;
+            if (oldest == nullptr || candidate->id < oldest->id) oldest = candidate;
+        }
+        if (oldest != nullptr) {
+            oldest->accepted = true;
+            co_return oldest->id;
         }
         if (slot.closing) co_return std::unexpected(make_error_code(quic_errc::peer_closed));
         if (!co_await notify(impl, slot_index + 1))

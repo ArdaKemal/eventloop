@@ -19,17 +19,24 @@ to it as described there.
 | Capacity | Default / limit |
 | --- | --- |
 | `http::server_options::connection_capacity` | 8; 1..256 |
-| `request_capacity` | 0 selects four scratch buffers per connection; explicit 1..8192 |
+| `request_capacity` | 0 selects ten scratch buffers per connection; explicit 1..8192 |
 | Peer active bidirectional / unidirectional streams | 32 / 8 per connection |
 | Reusable stream-task slots | 40 per connection |
 | Request header block / decoded fields | 16 KiB / 128 |
 | QPACK dynamic table | Disabled |
-| `max_udp_payload_size` | 1472; clamped to 1200..8192, negotiated down to peer limit |
+| `max_udp_payload_size` | 8192; clamped to 1200..8192, negotiated down to peer limit; reached by path MTU probing ([QUIC](quic.md#socket-and-path-mtu)) |
 
 Startup allocates endpoint routes/state/waiters/handles proportional to
-connection capacity, plus about 52 KiB per request scratch buffer. Excess
-connections are rejected. Full scratch pool or request-frame exhaustion sends
-H3_REQUEST_REJECTED only on that request; the connection continues. Scratch
+connection capacity, plus about 52 KiB per request scratch buffer. Connection
+slots (about 2.3 MiB each) and scratch buffers are reserved but not written at
+startup beyond a scratch buffer's first page, so resident memory grows with the
+connections and requests actually served (about 15 MiB idle at 64 connections
+and 640 buffers, measured on Linux). Excess
+connections are rejected. When the scratch pool is full, a connection waits
+for a buffer before accepting its next stream, in request order across
+connections; later streams wait in QUIC's bounded buffers. Request-frame
+exhaustion sends H3_REQUEST_REJECTED only on that request; the connection
+continues. Scratch
 stays held until the request ends, reading stops, or failure. Connection-frame
 exhaustion rejects that connection without stopping the listener; peer
 unidirectional-frame exhaustion closes it with H3_INTERNAL_ERROR.
