@@ -5,6 +5,7 @@
 #include "ip_endpoint_native.h"
 
 #include <mswsock.h>
+#include <mstcpip.h>
 #include <cerrno>
 #include <io.h>
 #include <limits>
@@ -355,7 +356,16 @@ auto socket_operations::create_stream(ip_endpoint endpoint) -> native_socket
 auto socket_operations::create_listener(ip_endpoint endpoint) -> native_socket
 { return create(socket_family(endpoint), SOCK_STREAM, 0); }
 auto socket_operations::create_datagram(ip_endpoint endpoint) -> native_socket
-{ return create(socket_family(endpoint), SOCK_DGRAM, 0); }
+{
+    const auto socket = create(socket_family(endpoint), SOCK_DGRAM, 0);
+    // Otherwise an ICMP port unreachable for an earlier send fails the next
+    // receive with WSAECONNRESET, which closes a QUIC server's whole endpoint.
+    BOOL report = FALSE;
+    DWORD bytes = 0;
+    (void)::WSAIoctl(static_cast<SOCKET>(socket), SIO_UDP_CONNRESET, &report, sizeof(report),
+                     nullptr, 0, &bytes, nullptr, nullptr);
+    return socket;
+}
 
 auto socket_operations::prepare_listener(native_socket socket,
                                          ip_endpoint endpoint,

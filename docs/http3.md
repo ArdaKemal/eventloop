@@ -38,7 +38,9 @@ Static headers/I/O use scratch; listings and OpenSSL may allocate separately.
 Request frames use the 2048-byte class: size
 `event_loop_options::coroutine_frame_capacities` for concurrency, as examples do.
 Handshake datagrams stay bounded at 1200 bytes; path MTU discovery is absent, so lower
-application payloads for constrained paths.
+application payloads for constrained paths. Before address validation the server builds
+a packet only when its remaining 3x anti-amplification credit covers a full datagram,
+and pads only ack-eliciting Initials.
 
 ## Routed bodies and responses
 

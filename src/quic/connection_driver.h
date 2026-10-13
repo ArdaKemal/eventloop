@@ -14,6 +14,7 @@ namespace eventloop::quic::detail {
 class connection_driver {
 public:
     static constexpr std::size_t queue_capacity = 16;
+    static_assert(queue_capacity >= 2 * udp_endpoint::receive_burst);
     static constexpr std::size_t packet_capacity = bounded_connection::datagram_buffer_size;
     connection_driver(event_loop& loop, udp_endpoint& endpoint, bounded_connection& connection,
         std::span<const std::uint8_t> local_cid, std::span<const std::uint8_t> peer_cid,
@@ -76,12 +77,14 @@ public:
         if (scheduler_.pending()) return std::unexpected(key_update_error::invalid_input);
         const auto pto = connection_.application_pto();
         if (!pto) return std::unexpected(key_update_error::handshake_not_confirmed);
-        return connection_.core().initiate_key_update(lifecycle_time_point::clock::now(), *pto);
+        const auto result=connection_.core().initiate_key_update(lifecycle_time_point::clock::now(), *pto);
+        notify();
+        return result;
     }
     [[nodiscard]] auto run() -> task<std::expected<void,connection_error>> { return pump(loop_,*this); }
     [[nodiscard]] auto dropped_packets() const noexcept -> std::size_t { return dropped_; }
-    // Internal frame-local wait; bounded polling covers idle/recovery work,
-    // while notify() can advance it without inline resume.
+    // Internal frame-local wait until a deadline (1 ms by default); notify()
+    // advances it without inline resume.
     class idle_wait {
     public:
         explicit idle_wait(connection_driver& driver,
@@ -118,18 +121,15 @@ public:
         }
         [[nodiscard]] auto await_resume() noexcept -> bool
         { driver_.idle_=nullptr; driver_.work_pending_=false; return !cancelled_; }
+        // Resume from the loop's FIFO wakeup queue: the endpoint's receive
+        // loop queues itself there between bursts, behind woken drivers.
         auto wake() noexcept -> void
         {
             if (signalled_) return;
             signalled_=true;
-            auto* cancellation=timer_.cancellation.state;
             eventloop::detail::coroutine_frame_access::cancel_timer(timer_);
-            timer_.deadline=event_loop::clock::now();
-            timer_.owner=&driver_.loop_;
-            if (!eventloop::detail::coroutine_frame_access::attach_cancellation(*cancellation,timer_.cancellation))
-                cancelled_=true;
-            try { eventloop::detail::coroutine_frame_access::register_timer(driver_.loop_,timer_); }
-            catch (...) { std::terminate(); }
+            node_.handle=timer_.handle;
+            eventloop::detail::coroutine_frame_access::schedule_wakeup(driver_.loop_,node_);
         }
     private:
         static auto cancel(eventloop::detail::coroutine_cancellation_node& node) noexcept -> void
@@ -141,6 +141,7 @@ public:
         }
         connection_driver& driver_;
         eventloop::detail::coroutine_timer_node timer_;
+        eventloop::detail::wakeup_node node_;
         bool cancelled_ {},signalled_ {};
     };
 private:
@@ -250,10 +251,17 @@ private:
                     } else if (frame->type==0x1b) {
                         path_challenge token;
                         std::copy(frame->data.begin(),frame->data.end(),token.begin());
+                        const auto previous=endpoint_.router().peer(route_);
                         if (endpoint_.router().accept_path_response(route_,token)) {
                             candidate_challenge_active_=false;
                             candidate_attempts_=0;
                             connection_.recovery().set_peer_address_validated(true);
+                            // A new address, not only a new port, is a new path
+                            // with its own RTT and congestion (RFC 9000 9.4).
+                            const auto current=endpoint_.router().peer(route_);
+                            if (previous && current && !same_address(*previous,*current) &&
+                                !connection_.recovery().reset_path_recovery(connection_.send_datagram_size()))
+                                return std::unexpected(connection_error::invalid_state);
                         }
                     }
                     cursor+=frame->encoded_size;
@@ -263,9 +271,34 @@ private:
                 if (received->kind==packet_kind::handshake) (void)endpoint_.router().validate_peer(route_);
             }
             if (!connection_.core().poll(now,std::chrono::seconds(1))) return std::unexpected(connection_error::invalid_state);
+            // RFC 9002 6.2.2.1: a server that cannot send a full datagram must
+            // not arm PTO until client datagrams restore credit. A client keeps
+            // an anti-deadlock PTO before address validation, at the highest
+            // handshake level keyed, even with nothing in flight.
+            if (connection_.role()==endpoint_role::server) {
+                connection_.recovery().set_pto_blocked(
+                    endpoint_.send_credit(route_)<scheduler_.datagram_limit(tls_level::initial));
+            } else {
+                const auto& core=connection_.core();
+                const std::uint8_t keyed=core.keys_available(tls_level::handshake,tls_direction::write) ? 2 :
+                    core.keys_available(tls_level::initial,tls_direction::write) ? 1 : 0;
+                if (keyed>client_probe_keyed_) {
+                    (void)connection_.recovery().configure_client_handshake_probe(keyed==2 ?
+                        packet_number_space::handshake : packet_number_space::initial,now);
+                    client_probe_keyed_=keyed;
+                }
+            }
             const auto timeout=connection_.on_timeout(now);
             if (!timeout) return std::unexpected(timeout.error());
-            if (timeout->probe_space) { probe_level_=static_cast<tls_level>(*timeout->probe_space); probes_=timeout->probe_count; }
+            if (timeout->probe_space) {
+                probe_level_=static_cast<tls_level>(*timeout->probe_space); probes_=timeout->probe_count;
+                scheduler_.begin_probes();
+                // Initial wins a PTO tie with Handshake; probe Handshake too
+                // rather than wait for its own backed-off PTO (RFC 9002 6.2.4).
+                handshake_probe_=probe_level_==tls_level::initial &&
+                    !connection_.core().level_discarded(tls_level::handshake) &&
+                    connection_.core().keys_available(tls_level::handshake,tls_direction::write);
+            }
             if (!synchronize_candidate(now))
                 return std::unexpected(connection_error::provider_failure);
             if (endpoint_.router().role()==path_endpoint_role::server && connection_.core().handshake_confirmed() && !handshake_done_) {
@@ -291,12 +324,14 @@ private:
         if (level != tls_level::application) fields.source_cid={local_.data(),local_size_};
         return scheduler_.prepare(level,fields,now,output,build_scratch_,probe);
     }
-    [[nodiscard]] static auto same_peer(const ip_endpoint& a,const ip_endpoint& b) noexcept -> bool
+    [[nodiscard]] static auto same_address(const ip_endpoint& a,const ip_endpoint& b) noexcept -> bool
     {
         const auto length=a.address_family==ip_endpoint::family::ipv4?4:16;
-        return a.address_family==b.address_family&&a.port==b.port&&a.scope_id==b.scope_id&&
+        return a.address_family==b.address_family&&a.scope_id==b.scope_id&&
             std::equal(a.address.begin(),a.address.begin()+length,b.address.begin());
     }
+    [[nodiscard]] static auto same_peer(const ip_endpoint& a,const ip_endpoint& b) noexcept -> bool
+    { return same_address(a,b)&&a.port==b.port; }
     auto queue_path_response(std::span<const std::byte> bytes,ip_endpoint peer) noexcept -> bool
     {
         for (auto& job:path_responses_) if (!job.occupied) {
@@ -347,6 +382,21 @@ private:
         if (!self.connection_.record_sent(tls_level::application,packet,{}))
             co_return std::unexpected(connection_error::invalid_state);
         co_return true;
+    }
+    // Sleep until the earliest timer the connection owns: loss or PTO alarm,
+    // idle or key-retirement deadline (tick polls lifecycle with a 1 s PTO),
+    // path probe, or a short retry. Datagrams, application operations and
+    // close requests wake the pump through notify().
+    auto next_wake(lifecycle_time_point now,bool retry) noexcept -> event_loop::clock::time_point
+    {
+        auto deadline=connection_.core().next_deadline(std::chrono::seconds(1))
+            .value_or(lifecycle_time_point::max());
+        if (const auto alarm=connection_.recovery().next_alarm()) deadline=std::min(deadline,alarm->deadline);
+        if (candidate_challenge_active_) deadline=std::min(deadline,candidate_probe_due_);
+        const auto soon=now+std::chrono::milliseconds(1);
+        if (retry) deadline=std::min(deadline,soon);
+        // A deadline that passed yet stays armed degrades to polling, not spinning.
+        return deadline<=now ? soon : deadline;
     }
     auto synchronize_candidate(lifecycle_time_point now) noexcept -> bool
     {
@@ -500,12 +550,21 @@ private:
             // receive-queue headroom and yield before sending more.
             constexpr std::size_t burst_capacity=queue_capacity-2;
             std::size_t transmitted=0;
-            bool stop_sending=false;
+            // A refused socket send or a waiting PATH_RESPONSE retries soon;
+            // nothing else notifies the pump about them.
+            bool stop_sending=false,retry=false;
             for (const auto level : {tls_level::initial,tls_level::handshake,tls_level::application}) {
                 if (stop_sending) break;
                 if (!self.connection_.core().keys_available(level,tls_direction::write)) continue;
                 while (transmitted<burst_capacity) {
-                    const bool probe=self.probes_ && self.probe_level_==level;
+                    // Build only what the flush may send (RFC 9000 8.1); a
+                    // packet refused there would be recorded but never sent.
+                    if (self.endpoint_.send_credit(self.route_)<self.scheduler_.datagram_limit(level)) {
+                        stop_sending=true;
+                        break;
+                    }
+                    const bool probe=(self.probes_ && self.probe_level_==level) ||
+                        (level==tls_level::handshake && self.handshake_probe_);
                     // Build the packet directly into the offload batch; a
                     // later loss recovers any datagram the provider drops.
                     const auto reserved_error=self.endpoint_.reserve_send(
@@ -523,14 +582,15 @@ private:
                     const auto committed_error=self.endpoint_.commit_send(*prepared);
                     const auto completed=self.scheduler_.complete(true,now);
                     if (!completed) co_return std::unexpected(completed.error());
-                    if (probe) --self.probes_;
+                    if (probe && self.probe_level_==level) --self.probes_;
+                    else if (probe) self.handshake_probe_=false;
                     ++transmitted;
                     const auto error=reserved_error?reserved_error:committed_error;
                     if (error) {
                         const auto value=error.value();
                         if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY)
                             co_return std::unexpected(connection_error::provider_failure);
-                        stop_sending=true;
+                        stop_sending=retry=true;
                         break;
                     }
                 }
@@ -539,13 +599,15 @@ private:
                 const auto value=flushed.value();
                 if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY)
                     co_return std::unexpected(connection_error::provider_failure);
+                retry=true;
             }
+            for (const auto& job:self.path_responses_) retry|=job.occupied;
             if (self.progress_) self.progress_(self.progress_argument_);
             // A progress callback can make more application data ready, and
             // yielded socket receivers can supply ACKs/credit. Give them a
             // turn before deciding that this connection needs a timed retry.
             if (transmitted && co_await yield(loop)) continue;
-            if (!co_await idle_wait(self)) break;
+            if (!co_await idle_wait(self,self.next_wake(now,retry))) break;
         }
         co_return std::expected<void,connection_error>{};
     }
@@ -579,6 +641,7 @@ private:
         fields.destination_cid={self.peer_.data(),self.peer_size_};
         if (*level!=tls_level::application) fields.source_cid={self.local_.data(),self.local_size_};
         if (*level==tls_level::initial) fields.token=self.initial_token_;
+        fields.packet_number_length=core.packet_number_length(*level);
         // The receive scratch is idle once the pump has stopped.
         const auto payload=std::as_writable_bytes(std::span(self.packet_scratch_));
         const auto encoded=encode_frame(frame,payload);
@@ -624,6 +687,8 @@ private:
     std::uint8_t candidate_attempts_{};
     tls_level probe_level_{};
     std::uint8_t probes_{};
+    std::uint8_t client_probe_keyed_{};
+    bool handshake_probe_{};
     // Requested CONNECTION_CLOSE frame type and error code.
     std::optional<std::pair<std::uint64_t,std::uint64_t>> close_frame_{};
     std::optional<connection_error> failure_{};

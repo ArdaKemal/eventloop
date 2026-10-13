@@ -41,22 +41,23 @@ auto insertion_and_capacity() -> void
     constexpr std::array initial {ack_range {10, 10}, ack_range {7, 7},
                                   ack_range {3, 3}};
     expect_ranges(received, initial);
-    check(received.insert(5).error() ==
-              received_packet_error::capacity_exhausted,
-          "reject fourth disjoint range");
-    check(received.largest_received() == 10,
-          "failed insertion does not advance largest received");
-    expect_ranges(received, initial);
+    check(received.insert(5) == true && received.minimum_acceptable() == 4,
+          "fourth disjoint range evicts the oldest");
+    constexpr std::array evicted {ack_range {10, 10}, ack_range {7, 7},
+                                  ack_range {5, 5}};
+    expect_ranges(received, evicted);
+    check(received.insert(3).error() == received_packet_error::retired_packet_number,
+          "evicted packets count as retired");
     check(received.insert(7) == false, "duplicate at capacity");
     check(received.insert(8) == true && received.insert(9) == true,
           "adjacent packets merge higher ranges at capacity");
-    constexpr std::array merged {ack_range {7, 10}, ack_range {3, 3}};
+    constexpr std::array merged {ack_range {7, 10}, ack_range {5, 5}};
     expect_ranges(received, merged);
-    check(received.insert(5) == true && received.insert(4) == true &&
-          received.insert(6) == true, "join below and bridge ranges");
-    constexpr std::array bridged {ack_range {3, 10}};
+    check(received.insert(4) == true && received.insert(6) == true,
+          "join below and bridge ranges");
+    constexpr std::array bridged {ack_range {4, 10}};
     expect_ranges(received, bridged);
-    check(received.insert(4) == false, "interior duplicate");
+    check(received.insert(5) == false, "interior duplicate");
     check(received.insert(max_varint_value + 1).error() ==
               received_packet_error::invalid_packet_number,
           "reject out-of-range packet number");
@@ -265,14 +266,17 @@ auto highest_at_capacity() -> void
     received_packet_ranges<2> received;
     check(received.insert(10) == true && received.insert(7) == true,
           "full capacity setup");
-    check(received.insert(20).error() ==
-              received_packet_error::capacity_exhausted &&
-          received.largest_received() == 10,
-          "rejected highest packet does not advance history");
-    check(received.retire_through(20).error() ==
-              received_packet_error::invalid_retirement,
-          "cannot retire beyond largest successfully received");
-    check(received.insert(11) == true && received.largest_received() == 11,
+    check(received.insert(20) == true && received.largest_received() == 20 &&
+          received.minimum_acceptable() == 8,
+          "new highest packet evicts the oldest range");
+    check(received.insert(15) == true && received.minimum_acceptable() == 11,
+          "each new disjoint range evicts the next oldest");
+    check(received.insert(12).error() == received_packet_error::retired_packet_number &&
+          received.largest_received() == 20,
+          "a packet older than every range is refused at capacity");
+    check(received.retire_through(10) == false,
+          "retiring an evicted range is a stale no-op");
+    check(received.insert(21) == true && received.largest_received() == 21,
           "adjacent highest packet succeeds at full capacity");
 }
 

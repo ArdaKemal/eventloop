@@ -76,6 +76,11 @@ public:
         return true;
     }
 
+    // Until the peer's parameters arrive, the local value bounds the
+    // handshake (RFC 9000 10.1); negotiation replaces it.
+    constexpr auto set_local_idle_timeout(lifecycle_duration local) noexcept -> void
+    { if (live() && local.count() >= 0) idle_timeout_ = local; }
+
     [[nodiscard]] constexpr auto handshake_complete(lifecycle_time_point now)
         noexcept -> bool
     {

@@ -125,6 +125,8 @@ public:
     { check_owner(); return registry_; }
     [[nodiscard]] auto flow() const noexcept -> const flow_control<stream_capacity>&
     { check_owner(); return flow_; }
+    [[nodiscard]] auto role() const noexcept -> endpoint_role
+    { check_owner(); return role_; }
     [[nodiscard]] auto send_datagram_size() const noexcept -> std::size_t
     { check_owner(); return send_datagram_size_; }
     [[nodiscard]] auto recovery() noexcept -> recovery_orchestration<packet_capacity>&
@@ -156,7 +158,7 @@ public:
         check_owner();
         const auto promoted = path_recovery_.promote_candidate();
         if (!promoted) return promoted;
-        if (!recovery_.reset_path_recovery(1200))
+        if (!recovery_.reset_path_recovery(send_datagram_size_))
             return std::unexpected(path_recovery_error::invalid_datagram_size);
         return {};
     }
@@ -563,7 +565,7 @@ private:
         const auto local_cap = std::clamp<std::uint64_t>(self.local_.udp_payload, 1200, buffer_cap);
         const auto peer_cap = std::clamp<std::uint64_t>(self.peer_.udp_payload, 1200, buffer_cap);
         self.send_datagram_size_ = static_cast<std::size_t>(std::min(local_cap, peer_cap));
-        if (!self.recovery_.reset(self.send_datagram_size_)) return false;
+        if (!self.recovery_.increase_max_datagram_size(self.send_datagram_size_)) return false;
         self.outgoing_datagrams_.reset(self.peer_.datagram);
         self.recovery_.set_max_ack_delay(std::chrono::milliseconds(self.peer_.ack_delay));
         return self.registry_.set_peer_limit(stream_direction::bidirectional, self.peer_.bidi).has_value() &&
@@ -730,7 +732,9 @@ private:
                 ? INT64_MAX : static_cast<std::int64_t>(frame.ack_delay << peer_.ack_exponent);
             const auto result = recovery_.on_ack(static_cast<packet_number_space>(level), frame,
                 receive_time_, std::chrono::microseconds(us), retired_);
-            return result && retire(result->retired);
+            if (!result || !retire(result->retired)) return false;
+            core_.packet_acknowledged(level, frame.largest_acknowledged);
+            return true;
         }
         if (frame.type >= 8 && frame.type <= 15) {
             auto* s = admit(frame.stream_id);

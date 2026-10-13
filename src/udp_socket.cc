@@ -142,6 +142,8 @@ auto udp_socket::send_batch(std::span<const std::byte> buffer,
         const auto length = std::min(segment_size, buffer.size() - offset);
         const auto result = detail::socket_operations::send_datagram_now(
             descriptor_.get(), buffer.data() + offset, length, destination);
+        // Report the datagrams already sent; the caller accounts for them.
+        if ((result.error || result.pending) && total != 0) return total;
         if (result.error) return std::unexpected(result.error);
         if (result.pending)
             return std::unexpected(

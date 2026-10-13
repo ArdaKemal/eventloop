@@ -129,9 +129,41 @@ auto grease_quic_bit_packets() -> void
     }
 }
 
+// RFC 9000 17.1/A.2: the sender widens packet numbers with the unacknowledged
+// distance, so a receiver that saw nothing since the largest acknowledged
+// packet still decodes them.
+auto packet_number_lengths() -> void
+{
+    static_assert(packet_number_length_for(0, std::nullopt) == 1);
+    static_assert(packet_number_length_for(127, std::nullopt) == 2);
+    static_assert(packet_number_length_for(0xac5c02, 0xabe8b3) == 2);
+    static_assert(packet_number_length_for(0xace8fe, 0xabe8b3) == 3);
+    static_assert(packet_number_length_for(0x50000000, 0) == 4);
+    const std::array<std::uint8_t, 4> cid {1, 2, 3, 4};
+    const std::array<std::uint8_t, 3> ping {1, 0, 0};
+    std::array<std::uint8_t, 128> packet {}, scratch {}, plaintext {};
+    const std::array<std::uint8_t, 32> secret {};
+    const auto keys = derive_aes_128_gcm_keys(version_1, secret);
+    CHECK(keys);
+    // A one-byte encoding of 300 decodes to 44 for a receiver at 0.
+    for (const std::uint64_t number : {300u, 70000u}) {
+        protected_packet_fields fields;
+        fields.kind = packet_kind::short_header;
+        fields.destination_cid = cid;
+        fields.packet_number = number;
+        fields.packet_number_length = packet_number_length_for(number, 0);
+        const auto size = build_protected_packet(fields, *keys, ping, packet, scratch);
+        CHECK(size);
+        const auto opened = open_protected_packet(std::span(packet).first(*size), 0,
+            cid.size(), version_1, *keys, 0, scratch, plaintext);
+        CHECK(opened && opened->packet_number == number);
+    }
+}
+
 int main()
 {
     grease_quic_bit_packets();
+    packet_number_lengths();
     const auto dcid = hex("8394c8f03e515708");
     const auto initial = derive_initial_secrets(version_1, dcid);
     CHECK(initial);

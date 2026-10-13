@@ -3,6 +3,7 @@
 #include "quic/packet_header.h"
 #include "quic/packet_protection.h"
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -55,6 +56,17 @@ struct opened_protected_packet {
 // placed before plaintext so a trailing lengthless STREAM frame keeps its
 // exact data. All plaintext/CID/token inputs, output, and scratch must be
 // pairwise disjoint.
+// RFC 9000 17.1 and A.2: bytes needed to encode `number` so a receiver whose
+// largest received number is at least `largest_acknowledged` decodes it.
+[[nodiscard]] constexpr auto packet_number_length_for(std::uint64_t number,
+    std::optional<std::uint64_t> largest_acknowledged) noexcept -> std::uint8_t
+{
+    const auto unacknowledged = largest_acknowledged && *largest_acknowledged < number
+        ? number - *largest_acknowledged : number + 1;
+    const auto bits = static_cast<std::size_t>(std::bit_width(unacknowledged)) + 1;
+    return static_cast<std::uint8_t>(bits > 24 ? 4 : (bits + 7) / 8);
+}
+
 [[nodiscard]] auto build_protected_packet(
     const protected_packet_fields& fields, const aes_128_gcm_keys& keys,
     std::span<const std::uint8_t> plaintext,

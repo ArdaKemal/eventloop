@@ -373,6 +373,64 @@ auto control_scenario(const std::filesystem::path& certificate) -> bool
     return true;
 }
 
+// A pending read on an idle connection resumes as soon as it is cancelled:
+// the driver sleeps until its next deadline, so nothing else would wake it.
+struct cancel_outcome {
+    bool cancelled {false};
+    event_loop::clock::duration elapsed {};
+};
+
+auto cancel_server(event_loop&, quic_endpoint& server) -> task<void>
+{
+    auto accepted = flatten_result(co_await server.async_accept());
+    if (!accepted) co_return;
+    auto connection = std::move(*accepted);
+    (void)co_await connection.async_accept_stream();
+}
+
+auto cancel_client(event_loop& loop, quic_endpoint& server, quic_endpoint& client,
+                   cancel_outcome& result) -> task<void>
+{
+    auto connected = flatten_result(co_await client.async_connect(server.local_endpoint(), "localhost"));
+    if (connected) {
+        auto connection = std::move(*connected);
+        const auto id = flatten_result(co_await connection.async_open_stream(
+            quic_stream_direction::bidirectional));
+        std::array<std::byte, 8> buffer {};
+        const auto started = event_loop::clock::now();
+        const auto read = id ? co_await with_timeout(loop, connection.async_read(*id, buffer), 20ms)
+                             : std::expected<timeout_result<std::expected<std::size_t, std::error_code>>,
+                                             task_result> {};
+        result.elapsed = event_loop::clock::now() - started;
+        result.cancelled = read && read->state ==
+            timeout_result<std::expected<std::size_t, std::error_code>>::outcome::timed_out;
+    }
+    co_await server.async_close();
+    co_await client.async_close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto cancel_scenario(const std::filesystem::path& certificate) -> bool
+{
+    event_loop loop;
+    quic_server_options server_options;
+    server_options.certificate_chain = certificate / "cert.pem";
+    server_options.private_key = certificate / "key.pem";
+    server_options.alpn = protocol;
+    quic_client_options client_options;
+    client_options.alpn = protocol;
+    client_options.trusted_ca = certificate / "cert.pem";
+    quic_endpoint server(loop, ip_endpoint::loopback_v4(0), std::move(server_options));
+    quic_endpoint client(loop, ip_endpoint::loopback_v4(0), std::move(client_options));
+    cancel_outcome result;
+    check(loop.spawn(cancel_server(loop, server)) == task_spawn_result::accepted,
+          "spawn cancel server");
+    check(loop.spawn(cancel_client(loop, server, client, result)) == task_spawn_result::accepted,
+          "spawn cancel client");
+    (void)loop.run();
+    return result.cancelled && result.elapsed < std::chrono::milliseconds(500);
+}
+
 // Closing the server endpoint sends CONNECTION_CLOSE (NO_ERROR) on every
 // connection before the socket closes, so peers do not wait for idle timeout.
 struct shutdown_outcome {
@@ -1022,6 +1080,7 @@ auto main() -> int
     const bool small_v1 = scenario(quic_version::v1, directory, true);
     const bool small_v2 = scenario(quic_version::v2, directory, true);
     const bool control = control_scenario(directory);
+    const bool cancel = cancel_scenario(directory);
     const bool shutdown = shutdown_scenario(directory);
     const bool indexed = worker_index_scenario(directory);
     const bool http3_indexed = http3_worker_index_scenario(directory);
@@ -1045,6 +1104,7 @@ auto main() -> int
     check(small_v1, "QUIC v1 small receive windows");
     check(small_v2, "QUIC v2 small receive windows");
     check(control, "QUIC stream control and application close");
+    check(cancel, "QUIC cancelled read on an idle connection resumes promptly");
     check(shutdown, "QUIC endpoint close notifies peers");
     check(indexed, "QUIC worker index in connection IDs");
     check(http3_indexed, "HTTP/3 worker index in connection IDs");

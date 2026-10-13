@@ -221,6 +221,13 @@ public:
         return {};
     }
 
+    // Remaining anti-amplification credit on the connection's current path.
+    [[nodiscard]] auto send_credit(endpoint_connection handle) const -> std::uint64_t
+    {
+        check_owner();
+        return paths_.send_credit(handle);
+    }
+
     [[nodiscard]] auto begin_send_to(endpoint_connection handle, std::size_t bytes,
         bool candidate) -> std::expected<ip_endpoint, endpoint_error>
     {

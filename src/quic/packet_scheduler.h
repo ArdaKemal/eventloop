@@ -20,6 +20,17 @@ public:
     ~packet_scheduler() { connection_.set_retirement_observer(nullptr, nullptr); }
     packet_scheduler(const packet_scheduler&) = delete;
     auto operator=(const packet_scheduler&) -> packet_scheduler& = delete;
+    // Application packets may use the negotiated datagram size; handshake
+    // packets stay at the QUIC minimum so anti-amplification is unaffected.
+    [[nodiscard]] auto datagram_limit(tls_level level) const noexcept -> std::size_t
+    {
+        return level == tls_level::application
+            ? std::clamp<std::size_t>(connection_.send_datagram_size(), 1200, maximum_datagram)
+            : std::size_t {1200};
+    }
+    // Each PTO's probes start from the oldest unacknowledged CRYPTO data and
+    // continue past one another (RFC 9002 6.2.4).
+    auto begin_probes() noexcept -> void { probe_next_ = {}; }
     auto request_ack(tls_level level) noexcept -> void
     { if (static_cast<std::size_t>(level) < 3) ++ack_pending_[static_cast<std::size_t>(level)]; }
     // Control frames are copied and bounded. The connection retirement
@@ -65,17 +76,14 @@ public:
             }
         }
         const auto index = static_cast<std::size_t>(level);
-        // Application packets may use the negotiated datagram size; handshake
-        // packets stay at the QUIC minimum so anti-amplification is unaffected.
-        const auto datagram_limit = std::clamp<std::size_t>(
-            connection_.send_datagram_size(), 1200, maximum_datagram);
-        const auto level_max = level == tls_level::application ? datagram_limit : std::size_t {1200};
-        if (index >= 3 || output.size() < level_max)
+        if (index >= 3) return std::unexpected(connection_error::output_too_small);
+        const auto level_max = datagram_limit(level);
+        if (output.size() < level_max)
             return std::unexpected(connection_error::output_too_small);
         fields.kind = level == tls_level::initial ? packet_kind::initial :
             level == tls_level::handshake ? packet_kind::handshake : packet_kind::short_header;
-        payload_limit_ = level == tls_level::application && datagram_limit > 100
-            ? datagram_limit - 100 : payload_limit;
+        fields.packet_number_length = connection_.core().packet_number_length(level);
+        payload_limit_ = level == tls_level::application ? level_max - 100 : payload_limit;
         if (level == tls_level::initial) {
             // Retry tokens consume Initial wire space. Split CRYPTO across
             // packets rather than selecting a chunk that cannot fit afterward.
@@ -90,10 +98,11 @@ public:
         ack_generation_ = ack_pending_[index]; used_ = range_count_ = control_count_ = 0;
         datagram_ = false; ack_ = false; acknowledged_peer_update_.reset();
         bool eliciting = false;
+        std::size_t ack_size = 0;
         if (ack_pending_[index]) {
             const auto ack = connection_.core().make_ack(level, 0, ack_storage_);
             if (ack && append(*ack)) {
-                ack_ = true; ack_largest_ = ack->largest_acknowledged;
+                ack_ = true; ack_largest_ = ack->largest_acknowledged; ack_size = used_;
                 const auto peer_update = connection_.core().peer_update_packet();
                 if (peer_update && covers(*ack, *peer_update))
                     acknowledged_peer_update_ = peer_update;
@@ -108,8 +117,12 @@ public:
         }
         };
         if (!probe) append_controls();
-        auto crypto = probe ? connection_.core().next_crypto_probe(level, remaining()) : crypto_send_chunk{};
+        // Probes prefer unprobed outstanding data, then new data, then the
+        // oldest outstanding data again.
+        auto crypto = probe ? connection_.core().next_crypto_probe(level, remaining(), probe_next_[index])
+            : crypto_send_chunk{};
         if (crypto.data.empty()) crypto = connection_.core().next_crypto(level, remaining());
+        if (crypto.data.empty() && probe) crypto = connection_.core().next_crypto_probe(level, remaining());
         if (!crypto.data.empty()) {
             decoded_frame frame; frame.type = 6; frame.offset = crypto.offset; frame.data = crypto.data;
             if (append(frame)) {
@@ -173,26 +186,36 @@ public:
         else if (probe) append_controls();
         if (probe && !eliciting) { decoded_frame ping; ping.type = 1; if (append(ping)) eliciting = true; }
         if (!used_) return std::unexpected(connection_error::invalid_state);
-        if (level == tls_level::initial) {
-            const auto overhead = 7 + fields.destination_cid.size() + fields.source_cid.size() +
-                varint_size(fields.token.size()) + fields.token.size() + 2 + fields.packet_number_length + 16;
-            if (overhead > level_max || used_ > level_max - overhead)
-                return std::unexpected(connection_error::output_too_small);
-            std::fill(payload_.begin() + used_, payload_.begin() + level_max - overhead, std::byte{});
-            used_ = level_max - overhead;
-        }
-        const auto size = connection_.core().build(fields,
-            {reinterpret_cast<const std::uint8_t*>(payload_.data()),used_}, output.first(level_max), scratch);
-        if (!size) return std::unexpected(size.error());
-        packet_ = {*number,now,eliciting,eliciting || level == tls_level::initial,*size};
-        const auto preview = connection_.preflight_sent(level, packet_, probe);
-        if (!preview) {
+        for (;;) {
+            // Clients pad every Initial datagram, servers only ack-eliciting
+            // ones (RFC 9000 14.1); padding an ACK spends amplification credit.
+            const bool padded = level == tls_level::initial &&
+                (eliciting || connection_.role() == endpoint_role::client);
+            if (padded) {
+                const auto overhead = 7 + fields.destination_cid.size() + fields.source_cid.size() +
+                    varint_size(fields.token.size()) + fields.token.size() + 2 + fields.packet_number_length + 16;
+                if (overhead > level_max || used_ > level_max - overhead)
+                    return std::unexpected(connection_error::output_too_small);
+                std::fill(payload_.begin() + used_, payload_.begin() + level_max - overhead, std::byte{});
+                used_ = level_max - overhead;
+            }
+            const auto size = connection_.core().build(fields,
+                {reinterpret_cast<const std::uint8_t*>(payload_.data()),used_}, output.first(level_max), scratch);
+            if (!size) return std::unexpected(size.error());
+            packet_ = {*number,now,eliciting,eliciting || padded,*size};
+            const auto preview = connection_.preflight_sent(level, packet_, probe);
+            if (preview) {
+                pending_ = true; level_ = level; probe_ = probe;
+                return *size;
+            }
             // A refused packet is never sent; reuse its PN for the next one.
             connection_.core().unbuild(level);
-            return std::unexpected(preview.error());
+            // A full congestion window must not hold back a pending ACK
+            // (RFC 9002 7): retry with the ACK alone, outside bytes in flight.
+            if (!ack_ || !eliciting || probe) return std::unexpected(preview.error());
+            used_ = ack_size; range_count_ = control_count_ = 0;
+            datagram_ = false; eliciting = false;
         }
-        pending_ = true; level_ = level; probe_ = probe;
-        return *size;
     }
     [[nodiscard]] auto complete(bool sent, lifecycle_time_point now)
         -> std::expected<void, connection_error>
@@ -200,6 +223,9 @@ public:
         if (!pending_) return std::unexpected(connection_error::invalid_state);
         pending_ = false;
         if (!sent) return {};
+        if (probe_)
+            for (std::size_t i = 0; i < range_count_; ++i)
+                if (ranges_[i].crypto) probe_next_[static_cast<std::size_t>(level_)] = ranges_[i].offset + ranges_[i].size;
         packet_.sent_time = now;
         const auto result = connection_.record_sent(level_,packet_,{ranges_.data(),range_count_},probe_,
             {range_slots_.data(),range_count_},
@@ -254,7 +280,7 @@ private:
     std::array<bounded_connection::stream_slot*,bounded_connection::frames_per_packet> range_slots_{};
     std::array<control_slot,16> controls_{};
     std::array<std::size_t,16> control_indices_{};
-    std::array<std::uint64_t,3> ack_pending_{};
+    std::array<std::uint64_t,3> ack_pending_{}, probe_next_{};
     sent_packet packet_{};
     std::size_t used_{},range_count_{},control_count_{};
     std::uint64_t ack_largest_{}, ack_generation_{};

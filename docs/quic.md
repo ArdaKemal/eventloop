@@ -25,6 +25,11 @@ cancellation returns `operation_canceled`.
 storage, possibly partial. Retry remaining bytes; `fin` closes only when the
 whole supplied span is accepted. Borrow the span through completion/cancellation.
 
+Pending operations resume on connection progress or at once on cancellation.
+They share 256 waiters per connection slot; an operation that finds the pool
+full returns `capacity_exceeded`. An idle connection's driver sleeps until its
+next loss, PTO, idle, key-retirement or path-probe deadline.
+
 ## Reset and stop-sending
 
 `reset_stream()`/`stop_sending()` synchronously queue application codes <=2^62-1

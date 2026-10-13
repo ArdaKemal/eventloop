@@ -233,16 +233,23 @@ auto parse_response(std::span<const std::byte> bytes, response_view& view) -> vo
 }
 
 auto send_all(event_loop&, quic_connection& connection, std::uint64_t id,
-              std::span<const std::byte> bytes, bool fin) -> task<bool>
+              std::span<const std::byte> bytes, bool fin) -> task<std::error_code>
 {
     while (!bytes.empty()) {
         const auto sent = flatten_result(co_await connection.async_write(id, bytes, false));
-        if (!sent || *sent == 0) co_return false;
+        if (!sent) co_return sent.error();
+        if (*sent == 0) co_return std::make_error_code(std::errc::io_error);
         bytes = bytes.subspan(*sent);
     }
-    if (fin && !flatten_result(co_await connection.async_write(id, {}, true))) co_return false;
-    co_return true;
+    if (fin) {
+        const auto finished = flatten_result(co_await connection.async_write(id, {}, true));
+        if (!finished) co_return finished.error();
+    }
+    co_return std::error_code {};
 }
+
+auto sent(const std::expected<std::error_code, task_result>& result) -> bool
+{ return result && !*result; }
 
 auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::byte> request,
               const request_spec& spec, response_view& view) -> task<void>
@@ -250,8 +257,11 @@ auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::by
     const auto id = flatten_result(co_await connection.async_open_stream(
         quic_stream_direction::bidirectional));
     check(id.has_value(), "open request stream");
-    check((co_await send_all(loop, connection, *id, request, !spec.wait_continue))
-              .value_or(false), "send request");
+    // The server may answer and stop reading before the whole body is sent
+    // (RFC 9114 4.1.1); the response still arrives.
+    const auto request_sent = co_await send_all(loop, connection, *id, request, !spec.wait_continue);
+    check(sent(request_sent) || (request_sent && *request_sent == quic_errc::stream_reset),
+          "send request");
     std::vector<std::byte> bytes;
     std::array<std::byte, 1024> buffer {};
     if (spec.wait_continue) {
@@ -280,10 +290,10 @@ auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::by
         }
         for (const auto& part : spec.body) {
             const auto frame = data_frame(part);
-            check((co_await send_all(loop, connection, *id, frame, false)).value_or(false),
+            check(sent(co_await send_all(loop, connection, *id, frame, false)),
                   "send body after Continue");
         }
-        check((co_await send_all(loop, connection, *id, {}, true)).value_or(false),
+        check(sent(co_await send_all(loop, connection, *id, {}, true)),
               "finish request after Continue");
     }
     for (;;) {
@@ -306,8 +316,8 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
     const auto control = flatten_result(co_await connection.async_open_stream(
         quic_stream_direction::unidirectional));
     const std::array<std::byte, 3> settings {std::byte {0}, std::byte {4}, std::byte {0}};
-    check(control && (co_await send_all(loop, connection, *control, settings, false))
-              .value_or(false), "client control stream");
+    check(control && sent(co_await send_all(loop, connection, *control, settings, false)),
+          "client control stream");
     for (std::size_t index = 0; index < requests.size(); ++index)
         (void)co_await exchange(loop, connection, std::move(requests[index]), specs[index],
                                responses[index]);

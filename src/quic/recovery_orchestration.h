@@ -101,19 +101,30 @@ public:
     // RFC 9000 Section 9.4: migrating to a new path resets only the
     // path-specific RTT estimator and congestion controller. Packet-number
     // spaces, ACK ranges, sent-packet history, and loss detection remain
-    // connection-wide. Call after path validation promotes a new path.
+    // connection-wide, and packets in flight stay counted. Call after path
+    // validation promotes a new path.
     [[nodiscard]] constexpr auto reset_path_recovery(
         std::size_t max_datagram_size,
         recovery_duration starting_rtt = initial_rtt) noexcept
         -> std::expected<void, recovery_error>
     {
         auto controller = congestion_;
-        if (const auto result = controller.reset(max_datagram_size); !result)
+        if (const auto result = controller.restart(max_datagram_size); !result)
             return std::unexpected(congestion_failure(result.error()));
         congestion_ = controller;
         rtt_.reset(starting_rtt);
         pto_count_ = 0;
         refresh_loss_deadlines();
+        return {};
+    }
+
+    // Apply the negotiated datagram size without discarding packets in
+    // flight or RTT samples taken during the handshake.
+    [[nodiscard]] constexpr auto increase_max_datagram_size(std::size_t size) noexcept
+        -> std::expected<void, recovery_error>
+    {
+        if (const auto result = congestion_.increase_max_datagram_size(size); !result)
+            return std::unexpected(congestion_failure(result.error()));
         return {};
     }
 

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
 using namespace eventloop::quic::detail;
 static auto checked(bool value, int line) -> void
@@ -14,7 +15,8 @@ struct contexts {
     std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> client {SSL_CTX_new(TLS_method()), SSL_CTX_free};
     std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> server {SSL_CTX_new(TLS_method()), SSL_CTX_free};
 
-    contexts()
+    // A large comment extension stands in for a long certificate chain.
+    explicit contexts(std::size_t comment_size = 0)
     {
         check(client && server);
         std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key {
@@ -37,6 +39,13 @@ struct contexts {
             X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
                                const_cast<char*>("DNS:localhost")), X509_EXTENSION_free};
         check(san && X509_add_ext(certificate.get(), san.get(), -1) == 1);
+        if (comment_size) {
+            std::string text(comment_size, 'x');
+            std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> comment {
+                X509V3_EXT_conf_nid(nullptr, nullptr, NID_netscape_comment, text.data()),
+                X509_EXTENSION_free};
+            check(comment && X509_add_ext(certificate.get(), comment.get(), -1) == 1);
+        }
         check(X509_sign(certificate.get(), key.get(), EVP_sha256()) > 0);
         check(SSL_CTX_use_certificate(server.get(), certificate.get()) == 1);
         check(SSL_CTX_use_PrivateKey(server.get(), key.get()) == 1);
@@ -421,6 +430,7 @@ static auto observe(event_loop& loop,bounded_connection& client,bounded_connecti
             id=client.open_stream(stream_direction::bidirectional).value();
             check(client.stream(*id)->send.append(data).has_value());
             check(client.stream(*id)->send.close().has_value());
+            client_driver.notify(); // As the public API does after a write.
         }
         if (id && client.stream(*id)->send.complete()) {
             const auto* stream=server.stream(*id);
@@ -451,6 +461,151 @@ static auto observe(event_loop& loop,bounded_connection& client,bounded_connecti
     check(client_driver.retired() && server_driver.retired());
     loop.shutdown(event_loop::clock::duration::zero());
 }
+// An unvalidated server builds only what its anti-amplification credit lets
+// it send (RFC 9000 8.1): every packet recorded in flight reaches the socket.
+// A burst larger than a connection's receive queue, here 40 copies of the
+// client's Initial datagram sent back to back, reaches the connection whole:
+// the endpoint lets the driver drain between bursts.
+static auto receive_burst(event_loop& loop,connection_driver& driver,bounded_connection& client,
+    udp_endpoint& endpoint,udp_socket& peer,buffers& storage) -> task<void>
+{
+    check(client.core().advance(lifecycle_time_point::clock::now()).has_value());
+    const auto scheduler_storage=std::make_unique<packet_scheduler>(client);
+    protected_packet_fields fields; fields.destination_cid=dcid; fields.source_cid=dcid;
+    const auto now=lifecycle_time_point::clock::now();
+    const auto size=scheduler_storage->prepare(tls_level::initial,fields,now,
+        storage.encoded,storage.build_scratch);
+    check(size && scheduler_storage->complete(true,now).has_value());
+    for (int copy=0;copy<40;++copy)
+        check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*size)),
+                                          endpoint.local_endpoint())).has_value());
+    co_await sleep_for(loop,100ms);
+    check(driver.dropped_packets()==0);
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+// When the server's Initial PTO fires with Handshake data outstanding, it
+// probes Handshake in the same round (RFC 9002 6.2.4).
+static auto handshake_probe(event_loop& loop,bounded_connection& server,bounded_connection& client,
+    udp_endpoint& endpoint,udp_socket& peer,buffers& storage) -> task<void>
+{
+    check(client.core().advance(lifecycle_time_point::clock::now()).has_value());
+    const auto scheduler_storage=std::make_unique<packet_scheduler>(client);
+    for (;;) {
+        protected_packet_fields fields; fields.destination_cid=dcid; fields.source_cid=dcid;
+        const auto now=lifecycle_time_point::clock::now();
+        const auto size=scheduler_storage->prepare(tls_level::initial,fields,now,
+            storage.encoded,storage.build_scratch);
+        if (!size) break;
+        check(scheduler_storage->complete(true,now).has_value());
+        check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*size)),
+                                          endpoint.local_endpoint())).has_value());
+    }
+    auto input=std::as_writable_bytes(std::span(storage.plaintext));
+    while (server.recovery().pto_count()==0) {
+        const auto size=co_await receive_raw(loop,peer,input);
+        check(size.has_value());
+    }
+    bool handshake=false;
+    for (;;) {
+        const auto size=co_await receive_raw(loop,peer,input);
+        if (!size || *size==0) break;
+        const auto header=parse_packet_header(std::span<const std::byte>(input).first(*size),0,dcid.size(),true);
+        handshake|=header && header->kind==packet_kind::handshake;
+    }
+    check(handshake);
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+static auto amplification(event_loop& loop,bounded_connection& server,bounded_connection& client,
+    udp_endpoint& endpoint,udp_socket& peer,buffers& storage) -> task<void>
+{
+    check(client.core().advance(lifecycle_time_point::clock::now()).has_value());
+    const auto scheduler_storage=std::make_unique<packet_scheduler>(client);
+    std::size_t sent=0,received=0;
+    for (;;) {
+        protected_packet_fields fields; fields.destination_cid=dcid; fields.source_cid=dcid;
+        const auto now=lifecycle_time_point::clock::now();
+        const auto size=scheduler_storage->prepare(tls_level::initial,fields,now,
+            storage.encoded,storage.build_scratch);
+        if (!size) break;
+        check(scheduler_storage->complete(true,now).has_value());
+        check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*size)),
+                                          endpoint.local_endpoint())).has_value());
+        sent+=*size;
+    }
+    // Receive without acknowledging, well before the first 999 ms PTO.
+    auto input=std::as_writable_bytes(std::span(storage.plaintext));
+    for (;;) {
+        const auto size=co_await receive_raw(loop,peer,input);
+        if (!size || *size==0) break;
+        received+=*size;
+    }
+    check(received>sent && received<=3*sent);
+    check(server.recovery().congestion().bytes_in_flight()==received);
+    check(!server.core().keys_available(tls_level::application,tls_direction::read));
+    // Blocked, the server arms no PTO (RFC 9002 6.2.2.1): nothing is sent or
+    // counted past the first 999 ms PTO.
+    co_await sleep_for(loop,700ms);
+    check(server.recovery().pto_count()==0 && !server.recovery().next_alarm());
+    check(co_await receive_raw(loop,peer,input)==0);
+    // A client datagram restores credit and the server resumes at once.
+    protected_packet_fields fields; fields.destination_cid=dcid; fields.source_cid=dcid;
+    const auto now=lifecycle_time_point::clock::now();
+    const auto ping=scheduler_storage->prepare(tls_level::initial,fields,now,
+        storage.encoded,storage.build_scratch,true);
+    check(ping && scheduler_storage->complete(true,now).has_value());
+    check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*ping)),
+                                      endpoint.local_endpoint())).has_value());
+    const auto resumed=co_await receive_raw(loop,peer,input);
+    check(resumed && *resumed!=0 &&
+          lifecycle_time_point::clock::now()-now<std::chrono::milliseconds(100));
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+static auto amplification_scenario(bool probe) -> void
+{
+    contexts context(probe ? 0 : 8000);
+    event_loop loop;
+    auto owned=std::make_unique<udp_socket>(loop,ip_endpoint::loopback_v4());
+    auto* peer=owned.get();
+    const auto address=peer->local_endpoint();
+    loop.add(std::move(owned));
+    auto endpoint_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    connection_callbacks callbacks{nullptr,valid_parameters,nullptr};
+    auto server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks,lifecycle_time_point::clock::now());
+    auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks,lifecycle_time_point::clock::now());
+    check(server->initialize(context.server.get(),{true,{},protocol,parameters},version_1,dcid).has_value());
+    check(client->initialize(context.client.get(),{false,"localhost",protocol,parameters},version_1,dcid).has_value());
+    auto driver=std::make_unique<connection_driver>(loop,*endpoint_storage,*server,dcid,dcid,address);
+    auto storage=std::make_unique<buffers>();
+    bool clean=false;
+    check(loop.spawn(receiver(loop,*endpoint_storage))==task_spawn_result::accepted);
+    check(loop.spawn(drive(loop,*driver,clean))==task_spawn_result::accepted);
+    check(loop.spawn((probe ? handshake_probe : amplification)(loop,*server,*client,
+        *endpoint_storage,*peer,*storage))==task_spawn_result::accepted);
+    (void)loop.run();
+}
+static auto receive_burst_scenario() -> void
+{
+    contexts context;
+    event_loop loop;
+    auto owned=std::make_unique<udp_socket>(loop,ip_endpoint::loopback_v4());
+    auto* peer=owned.get();
+    const auto address=peer->local_endpoint();
+    loop.add(std::move(owned));
+    auto endpoint_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::server);
+    connection_callbacks callbacks{nullptr,valid_parameters,nullptr};
+    auto server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks,lifecycle_time_point::clock::now());
+    auto client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks,lifecycle_time_point::clock::now());
+    check(server->initialize(context.server.get(),{true,{},protocol,parameters},version_1,dcid).has_value());
+    check(client->initialize(context.client.get(),{false,"localhost",protocol,parameters},version_1,dcid).has_value());
+    auto driver=std::make_unique<connection_driver>(loop,*endpoint_storage,*server,dcid,dcid,address);
+    auto storage=std::make_unique<buffers>();
+    bool clean=false;
+    check(loop.spawn(receiver(loop,*endpoint_storage))==task_spawn_result::accepted);
+    check(loop.spawn(drive(loop,*driver,clean))==task_spawn_result::accepted);
+    check(loop.spawn(receive_burst(loop,*driver,*client,*endpoint_storage,*peer,*storage))==
+          task_spawn_result::accepted);
+    (void)loop.run();
+}
 int main()
 {
 #ifdef _WIN32
@@ -460,6 +615,9 @@ int main()
     notification_scenario();
     for (auto version : {version_1,version_2}) lost_close_scenario(context,version);
     handshake_close_scenario(context);
+    amplification_scenario(false);
+    amplification_scenario(true);
+    receive_burst_scenario();
     for (auto version : {version_1,version_2}) {
         event_loop loop;
         auto client_storage=std::make_unique<udp_endpoint>(loop,ip_endpoint::loopback_v4(),path_endpoint_role::client);

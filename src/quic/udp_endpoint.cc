@@ -100,10 +100,29 @@ auto udp_endpoint::reserve_send(endpoint_connection handle, std::size_t size,
     return flush_error;
 }
 
+auto transient_send_error(std::error_code error) noexcept -> bool
+{
+    for (const auto code : {std::errc::resource_unavailable_try_again, std::errc::operation_would_block,
+             std::errc::device_or_resource_busy, std::errc::no_buffer_space, std::errc::not_enough_memory,
+             std::errc::host_unreachable, std::errc::network_unreachable, std::errc::network_down,
+             std::errc::connection_refused, std::errc::operation_not_permitted,
+             std::errc::permission_denied})
+        if (error == code) return true;
+    return false;
+}
+
 auto udp_endpoint::reserved() noexcept -> std::span<std::uint8_t>
 {
     return {reinterpret_cast<std::uint8_t*>(send_batch_bytes_.data()) + send_batch_write_,
             send_batch_reserved_};
+}
+
+auto udp_endpoint::send_credit(endpoint_connection handle) const -> std::uint64_t
+{
+    const auto credit = router_.send_credit(handle);
+    const auto queued = send_batch_active_ && send_batch_handle_ == handle &&
+        !send_batch_candidate_ ? send_batch_write_ : 0;
+    return credit > queued ? credit - queued : 0;
 }
 
 auto udp_endpoint::commit_send(std::size_t size) noexcept -> std::error_code
@@ -165,25 +184,37 @@ auto udp_endpoint::flush_send() -> std::error_code
             std::generic_category());
     const auto sent = socket_->send_batch(
         std::span<const std::byte>(send_batch_bytes_).first(total), segment, *peer);
-    const bool success = sent && *sent == total;
-    router_.finish_send(handle, total, success);
-    if (!sent) {
-        const auto value = sent.error().value();
-        if (value == EAGAIN || value == EWOULDBLOCK || value == EBUSY)
-            return std::error_code(EAGAIN, std::generic_category());
-        return sent.error();
-    }
-    if (*sent != total) return std::error_code(EIO, std::generic_category());
+    // Count the bytes that left, even when a fallback send stopped early.
+    router_.finish_send(handle, sent ? *sent : 0, sent.has_value());
+    if (!sent && !transient_send_error(sent.error())) return sent.error();
+    if (!sent || *sent != total) return std::error_code(EAGAIN, std::generic_category());
     return {};
 }
 
-auto udp_endpoint::receive_loop(event_loop&, udp_endpoint& endpoint) -> task<std::error_code>
+namespace {
+
+struct queue_behind_wakeups {
+    event_loop& loop;
+    eventloop::detail::wakeup_node node {};
+    [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
+    auto await_suspend(std::coroutine_handle<> handle) noexcept -> void
+    {
+        node.handle = handle;
+        eventloop::detail::coroutine_frame_access::schedule_wakeup(loop, node);
+    }
+    static auto await_resume() noexcept -> void {}
+};
+
+} // namespace
+
+auto udp_endpoint::receive_loop(event_loop& loop, udp_endpoint& endpoint) -> task<std::error_code>
 {
     endpoint.check_owner();
     if (endpoint.receiving_) co_return std::error_code(EBUSY, std::generic_category());
     endpoint.receiving_ = true;
     struct reset { udp_endpoint& endpoint; ~reset() { endpoint.receiving_ = false; } }
         guard {endpoint};
+    std::size_t burst = 0;
     while (endpoint.socket_) {
         const auto received = co_await endpoint.socket_->async_receive_from(endpoint.receive_buffer_);
         if (!received) {
@@ -200,6 +231,16 @@ auto udp_endpoint::receive_loop(event_loop&, udp_endpoint& endpoint) -> task<std
         const bool coalesced = segment != 0 && total > segment;
         std::size_t offset = 0;
         do {
+            // Receives complete synchronously while datagrams are queued, so
+            // a burst could overrun a connection's bounded queue and starve
+            // other work. Between bursts, queue behind drivers that yielded
+            // (posted work) and then behind drivers it woke (wakeups).
+            if (++burst > receive_burst) {
+                burst = 1;
+                (void)co_await yield(loop);
+                co_await queue_behind_wakeups {loop};
+                if (!endpoint.socket_) co_return std::error_code(ECANCELED, std::generic_category());
+            }
             const auto size = coalesced ? std::min(segment, total - offset) : total;
             const auto datagram = std::span<const std::byte>(base + offset, size);
             bool handled = false;
@@ -303,6 +344,8 @@ auto udp_endpoint::send(event_loop&, udp_endpoint& endpoint, endpoint_connection
     const auto result = co_await endpoint.socket_->async_send_to(bytes, *peer);
     endpoint.sending_ = false;
     endpoint.router_.finish_send(handle, bytes.size(), result.has_value());
+    if (!result && transient_send_error(result.error()))
+        co_return std::unexpected(std::error_code(EAGAIN, std::generic_category()));
     co_return result;
 }
 

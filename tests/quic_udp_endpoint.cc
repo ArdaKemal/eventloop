@@ -123,6 +123,15 @@ int main()
     WSADATA data {};
     check(WSAStartup(MAKEWORD(2, 2), &data) == 0);
 #endif
+    // Local send failures become packet loss; others still fail the send.
+    check(transient_send_error(std::make_error_code(std::errc::no_buffer_space)) &&
+          transient_send_error(std::make_error_code(std::errc::network_unreachable)) &&
+          transient_send_error(std::make_error_code(std::errc::resource_unavailable_try_again)) &&
+          !transient_send_error(std::make_error_code(std::errc::operation_canceled)) &&
+          !transient_send_error(std::make_error_code(std::errc::message_size)));
+#ifndef _WIN32
+    check(transient_send_error(std::error_code(ENOBUFS, std::system_category())));
+#endif
     roundtrip();
     forwarding();
 #ifdef _WIN32

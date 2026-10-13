@@ -49,6 +49,29 @@ auto initial_windows() -> void
           "oversized PMTU cannot overflow minimum window");
 }
 
+auto negotiated_datagram_size() -> void
+{
+    newreno_congestion_controller cc;
+    check(cc.on_packet_sent(1200, true).has_value() &&
+          cc.increase_max_datagram_size(1472).has_value() &&
+          cc.congestion_window() == 14720 && cc.bytes_in_flight() == 1200 &&
+          cc.minimum_window() == 2944,
+          "larger datagram keeps flight and raises the initial window");
+    check(cc.increase_max_datagram_size(1400).error() ==
+              congestion_error::invalid_datagram_size &&
+          cc.congestion_window() == 14720,
+          "datagram size cannot shrink");
+
+    newreno_congestion_controller after_loss;
+    check(after_loss.on_packet_sent(1200, true).has_value() &&
+          after_loss.on_packet_lost(packet(0ms, 1200), at(1ms)).has_value(),
+          "loss before transport parameters");
+    const auto reduced = after_loss.congestion_window();
+    check(after_loss.increase_max_datagram_size(1472).has_value() &&
+          after_loss.congestion_window() == reduced,
+          "congestion event keeps its reduced window");
+}
+
 auto flight_and_slow_start() -> void
 {
     newreno_congestion_controller cc;
@@ -194,6 +217,7 @@ auto boundaries() -> void
 auto main() -> int
 {
     initial_windows();
+    negotiated_datagram_size();
     flight_and_slow_start();
     recovery_and_avoidance();
     minimum_and_persistent();

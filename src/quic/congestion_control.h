@@ -35,20 +35,41 @@ public:
     [[nodiscard]] constexpr auto reset(std::size_t max_datagram_size) noexcept
         -> std::expected<void, congestion_error>
     {
+        if (const auto result = restart(max_datagram_size); !result) return result;
+        bytes_in_flight_ = 0;
+        return {};
+    }
+
+    // Start over on a new path (RFC 9000 9.4). Packets already in flight stay
+    // counted, so their ACKs or losses still retire them.
+    [[nodiscard]] constexpr auto restart(std::size_t max_datagram_size) noexcept
+        -> std::expected<void, congestion_error>
+    {
         if (max_datagram_size < 1200 ||
             max_datagram_size > std::numeric_limits<std::size_t>::max() / 2)
             return std::unexpected(congestion_error::invalid_datagram_size);
 
         max_datagram_size_ = max_datagram_size;
-        const auto initial_cap = std::max(std::size_t {14720},
-                                          max_datagram_size * 2);
-        congestion_window_ = std::min(saturated_bytes_multiply(
-                                          max_datagram_size, 10), initial_cap);
-        bytes_in_flight_ = 0;
+        congestion_window_ = initial_window(max_datagram_size);
         slow_start_threshold_ = std::numeric_limits<std::size_t>::max();
         recovery_start_.reset();
         in_recovery_period_ = false;
         avoidance_credit_ = 0;
+        return {};
+    }
+
+    // Raise the datagram size once the peer's max_udp_payload_size is known,
+    // keeping packets in flight. Before any congestion event the window
+    // grows to the initial window for the new size (RFC 9002 7.2).
+    [[nodiscard]] constexpr auto increase_max_datagram_size(
+        std::size_t max_datagram_size) noexcept -> std::expected<void, congestion_error>
+    {
+        if (max_datagram_size < max_datagram_size_ ||
+            max_datagram_size > std::numeric_limits<std::size_t>::max() / 2)
+            return std::unexpected(congestion_error::invalid_datagram_size);
+        max_datagram_size_ = max_datagram_size;
+        if (!recovery_start_ && slow_start_threshold_ == std::numeric_limits<std::size_t>::max())
+            congestion_window_ = std::max(congestion_window_, initial_window(max_datagram_size));
         return {};
     }
 
@@ -168,6 +189,13 @@ public:
         -> bool { return in_recovery_period_; }
 
 private:
+    [[nodiscard]] static constexpr auto initial_window(std::size_t max_datagram_size) noexcept
+        -> std::size_t
+    {
+        const auto cap = std::max(std::size_t {14720}, max_datagram_size * 2);
+        return std::min(saturated_bytes_multiply(max_datagram_size, 10), cap);
+    }
+
     [[nodiscard]] static constexpr auto saturated_bytes_add(
         std::size_t left, std::size_t right) noexcept -> std::size_t
     {

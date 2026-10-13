@@ -23,8 +23,15 @@ struct endpoint_accept_callback {
 // Internal transport adapter. Endpoint and registered connection objects must
 // outlive all receive/send tasks. run() permits one receiver; async_send permits
 // one sender. Caller drives connection deadlines and packet scheduling.
+// Local send failures that later loss recovery repairs: a full socket buffer,
+// a temporarily unreachable route, or a firewall drop. The endpoint reports
+// them as EAGAIN so connections treat them as packet loss, not failure.
+[[nodiscard]] auto transient_send_error(std::error_code) noexcept -> bool;
+
 class udp_endpoint {
 public:
+    // Datagrams dispatched before the receive loop lets other work run.
+    static constexpr std::size_t receive_burst = 8;
     static constexpr std::size_t maximum_datagram_size = 65527;
     udp_endpoint(event_loop&, ip_endpoint local, path_endpoint_role,
                  std::size_t short_cid_length = 8,
@@ -61,6 +68,9 @@ public:
     [[nodiscard]] auto reserve_send(endpoint_connection, std::size_t, bool candidate)
         -> std::error_code;
     [[nodiscard]] auto reserved() noexcept -> std::span<std::uint8_t>;
+    // Anti-amplification credit left after the datagrams already batched for
+    // this connection, so the owner builds only packets the flush can send.
+    [[nodiscard]] auto send_credit(endpoint_connection) const -> std::uint64_t;
     [[nodiscard]] auto commit_send(std::size_t size) noexcept -> std::error_code;
     // Flush queued datagrams with one offload/syscall batch. Always clears the
     // pending batch, even on failure.

@@ -128,10 +128,11 @@ public:
 
         // Group zero is endpoint acceptance; each slot has its own group.
         // All groups share the same pool, retaining the aggregate capacity.
+        // Returns the waiter's node, or no_index when the pool is full.
         auto register_waiter(std::size_t index,
-                             std::coroutine_handle<> handle) noexcept -> bool
+                             std::coroutine_handle<> handle) noexcept -> std::size_t
         {
-            if (free_head == no_index) return false;
+            if (free_head == no_index) return no_index;
             const auto node = free_head;
             free_head = next[node];
             next[node] = no_index;
@@ -141,8 +142,12 @@ public:
             else next[queue.tail] = node;
             queue.tail = node;
             ++queue.count;
-            return true;
+            return node;
         }
+
+        // A cancelled waiter leaves its node queued without a handle; the
+        // group's next drain frees it.
+        auto forget_waiter(std::size_t node) noexcept -> void { handles[node] = {}; }
 
         auto request_wake(std::size_t index) noexcept -> void
         {
@@ -304,8 +309,9 @@ public:
     // handle once and is resumed by the connection-driver progress callback, so
     // stream/DATAGRAM operations do not poll on a timer.
     auto register_waiter(std::size_t group,
-                         std::coroutine_handle<> handle) noexcept -> bool
+                         std::coroutine_handle<> handle) noexcept -> std::size_t
     { return waiters_->register_waiter(group, handle); }
+    auto forget_waiter(std::size_t node) noexcept -> void { waiters_->forget_waiter(node); }
 
     auto wake_connection(std::size_t slot_index) noexcept -> void
     {
@@ -737,22 +743,59 @@ private:
 
 namespace {
 
-// Resumes when the connection-driver progress hook fires. It does not attach a
-// cancellation node: operations observe cancellation on their next resume, and
-// stop_all() wakes every waiter so shutdown cannot deadlock.
+// Resumes when the connection-driver progress hook fires, or at once when its
+// task is cancelled; the operation then observes the cancellation. stop_all()
+// wakes every waiter so shutdown cannot deadlock. False means the shared
+// waiter pool is full; operations report capacity_exceeded rather than spin.
 class notify_awaiter {
 public:
     explicit notify_awaiter(quic_endpoint::implementation& impl,
                             std::size_t group = 0) noexcept
-        : impl_(&impl), group_(group) {}
+        : impl_(&impl), group_(group)
+    {
+        cancellation_.operation = this;
+        cancellation_.cancel = &cancel;
+    }
+    notify_awaiter(const notify_awaiter&) = delete;
+    auto operator=(const notify_awaiter&) -> notify_awaiter& = delete;
     [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
     template<typename Promise>
     auto await_suspend(std::coroutine_handle<Promise> handle) noexcept -> bool
-    { return impl_->register_waiter(group_, handle); }
-    auto await_resume() const noexcept -> void {}
+    {
+        auto& state = *handle.promise().cancellation_state();
+        if (state.requested) return false;
+        node_ = impl_->register_waiter(group_, handle);
+        if (node_ == no_waiter) { full_ = true; return false; }
+        if (!eventloop::detail::coroutine_frame_access::attach_cancellation(state, cancellation_)) {
+            impl_->forget_waiter(node_);
+            return false;
+        }
+        attached_ = true;
+        handle_ = handle;
+        return true;
+    }
+    [[nodiscard]] auto await_resume() noexcept -> bool
+    {
+        if (attached_) eventloop::detail::coroutine_frame_access::detach_cancellation(cancellation_);
+        return !full_;
+    }
 private:
+    static constexpr auto no_waiter = static_cast<std::size_t>(-1);
+    static auto cancel(eventloop::detail::coroutine_cancellation_node& node) noexcept -> void
+    {
+        auto& self = *static_cast<notify_awaiter*>(node.operation);
+        eventloop::detail::coroutine_frame_access::detach_cancellation(node);
+        self.attached_ = false;
+        self.impl_->forget_waiter(self.node_);
+        self.handle_.resume();
+    }
     quic_endpoint::implementation* impl_;
     std::size_t group_;
+    std::size_t node_ {no_waiter};
+    std::coroutine_handle<> handle_ {};
+    eventloop::detail::coroutine_cancellation_node cancellation_ {};
+    bool attached_ {false};
+    bool full_ {false};
 };
 
 auto notify(quic_endpoint::implementation& impl,
@@ -823,7 +866,8 @@ auto read_stream(event_loop&, quic_endpoint::implementation& impl,
             (void)slot.connection->finish_read(stream_id);
             co_return std::size_t {0};
         }
-        co_await notify(impl, slot_index + 1);
+        if (!co_await notify(impl, slot_index + 1))
+            co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
     }
 }
 
@@ -867,7 +911,8 @@ auto write_stream(event_loop&, quic_endpoint::implementation& impl,
             if (slot.driver) slot.driver->notify();
             co_return accepted;
         }
-        co_await notify(impl, slot_index + 1);
+        if (!co_await notify(impl, slot_index + 1))
+            co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
     }
 }
 
@@ -896,7 +941,8 @@ auto accept_stream(event_loop&, quic_endpoint::implementation& impl,
             co_return candidate.id;
         }
         if (slot.closing) co_return std::unexpected(make_error_code(quic_errc::peer_closed));
-        co_await notify(impl, slot_index + 1);
+        if (!co_await notify(impl, slot_index + 1))
+            co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
     }
 }
 
@@ -915,10 +961,14 @@ auto send_datagram_task(event_loop&, quic_endpoint::implementation& impl,
         if (!slot.occupied || slot.generation != generation || !slot.connection)
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         const auto result = slot.connection->queue_datagram(payload);
-        if (result.has_value()) co_return std::expected<void, std::error_code> {};
+        if (result.has_value()) {
+            if (slot.driver) slot.driver->notify();
+            co_return std::expected<void, std::error_code> {};
+        }
         if (result.error() == datagram_queue_error::frame_too_large)
             co_return std::unexpected(make_error_code(quic_errc::invalid_argument));
-        co_await notify(impl, slot_index + 1);
+        if (!co_await notify(impl, slot_index + 1))
+            co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
     }
 }
 
@@ -938,7 +988,8 @@ auto receive_datagram_task(event_loop&, quic_endpoint::implementation& impl,
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         const auto received = slot.connection->receive_datagram(buffer);
         if (received.has_value()) co_return *received;
-        co_await notify(impl, slot_index + 1);
+        if (!co_await notify(impl, slot_index + 1))
+            co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
     }
 }
 
@@ -969,7 +1020,8 @@ auto accept_connection(event_loop&, quic_endpoint::implementation& impl)
         // ends acceptance itself.
         if (impl.closing_)
             co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
-        co_await notify(impl);
+        if (!co_await notify(impl))
+            co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
     }
 }
 
@@ -999,7 +1051,8 @@ auto connect_task(event_loop&, quic_endpoint::implementation& impl,
             co_return quic_connection {impl.owner_, index, generation};
         if (slot.closing || impl.closing_)
             co_return std::unexpected(make_error_code(quic_errc::peer_closed));
-        co_await notify(impl, index + 1);
+        if (!co_await notify(impl, index + 1))
+            co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
     }
 }
 

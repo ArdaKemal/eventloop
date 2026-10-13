@@ -129,6 +129,9 @@ int main()
         check(client->initialize(context.client.get(), {false,"localhost",protocol,parameters},version,dcid).has_value());
         check(server->initialize(context.server.get(), {true,{},protocol,parameters},version,dcid).has_value());
         auto now = lifecycle_time_point {};
+        // The local max_idle_timeout (10 ms) bounds a handshake that stalls.
+        check(client->next_deadline(std::chrono::milliseconds(1)) ==
+              now + std::chrono::milliseconds(10));
         check(client->advance(now).has_value());
         check(server->advance(now).has_value());
         buffers buffer;

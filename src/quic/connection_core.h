@@ -59,6 +59,12 @@ public:
     // Inspect before build(); successful build() consumes this number.
     [[nodiscard]] auto next_packet_number(tls_level) const noexcept
         -> std::optional<std::uint64_t>;
+    // RFC 9000 17.1 and A.2: the encoded length of the next packet number,
+    // wide enough for twice the distance to the largest acknowledged number.
+    // build() always uses it; callers padding Initial packets read it first.
+    [[nodiscard]] auto packet_number_length(tls_level) const noexcept -> std::uint8_t;
+    // Record the largest packet number the peer acknowledged at this level.
+    auto packet_acknowledged(tls_level, std::uint64_t largest) noexcept -> void;
     // Apply a validated Retry before any authenticated response, preserving
     // TLS's exact ClientHello and the Initial packet-number send sequence.
     [[nodiscard]] auto apply_retry(std::span<const std::uint8_t>)
@@ -81,7 +87,8 @@ public:
     [[nodiscard]] auto level_discarded(tls_level) const noexcept -> bool;
     [[nodiscard]] auto next_crypto(tls_level, std::size_t maximum) const noexcept
         -> crypto_send_chunk;
-    [[nodiscard]] auto next_crypto_probe(tls_level, std::size_t maximum) const noexcept
+    [[nodiscard]] auto next_crypto_probe(tls_level, std::size_t maximum,
+        std::uint64_t from = 0) const noexcept
         -> crypto_send_chunk;
     [[nodiscard]] auto mark_crypto_sent(tls_level, std::uint64_t offset, std::size_t size)
         -> std::expected<void, connection_error>;
@@ -159,6 +166,7 @@ private:
     std::array<received_packet_ranges<receive_range_capacity>, 3> received_ {};
     std::array<std::array<std::optional<aes_128_gcm_keys>, 2>, 3> keys_ {};
     std::array<std::uint64_t, 3> next_packet_number_ {};
+    std::array<std::optional<std::uint64_t>, 3> largest_acknowledged_ {};
     std::array<bool, 3> discarded_levels_ {};
     packet_protection_context protection_;
     key_update_state key_update_;

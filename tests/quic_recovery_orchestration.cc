@@ -425,6 +425,43 @@ auto client_handshake_antideadlock() -> void
     check(!recovery.next_alarm(), "handshake confirmation cancels anti-deadlock timer");
 }
 
+auto negotiated_datagram_size_keeps_state() -> void
+{
+    recovery_orchestration<4> recovery;
+    std::array<retired_packet, 8> output {};
+    check(recovery.record(packet_number_space::initial, packet(0, 0ms)).has_value() &&
+          recovery.record(packet_number_space::handshake, packet(0, 1ms)).has_value() &&
+          recovery.on_ack(packet_number_space::initial, ack(0), at(40ms),
+                          0us, output)->retired == 1,
+          "handshake RTT sample before transport parameters");
+    check(recovery.increase_max_datagram_size(1472).has_value() &&
+          recovery.rtt().smoothed_rtt() == 40ms &&
+          recovery.history(packet_number_space::handshake)->size() == 1 &&
+          recovery.congestion().bytes_in_flight() == 1200 &&
+          recovery.congestion().congestion_window() == 14720,
+          "transport parameters keep RTT, history, and flight");
+    check(recovery.next_alarm()->deadline < at(1000ms),
+          "PTO uses the handshake RTT instead of the initial 333 ms estimate");
+}
+
+auto migration_keeps_flight() -> void
+{
+    recovery_orchestration<4> recovery;
+    std::array<retired_packet, 8> output {};
+    const auto space = packet_number_space::application_data;
+    check(recovery.record(space, packet(0, 0ms)).has_value() &&
+          recovery.record(space, packet(1, 1ms)).has_value() &&
+          recovery.on_ack(space, ack(0), at(40ms), 0us, output)->retired == 1,
+          "RTT sample and a packet in flight before migration");
+    check(recovery.reset_path_recovery(1200).has_value() && !recovery.rtt().has_sample() &&
+          recovery.congestion().bytes_in_flight() == 1200 &&
+          recovery.congestion().congestion_window() == 12000,
+          "new path restarts RTT and window but keeps flight");
+    check(recovery.on_ack(space, ack(1), at(60ms), 0us, output)->retired == 1 &&
+          recovery.congestion().bytes_in_flight() == 0,
+          "ACK of a packet sent on the old path still retires it");
+}
+
 auto ack_only_progress_resets_pto() -> void
 {
     recovery_orchestration<2> recovery;
@@ -477,6 +514,8 @@ auto main() -> int
     loss_timer_has_absolute_priority();
     discard_resets_backoff();
     client_handshake_antideadlock();
+    negotiated_datagram_size_keeps_state();
+    migration_keeps_flight();
     ack_only_progress_resets_pto();
     ecn_shares_the_path_controller();
 }

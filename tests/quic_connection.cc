@@ -311,7 +311,7 @@ int main()
         check(client->path_recovery().active_handle() == 1 &&
               !client->path_recovery().candidate_handle() &&
               client->path_recovery().find(0) == nullptr);
-        check(client->recovery().congestion().bytes_in_flight() == 0 &&
+        check(client->recovery().congestion().bytes_in_flight() == 1200 &&
               !client->recovery().rtt().has_sample());
         check(client->begin_path_candidate(2).has_value());
         check(client->cancel_path_candidate().has_value());

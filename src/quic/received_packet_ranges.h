@@ -14,14 +14,15 @@ namespace eventloop::quic::detail {
 enum class received_packet_error {
     invalid_packet_number,
     retired_packet_number,
-    capacity_exhausted,
     invalid_retirement,
     empty,
     invalid_ack_delay,
 };
 
-// One instance tracks one packet-number space. Capacity exhaustion rejects a
-// disjoint insertion. Explicit retirement advances the acceptance floor.
+// One instance tracks one packet-number space. When full, a disjoint newer
+// packet evicts the oldest range (RFC 9000 13.2.3) and raises the acceptance
+// floor past it; a disjoint packet older than every range is refused as
+// retired. Explicit retirement also advances the floor.
 template <std::size_t Capacity>
 class received_packet_ranges {
     static_assert(Capacity > 0);
@@ -58,7 +59,7 @@ public:
     }
 
     // Returns false for a duplicate. A failed insertion leaves every range
-    // unchanged, including when the array has no free slot.
+    // unchanged.
     [[nodiscard]] constexpr auto insert(std::uint64_t number) noexcept
         -> std::expected<bool, received_packet_error>
     {
@@ -92,8 +93,12 @@ public:
         } else if (join_below) {
             ranges_[index].largest = number;
         } else {
-            if (size_ == Capacity)
-                return std::unexpected(received_packet_error::capacity_exhausted);
+            if (size_ == Capacity) {
+                if (index == size_)
+                    return std::unexpected(received_packet_error::retired_packet_number);
+                minimum_acceptable_ = ranges_[size_ - 1].largest + 1;
+                --size_;
+            }
             for (std::size_t at = size_; at > index; --at)
                 ranges_[at] = ranges_[at - 1];
             ranges_[index] = ack_range {number, number};

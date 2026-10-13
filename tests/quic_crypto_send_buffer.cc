@@ -71,6 +71,17 @@ auto partial_ack_and_loss() -> void
           "late duplicate reports do not resurrect retired data");
 }
 
+auto successive_probes_carry_different_bytes() -> void
+{
+    crypto_send_buffer<16> buffer;
+    check(buffer.append(input("abcdefghij")) == 0 && buffer.mark_sent(0, 10).has_value() &&
+          buffer.acknowledge(3, 2).has_value(), "outstanding flight with a gap");
+    check(equals(buffer.next_unacknowledged(3), 0, "abc"), "first probe takes the oldest bytes");
+    check(equals(buffer.next_unacknowledged(3, 3), 5, "fgh"), "next probe skips past it and ACKed bytes");
+    check(equals(buffer.next_unacknowledged(3, 8), 8, "ij"), "probe reaches the end of the flight");
+    check(buffer.next_unacknowledged(3, 10).data.empty(), "nothing follows the last probe");
+}
+
 auto overlapping_transmissions_and_wrap() -> void
 {
     crypto_send_buffer<8> buffer;
@@ -343,6 +354,7 @@ auto pending_run_word_boundaries() -> void
 auto main() -> int
 {
     partial_ack_and_loss();
+    successive_probes_carry_different_bytes();
     overlapping_transmissions_and_wrap();
     bounds_and_failure_atomicity();
     delayed_reports_after_ring_reuse();

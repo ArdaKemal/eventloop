@@ -245,13 +245,14 @@ public:
     }
 
     // PTO selects transmitted bytes without marking the original packet lost
-    // or mutating pending state. ACKed bytes are never selected.
-    [[nodiscard]] constexpr auto next_unacknowledged(std::size_t max_size) const noexcept
-        -> crypto_send_chunk
+    // or mutating pending state. ACKed bytes are never selected. A later
+    // probe passes the end of the previous one to carry different bytes.
+    [[nodiscard]] constexpr auto next_unacknowledged(std::size_t max_size,
+        std::uint64_t from = 0) const noexcept -> crypto_send_chunk
     {
         if (max_size == 0 || base_ == end_) return {};
         for (std::size_t i = 0; i < sent_.size_; ++i) {
-            const auto begin = std::max(sent_.ranges_[i].begin, base_);
+            const auto begin = std::max({sent_.ranges_[i].begin, base_, from});
             const auto end = std::min(sent_.ranges_[i].end, end_);
             auto cur = begin;
             while (cur < end) {

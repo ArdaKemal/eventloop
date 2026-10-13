@@ -121,11 +121,15 @@ public:
             return std::unexpected(path_validation_error::unknown_path);
         if (bytes > max_bytes - slot->sent_bytes)
             return std::unexpected(path_validation_error::counter_overflow);
-        if (role_ == path_endpoint_role::client || slot->validated)
-            return true;
-        const auto limit = slot->received_bytes > max_bytes / 3
-                               ? max_bytes : slot->received_bytes * 3;
-        return bytes <= limit - slot->sent_bytes;
+        return bytes <= credit(*slot);
+    }
+
+    // Bytes this path may still send before anti-amplification blocks it.
+    [[nodiscard]] constexpr auto send_credit(path_handle handle) const noexcept
+        -> std::uint64_t
+    {
+        const auto* slot = find(handle);
+        return slot == nullptr ? 0 : credit(*slot);
     }
 
     [[nodiscard]] constexpr auto record_sent(path_handle handle,
@@ -217,6 +221,16 @@ private:
         for (const auto& slot : slots_)
             if (slot.occupied && slot.handle == handle) return &slot;
         return nullptr;
+    }
+
+    [[nodiscard]] constexpr auto credit(const path_validation_slot& slot) const noexcept
+        -> std::uint64_t
+    {
+        if (role_ == path_endpoint_role::client || slot.validated)
+            return max_bytes - slot.sent_bytes;
+        const auto limit = slot.received_bytes > max_bytes / 3
+                               ? max_bytes : slot.received_bytes * 3;
+        return limit > slot.sent_bytes ? limit - slot.sent_bytes : 0;
     }
 
     std::span<path_validation_slot> slots_ {};

@@ -131,7 +131,8 @@ public:
     // `buffer` at `segment_size` boundaries (the final segment may be shorter).
     // Uses UDP segmentation offload where the platform supports it and falls
     // back to one send per segment otherwise. Non-blocking: returns the number
-    // of bytes accepted, or a readiness/error code. `buffer` is caller-owned
+    // of bytes accepted, which the fallback may leave short after a failure
+    // past the first segment, or a readiness/error code. `buffer` is caller-owned
     // and remains valid until this call returns.
     [[nodiscard]] auto send_batch(std::span<const std::byte> buffer,
                                   std::size_t segment_size,

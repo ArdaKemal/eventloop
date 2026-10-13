@@ -74,6 +74,7 @@ auto connection_core::initialize(SSL_CTX* context, const tls_options& options,
         role_ == endpoint_role::client ? parameter_sender::client : parameter_sender::server);
     if (!local_parameters) return std::unexpected(connection_error::invalid_configuration);
     local_idle_timeout_ = idle_timeout(*local_parameters);
+    lifecycle_.set_local_idle_timeout(local_idle_timeout_);
     version_ = version;
     // tls_provider appends the empty grease_quic_bit parameter when the caller
     // does not supply it, so this endpoint always advertises RFC 9287 support
@@ -187,6 +188,20 @@ auto connection_core::next_packet_number(tls_level level) const noexcept
     if (index(level) >= 3 || next_packet_number_[index(level)] > max_packet_number) return {};
     return next_packet_number_[index(level)];
 }
+auto connection_core::packet_number_length(tls_level level) const noexcept -> std::uint8_t
+{
+    check_owner();
+    if (index(level) >= 3) return 4;
+    return packet_number_length_for(next_packet_number_[index(level)],
+                                    largest_acknowledged_[index(level)]);
+}
+auto connection_core::packet_acknowledged(tls_level level, std::uint64_t largest) noexcept -> void
+{
+    check_owner();
+    if (index(level) >= 3) return;
+    auto& current = largest_acknowledged_[index(level)];
+    if (!current || largest > *current) current = largest;
+}
 
 auto connection_core::apply_retry(std::span<const std::uint8_t> dcid)
     -> std::expected<void, connection_error>
@@ -287,8 +302,9 @@ auto connection_core::level_discarded(tls_level level) const noexcept -> bool
 { check_owner(); return index(level) < 3 && discarded_levels_[index(level)]; }
 auto connection_core::next_crypto(tls_level level, std::size_t maximum) const noexcept -> crypto_send_chunk
 { check_owner(); return index(level) < 3 ? output_[index(level)].next_pending(maximum) : crypto_send_chunk {}; }
-auto connection_core::next_crypto_probe(tls_level level, std::size_t maximum) const noexcept -> crypto_send_chunk
-{ check_owner(); return index(level) < 3 ? output_[index(level)].next_unacknowledged(maximum) : crypto_send_chunk {}; }
+auto connection_core::next_crypto_probe(tls_level level, std::size_t maximum,
+    std::uint64_t from) const noexcept -> crypto_send_chunk
+{ check_owner(); return index(level) < 3 ? output_[index(level)].next_unacknowledged(maximum, from) : crypto_send_chunk {}; }
 auto connection_core::mark_crypto_sent(tls_level level, std::uint64_t offset, std::size_t size)
     -> std::expected<void, connection_error>
 {
@@ -346,6 +362,7 @@ auto connection_core::build(protected_packet_fields fields,
     if (number > max_packet_number) return fail(connection_error::capacity_exceeded);
     fields.version = version_;
     fields.packet_number = number;
+    fields.packet_number_length = packet_number_length(*level);
     // RFC 9287: only grease the QUIC bit once the peer has advertised support.
     // Before that the bit must remain set. xorshift avoids a per-packet CSPRNG.
     if (peer_grease_quic_bit_) {

@@ -120,6 +120,33 @@ int main()
                 0,dcid.size(),version,*keys,{},buffer.packet_scratch,buffer.plaintext,buffer.auth_scratch);
             check(opened && opened->packet_number==next);
         }
+        // A partial ClientHello draws an ACK-only server Initial, which stays
+        // unpadded and outside bytes in flight (RFC 9000 14.1).
+        {
+            auto ack_client=std::make_unique<bounded_connection>(endpoint_role::client,callbacks);
+            auto ack_server=std::make_unique<bounded_connection>(endpoint_role::server,callbacks);
+            check(ack_client->initialize(context.client.get(),{false,"localhost",protocol,parameters},version,dcid).has_value());
+            check(ack_server->initialize(context.server.get(),{true,{},protocol,parameters},version,dcid).has_value());
+            check(ack_client->core().advance(lifecycle_time_point{}).has_value());
+            check(ack_server->core().advance(lifecycle_time_point{}).has_value());
+            packet_scheduler client_scheduler(*ack_client), server_scheduler(*ack_server);
+            std::array<std::uint8_t,512> token {};
+            protected_packet_fields fields; fields.destination_cid=dcid; fields.source_cid=dcid; fields.token=token;
+            buffers buffer;
+            const auto size=client_scheduler.prepare(tls_level::initial,fields,lifecycle_time_point{},
+                buffer.encoded,buffer.build_scratch);
+            check(size && client_scheduler.complete(true,lifecycle_time_point{}).has_value());
+            check(!ack_client->core().next_crypto(tls_level::initial,2048).data.empty());
+            check(ack_server->receive(std::span(buffer.encoded).first(*size),0,dcid.size(),
+                buffer.packet_scratch,buffer.plaintext,buffer.auth_scratch,lifecycle_time_point{},
+                std::chrono::milliseconds(10)).has_value());
+            server_scheduler.request_ack(tls_level::initial);
+            protected_packet_fields reply; reply.destination_cid=dcid; reply.source_cid=dcid;
+            const auto ack=server_scheduler.prepare(tls_level::initial,reply,lifecycle_time_point{},
+                buffer.encoded,buffer.build_scratch);
+            check(ack && *ack<1200 && server_scheduler.complete(true,lifecycle_time_point{}).has_value());
+            check(ack_server->recovery().congestion().bytes_in_flight()==0);
+        }
         packet_scheduler outgoing(*client), incoming(*server);
         buffers buffer;
         // A bounded maximum Retry token leaves less CRYPTO room per Initial.
@@ -142,7 +169,7 @@ int main()
             if (!size) return false;
             check(scheduler.pending());
             if (level==tls_level::initial) {
-                check(*size==1200);
+                check(*size==1200 || &from==server.get());
                 const auto header=parse_packet_header(std::as_bytes(std::span(buffer.encoded).first(*size)),0,dcid.size(),true);
                 check(header.has_value());
                 check(std::ranges::equal(header->token,std::as_bytes(fields.token)));
@@ -161,6 +188,8 @@ int main()
                 check(frame.has_value()); cursor+=frame->encoded_size;
                 eliciting |= frame->type!=0 && frame->type!=2 && frame->type!=3;
             }
+            // Servers pad only ack-eliciting Initials (RFC 9000 14.1).
+            if (level==tls_level::initial) check(eliciting==(*size==1200) || &from==client.get());
             if(eliciting) receiver.request_ack(level);
             return true;
         };
@@ -195,7 +224,16 @@ int main()
         check(client->core().next_crypto_probe(tls_level::initial,100).offset==crypto_probe.offset);
         check(send(*client,*server,outgoing,incoming,tls_level::initial,false,true));
         check(client->recovery().history(packet_number_space::initial)->size()==2);
-        check(decode_frame(std::as_bytes(std::span(buffer.plaintext).first(last_plaintext_size)))->type==6);
+        const auto first_probe=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(last_plaintext_size)));
+        check(first_probe && first_probe->type==6 && first_probe->offset==crypto_probe.offset);
+        // A second probe in the same PTO continues past the first, here into
+        // ClientHello bytes not yet sent (RFC 9002 6.2.4).
+        const auto first_probe_end=first_probe->offset+first_probe->data.size();
+        check(first_probe_end<hello_size);
+        check(send(*client,*server,outgoing,incoming,tls_level::initial,false,true));
+        const auto second_probe=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(last_plaintext_size)));
+        check(second_probe && second_probe->type==6 && second_probe->offset==first_probe_end);
+        outgoing.begin_probes();
         for(int step=0;step<100;++step) {
             now+=std::chrono::milliseconds(1); bool progress=false;
             for(auto level:{tls_level::initial,tls_level::handshake,tls_level::application}) {
@@ -381,5 +419,31 @@ int main()
         check(send(*client,*server,outgoing,incoming,tls_level::application));
         check(outgoing.packet_number()==*blocked_number);
         check(server->stream(*fin_only)!=nullptr);
+        // A full congestion window still lets a pending ACK out on its own
+        // (RFC 9002 7). DATAGRAMs fill the window without flow credit.
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        const std::array<std::byte,1000> payload {};
+        for (;;) {
+            check(client->queue_datagram(payload).has_value());
+            const auto filled=outgoing.prepare(tls_level::application,blocked_fields,now,
+                buffer.encoded,buffer.build_scratch);
+            if (!filled) { check(filled.error()==connection_error::capacity_exceeded); break; }
+            check(outgoing.complete(true,now).has_value());
+        }
+        check(!client->recovery().congestion().can_send(payload.size()));
+        decoded_frame ping; ping.type=1;
+        check(incoming.queue_control(tls_level::application,ping).has_value());
+        check(send(*server,*client,incoming,outgoing,tls_level::application));
+        const auto flight=client->recovery().congestion().bytes_in_flight();
+        const auto ack_only=outgoing.prepare(tls_level::application,blocked_fields,now,
+            buffer.encoded,buffer.build_scratch);
+        check(ack_only.has_value() && outgoing.complete(true,now).has_value());
+        check(client->recovery().congestion().bytes_in_flight()==flight &&
+              client->outgoing_datagrams().size()==1);
+        const auto opened=server->receive(std::span(buffer.encoded).first(*ack_only),0,dcid.size(),
+            buffer.packet_scratch,buffer.plaintext,buffer.auth_scratch,now,std::chrono::milliseconds(10));
+        check(opened.has_value());
+        const auto frame=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(opened->plaintext_size)));
+        check(frame && (frame->type==2 || frame->type==3) && frame->encoded_size==opened->plaintext_size);
     }
 }
