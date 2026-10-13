@@ -137,8 +137,13 @@ struct measurement {
     std::size_t routed_records {0};
     std::size_t static_records {0};
     std::size_t requests {0};
+    bool kernel_tls {false};
     bool done {false};
 };
+
+// Userspace TLS record writes make small OpenSSL allocations (WPACKET state,
+// measured with OpenSSL 3.5 and 4.0); transmit kTLS makes none.
+constexpr std::size_t userspace_tls_allocations_per_request = 8;
 
 struct client_buffers {
     std::array<std::byte, 4096> request {};
@@ -211,6 +216,7 @@ auto client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> c
         secured = handshake && *handshake;
     }
     check(secured, "TLS handshake");
+    result.kernel_tls = peer->kernel_sendfile_available();
     constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     std::vector<std::byte> opening(std::as_bytes(std::span(preface)).begin(),
                                    std::as_bytes(std::span(preface)).end());
@@ -320,12 +326,18 @@ auto main() -> int
                   << result->routed << ", static " << result->static_files << "; OpenSSL routed "
                   << result->routed_openssl << ", static " << result->static_openssl
                   << "; OpenSSL record buffers routed " << result->routed_records
-                  << ", static " << result->static_records << '\n';
+                  << ", static " << result->static_records << "; "
+                  << (result->kernel_tls ? "kernel" : "userspace") << " TLS\n";
     }
-    for (const auto* result : {&uncached, &cached})
-        check(result->routed == 0 && result->static_files == 0 &&
-              result->routed_openssl == 0 && result->static_openssl == 0,
+    for (const auto* result : {&uncached, &cached}) {
+        check(result->routed == 0 && result->static_files == 0,
               "steady-state requests allocate");
+        const auto openssl_limit = result->kernel_tls
+            ? 0 : userspace_tls_allocations_per_request * result->requests;
+        check(result->routed_openssl <= openssl_limit &&
+              result->static_openssl <= openssl_limit,
+              "steady-state requests allocate in OpenSSL");
+    }
     for (const auto* result : {&uncached, &cached})
         check(result->routed_records <= 6 * result->requests &&
               result->static_records <= 6 * result->requests,

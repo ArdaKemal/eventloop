@@ -334,7 +334,13 @@ auto session::commit_read(std::size_t size) -> void
     pump_responses();
 }
 
-auto session::output() const noexcept -> std::span<const std::byte>
+auto session::output() noexcept -> std::span<const std::byte>
+{
+    output_lent_ = true;
+    return pending_output();
+}
+
+auto session::pending_output() const noexcept -> std::span<const std::byte>
 {
     return std::span {output_}.subspan(output_offset_,
         std::min({output_size_, output_.size() - output_offset_,
@@ -343,10 +349,12 @@ auto session::output() const noexcept -> std::span<const std::byte>
 
 auto session::consume_output(std::size_t size) -> void
 {
-    if (size > output().size()) {
+    if (size > pending_output().size()) {
         connection_error(internal_error);
         return;
     }
+    output_lent_ = false;
+    lent_output_ = std::vector<std::byte> {};
     output_offset_ = (output_offset_ + size) % output_.size();
     output_size_ -= size;
     if (file_send_active_) file_send_prefix_ -= size;
@@ -360,7 +368,7 @@ auto session::take_file_send(bool include_prefix) noexcept -> std::optional<file
     if (file_send_prefix_ != 0) {
         // A wrapped queue is drained normally until its remaining prefix is
         // contiguous. Never expose bytes after the file ordering barrier.
-        if (!include_prefix || output().size() != file_send_prefix_)
+        if (!include_prefix || pending_output().size() != file_send_prefix_)
             return std::nullopt;
         file_send_.prefix = output();
     }
@@ -807,7 +815,9 @@ auto session::dispatch_data() -> void
             const auto pad = byte_value(frame_data_[0]);
             payload = pad < payload ? payload - 1 - pad : 0;
         }
-        if (payload > route_body_slot_size - (value->body_end - value->body_begin)) {
+        // DATA beyond a flow-control window fails below instead of pausing.
+        if (flow_size <= value->receive_window && flow_size <= connection_receive_window_ &&
+            payload > route_body_slot_size - (value->body_end - value->body_begin)) {
             stalled_ = true;
             stalled_need_ = payload;
             return;
@@ -935,6 +945,12 @@ auto session::dispatch_settings() -> void
             connection_error(protocol_error);
         } else {
             server_settings_acked_ = true;
+            // RFC 9113 section 6.9.2: the advertised initial window now
+            // applies to open streams too.
+            if (routes_ != nullptr) {
+                for (const auto slot : std::span(slot_order_).first(active_count_))
+                    streams_[slot]->receive_window -= 65535 - route_body_slot_size;
+            }
         }
         return;
     }
@@ -1290,7 +1306,8 @@ auto session::allocate_stream(std::uint32_t id) noexcept -> stream*
     }
     auto* found = streams_[slot_order_[active_count_++]].get();
     found->id = id;
-    found->receive_window = 65535;
+    found->receive_window = routes_ != nullptr && server_settings_acked_
+        ? route_body_slot_size : 65535;
     found->send_window = peer_initial_window_;
     found->request_body_size = 0;
     found->content_length.reset();
@@ -1346,9 +1363,16 @@ auto session::reset_stream(stream& value, closed_reason reason) noexcept -> void
         if (release_hook_ != nullptr)
             release_hook_(release_context_, value.id, value.stream_finished);
     }
-    const auto slot = value.slot;
-    value = stream {};
-    value.slot = slot;
+    // Later requests reuse the request strings' capacity. Moving an empty
+    // string over them frees it in some standard libraries, so swap it out.
+    stream fresh;
+    fresh.slot = value.slot;
+    for (const auto member : {&stream::method, &stream::target, &stream::if_none_match,
+                              &stream::if_modified_since, &stream::range}) {
+        (fresh.*member).swap(value.*member);
+        (fresh.*member).clear();
+    }
+    value = std::move(fresh);
 }
 
 // Routes a stream whose request headers were just validated. Returns false
@@ -1618,6 +1642,11 @@ auto session::reserve_output(std::size_t needed, std::size_t file_payload_size) 
         if (first != output_size_) {
             std::memcpy(grown.data() + first, output_.data(), output_size_ - first);
         }
+        // A transport may still be sending lent bytes from the old storage.
+        if (output_lent_) {
+            lent_output_ = std::move(output_);
+            output_lent_ = false;
+        }
         output_ = std::move(grown);
         output_offset_ = 0;
     }
@@ -1790,6 +1819,7 @@ auto session::pump_responses() -> void
                 static_cast<std::uint64_t>(value.send_window)}));
             if (!append_frame(data_frame, 0, value.id, value.chunk.first(count))) return;
             value.chunk = value.chunk.subspan(count);
+            response_cursor_ = (index + 1) % stream_count_;
             connection_send_window_ -= static_cast<std::int64_t>(count);
             value.send_window -= static_cast<std::int64_t>(count);
             continue;

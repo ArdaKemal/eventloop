@@ -75,7 +75,9 @@ public:
 
     [[nodiscard]] auto read_buffer() noexcept -> std::span<std::byte>;
     auto commit_read(std::size_t size) -> void;
-    [[nodiscard]] auto output() const noexcept -> std::span<const std::byte>;
+    // The transport may borrow output() until consume_output(), while more
+    // output is queued; one borrow is outstanding at a time.
+    [[nodiscard]] auto output() noexcept -> std::span<const std::byte>;
     auto consume_output(std::size_t size) -> void;
     // Assigns into value's existing strings, so a caller reusing one request
     // keeps their capacity across requests.
@@ -244,6 +246,7 @@ private:
     auto append_file_frame(std::uint8_t flags, std::uint32_t stream_id,
                            native_socket file, std::uint64_t offset,
                            std::size_t size) -> file_frame;
+    [[nodiscard]] auto pending_output() const noexcept -> std::span<const std::byte>;
     [[nodiscard]] auto reserve_output(std::size_t needed,
                                       std::size_t file_payload_size) -> bool;
     auto append_output(std::span<const std::byte> bytes) noexcept -> void;
@@ -327,6 +330,10 @@ private:
     std::size_t routed_next_ = 0;
     std::vector<std::byte> header_block_;
     std::vector<std::byte> output_;
+    // The storage output() last lent while the queue grew; kept until
+    // consume_output() reports the transport done with it.
+    std::vector<std::byte> lent_output_;
+    bool output_lent_ = false;
     std::vector<field> decoded_fields_;
     std::vector<std::byte> encoded_block_;
     hpack_decoder decoder_;
