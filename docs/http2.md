@@ -31,7 +31,9 @@ Lower urgency wins; within an urgency, non-incremental responses run in stream
 order, then incremental responses share DATA round-robin. Flow-blocked streams
 do not block others. Defaults are urgency 3/non-incremental; malformed values
 keep defaults, updates for unopened streams are ignored.
-SETTINGS_NO_RFC7540_PRIORITIES is advertised; RFC 7540 PRIORITY frames receive
+Across connections, a writer yields to the loop after 64 KiB of writes
+that did not suspend, so one connection with queued responses on a fast
+socket cannot starve others. SETTINGS_NO_RFC7540_PRIORITIES is advertised; RFC 7540 PRIORITY frames receive
 validity checks but do not affect scheduling.
 
 ## Handlers, flow control, and cancellation

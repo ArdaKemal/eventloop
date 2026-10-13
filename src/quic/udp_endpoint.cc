@@ -24,7 +24,7 @@ udp_endpoint::udp_endpoint(event_loop& loop, ip_endpoint local, path_endpoint_ro
         auto socket = std::make_unique<udp_socket>(loop, local, reuse_port);
         local_ = socket->local_endpoint();
         socket_ = socket.get();
-        socket->enable_receive_coalescing();
+        dont_fragment_ = socket->prepare_quic(local_.address_family == ip_endpoint::family::ipv6);
         socket->set_lifetime_observer(this, socket_destroyed);
         loop.add(std::move(socket));
     } catch (...) {

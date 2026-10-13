@@ -12,14 +12,18 @@ Endpoints reserve 80 active slots per connection: 32 bidirectional and eight
 unidirectional for each initiator. Advertised counts cap to peer reservations;
 local opens obey peer cumulative grants and local active reservations. Slots
 retire after both directions finish and sent data is acknowledged; peer
-retirement replenishes MAX_STREAMS. Bounded ordinal ranges retain retired IDs
+retirement replenishes MAX_STREAMS, advertised once the peer has opened half
+of the last grant. MAX_STREAM_DATA is sent only while a stream's final size
+is unknown (RFC 9000 3.2). Bounded ordinal ranges retain retired IDs
 against delayed reopening; sparse retirement can exhaust ranges and delay
 reclamation. Aggregate receive window <=128 KiB, per-stream buffering <=4 KiB;
 no unbounded fallback. These windows bound buffered data, not total transfers.
 
 `quic_endpoint::async_accept()` returns an early failure/peer-close as that
 connection's error; accept again to continue. Endpoint close or accept-task
-cancellation returns `operation_canceled`.
+cancellation returns `operation_canceled`. `quic_connection::async_accept_stream()`
+returns peer streams lowest ID first among those with data, so a stream that
+reuses a retired slot does not overtake older ones.
 
 `quic_connection::async_write()` returns bytes accepted into bounded send
 storage, possibly partial. Retry remaining bytes; `fin` closes only when the
@@ -28,8 +32,29 @@ whole supplied span is accepted. Borrow the span through completion/cancellation
 Pending operations resume on connection progress or at once on cancellation.
 They share 256 waiters per connection slot; an operation that finds the pool
 full returns `capacity_exceeded`; a cancelled operation returns its waiter at
-once. An idle connection's driver sleeps until its
+once. After 1-RTT packets that want an ACK, the driver lets woken tasks run
+for one loop turn before sending, so the ACK rides on their replies. An idle
+connection's driver sleeps until its
 next loss, PTO, idle, key-retirement or path-probe deadline.
+
+## Socket and path MTU
+
+Application packets start at the Ethernet payload: 1472 bytes, or 1452 to an
+IPv6 peer. On Linux endpoints set the don't-fragment bit, and after the
+handshake is confirmed each connection probes larger sizes with a PING
+padded to the probed size, outside congestion control, sent up to three times
+a PTO apart (RFC 9000 14.3). The negotiated `max_udp_payload_size` (default
+8192) goes first. An ACK raises the packet size to the probed size; EMSGSIZE
+or three unacknowledged probes lower the upper bound, and the search halves
+the remaining gap until it is under 64 bytes. If a send later fails with
+EMSGSIZE because the kernel learned a smaller path MTU, the connection drops
+to 1200 bytes and the lost packets are recovered as usual. Other platforms do
+not set the bit, so they keep the start size.
+
+On Linux, endpoints enable UDP_GRO and request a 2 MiB socket receive buffer,
+which the kernel caps at `net.core.rmem_max`. With the 208 KiB default, a
+burst of 64 handshakes on one loop overflowed the buffer and the losses left
+clients at minimum congestion windows; raise `rmem_max` if it is lower.
 
 ## Reset and stop-sending
 

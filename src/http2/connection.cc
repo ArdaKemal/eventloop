@@ -228,6 +228,10 @@ struct connection_state;
 
 // RFC 9113 section 7 error codes used by routed streams.
 constexpr std::uint32_t internal_error = 2;
+// Writes to a socket that stays writable complete without suspending, so a
+// connection with queued responses yields after this many bytes to let other
+// ready connections run on the loop.
+constexpr std::size_t write_turn_bytes = 64 * 1024;
 constexpr std::uint32_t refused_stream_error = 7;
 constexpr std::uint32_t cancel_error = 8;
 
@@ -878,11 +882,17 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
     if (loop.spawn(read_loop(loop, *connection), reader) != task_spawn_result::accepted)
         co_return false;
     bool clean = false;
+    std::size_t turn = 0;
     for (;;) {
+        if (turn >= write_turn_bytes) {
+            turn = 0;
+            (void)co_await yield(loop);
+        }
         if (auto file = state->take_file_send(true)) {
             auto sent = operation_result(co_await peer.async_send_file(
                 file->file.get(), file->offset, file->size, file->prefix));
             if (!sent) break;
+            turn += file->prefix.size() + file->size;
             state->consume_output(file->prefix.size());
             state->complete_file_send(std::move(file->file));
             connection->drain();
@@ -891,10 +901,12 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
         if (!state->output().empty()) {
             auto written = operation_result(co_await peer.async_write_some(state->output()));
             if (!written || *written == 0) break;
+            turn += *written;
             state->consume_output(*written);
             connection->drain();
             continue;
         }
+        turn = 0;
         if (state->closed()) {
             clean = true;
             break;
@@ -947,6 +959,7 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
         auto state = std::make_unique<session>(peer.kernel_sendfile_available());
         idle_deadline idle {deadline, idle_timeout};
         request incoming;
+        std::size_t turn = 0;
         for (;;) {
             while (state->pop_request(incoming)) {
                 serve_request(*state, incoming, document_root->descriptor.get(),
@@ -954,10 +967,15 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
             }
 
             for (;;) {
+                if (turn >= write_turn_bytes) {
+                    turn = 0;
+                    (void)co_await yield(loop);
+                }
                 if (auto file = state->take_file_send(true)) {
                     auto sent = operation_result(co_await peer.async_send_file(
                         file->file.get(), file->offset, file->size, file->prefix));
                     if (!sent) co_return false;
+                    turn += file->prefix.size() + file->size;
                     state->consume_output(file->prefix.size());
                     state->complete_file_send(std::move(file->file));
                     continue;
@@ -966,6 +984,7 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
                 auto written = operation_result(
                     co_await peer.async_write_some(state->output()));
                 if (!written || *written == 0) co_return false;
+                turn += *written;
                 state->consume_output(*written);
                 if (state->closed()) co_return true;
             }

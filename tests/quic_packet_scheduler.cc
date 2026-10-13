@@ -278,6 +278,9 @@ int main()
         // Consuming receive storage renews both credits and reliably advertises
         // them, so a bounded ring supports a transfer beyond its initial window.
         check(server->consume_stream(*id,3).has_value());
+        // The FIN fixed this stream's final size, so it needs no further
+        // stream credit (RFC 9000 3.2); ngtcp2 counts such frames as glitches.
+        check(!server->stream(*id)->credit_pending);
         check(send(*server,*client,incoming,outgoing,tls_level::application));
         const auto bulk=client->open_stream(stream_direction::bidirectional); check(bulk.has_value());
         const std::array<std::byte,1024> block{};

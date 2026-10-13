@@ -88,7 +88,9 @@ public:
         std::size_t bytes, bool in_flight, bool bypass_window = false) noexcept
         -> std::expected<void, congestion_error>
     {
-        if (bytes == 0 || bytes > max_datagram_size_)
+        // Packets outside the flight, such as path MTU probes, may exceed the
+        // current datagram size.
+        if (bytes == 0 || (in_flight && bytes > max_datagram_size_))
             return std::unexpected(congestion_error::invalid_packet_size);
         if (!in_flight) return {};
         if (bytes > std::numeric_limits<std::size_t>::max() - bytes_in_flight_)
@@ -214,7 +216,7 @@ private:
         congestion_packet packet) const noexcept
         -> std::optional<congestion_error>
     {
-        if (packet.bytes == 0 || packet.bytes > max_datagram_size_)
+        if (packet.bytes == 0 || (packet.in_flight && packet.bytes > max_datagram_size_))
             return congestion_error::invalid_packet_size;
         if (packet.in_flight && packet.bytes > bytes_in_flight_)
             return congestion_error::flight_underflow;

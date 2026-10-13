@@ -48,6 +48,8 @@ public:
 
     [[nodiscard]] auto router() noexcept -> endpoint_router& { return router_; }
     [[nodiscard]] auto local_endpoint() const noexcept -> ip_endpoint { return local_; }
+    // Datagrams carry the don't-fragment bit, so path MTU probes are reliable.
+    [[nodiscard]] auto dont_fragment() const noexcept -> bool { return dont_fragment_; }
     auto close() -> void;
     [[nodiscard]] auto run() -> task<std::error_code>;
     // Bytes remain caller-owned until completion. No outbound queue is hidden
@@ -96,6 +98,7 @@ private:
     std::thread::id owner_ {std::this_thread::get_id()};
     udp_socket* socket_ {};
     ip_endpoint local_ {};
+    bool dont_fragment_ {false};
     endpoint_router router_;
     endpoint_accept_callback accept_;
     std::shared_ptr<quic_worker_group> group_;

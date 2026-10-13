@@ -28,8 +28,8 @@ http2 = true
 [defaults.http3]
 port = 0                   # UDP; may share a port number with TCP TLS.
 connections = 8            # 1..256 per server
-requests = 0               # 0 selects four scratch slots per connection.
-max_datagram = 1472         # 1200..8192 bytes
+requests = 0               # 0 selects ten scratch slots per connection.
+max_datagram = 8192         # 1200..8192 bytes
 
 [[server]]
 name = "public"

@@ -164,6 +164,65 @@ auto send_sparse_streams(event_loop&, quic_connection& connection) -> task<bool>
     co_return true;
 }
 
+// Reads the peer's reply and FIN, then answers and finishes the stream.
+auto answer_stream(event_loop&, quic_connection& connection, std::uint64_t id) -> task<bool>
+{
+    std::array<std::byte, 8> buffer {};
+    const auto count = flatten_result(co_await connection.async_read(id, buffer));
+    if (!count || *count != reply.size()) co_return false;
+    const auto eof = flatten_result(co_await connection.async_read(id, buffer));
+    if (!eof || *eof != 0) co_return false;
+    const auto sent = flatten_result(co_await connection.async_write(id, reply, true));
+    co_return sent && *sent == reply.size();
+}
+
+// A stream opened after a slot was retired takes the lowest free slot; it must
+// still be accepted after the streams the peer opened before it.
+auto accept_in_open_order(event_loop& loop, quic_connection& connection) -> task<bool>
+{
+    const auto first = flatten_result(co_await connection.async_accept_stream());
+    if (!first || !(co_await answer_stream(loop, connection, *first)).value_or(false)) co_return false;
+    (void)co_await sleep_for(loop, 100ms);
+    for (std::uint64_t later = 1; later <= 3; ++later) {
+        const auto id = flatten_result(co_await connection.async_accept_stream());
+        if (!id || *id != *first + later * 4 ||
+            !(co_await answer_stream(loop, connection, *id)).value_or(false)) co_return false;
+    }
+    co_return true;
+}
+
+auto open_with_reply(event_loop&, quic_connection& connection, std::uint64_t& id) -> task<bool>
+{
+    const auto opened = flatten_result(co_await connection.async_open_stream(
+        quic_stream_direction::bidirectional));
+    if (!opened) co_return false;
+    id = *opened;
+    const auto sent = flatten_result(co_await connection.async_write(id, reply, true));
+    co_return sent && *sent == reply.size();
+}
+
+auto open_after_retirement(event_loop& loop, quic_connection& connection) -> task<bool>
+{
+    std::array<std::byte, 8> buffer {};
+    std::array<std::uint64_t, 4> streams {};
+    for (std::size_t index = 0; index < 3; ++index)
+        if (!(co_await open_with_reply(loop, connection, streams[index])).value_or(false))
+            co_return false;
+    for (auto* id = streams.data(); id != streams.data() + 4; ++id) {
+        if (id == streams.data() + 1) {
+            // Let the first stream retire on both sides before opening the last.
+            (void)co_await sleep_for(loop, 50ms);
+            if (!(co_await open_with_reply(loop, connection, streams[3])).value_or(false))
+                co_return false;
+        }
+        const auto count = flatten_result(co_await connection.async_read(*id, buffer));
+        if (!count || *count != reply.size()) co_return false;
+        const auto eof = flatten_result(co_await connection.async_read(*id, buffer));
+        if (!eof || *eof != 0) co_return false;
+    }
+    co_return true;
+}
+
 // The operation fails with `error` instead of waiting indefinitely.
 template<typename T>
 auto fails_with(event_loop& loop, task<std::expected<T, std::error_code>> operation,
@@ -218,7 +277,9 @@ auto server_serve(event_loop& loop, quic_endpoint& server, outcome& result) -> t
     if (datagram_ok)
         (void)flatten_result(co_await connection.async_send_datagram(datagram_out));
     const auto sparse_ok = co_await accept_sparse_streams(loop, connection);
-    result.server_ok = stream_ok && uni_ok && datagram_ok && sparse_ok && *sparse_ok;
+    const auto order_ok = co_await accept_in_open_order(loop, connection);
+    result.server_ok = stream_ok && uni_ok && datagram_ok && sparse_ok && *sparse_ok &&
+        order_ok && *order_ok;
 }
 
 auto client_run(event_loop& loop, quic_endpoint& client, ip_endpoint server,
@@ -263,8 +324,10 @@ auto client_run(event_loop& loop, quic_endpoint& client, ip_endpoint server,
         std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*received),
                    datagram_out.begin());
     const auto sparse_ok = co_await send_sparse_streams(loop, connection);
+    const auto order_ok = co_await open_after_retirement(loop, connection);
     (void)flatten_result(co_await connection.async_write(*stream, {}, true));
-    result.client_ok = stream_ok && uni_ok && datagram_ok && sparse_ok && *sparse_ok;
+    result.client_ok = stream_ok && uni_ok && datagram_ok && sparse_ok && *sparse_ok &&
+        order_ok && *order_ok;
 }
 
 auto watch(event_loop& loop, quic_endpoint& server, quic_endpoint& client,

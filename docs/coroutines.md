@@ -60,7 +60,9 @@ failure rather than allocating replacements. Frame payload classes are
 128/256/512/1024/2048/4096 bytes, and 16 times larger on Windows
 (2048 through 65536 bytes) because MSVC frames are about ten times larger
 for the same coroutines. Default hard slots are
-64/32/16/10240/4/2; warm slots 64/32/16/160/4/2. Zero disables a class;
+64/32/10240/10240/4/2, enough for 10k idle HTTPS connections per loop (a
+1024-byte connection frame plus a 512-byte pending TLS read); warm slots
+64/32/16/160/4/2. Zero disables a class;
 warm counts clamp to hard limits. Frame state must not exceed `max_align_t`
 alignment. `post_capacity` defaults to 1024, `coroutine_completion_capacity`
 and `file_io_depth` to 128; each must be a power of two >= 2.
