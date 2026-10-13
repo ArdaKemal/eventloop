@@ -27,7 +27,8 @@ whole supplied span is accepted. Borrow the span through completion/cancellation
 
 Pending operations resume on connection progress or at once on cancellation.
 They share 256 waiters per connection slot; an operation that finds the pool
-full returns `capacity_exceeded`. An idle connection's driver sleeps until its
+full returns `capacity_exceeded`; a cancelled operation returns its waiter at
+once. An idle connection's driver sleeps until its
 next loss, PTO, idle, key-retirement or path-probe deadline.
 
 ## Reset and stop-sending
@@ -86,7 +87,13 @@ ID the endpoint issues equal to the index; the other seven bytes stay random.
 The endpoint issues one 8-byte ID per connection and no NEW_CONNECTION_ID
 frames. Packets after the server's first Initial carry that ID, so a steering
 layer can map them to the owner; the client's first Initial carries a
-client-chosen ID and cannot be steered this way.
+client-chosen ID and cannot be steered this way. The endpoint accepts the
+peer's NEW_CONNECTION_ID frames: when Retire Prior To covers the ID in use, it
+addresses the peer's next active ID and sends RETIRE_CONNECTION_ID for each
+retired one. A datagram from the peer that cannot be routed, or a short-header
+packet that cannot be decrypted, ending in the stateless reset token of the ID
+in use makes the connection drain at once (RFC 9000 10.3.1). The endpoint
+itself sends no stateless reset tokens or resets.
 
 `quic_worker_group(workers)` (1..256) lets those endpoints forward misrouted
 packets to each other. Give every endpoint the same

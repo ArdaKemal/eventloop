@@ -118,8 +118,8 @@ public:
         };
 
         explicit waiter_state(std::size_t slots)
-            : handles(slots * 256), next(handles.size()), groups(slots + 1),
-              pending(groups.size())
+            : handles(slots * 256), next(handles.size()), previous(handles.size()),
+              owner(handles.size()), groups(slots + 1), pending(groups.size())
         {
             for (std::size_t i = 0; i < next.size(); ++i)
                 next[i] = i + 1 == next.size() ? no_index : i + 1;
@@ -137,7 +137,9 @@ public:
             free_head = next[node];
             next[node] = no_index;
             handles[node] = handle;
+            owner[node] = index;
             auto& queue = groups[index];
+            previous[node] = queue.tail;
             if (queue.tail == no_index) queue.head = node;
             else next[queue.tail] = node;
             queue.tail = node;
@@ -145,9 +147,14 @@ public:
             return node;
         }
 
-        // A cancelled waiter leaves its node queued without a handle; the
-        // group's next drain frees it.
-        auto forget_waiter(std::size_t node) noexcept -> void { handles[node] = {}; }
+        // A cancelled waiter returns its node to the pool at once, so repeated
+        // timeouts on an idle connection cannot exhaust it.
+        auto forget_waiter(std::size_t node) noexcept -> void
+        {
+            unlink(node);
+            next[node] = free_head;
+            free_head = node;
+        }
 
         auto request_wake(std::size_t index) noexcept -> void
         {
@@ -168,20 +175,29 @@ public:
                 --pending_count;
                 auto& queue = groups[index];
                 queue.pending = false;
+                // A resumed waiter may cancel or add others in this group.
                 const auto initial = queue.count;
-                for (std::size_t i = 0; i < initial; ++i) {
+                for (std::size_t i = 0; i < initial && queue.head != no_index; ++i) {
                     const auto node = queue.head;
-                    auto handle = handles[node];
-                    queue.head = next[node];
-                    if (queue.head == no_index) queue.tail = no_index;
-                    --queue.count;
-                    handles[node] = {};
+                    const auto handle = handles[node];
+                    unlink(node);
                     next[node] = free_head;
                     free_head = node;
-                    if (handle && !handle.done()) handle.resume();
+                    if (!handle.done()) handle.resume();
                 }
             }
             waking = false;
+        }
+
+        auto unlink(std::size_t node) noexcept -> void
+        {
+            auto& queue = groups[owner[node]];
+            if (previous[node] == no_index) queue.head = next[node];
+            else next[previous[node]] = next[node];
+            if (next[node] == no_index) queue.tail = previous[node];
+            else previous[next[node]] = previous[node];
+            --queue.count;
+            handles[node] = {};
         }
 
         auto wake_connection(std::size_t slot_index) noexcept -> void
@@ -199,6 +215,8 @@ public:
 
         std::vector<std::coroutine_handle<>> handles;
         std::vector<std::size_t> next;
+        std::vector<std::size_t> previous;
+        std::vector<std::size_t> owner;
         std::vector<group> groups;
         std::vector<std::size_t> pending;
         std::size_t free_head {no_index};
@@ -604,9 +622,10 @@ private:
             entry->clear();
             return false;
         }
+        // The driver owns its route: clear() destroys it, which removes the
+        // route once. Removing it here too made that destructor terminate.
         if (self.loop_.spawn(self.drive(self.loop_, self, *entry)) !=
             task_spawn_result::accepted) {
-            (void)self.endpoint_.router().remove(entry->route);
             entry->clear();
             return false;
         }
@@ -965,6 +984,8 @@ auto send_datagram_task(event_loop&, quic_endpoint::implementation& impl,
             if (slot.driver) slot.driver->notify();
             co_return std::expected<void, std::error_code> {};
         }
+        if (result.error() == datagram_queue_error::not_negotiated)
+            co_return std::unexpected(make_error_code(quic_errc::datagram_not_supported));
         if (result.error() == datagram_queue_error::frame_too_large)
             co_return std::unexpected(make_error_code(quic_errc::invalid_argument));
         if (!co_await notify(impl, slot_index + 1))
@@ -988,6 +1009,10 @@ auto receive_datagram_task(event_loop&, quic_endpoint::implementation& impl,
             co_return std::unexpected(make_error_code(quic_errc::not_connected));
         const auto received = slot.connection->receive_datagram(buffer);
         if (received.has_value()) co_return *received;
+        if (received.error() == datagram_queue_error::not_negotiated)
+            co_return std::unexpected(make_error_code(quic_errc::datagram_not_supported));
+        if (received.error() == datagram_queue_error::output_too_small)
+            co_return std::unexpected(make_error_code(quic_errc::output_too_small));
         if (!co_await notify(impl, slot_index + 1))
             co_return std::unexpected(make_error_code(quic_errc::capacity_exceeded));
     }

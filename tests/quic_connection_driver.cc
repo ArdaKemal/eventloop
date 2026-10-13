@@ -540,7 +540,13 @@ static auto amplification(event_loop& loop,bounded_connection& server,bounded_co
         received+=*size;
     }
     check(received>sent && received<=3*sent);
-    check(server.recovery().congestion().bytes_in_flight()==received);
+    // Every byte the server sent is in flight except its ACK-only packets,
+    // which it sends when a client Initial arrives after its own flight.
+    std::size_t ack_only=0;
+    for (const auto space : {packet_number_space::initial,packet_number_space::handshake})
+        for (const auto& packet : server.recovery().history(space)->remaining())
+            if (!packet.in_flight) ack_only+=packet.bytes;
+    check(server.recovery().congestion().bytes_in_flight()+ack_only==received);
     check(!server.core().keys_available(tls_level::application,tls_direction::read));
     // Blocked, the server arms no PTO (RFC 9002 6.2.2.1): nothing is sent or
     // counted past the first 999 ms PTO.

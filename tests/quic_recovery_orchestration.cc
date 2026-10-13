@@ -457,9 +457,17 @@ auto migration_keeps_flight() -> void
           recovery.congestion().bytes_in_flight() == 1200 &&
           recovery.congestion().congestion_window() == 12000,
           "new path restarts RTT and window but keeps flight");
-    check(recovery.on_ack(space, ack(1), at(60ms), 0us, output)->retired == 1 &&
+    check(recovery.on_ack(space, ack(1), at(1000ms), 0us, output)->retired == 1 &&
           recovery.congestion().bytes_in_flight() == 0,
           "ACK of a packet sent on the old path still retires it");
+    check(!recovery.rtt().has_sample() && recovery.congestion().congestion_window() == 12000,
+          "an old-path ACK neither samples RTT nor grows the new path's window");
+    check(recovery.record(space, packet(2, 1001ms)).has_value() &&
+          recovery.record(space, packet(3, 1002ms)).has_value() &&
+          recovery.record(space, packet(4, 1003ms)).has_value() &&
+          recovery.record(space, packet(5, 1004ms)).has_value() &&
+          recovery.on_ack(space, ack(5), at(1040ms), 0us, output).has_value() &&
+          recovery.rtt().has_sample(), "new-path packets sample RTT");
 }
 
 auto ack_only_progress_resets_pto() -> void

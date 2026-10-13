@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -80,6 +81,20 @@ auto successive_probes_carry_different_bytes() -> void
     check(equals(buffer.next_unacknowledged(3, 3), 5, "fgh"), "next probe skips past it and ACKed bytes");
     check(equals(buffer.next_unacknowledged(3, 8), 8, "ij"), "probe reaches the end of the flight");
     check(buffer.next_unacknowledged(3, 10).data.empty(), "nothing follows the last probe");
+}
+
+auto split_loss_keeps_later_losses() -> void
+{
+    crypto_send_buffer<64> buffer;
+    std::string bytes(64, 'x');
+    for (std::size_t i = 20; i < 30; ++i) bytes[i] = 'a' + static_cast<char>(i - 20);
+    check(buffer.append(input(bytes)) == 0 && buffer.mark_sent(0, 64).has_value() &&
+          buffer.mark_lost(0, 10).has_value() && buffer.mark_lost(20, 10).has_value(),
+          "two lost ranges");
+    check(buffer.acknowledge(4, 2).has_value(), "ACK splits the first lost range");
+    check(buffer.mark_sent(0, 4).has_value() && buffer.mark_sent(6, 4).has_value(),
+          "split halves retransmitted");
+    check(equals(buffer.next_pending(16), 20, "abcdefghij"), "later lost range still pending");
 }
 
 auto overlapping_transmissions_and_wrap() -> void
@@ -355,6 +370,7 @@ auto main() -> int
 {
     partial_ack_and_loss();
     successive_probes_carry_different_bytes();
+    split_loss_keeps_later_losses();
     overlapping_transmissions_and_wrap();
     bounds_and_failure_atomicity();
     delayed_reports_after_ring_reuse();

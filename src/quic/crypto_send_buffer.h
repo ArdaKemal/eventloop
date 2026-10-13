@@ -131,18 +131,31 @@ class crypto_send_buffer {
             return true;
         }
 
+        // Only a range strictly containing [begin, end) splits. Without room
+        // for the split it stays whole, which at worst resends bytes.
         constexpr auto remove(std::uint64_t begin, std::uint64_t end) noexcept -> void
         {
             if (begin >= end) return;
+            for (std::size_t i = 0; i < size_; ++i) {
+                if (ranges_[i].begin < begin && ranges_[i].end > end) {
+                    if (size_ >= max_ranges) return;
+                    std::copy_backward(ranges_.begin() + i + 1, ranges_.begin() + size_,
+                                       ranges_.begin() + size_ + 1);
+                    ranges_[i + 1] = {end, ranges_[i].end};
+                    ranges_[i].end = begin;
+                    ++size_;
+                    return;
+                }
+            }
             std::size_t write = 0;
             for (std::size_t i = 0; i < size_; ++i) {
-                const auto r = ranges_[i];
-                if (r.end <= begin || r.begin >= end) {
-                    ranges_[write++] = r;
-                    continue;
+                auto r = ranges_[i];
+                if (r.end > begin && r.begin < end) {
+                    if (r.begin < begin) r.end = begin;
+                    else if (r.end > end) r.begin = end;
+                    else continue;
                 }
-                if (r.begin < begin && write < max_ranges) ranges_[write++] = {r.begin, begin};
-                if (r.end > end && write < max_ranges) ranges_[write++] = {end, r.end};
+                ranges_[write++] = r;
             }
             size_ = write;
         }

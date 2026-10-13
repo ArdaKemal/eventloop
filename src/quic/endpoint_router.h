@@ -3,6 +3,7 @@
 #include "eventloop/ip_endpoint.h"
 #include "quic/packet_header.h"
 #include "quic/path_validation.h"
+#include "quic/stateless_reset.h"
 #include "quic/version_negotiation.h"
 
 #include <array>
@@ -47,6 +48,9 @@ struct endpoint_callbacks {
     // The ordinary packet callback may enqueue work and is not authentication.
     bool (*authenticate_changed_peer)(void*, std::span<const std::byte>,
                     const packet_header&, eventloop::ip_endpoint) noexcept {};
+    // A datagram matched the connection's stateless reset token; the owner
+    // enters draining. Called during dispatch: record it and return.
+    void (*stateless_reset)(void*) noexcept {};
 };
 
 // Caller-owned connection objects must outlive their registrations. This layer
@@ -119,6 +123,22 @@ public:
         *connection = {};
         (void)paths_.remove(handle);
         (void)candidate_paths_.remove(handle);
+        return {};
+    }
+
+    // The token of the peer connection ID in use (RFC 9000 10.3.1); an empty
+    // token stops detection. Unroutable datagrams from the connection's peer
+    // are compared against it.
+    [[nodiscard]] auto set_reset_token(endpoint_connection handle,
+        std::span<const std::byte> token) -> std::expected<void, endpoint_error>
+    {
+        check_owner();
+        auto* connection = find(handle);
+        if (!connection) return std::unexpected(endpoint_error::unknown_connection);
+        if (!token.empty() && token.size() != connection->reset_token.size())
+            return std::unexpected(endpoint_error::invalid_argument);
+        std::ranges::copy(token, connection->reset_token.begin());
+        connection->has_reset_token = !token.empty();
         return {};
     }
 
@@ -274,10 +294,16 @@ public:
         if (dispatching_) std::terminate();
         const auto first = parse_packet_header(datagram, 0, short_cid_length_,
                                                grease_quic_bit_);
-        if (!first) return std::unexpected(endpoint_error::malformed_packet);
+        if (!first) {
+            check_stateless_reset(datagram, source);
+            return std::unexpected(endpoint_error::malformed_packet);
+        }
         const auto handle = lookup(first->destination_cid);
         auto* connection = find(handle);
-        if (!connection) return std::unexpected(endpoint_error::unknown_connection);
+        if (!connection) {
+            check_stateless_reset(datagram, source);
+            return std::unexpected(endpoint_error::unknown_connection);
+        }
         dispatching_ = true;
         struct reset { bool& flag; ~reset() { flag = false; } } guard {dispatching_};
         const bool changed_peer = !same_peer(connection->peer, source);
@@ -336,6 +362,8 @@ private:
         endpoint_connection handle {};
         ip_endpoint peer {};
         endpoint_callbacks callbacks {};
+        stateless_reset_token reset_token {};
+        bool has_reset_token {};
         bool sending {};
         ip_endpoint candidate_peer {};
         bool candidate {};
@@ -354,6 +382,21 @@ private:
         return a.address_family == b.address_family && a.port == b.port &&
             a.scope_id == b.scope_id && std::equal(a.address.begin(),
                 a.address.begin() + length, b.address.begin());
+    }
+    auto check_stateless_reset(std::span<const std::byte> datagram,
+                                ip_endpoint source) noexcept -> void
+    {
+        if (datagram.size() < 21) return;
+        for (const auto& slot : connections_) {
+            if (!slot.handle || !slot.has_reset_token || !slot.callbacks.stateless_reset ||
+                !same_peer(slot.peer, source)) continue;
+            const auto matched = quic::detail::detect_stateless_reset(datagram,
+                std::span(&slot.reset_token, 1));
+            if (matched && *matched) {
+                slot.callbacks.stateless_reset(slot.callbacks.argument);
+                return;
+            }
+        }
     }
     auto find(endpoint_connection handle) noexcept -> connection_slot*
     { for (auto& slot : connections_) if (handle && slot.handle == handle) return &slot;

@@ -573,6 +573,9 @@ auto connection_core::retire_ack(tls_level level, std::uint64_t largest)
 }
 auto connection_core::close_sent(lifecycle_time_point now, lifecycle_duration pto) noexcept -> bool
 { check_owner(); return lifecycle_.close_sent(now, pto); }
+auto connection_core::stateless_reset(lifecycle_time_point now, lifecycle_duration pto) noexcept
+    -> bool
+{ check_owner(); return lifecycle_.enter_draining(now, pto); }
 auto connection_core::poll(lifecycle_time_point now, lifecycle_duration pto) noexcept -> bool
 {
     check_owner();

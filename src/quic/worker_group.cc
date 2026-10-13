@@ -41,13 +41,17 @@ auto worker_inbox::push(std::span<const std::byte> datagram, ip_endpoint source)
     -> void
 {
     const std::lock_guard lock {mutex_};
-    if (closed_ || count_ == capacity || datagram.size() > slot_size_) return;
-    const auto slot = (head_ + count_) % capacity;
-    std::ranges::copy(datagram, slots_.begin() + static_cast<std::ptrdiff_t>(slot * slot_size_));
-    sizes_[slot] = datagram.size();
-    sources_[slot] = source;
-    ++count_;
-    if (!scheduled_) schedule();
+    if (closed_) return;
+    if (count_ < capacity && datagram.size() <= slot_size_) {
+        const auto slot = (head_ + count_) % capacity;
+        std::ranges::copy(datagram, slots_.begin() + static_cast<std::ptrdiff_t>(slot * slot_size_));
+        sizes_[slot] = datagram.size();
+        sources_[slot] = source;
+        ++count_;
+    }
+    // Even a dropped datagram retries a failed post, or a full inbox would
+    // never drain.
+    if (count_ != 0 && !scheduled_) schedule();
 }
 
 auto worker_inbox::schedule() noexcept -> void

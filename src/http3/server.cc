@@ -975,7 +975,7 @@ auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t 
     }
 }
 
-auto serve_connection(event_loop& loop, quic_connection connection,
+auto serve_connection(event_loop& loop, quic_connection& connection,
                       std::shared_ptr<http::detail::document_root> root,
                       stream_handlers& handlers, storage_pool& pool,
                       const request_settings& settings) -> task<void>
@@ -1045,8 +1045,11 @@ auto serve_connection(event_loop& loop, quic_connection connection,
 
 class http3_server::implementation {
 public:
+    // The slot owns the connection handle, so a connection task whose frame
+    // cannot be allocated leaves it here to close.
     struct connection_slot {
         stream_handlers handlers;
+        quic_connection connection;
         std::optional<task_handle<void>> handle;
     };
 
@@ -1120,17 +1123,15 @@ auto http3_server::run_loop(event_loop& loop, http3_server& server) -> task<void
             [](const auto& entry) { return !entry.handle || entry.handle->done(); });
         if (slot == impl.connections_.end()) { accepted->close(); continue; }
         slot->handle.emplace();
-        const auto spawned = loop.spawn(serve_connection(loop, std::move(*accepted), impl.root_,
+        slot->connection = std::move(*accepted);
+        const auto spawned = loop.spawn(serve_connection(loop, slot->connection, impl.root_,
                 slot->handlers, impl.request_storage_, impl.settings_), *slot->handle);
         if (spawned != task_spawn_result::accepted) {
             slot->handle.reset();
-            if (spawned == task_spawn_result::frame_allocation_failure) {
-                // The connection task frame was never created, so the accepted
-                // connection is untouched. Reject only this connection instead
-                // of tearing down the listener and every live connection.
-                accepted->close();
-                continue;
-            }
+            slot->connection.close();
+            // Without a connection task frame, reject only this connection
+            // instead of tearing down the listener and every live connection.
+            if (spawned == task_spawn_result::frame_allocation_failure) continue;
             break;
         }
     }

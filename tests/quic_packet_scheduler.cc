@@ -399,6 +399,41 @@ int main()
         }
         check(send(*server,*client,incoming,outgoing,tls_level::application));
         for (const auto stream_id : selected) check(client->stream(stream_id)->send.complete());
+        // A peer never acknowledges ACK-only packets on their own and they are
+        // never declared lost, so they must not exhaust the sent history.
+        for (std::size_t i=0;i<2*bounded_connection::packet_capacity;++i) {
+            decoded_frame ping; ping.type=1;
+            check(incoming.queue_control(tls_level::application,ping).has_value());
+            check(send(*server,*client,incoming,outgoing,tls_level::application));
+            check(send(*client,*server,outgoing,incoming,tls_level::application));
+        }
+        check(client->recovery().history(packet_number_space::application_data)->size()<
+              bounded_connection::packet_capacity);
+        // NEW_CONNECTION_ID retiring the ID in use moves the client to the
+        // new one and queues RETIRE_CONNECTION_ID (RFC 9000 5.1.2). The
+        // server's own ID differs from the test's fixed DCID.
+        {
+            const std::array<std::byte,8> server_id {std::byte{9}}, next_id {std::byte{7}};
+            const std::array<std::byte,16> token {};
+            check(client->peer_ids().set_initial(std::as_bytes(std::span(dcid))).has_value());
+            check(server->local_ids().set_initial(server_id).has_value());
+            decoded_frame issued; issued.type=0x18; issued.sequence_number=1; issued.retire_prior_to=1;
+            issued.connection_id=next_id; issued.stateless_reset_token=token;
+            check(incoming.queue_control(tls_level::application,issued).has_value());
+            check(send(*server,*client,incoming,outgoing,tls_level::application));
+            const auto* selected=client->peer_ids().selected();
+            check(selected && selected->sequence_number==1 && std::ranges::equal(selected->id(),next_id));
+            check(send(*client,*server,outgoing,incoming,tls_level::application));
+            bool retired=false;
+            for (std::size_t cursor=0; cursor<last_plaintext_size;) {
+                const auto frame=decode_frame(std::as_bytes(std::span(buffer.plaintext)
+                    .first(last_plaintext_size)).subspan(cursor));
+                check(frame.has_value()); cursor+=frame->encoded_size;
+                retired=retired || (frame->type==0x19 && frame->sequence_number==0);
+            }
+            check(retired && !client->peer_ids().next_retirement());
+            check(server->local_ids().find(0)->retired);
+        }
         // A packet that preflight refuses (full window or sent history) must
         // not consume its packet number: each gap permanently uses one
         // sent-range slot, so repeated refusals would exhaust them and stall.

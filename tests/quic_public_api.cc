@@ -164,6 +164,18 @@ auto send_sparse_streams(event_loop&, quic_connection& connection) -> task<bool>
     co_return true;
 }
 
+// The operation fails with `error` instead of waiting indefinitely.
+template<typename T>
+auto fails_with(event_loop& loop, task<std::expected<T, std::error_code>> operation,
+                quic_errc error) -> task<bool>
+{
+    auto timed = co_await with_timeout(loop, std::move(operation), 5s);
+    if (!timed || timed->state != timeout_result<std::expected<T, std::error_code>>::outcome::completed ||
+        !timed->result) co_return false;
+    const auto result = flatten_result(std::move(*timed->result));
+    co_return !result && result.error() == make_error_code(error);
+}
+
 auto server_serve(event_loop& loop, quic_endpoint& server, outcome& result) -> task<void>
 {
     auto accepted = flatten_result(co_await server.async_accept());
@@ -195,8 +207,12 @@ auto server_serve(event_loop& loop, quic_endpoint& server, outcome& result) -> t
             *uni, server_uni_data, true));
         uni_ok = sent && *sent == server_uni_data.size();
     }
+    // A buffer too small for the next DATAGRAM fails and leaves it queued.
+    const bool small_ok = (co_await fails_with(loop,
+        connection.async_receive_datagram(std::span(buffer).first(datagram_in.size() - 1)),
+        quic_errc::output_too_small)).value_or(false);
     auto received = flatten_result(co_await connection.async_receive_datagram(buffer));
-    const bool datagram_ok = received && *received == datagram_in.size() &&
+    const bool datagram_ok = small_ok && received && *received == datagram_in.size() &&
         std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*received),
                    datagram_in.begin());
     if (datagram_ok)
@@ -235,9 +251,15 @@ auto client_run(event_loop& loop, quic_endpoint& client, ip_endpoint server,
                 buffer.begin() + static_cast<std::ptrdiff_t>(*uni_count),
                 server_uni_data.begin());
     }
+    // A DATAGRAM within the peer's frame limit but too large for a 1472-byte
+    // packet is refused rather than blocking the queue behind it.
+    const std::vector<std::byte> oversized(1400);
+    const auto refused = flatten_result(co_await connection.async_send_datagram(oversized));
+    const bool oversized_ok = !refused &&
+        refused.error() == make_error_code(quic_errc::invalid_argument);
     (void)flatten_result(co_await connection.async_send_datagram(datagram_in));
     auto received = flatten_result(co_await connection.async_receive_datagram(buffer));
-    const bool datagram_ok = received && *received == datagram_out.size() &&
+    const bool datagram_ok = oversized_ok && received && *received == datagram_out.size() &&
         std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*received),
                    datagram_out.begin());
     const auto sparse_ok = co_await send_sparse_streams(loop, connection);
@@ -378,6 +400,7 @@ auto control_scenario(const std::filesystem::path& certificate) -> bool
 struct cancel_outcome {
     bool cancelled {false};
     event_loop::clock::duration elapsed {};
+    bool datagram_unsupported {false};
 };
 
 auto cancel_server(event_loop&, quic_endpoint& server) -> task<void>
@@ -404,6 +427,20 @@ auto cancel_client(event_loop& loop, quic_endpoint& server, quic_endpoint& clien
         result.elapsed = event_loop::clock::now() - started;
         result.cancelled = read && read->state ==
             timeout_result<std::expected<std::size_t, std::error_code>>::outcome::timed_out;
+        // Cancelled waits return their waiter at once: more timeouts than the
+        // endpoint's waiter pool holds still all time out.
+        for (int i = 0; id && result.cancelled && i != 2100; ++i) {
+            const auto again = co_await with_timeout(loop, connection.async_read(*id, buffer), 1ms);
+            result.cancelled = again && again->state ==
+                timeout_result<std::expected<std::size_t, std::error_code>>::outcome::timed_out;
+        }
+        // DATAGRAM was not negotiated (RFC 9221 3).
+        const std::array<std::byte, 1> payload {};
+        result.datagram_unsupported =
+            (co_await fails_with(loop, connection.async_send_datagram(payload),
+                                 quic_errc::datagram_not_supported)).value_or(false) &&
+            (co_await fails_with(loop, connection.async_receive_datagram(buffer),
+                                 quic_errc::datagram_not_supported)).value_or(false);
     }
     co_await server.async_close();
     co_await client.async_close();
@@ -428,7 +465,8 @@ auto cancel_scenario(const std::filesystem::path& certificate) -> bool
     check(loop.spawn(cancel_client(loop, server, client, result)) == task_spawn_result::accepted,
           "spawn cancel client");
     (void)loop.run();
-    return result.cancelled && result.elapsed < std::chrono::milliseconds(500);
+    return result.cancelled && result.elapsed < std::chrono::milliseconds(500) &&
+           result.datagram_unsupported;
 }
 
 // Closing the server endpoint sends CONNECTION_CLOSE (NO_ERROR) on every
@@ -1026,7 +1064,8 @@ auto scenario(quic_version version, const std::filesystem::path& certificate,
     server_options.certificate_chain = certificate / "cert.pem";
     server_options.private_key = certificate / "key.pem";
     server_options.alpn = protocol;
-    server_options.limits.max_datagram_frame_size = 1200;
+    // Larger than a 1472-byte packet can carry; see client_run.
+    server_options.limits.max_datagram_frame_size = 1500;
 
     quic_client_options client_options;
     client_options.alpn = protocol;
@@ -1067,6 +1106,9 @@ auto main() -> int
     WSADATA data {};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
 #endif
+    // Every quic_errc is an error: a zero error_code would read as success.
+    check(static_cast<bool>(make_error_code(quic_errc::invalid_argument)),
+          "quic_errc values are nonzero");
     // Unique per process: concurrent runs must not delete each other's files.
     const auto directory = std::filesystem::temp_directory_path() /
         ("eventloop-quic-public-" + std::to_string(std::random_device {}()));

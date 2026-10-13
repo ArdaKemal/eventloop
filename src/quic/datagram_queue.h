@@ -109,7 +109,9 @@ public:
     [[nodiscard]] constexpr auto consume(std::span<std::byte> output) noexcept
         -> std::expected<std::size_t, datagram_queue_error>
     {
-        if (empty()) return std::unexpected(datagram_queue_error::empty);
+        if (empty())
+            return std::unexpected(max_frame_size_ == 0 ? datagram_queue_error::not_negotiated
+                                                        : datagram_queue_error::empty);
         const auto& slot = slots_[head_];
         if (output.size() < slot.size)
             return std::unexpected(datagram_queue_error::output_too_small);

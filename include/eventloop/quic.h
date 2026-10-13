@@ -27,8 +27,9 @@ enum class quic_version { v1, v2 };
 
 enum class quic_stream_direction { bidirectional, unidirectional };
 
+// Zero is reserved for success, as std::error_code requires.
 enum class quic_errc {
-    invalid_argument,
+    invalid_argument = 1,
     invalid_state,
     capacity_exceeded,
     not_connected,
@@ -155,6 +156,13 @@ public:
     [[nodiscard]] auto async_write(std::uint64_t stream_id,
                                    std::span<const std::byte> buffer, bool fin)
         -> task<std::expected<std::size_t, std::error_code>>;
+    // RFC 9221 DATAGRAMs. Both fail with quic_errc::datagram_not_supported
+    // when DATAGRAM was not negotiated in that direction. Send fails with
+    // quic_errc::invalid_argument for a payload that cannot fit one packet at
+    // the connection's current datagram size, and waits only while the queue
+    // is full. Receive waits only while the queue is empty and fails with
+    // quic_errc::output_too_small, leaving the DATAGRAM queued, when the
+    // buffer is smaller than the next one.
     [[nodiscard]] auto async_send_datagram(std::span<const std::byte> payload)
         -> task<std::expected<void, std::error_code>>;
     [[nodiscard]] auto async_receive_datagram(std::span<std::byte> buffer)

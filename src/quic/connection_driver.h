@@ -26,7 +26,7 @@ public:
         std::copy(local_cid.begin(), local_cid.end(), local_.begin()); local_size_=local_cid.size();
         std::copy(peer_cid.begin(), peer_cid.end(), peer_.begin()); peer_size_=peer_cid.size();
         const auto route=endpoint_.router().add(std::as_bytes(local_cid),peer,
-            {this,enqueue,authenticate_changed_peer},validated);
+            {this,enqueue,authenticate_changed_peer,stateless_reset},validated);
         if (!route) throw std::runtime_error("QUIC driver route capacity");
         route_=*route;
     }
@@ -147,6 +147,29 @@ public:
 private:
     struct queued_packet { std::array<std::uint8_t,packet_capacity> bytes{}; std::size_t size{}; ip_endpoint peer {}; };
     struct path_response_job { path_challenge token {}; ip_endpoint peer {}; bool occupied {}; };
+    static auto stateless_reset(void* argument) noexcept -> void
+    {
+        auto& self=*static_cast<connection_driver*>(argument);
+        self.reset_detected_=true; self.notify();
+    }
+    // A verified stateless reset drains without sending (RFC 9000 10.3.1).
+    auto drain_after_reset(lifecycle_time_point now) noexcept -> bool
+    {
+        reset_detected_=false;
+        if (!connection_.core().stateless_reset(now,
+                connection_.application_pto().value_or(std::chrono::seconds(1)))) return false;
+        stopped_=true;
+        return true;
+    }
+    // A short-header packet the connection cannot decrypt ends its datagram,
+    // so its tail is where a stateless reset carries the token.
+    [[nodiscard]] auto matches_reset_token(std::span<const std::byte> packet) const noexcept -> bool
+    {
+        const auto* selected=connection_.peer_ids().selected();
+        if (!selected || !selected->has_reset_token) return false;
+        const auto matched=detect_stateless_reset(packet,std::span(&selected->reset_token,1));
+        return matched && *matched;
+    }
     static auto authenticate_changed_peer(void* argument, std::span<const std::byte> datagram,
         const packet_header& header, ip_endpoint) noexcept -> bool
     {
@@ -188,7 +211,9 @@ private:
     __attribute__((noinline))
 #endif
     auto tick(lifecycle_time_point now) -> std::expected<void,connection_error>
-    {            while (count_) {
+    {
+            if (reset_detected_ && drain_after_reset(now)) return {};
+            while (count_) {
                 const auto& packet=queue_[head_];
                 const auto source=packet.peer;
                 const auto header=parse_packet_header(
@@ -207,6 +232,10 @@ private:
                     now,connection_.application_pto().value_or(std::chrono::seconds(1)));
                 head_=(head_+1)%queue_capacity; --count_;
                 if (!received) {
+                    if (received.error()==connection_error::authentication_failed &&
+                        header && header->kind==packet_kind::short_header &&
+                        matches_reset_token(std::as_bytes(std::span(packet.bytes).first(packet.size))) &&
+                        drain_after_reset(now)) return {};
                     if (received.error()==connection_error::authentication_failed ||
                         received.error()==connection_error::unavailable_keys ||
                         received.error()==connection_error::malformed_packet) continue;
@@ -234,6 +263,20 @@ private:
                     if (!learned->source_cid.empty()) {
                         peer_size_=learned->source_cid.size();
                         std::memcpy(peer_.data(),learned->source_cid.data(),peer_size_);
+                    }
+                }
+                // NEW_CONNECTION_ID with Retire Prior To may retire the ID in
+                // use; address the peer's next active one (RFC 9000 5.1.2).
+                if (const auto* selected=connection_.peer_ids().selected()) {
+                    if (selected->length!=0) {
+                        peer_size_=selected->length;
+                        std::memcpy(peer_.data(),selected->bytes.data(),peer_size_);
+                    }
+                    // Unroutable datagrams from the peer are checked against
+                    // the token of the ID in use.
+                    if (selected->has_reset_token && router_reset_token_!=selected->reset_token) {
+                        router_reset_token_=selected->reset_token;
+                        (void)endpoint_.router().set_reset_token(route_,selected->reset_token);
                     }
                 }
                 if (!connection_.synchronize_discarded_spaces())
@@ -703,6 +746,8 @@ private:
     bool (*retry_)(void*,std::span<const std::uint8_t>) noexcept {};
     std::span<const std::uint8_t> initial_token_{};
     bool authenticated_packet_seen_{};
+    bool reset_detected_{};
+    std::optional<stateless_reset_token> router_reset_token_{};
     bool work_pending_ {};
     bool running_{},stopped_{},started_{},handshake_done_{},candidate_challenge_active_{};
 };

@@ -103,7 +103,8 @@ private:
     std::uint8_t worker_index_ {};
     std::array<std::byte, maximum_datagram_size> receive_buffer_ {};
     std::array<std::byte, 600> version_buffer_ {};
-    std::array<std::byte, send_batch_capacity * send_segment_capacity> send_batch_bytes_ {};
+    // One GSO send carries at most the largest UDP payload (IPv4).
+    std::array<std::byte, 65507> send_batch_bytes_ {};
     std::size_t send_batch_count_ {};
     std::size_t send_batch_segment_ {};
     std::size_t send_batch_write_ {};

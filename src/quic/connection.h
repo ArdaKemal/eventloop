@@ -38,6 +38,8 @@ public:
     // negotiated per connection; the member below stays at the QUIC minimum
     // until peer transport parameters are validated.
     static constexpr std::size_t datagram_buffer_size = 8448;
+    // Room each 1-RTT packet reserves for its header, AEAD tag and framing.
+    static constexpr std::size_t packet_overhead = 100;
     struct transmitted_range {
         bool crypto {false};
         std::uint64_t stream_id {0}, offset {0};
@@ -334,9 +336,16 @@ public:
         check_owner();
         // Fast path: most application packets carry no pending control frame.
         if (!stream_control_pending_ && !data_credit_pending_ &&
-            !stream_credit_pending_[0] && !stream_credit_pending_[1])
+            !stream_credit_pending_[0] && !stream_credit_pending_[1] &&
+            !peer_id_retirement_pending_)
             return {};
         decoded_frame frame;
+        if (peer_id_retirement_pending_) {
+            if (const auto sequence = peer_ids_.next_retirement()) {
+                frame.type = 0x19; frame.sequence_number = *sequence; return frame;
+            }
+            peer_id_retirement_pending_ = false;
+        }
         for (auto* active : active_slots()) if (auto& s = *active; s.reset_pending) {
             frame.type = 4; frame.stream_id = s.id;
             frame.final_size = *s.state.send_final_size();
@@ -363,7 +372,8 @@ public:
     auto control_queued(const decoded_frame& frame) noexcept -> void
     {
         check_owner();
-        if (frame.type == 0x10) data_credit_pending_ = false;
+        if (frame.type == 0x19) (void)peer_ids_.mark_retirement_queued(frame.sequence_number);
+        else if (frame.type == 0x10) data_credit_pending_ = false;
         else if (frame.type == 0x12 || frame.type == 0x13)
             stream_credit_pending_[frame.type == 0x12 ? 0 : 1] = false;
         else if (auto* s = stream(frame.stream_id)) {
@@ -411,7 +421,14 @@ public:
     { check_owner(); return datagrams_.consume(output); }
     [[nodiscard]] auto queue_datagram(std::span<const std::byte> data)
         -> std::expected<void, datagram_queue_error>
-    { check_owner(); return outgoing_datagrams_.push(data); }
+    {
+        check_owner();
+        // A DATAGRAM that cannot fit one packet would block the queue head.
+        if (outgoing_datagrams_.max_frame_size() != 0 &&
+            1 + varint_size(data.size()) + data.size() > send_datagram_size_ - packet_overhead)
+            return std::unexpected(datagram_queue_error::frame_too_large);
+        return outgoing_datagrams_.push(data);
+    }
     // Remove only after a successful UDP send. DATAGRAMs are never retransmitted.
     [[nodiscard]] auto outgoing_datagrams() noexcept -> datagram_queue&
     { check_owner(); return outgoing_datagrams_; }
@@ -478,6 +495,14 @@ public:
         record->count = ranges.size();
         std::copy(ranges.begin(), ranges.end(), record->ranges.begin());
         record->stream_slots = range_streams;
+        // Keep a slot free for the next packet; the evicted ACK only loses
+        // its ACK-of-ACK retirement, and received ranges stay bounded.
+        if (recovery_.history(space)->remaining().size() == packet_capacity)
+            if (const auto evicted = recovery_.forget_oldest_not_in_flight(space)) {
+                const auto key = std::ranges::find(sent_keys_, record_key(space, *evicted));
+                if (key != sent_keys_.end())
+                    release(sent_[static_cast<std::size_t>(key - sent_keys_.begin())]);
+            }
         for (std::size_t j = 0; j < ranges.size(); ++j)
             if (!ranges[j].crypto) ++range_streams[j]->in_flight;
         range_index = 0;
@@ -560,6 +585,9 @@ private:
         const auto parsed = decode_transport_parameters(std::as_bytes(bytes),
             self.role_ == endpoint_role::client ? parameter_sender::server : parameter_sender::client);
         if (!parsed) return false;
+        if (const auto* token = parsed->find(static_cast<std::uint64_t>(
+                parameter_id::stateless_reset_token));
+            token && !self.peer_ids_.set_initial_reset_token(token->value)) return false;
         self.peer_ = limits(*parsed);
         const auto buffer_cap = static_cast<std::uint64_t>(datagram_buffer_size);
         const auto local_cap = std::clamp<std::uint64_t>(self.local_.udp_payload, 1200, buffer_cap);
@@ -769,7 +797,11 @@ private:
         }
         case 0x12: case 0x13:
             return registry_.set_peer_limit(frame.type == 0x12 ? stream_direction::bidirectional : stream_direction::unidirectional, frame.limit).has_value();
-        case 0x18: return peer_ids_.add(frame.sequence_number, frame.retire_prior_to, frame.connection_id, frame.stateless_reset_token).has_value();
+        case 0x18:
+            if (!peer_ids_.add(frame.sequence_number, frame.retire_prior_to, frame.connection_id,
+                    frame.stateless_reset_token)) return false;
+            peer_id_retirement_pending_ = peer_ids_.next_retirement().has_value();
+            return true;
         case 0x19: return local_ids_.retire(frame.sequence_number, destination_).has_value();
         case 0x1b: {
             path_challenge token; std::copy(frame.data.begin(), frame.data.end(), token.begin());
@@ -825,6 +857,7 @@ private:
     }();
     std::array<retired_packet, packet_capacity * 3> retired_ {};
     peer_connection_id_registry<8> peer_ids_;
+    bool peer_id_retirement_pending_ {false};
     local_connection_id_registry<8> local_ids_;
     std::array<path_validation_slot, 4> path_slots_ {};
     path_validation paths_;

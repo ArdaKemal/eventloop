@@ -1,4 +1,5 @@
 #include "quic/udp_endpoint.h"
+#include "quic/worker_group.h"
 #include "eventloop/udp_socket.h"
 
 #include <chrono>
@@ -116,6 +117,57 @@ auto forwarding() -> void
     owner.close();
     other.close();
 }
+// Large datagrams end a batch before it exceeds one GSO send's payload limit.
+auto large_batches() -> void
+{
+    event_loop loop;
+    udp_endpoint server(loop, ip_endpoint::loopback_v4(), path_endpoint_role::server, 2);
+    udp_endpoint client(loop, ip_endpoint::loopback_v4(), path_endpoint_role::client, 2);
+    constexpr std::array cid {std::byte {1}, std::byte {2}};
+    int packets = 0;
+    const auto handle = client.router().add(cid, server.local_endpoint(), {&packets, packet});
+    check(handle.has_value());
+    for (int i = 0; i != 9; ++i) {
+        check(!client.reserve_send(*handle, 8192, false));
+        check(!client.commit_send(8192));
+    }
+    check(!client.flush_send());
+    server.close();
+    client.close();
+}
+// A full inbox whose drain could not be posted still drains once the loop's
+// post queue has room, on the next push.
+auto inbox_backlog(event_loop& loop, worker_inbox& inbox, int& packets) -> task<void>
+{
+    std::array<std::byte, 24> datagram {};
+    datagram[0] = std::byte {0x41};
+    datagram[2] = std::byte {7};
+    for (std::size_t i = 0; i != worker_inbox::capacity; ++i) inbox.push(datagram, {});
+    // The timer runs after the posts that filled the queue have drained.
+    if (co_await sleep_for(loop, 1ms) != timer_wait_result::expired) co_return;
+    inbox.push(datagram, {});
+    for (unsigned i = 0; i != 200 && packets < 64; ++i)
+        if (co_await sleep_for(loop, 1ms) != timer_wait_result::expired) co_return;
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+auto forwarding_backlog() -> void
+{
+    event_loop_options options;
+    options.post_capacity = 2;
+    event_loop loop(options);
+    udp_endpoint owner(loop, ip_endpoint::loopback_v4(), path_endpoint_role::server, 2);
+    constexpr std::array cid {std::byte {0}, std::byte {7}};
+    int packets = 0;
+    check(owner.router().add(cid, ip_endpoint {}, {&packets, short_packet}).has_value());
+    const auto inbox = std::make_shared<worker_inbox>(loop, owner, 64);
+    check(loop.post([]() noexcept {}) && loop.post([]() noexcept {}) && !loop.post([]() noexcept {}));
+    check(loop.spawn(inbox_backlog(loop, *inbox, packets)) == task_spawn_result::accepted);
+    check(loop.spawn(watchdog(loop)) == task_spawn_result::accepted);
+    (void)loop.run();
+    check(packets == static_cast<int>(worker_inbox::capacity));
+    inbox->close();
+    owner.close();
+}
 }
 int main()
 {
@@ -134,6 +186,8 @@ int main()
 #endif
     roundtrip();
     forwarding();
+    forwarding_backlog();
+    large_batches();
 #ifdef _WIN32
     (void)WSACleanup();
 #endif

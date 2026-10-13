@@ -83,7 +83,8 @@ public:
         fields.kind = level == tls_level::initial ? packet_kind::initial :
             level == tls_level::handshake ? packet_kind::handshake : packet_kind::short_header;
         fields.packet_number_length = connection_.core().packet_number_length(level);
-        payload_limit_ = level == tls_level::application ? level_max - 100 : payload_limit;
+        payload_limit_ = level == tls_level::application
+            ? level_max - bounded_connection::packet_overhead : payload_limit;
         if (level == tls_level::initial) {
             // Retry tokens consume Initial wire space. Split CRYPTO across
             // packets rather than selecting a chunk that cannot fit afterward.

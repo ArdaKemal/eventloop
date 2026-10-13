@@ -27,6 +27,28 @@ auto long_packet(std::span<std::byte> out, std::byte destination = std::byte {1}
 int main()
 {
     {
+        // An unroutable datagram from the peer that ends in the connection's
+        // stateless reset token reaches its owner (RFC 9000 10.3.1).
+        int resets = 0;
+        const auto reset = [](void* argument) noexcept { ++*static_cast<int*>(argument); };
+        endpoint_router paths(path_endpoint_role::client, 2);
+        const auto peer = ip_endpoint::loopback_v4(7000);
+        const auto handle = paths.add(cid, peer, {&resets, packet, nullptr, reset}, true);
+        check(handle.has_value());
+        stateless_reset_token token {};
+        token.fill(std::byte {5});
+        std::array<std::byte, 40> datagram {};
+        datagram[0] = std::byte {0x40};
+        datagram[1] = std::byte {9};    // an unknown connection ID
+        std::ranges::copy(token, datagram.end() - 16);
+        check(!paths.dispatch(datagram, peer) && resets == 0);
+        check(paths.set_reset_token(*handle, token).has_value());
+        check(!paths.dispatch(datagram, ip_endpoint::loopback_v4(7001)) && resets == 0);
+        check(!paths.dispatch(datagram, peer) && resets == 1);
+        check(paths.set_reset_token(*handle, {}).has_value());
+        check(!paths.dispatch(datagram, peer) && resets == 1);
+    }
+    {
         int accepted = 0;
         endpoint_router paths(path_endpoint_role::server, 2);
         const auto original = ip_endpoint::loopback_v4(7000);

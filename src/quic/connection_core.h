@@ -126,6 +126,8 @@ public:
     [[nodiscard]] auto retire_ack(tls_level, std::uint64_t largest)
         -> std::expected<bool, received_packet_error>;
     [[nodiscard]] auto close_sent(lifecycle_time_point, lifecycle_duration) noexcept -> bool;
+    // A verified stateless reset enters draining (RFC 9000 10.3.1).
+    [[nodiscard]] auto stateless_reset(lifecycle_time_point, lifecycle_duration) noexcept -> bool;
     [[nodiscard]] auto poll(lifecycle_time_point, lifecycle_duration) noexcept -> bool;
     // Called by the owner only after a complete UDP datagram was transmitted.
     [[nodiscard]] auto packet_sent(lifecycle_time_point, bool ack_eliciting)

@@ -82,6 +82,21 @@ public:
         }
     }
 
+    // The server's stateless_reset_token transport parameter belongs to the
+    // handshake connection ID, which is learned before the parameters.
+    [[nodiscard]] constexpr auto set_initial_reset_token(
+        std::span<const std::byte> reset_token) noexcept
+        -> std::expected<void, connection_id_registry_error>
+    {
+        if (!initialized_)
+            return std::unexpected(connection_id_registry_error::missing_initial);
+        if (reset_token.size() != 16)
+            return std::unexpected(connection_id_registry_error::invalid_reset_token);
+        std::copy(reset_token.begin(), reset_token.end(), records_[0].reset_token.begin());
+        records_[0].has_reset_token = true;
+        return {};
+    }
+
     // Also accepts preferred_address sequence number one. Older Retire Prior
     // To values are ignored, but still must not exceed this frame's sequence.
     [[nodiscard]] constexpr auto add(std::uint64_t sequence_number,

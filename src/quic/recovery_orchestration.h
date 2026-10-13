@@ -73,6 +73,7 @@ public:
         event_count_ = 0;
         first_sample_highest_sent_.reset();
         last_persistent_endpoint_.reset();
+        old_path_highest_sent_ = {};
         pto_count_ = 0;
         handshake_confirmed_ = false;
         max_ack_delay_ = recovery_duration::zero();
@@ -101,8 +102,9 @@ public:
     // RFC 9000 Section 9.4: migrating to a new path resets only the
     // path-specific RTT estimator and congestion controller. Packet-number
     // spaces, ACK ranges, sent-packet history, and loss detection remain
-    // connection-wide, and packets in flight stay counted. Call after path
-    // validation promotes a new path.
+    // connection-wide, and packets in flight stay counted. Their ACKs and
+    // losses only retire flight: no RTT sample, window growth or congestion
+    // event reaches the new path. Call after path validation promotes it.
     [[nodiscard]] constexpr auto reset_path_recovery(
         std::size_t max_datagram_size,
         recovery_duration starting_rtt = initial_rtt) noexcept
@@ -113,6 +115,9 @@ public:
             return std::unexpected(congestion_failure(result.error()));
         congestion_ = controller;
         rtt_.reset(starting_rtt);
+        for (std::size_t i = 0; i < histories_.size(); ++i)
+            old_path_highest_sent_[i] = histories_[i].highest_sent();
+        first_sample_highest_sent_.reset();
         pto_count_ = 0;
         refresh_loss_deadlines();
         return {};
@@ -221,6 +226,7 @@ public:
             handshake_confirmed_, estimator, acked);
         if (!ack_count)
             return std::unexpected(history_failure(ack_count.error()));
+        if (*ack_count != 0 && old_path(space, acked[0].number)) estimator = rtt_;
         const auto detected = history.detect_lost(
             *history.largest_acked(), now, estimator.latest_rtt(),
             estimator.smoothed_rtt(), lost);
@@ -232,13 +238,12 @@ public:
         // Appendix A.7 applies congestion loss before ACK growth, so ACKs of
         // packets from the just-started recovery period do not inflate cwnd.
         for (std::size_t i = 0; i < detected->count; ++i) {
-            if (const auto result = controller.on_packet_lost(
-                    as_congestion_packet(lost[i]), now); !result)
+            if (const auto result = retire_lost(controller, space, lost[i], now); !result)
                 return std::unexpected(congestion_failure(result.error()));
         }
         for (std::size_t i = 0; i < *ack_count; ++i) {
-            if (const auto result = controller.on_packet_acked(
-                    as_congestion_packet(acked[i]), app_or_flow_limited); !result)
+            if (const auto result = controller.on_packet_acked(as_congestion_packet(acked[i]),
+                    app_or_flow_limited || old_path(space, acked[i].number)); !result)
                 return std::unexpected(congestion_failure(result.error()));
         }
         auto first_sample = first_sample_highest_sent_;
@@ -321,8 +326,8 @@ public:
             if (!result)
                 return std::unexpected(history_failure(result.error()));
             for (std::size_t i = 0; i < result->count; ++i) {
-                if (const auto retired = controller.on_packet_lost(
-                        as_congestion_packet(lost[i]), now); !retired)
+                if (const auto retired = retire_lost(controller,
+                        static_cast<packet_number_space>(index), lost[i], now); !retired)
                     return std::unexpected(congestion_failure(retired.error()));
                 staged[count++] = {static_cast<packet_number_space>(index),
                                    lost[i], retirement_reason::lost};
@@ -433,6 +438,22 @@ public:
     }
     [[nodiscard]] constexpr auto rtt() const noexcept -> const rtt_estimator&
     { return rtt_; }
+    // ACK-only packets are never declared lost, and a peer acknowledges them
+    // only alongside ack-eliciting packets. Forgetting the oldest one keeps a
+    // full space sending ACKs; it carries no flight or retransmittable data.
+    [[nodiscard]] constexpr auto forget_oldest_not_in_flight(
+        packet_number_space space) noexcept -> std::optional<std::uint64_t>
+    {
+        const auto index = space_index(space);
+        if (!index) return std::nullopt;
+        const auto packets = histories_[*index].remaining();
+        const auto oldest = std::ranges::find(packets, false, &sent_packet::in_flight);
+        if (oldest == packets.end()) return std::nullopt;
+        const auto number = oldest->number;
+        (void)histories_[*index].remove(number);
+        return number;
+    }
+
     [[nodiscard]] constexpr auto congestion() const noexcept
         -> const newreno_congestion_controller& { return congestion_; }
     [[nodiscard]] constexpr auto pto_count() const noexcept -> std::uint32_t
@@ -454,6 +475,22 @@ private:
                 packet.bytes, packet.in_flight, bypass_window); !result)
             return std::unexpected(congestion_failure(result.error()));
         return controller;
+    }
+
+    [[nodiscard]] constexpr auto old_path(packet_number_space space,
+                                          std::uint64_t number) const noexcept -> bool
+    {
+        const auto& highest = old_path_highest_sent_[static_cast<std::size_t>(space)];
+        return highest && number <= *highest;
+    }
+
+    [[nodiscard]] constexpr auto retire_lost(newreno_congestion_controller& controller,
+        packet_number_space space, const sent_packet& packet,
+        recovery_time_point now) const noexcept -> std::expected<void, congestion_error>
+    {
+        if (old_path(space, packet.number))
+            return controller.on_packet_discarded(as_congestion_packet(packet));
+        return controller.on_packet_lost(as_congestion_packet(packet), now);
     }
 
     static constexpr std::size_t event_capacity = 3 * Capacity;
@@ -675,6 +712,8 @@ private:
     std::optional<std::array<std::optional<std::uint64_t>, 3>>
         first_sample_highest_sent_ {};
     std::optional<recovery_time_point> last_persistent_endpoint_ {};
+    // Per space, the highest packet number sent before the last path change.
+    std::array<std::optional<std::uint64_t>, 3> old_path_highest_sent_ {};
     std::array<bool, 3> discarded_ {};
     std::uint32_t pto_count_ {0};
     recovery_duration max_ack_delay_ {};
