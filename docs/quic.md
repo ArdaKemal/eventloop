@@ -48,8 +48,16 @@ a PTO apart (RFC 9000 14.3). The negotiated `max_udp_payload_size` (default
 or three unacknowledged probes lower the upper bound, and the search halves
 the remaining gap until it is under 64 bytes. If a send later fails with
 EMSGSIZE because the kernel learned a smaller path MTU, the connection drops
-to 1200 bytes and the lost packets are recovered as usual. Other platforms do
-not set the bit, so they keep the start size.
+to 1200 bytes and the lost packets are recovered as usual. If 1200-byte
+datagrams fail with EMSGSIZE too, the path cannot carry QUIC and the
+connection stops sending and fails (RFC 9000 14). Other platforms do not set
+the bit, so they keep the start size.
+
+A server answers a client's new address by validating it with PATH_CHALLENGE
+and switches to it once validated; a client drops packets from any address but
+the server's, and drops server Initials that carry a token. PATH_CHALLENGE and
+PATH_RESPONSE datagrams are padded to 1200 bytes when the path's
+anti-amplification credit allows (RFC 9000 8.2).
 
 On Linux, endpoints enable UDP_GRO and request a 2 MiB socket receive buffer,
 which the kernel caps at `net.core.rmem_max`. With the 208 KiB default, a

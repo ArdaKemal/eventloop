@@ -23,6 +23,7 @@ namespace {
 constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 constexpr std::uint32_t protocol_error = 1;
 constexpr std::uint32_t stream_closed_error = 5;
+constexpr std::uint32_t frame_size_error = 6;
 constexpr std::uint32_t refused_stream_error = 7;
 
 auto check(bool condition, std::string_view message) -> void
@@ -231,6 +232,25 @@ auto skipped_stream_id_is_protocol_error() -> void
     check(error_of(state, 7, 0) == protocol_error, "lower unused stream id");
 }
 
+// A PRIORITY of the wrong length is a stream error (RFC 9113 6.3).
+auto priority_length_is_stream_error() -> void
+{
+    session state;
+    connect(state);
+    get(state, 1, 4);
+    drain(state);
+    const std::array<std::byte, 4> short_priority {};
+    std::vector<std::byte> input;
+    frame(input, 2, 0, 1, short_priority);
+    feed(state, input);
+    check(error_of(state, 3, 1) == frame_size_error, "short PRIORITY resets its stream");
+    check(error_of(state, 7, 0) == ~0u, "short PRIORITY keeps the connection");
+    drain(state);
+    get(state, 3);
+    request incoming;
+    check(state.pop_request(incoming) && incoming.stream_id == 3, "later stream serves");
+}
+
 auto window_overflow_error_scope() -> void
 {
     // WINDOW_UPDATE overflow is confined to its stream; a SETTINGS change
@@ -399,6 +419,7 @@ int main()
     frames_after_peer_reset_are_stream_errors();
     frames_racing_local_reset_are_discarded();
     skipped_stream_id_is_protocol_error();
+    priority_length_is_stream_error();
     window_overflow_error_scope();
     extended_connect();
 }

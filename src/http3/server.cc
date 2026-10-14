@@ -980,8 +980,10 @@ auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t 
         const bool ended = !got || *got == 0;
         const auto checked = ended ? stream.finish()
                                    : stream.receive(std::span(input).first(*got), critical);
+        // Every error on a critical stream closes the connection, including
+        // EXCESSIVE_LOAD from too many SETTINGS (RFC 9114 6.2.1).
         if (!checked) {
-            fail(connection, id, checked.error());
+            connection.close_application(static_cast<std::uint64_t>(checked.error()));
             co_return;
         }
         if (ended) co_return;

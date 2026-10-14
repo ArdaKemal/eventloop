@@ -57,6 +57,17 @@ auto hello(event_loop&, http::request& request, http::response& response) -> tas
     (void)co_await response.async_send(200, fields, text("hello"));
 }
 
+auto cookies(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    const auto value = request.header_value("cookie");
+    std::size_t count = 0;
+    for (const auto& field : request.headers())
+        if (field.name == "cookie") ++count;
+    check(count == (value ? 1u : 0u), "handler sees one joined Cookie field");
+    check(request.header_value("x-test") == "seen", "Cookie joining keeps other fields");
+    (void)co_await response.async_send(200, {}, text(value.value_or("<none>")));
+}
+
 auto info(event_loop&, http::request& request, http::response& response) -> task<void>
 {
     std::array<char, 256> body {};
@@ -539,6 +550,7 @@ auto main() -> int
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
           routes->add(http::method_type::get, "/short", short_body).has_value() &&
           routes->add(http::method_type::get, "/slow", slow).has_value() &&
+          routes->add(http::method_type::get, "/cookies", cookies).has_value() &&
           routes->add(http::method_type::post, "/timed", timed).has_value() &&
           routes->add(http::method_type::get, "/file", file,
                       const_cast<std::string*>(&file_path)).has_value(),
@@ -598,6 +610,13 @@ auto main() -> int
     auto partial_upload = request("POST", "/partial");
     partial_upload.body = std::vector<std::byte>(5000, std::byte {'p'});
     requests.push_back(std::move(partial_upload));
+    auto split_cookies = request("GET", "/cookies");
+    split_cookies.headers = {{"cookie", "a=1"}, {"x-test", "seen"}, {"cookie", "b=2; c=3"},
+                             {"cookie", "d=4"}};
+    requests.push_back(std::move(split_cookies));
+    auto one_cookie = request("GET", "/cookies");
+    one_cookie.headers = {{"cookie", "single=1"}, {"x-test", "seen"}};
+    requests.push_back(std::move(one_cookie));
 
     const auto results = serve(files,
         {.routes = routes, .document_root = directory.path() / "www",
@@ -636,6 +655,8 @@ auto main() -> int
     check(ok(results[15]).body == bytes("60000 " + std::to_string(large_sum)),
           "paused input resumes when the handler reads");
     check(ok(results[16]).body == bytes("partial"), "unread body stopped");
+    check(ok(results[17]).body == bytes("a=1; b=2; c=3; d=4"), "split Cookie lines join");
+    check(ok(results[18]).body == bytes("single=1"), "single Cookie line");
 
     // Handlers on one connection run concurrently: /hello on stream 3 is
     // answered while /slow on stream 1 sleeps.

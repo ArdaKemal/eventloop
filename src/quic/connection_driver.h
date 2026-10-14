@@ -416,8 +416,16 @@ private:
         fields.destination_cid={self.peer_.data(),self.peer_size_};
         const auto number=self.connection_.core().next_packet_number(tls_level::application);
         if (!number) co_return std::unexpected(connection_error::unavailable_keys);
-        const auto built=self.connection_.core().build(fields,
-            {reinterpret_cast<const std::uint8_t*>(self.path_payload_.data()),*encoded},self.output_,self.build_scratch_);
+        // PADDING expands the datagram to 1200 bytes when the path's
+        // anti-amplification credit allows it (RFC 9000 8.2.1, 8.2.2).
+        constexpr std::size_t expanded=1200;
+        const auto overhead=1+self.peer_size_+
+            self.connection_.core().packet_number_length(tls_level::application)+16;
+        const auto payload=std::span(self.packet_scratch_).first(
+            self.endpoint_.send_credit(self.route_,candidate)>=expanded ? expanded-overhead : *encoded);
+        std::fill(payload.begin(),payload.end(),std::uint8_t{0});
+        std::memcpy(payload.data(),self.path_payload_.data(),*encoded);
+        const auto built=self.connection_.core().build(fields,payload,self.output_,self.build_scratch_);
         if (!built) co_return std::unexpected(built.error());
         const auto bytes=std::as_bytes(std::span(self.output_).first(*built));
         const auto sent=candidate ? co_await self.endpoint_.async_send_candidate(self.route_,bytes)
@@ -508,9 +516,11 @@ private:
     }
     // The path MTU fell below the datagram size (the kernel learned it from
     // ICMP): the batch is lost and recovered as usual at the QUIC minimum.
-    auto path_shrank(int error) noexcept -> bool
+    // A path that refuses datagrams of the minimum size cannot carry QUIC, so
+    // the connection stops sending (RFC 9000 14.3).
+    auto path_shrank(int error,std::size_t datagram_size) noexcept -> bool
     {
-        if (error!=EMSGSIZE||!dont_fragment_) return false;
+        if (error!=EMSGSIZE||!dont_fragment_||datagram_size<=1200) return false;
         connection_.lower_datagram_size();
         mtu_search_=false;
         return true;
@@ -691,6 +701,7 @@ private:
             // A refused socket send or a waiting PATH_RESPONSE retries soon;
             // nothing else notifies the pump about them.
             bool stop_sending=false,retry=false;
+            const auto datagram_size=self.connection_.send_datagram_size();
             for (const auto level : {tls_level::initial,tls_level::handshake,tls_level::application}) {
                 if (stop_sending) break;
                 if (!self.connection_.core().keys_available(level,tls_direction::write)) continue;
@@ -727,7 +738,7 @@ private:
                     if (error) {
                         const auto value=error.value();
                         if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY &&
-                            !self.path_shrank(value))
+                            !self.path_shrank(value,datagram_size))
                             co_return std::unexpected(connection_error::provider_failure);
                         stop_sending=retry=true;
                         break;
@@ -736,7 +747,7 @@ private:
             }
             if (const auto flushed=self.endpoint_.flush_send(); flushed) {
                 const auto value=flushed.value();
-                if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY && !self.path_shrank(value))
+                if (value!=EAGAIN && value!=EWOULDBLOCK && value!=EBUSY && !self.path_shrank(value,datagram_size))
                     co_return std::unexpected(connection_error::provider_failure);
                 retry=true;
             }

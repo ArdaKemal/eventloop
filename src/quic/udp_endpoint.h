@@ -72,7 +72,8 @@ public:
     [[nodiscard]] auto reserved() noexcept -> std::span<std::uint8_t>;
     // Anti-amplification credit left after the datagrams already batched for
     // this connection, so the owner builds only packets the flush can send.
-    [[nodiscard]] auto send_credit(endpoint_connection) const -> std::uint64_t;
+    [[nodiscard]] auto send_credit(endpoint_connection, bool candidate = false) const
+        -> std::uint64_t;
     [[nodiscard]] auto commit_send(std::size_t size) noexcept -> std::error_code;
     // Flush queued datagrams with one offload/syscall batch. Always clears the
     // pending batch, even on failure.

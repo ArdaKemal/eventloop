@@ -49,6 +49,19 @@ int main()
         check(!paths.dispatch(datagram, peer) && resets == 1);
     }
     {
+        // A client discards authenticated packets from an address other than
+        // the server's (RFC 9000 9).
+        int accepted = 0;
+        endpoint_router paths(path_endpoint_role::client, 2);
+        const auto server = ip_endpoint::loopback_v4(7000);
+        const auto handle = paths.add(cid, server, {&accepted, packet, authenticate}, true);
+        check(handle.has_value());
+        const std::array<std::byte, 4> bytes{std::byte{0x40}, cid[0], cid[1], std::byte{99}};
+        check(!paths.dispatch(bytes, ip_endpoint::loopback_v4(7001)));
+        check(!paths.candidate_peer(*handle) && accepted == 0);
+        check(paths.dispatch(bytes, server) == std::size_t{1} && accepted == 1);
+    }
+    {
         int accepted = 0;
         endpoint_router paths(path_endpoint_role::server, 2);
         const auto original = ip_endpoint::loopback_v4(7000);
