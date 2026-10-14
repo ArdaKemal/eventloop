@@ -34,7 +34,8 @@ keep defaults, updates for unopened streams are ignored.
 Across connections, a writer yields to the loop after 64 KiB of writes
 that did not suspend, so one connection with queued responses on a fast
 socket cannot starve others. SETTINGS_NO_RFC7540_PRIORITIES is advertised; RFC 7540 PRIORITY frames receive
-validity checks but do not affect scheduling.
+validity checks but do not affect scheduling. A PRIORITY of the wrong length
+is a stream FRAME_SIZE_ERROR.
 
 ## Handlers, flow control, and cancellation
 
@@ -64,6 +65,9 @@ completes when bytes enter the output queue under flow control/priority;
   FLOW_CONTROL_ERROR; stream WINDOW_UPDATE overflow is a stream error.
 
 ## Bodies and responses
+
+Handlers see split Cookie lines joined with `; ` in arrival order as one
+field (RFC 9113 8.2.3); the join reuses the first line's string.
 
 Bodies may omit Content-Length. Reads beyond `max_request_body` return
 `message_size`; if the handler returns without a response, answer 413.
@@ -138,7 +142,8 @@ windows; streaming buffers one frame at a time.
 Optional decimal Content-Length must equal owned body size or source total;
 mismatch is `invalid_argument` before connecting for owned bodies, or on
 source overrun/short EOF. Supplying both body/source, connection-specific
-request fields, or TE other than `trailers` is also invalid.
+request fields, a Host field that differs from `:authority`, or TE other than
+`trailers` is also invalid.
 
 Malformed responses return `protocol_error`: connection-specific fields or any
 TE, nonnumeric/conflicting Content-Length, mismatched DATA totals, DATA

@@ -401,6 +401,8 @@ static auto receive_summary_scenario(event_loop& loop,bounded_connection& client
     const auto second_size=encode_frame(challenge,
         std::as_writable_bytes(std::span(buffer.frame).subspan(*first_size)));
     check(second_size.has_value());
+    const auto route=client_endpoint.router().lookup(std::as_bytes(std::span(dcid)));
+    const auto credit_before=client_endpoint.router().send_credit(route);
     const auto before_paths=*client.core().next_packet_number(tls_level::application);
     const auto& path_history=*client.recovery().history(packet_number_space::application_data);
     (void)inject(*first_size+*second_size,true);
@@ -413,6 +415,8 @@ static auto receive_summary_scenario(event_loop& loop,bounded_connection& client
         check(co_await sleep_for(loop,1ms)==timer_wait_result::expired);
     check(*server.paths().is_validated(100) && *server.paths().is_validated(101));
     check(path_history.highest_sent() && *path_history.highest_sent()>=before_paths+4);
+    // Each PATH_RESPONSE datagram is expanded to 1200 bytes (RFC 9000 8.2.2).
+    check(credit_before-client_endpoint.router().send_credit(route)>=4*1200);
 }
 static auto observe(event_loop& loop,bounded_connection& client,bounded_connection& server,
     connection_driver& client_driver,connection_driver& server_driver,

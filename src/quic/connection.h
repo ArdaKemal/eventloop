@@ -467,6 +467,9 @@ public:
         const auto header = parse_packet_header(std::as_bytes(datagram), offset, short_cid_length,
             core_.local_grease_quic_bit());
         if (!header) return std::unexpected(connection_error::malformed_packet);
+        // A client discards server Initials that carry a token (RFC 9000 17.2.2).
+        if (role() == endpoint_role::client && header->kind == packet_kind::initial &&
+            !header->token.empty()) return std::unexpected(connection_error::malformed_packet);
         receive_time_ = now;
         destination_ = header->destination_cid;
         const auto result = core_.receive(datagram, offset, short_cid_length,

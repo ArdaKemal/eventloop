@@ -117,11 +117,12 @@ auto udp_endpoint::reserved() noexcept -> std::span<std::uint8_t>
             send_batch_reserved_};
 }
 
-auto udp_endpoint::send_credit(endpoint_connection handle) const -> std::uint64_t
+auto udp_endpoint::send_credit(endpoint_connection handle, bool candidate) const
+    -> std::uint64_t
 {
-    const auto credit = router_.send_credit(handle);
+    const auto credit = router_.send_credit(handle, candidate);
     const auto queued = send_batch_active_ && send_batch_handle_ == handle &&
-        !send_batch_candidate_ ? send_batch_write_ : 0;
+        send_batch_candidate_ == candidate ? send_batch_write_ : 0;
     return credit > queued ? credit - queued : 0;
 }
 

@@ -799,6 +799,15 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
         connection.release(exchange);
         return;
     }
+    // Join split Cookie lines for the generic HTTP application (RFC 9113
+    // 8.2.3); emptied names are skipped below.
+    field* cookie = nullptr;
+    for (auto& entry : exchange.routed.fields) {
+        if (entry.name != "cookie") continue;
+        if (cookie == nullptr) { cookie = &entry; continue; }
+        cookie->value.append("; ").append(entry.value);
+        entry.name.clear();
+    }
     std::string_view method, target, authority, host, connect_protocol;
     exchange.headers.reserve(hpack_max_fields);
     for (const auto& entry : exchange.routed.fields) {

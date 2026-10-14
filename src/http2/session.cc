@@ -624,8 +624,8 @@ auto session::dispatch_frame() -> void
             return;
         }
         if (frame_payload_size_ != 5) {
-            connection_error(frame_size_error);
-            return;
+            stream_error(frame_stream_id_, frame_size_error);
+            break;
         }
         const auto dependency = read_u32(frame_data_) & 0x7fffffffu;
         if (dependency == frame_stream_id_) {

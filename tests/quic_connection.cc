@@ -145,6 +145,20 @@ int main()
         check(client->core().advance(now).has_value());
         check(server->core().advance(now).has_value());
         buffers buffer;
+        {
+            // A client discards a server Initial that carries a token
+            // (RFC 9000 17.2.2).
+            const std::array<std::uint8_t, 1> ping {1};
+            const std::array<std::uint8_t, 4> token {9, 9, 9, 9};
+            protected_packet_fields fields;
+            fields.kind = packet_kind::initial; fields.destination_cid = dcid; fields.token = token;
+            const auto size = server->core().build(fields, ping, buffer.encoded, buffer.build_scratch);
+            check(size.has_value());
+            const auto opened = client->receive(std::span(buffer.encoded).first(*size), 0,
+                dcid.size(), buffer.packet_scratch, buffer.plaintext, buffer.auth_scratch,
+                now, std::chrono::milliseconds(10));
+            check(!opened && opened.error() == connection_error::malformed_packet);
+        }
         for (int step = 0; step < 40; ++step) {
             now += std::chrono::milliseconds(1);
             bool progress = false;

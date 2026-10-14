@@ -130,6 +130,7 @@ struct outcome {
     bool survived {false};
     bool connection_closed {false};
     bool cancel_push_closed {false};
+    bool settings_load_closed {false};
     bool reclaimed {false};
     bool done {false};
 };
@@ -193,6 +194,30 @@ auto open_request(event_loop&, quic_connection& connection) -> task<std::uint64_
 
 // Both server slots are closed connections in their closing period. A new
 // connection reclaims one at once instead of waiting out three PTOs.
+// 9. SETTINGS with 33 distinct identifiers exceeds the server's bound:
+// H3_EXCESSIVE_LOAD closes the connection instead of resetting the control
+// stream (RFC 9114 6.2.1).
+auto excess_settings_close(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
+                           outcome& result) -> task<void>
+{
+    auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
+    if (!connected) co_return;
+    const auto control = flatten_result(co_await connected->async_open_stream(
+        quic_stream_direction::unidirectional));
+    if (!control) co_return;
+    std::string many;
+    for (char setting = 0x10; setting <= 0x30; ++setting) { many += setting; many += '\0'; }
+    auto settings = std::vector<std::byte> {std::byte {0}};
+    const auto framed = frame(0x04, many);
+    settings.insert(settings.end(), framed.begin(), framed.end());
+    const auto sent = (co_await send(loop, *connected, *control, settings, false)).value_or(false);
+    const auto id = (co_await open_request(loop, *connected)).value_or(0);
+    std::error_code error;
+    (void)co_await send(loop, *connected, id, get("/hello.txt"), true);
+    const auto status = (co_await response_status(loop, *connected, id, error)).value_or(0);
+    result.settings_load_closed = sent && status == 0 && error && error != reset_error;
+}
+
 auto reclaims_closed_slot(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
                           std::span<const std::byte> settings, outcome& result) -> task<void>
 {
@@ -308,6 +333,7 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server, outco
     status = (co_await response_status(loop, push_connection, probe, error)).value_or(0);
     result.cancel_push_closed = control_sent && status == 0 && error && error != reset_error;
 
+    co_await excess_settings_close(loop, endpoint, server, result);
     co_await reclaims_closed_slot(loop, endpoint, server, settings, result);
     result.done = true;
 }
@@ -360,6 +386,7 @@ auto main() -> int
     check(result.survived, "connection survives stream errors");
     check(result.connection_closed, "frame-sequence error closes the connection");
     check(result.cancel_push_closed, "unpromised CANCEL_PUSH closes the connection");
+    check(result.settings_load_closed, "excess SETTINGS identifiers close the connection");
     check(result.reclaimed, "full pool of closed connections admits a new one at once");
     std::puts("HTTP/3 server error scoping tests passed");
 }

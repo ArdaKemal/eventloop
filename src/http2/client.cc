@@ -239,8 +239,10 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     fields.push_back({":authority", request.authority.empty() ? hostname : request.authority});
     fields.push_back({":path", request.target});
     for (auto& item : request.headers) {
+        // A Host field must repeat :authority (RFC 9113 8.3.1).
         if (!valid_name(item.name) || !valid_value(item.value) ||
-            connection_specific(item.name) || (item.name == "te" && item.value != "trailers"))
+            connection_specific(item.name) || (item.name == "te" && item.value != "trailers") ||
+            (item.name == "host" && item.value != fields[2].value))
             co_return std::unexpected(failure(std::errc::invalid_argument));
     }
     // A declared request length must match the owned body, or the source total.

@@ -366,6 +366,14 @@ auto requests(const certificate_files& files) -> void
     trailers.headers.push_back({"te", "trailers"});
     check(exchange(files, std::move(trailers), response("200", {}, true)).has_value(),
           "request TE: trailers");
+    auto other_host = get();
+    other_host.headers.push_back({"host", "example.com"});
+    check(fails_with(exchange(files, std::move(other_host), {}), std::errc::invalid_argument),
+          "Host differing from :authority");
+    auto same_host = get();
+    same_host.headers.push_back({"host", "localhost"});
+    check(exchange(files, std::move(same_host), response("200", {}, true)).has_value(),
+          "Host equal to :authority");
     check(fails_with(exchange(files, get("CONNECT"), {}), std::errc::operation_not_supported),
           "CONNECT is unsupported");
 

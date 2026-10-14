@@ -241,11 +241,13 @@ public:
         return {};
     }
 
-    // Remaining anti-amplification credit on the connection's current path.
-    [[nodiscard]] auto send_credit(endpoint_connection handle) const -> std::uint64_t
+    // Remaining anti-amplification credit on the connection's current or
+    // candidate path.
+    [[nodiscard]] auto send_credit(endpoint_connection handle, bool candidate = false) const
+        -> std::uint64_t
     {
         check_owner();
-        return paths_.send_credit(handle);
+        return (candidate ? candidate_paths_ : paths_).send_credit(handle);
     }
 
     [[nodiscard]] auto begin_send_to(endpoint_connection handle, std::size_t bytes,
@@ -308,7 +310,9 @@ public:
         struct reset { bool& flag; ~reset() { flag = false; } } guard {dispatching_};
         const bool changed_peer = !same_peer(connection->peer, source);
         if (changed_peer) {
-            if (first->kind != packet_kind::short_header ||
+            // Only clients migrate: a client discards packets from any
+            // address but the server's (RFC 9000 9).
+            if (role_ == path_endpoint_role::client || first->kind != packet_kind::short_header ||
                 !connection->callbacks.authenticate_changed_peer ||
                 (connection->candidate && !same_peer(connection->candidate_peer, source)) ||
                 !connection->callbacks.authenticate_changed_peer(connection->callbacks.argument,
