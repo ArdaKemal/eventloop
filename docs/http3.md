@@ -20,8 +20,8 @@ to it as described there.
 | --- | --- |
 | `http::server_options::connection_capacity` | 8; 1..256 |
 | `request_capacity` | 0 selects ten scratch buffers per connection; explicit 1..8192 |
-| Peer active bidirectional / unidirectional streams | 32 / 8 per connection |
-| Reusable stream-task slots | 40 per connection |
+| Peer active bidirectional / unidirectional streams | 100 / 8 per connection (RFC 9114 6.1) |
+| Reusable stream-task slots | 108 per connection |
 | Request header block / decoded fields | 16 KiB / 128 |
 | QPACK dynamic table | Disabled |
 | `max_udp_payload_size` | 8192; clamped to 1200..8192, negotiated down to peer limit; reached by path MTU probing ([QUIC](quic.md#socket-and-path-mtu)) |

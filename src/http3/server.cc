@@ -29,7 +29,8 @@
 namespace eventloop::http {
 namespace {
 namespace h3 = eventloop::http3::detail;
-constexpr std::size_t max_streams = 40;
+// QUIC admits 100 peer bidirectional and 8 peer unidirectional streams.
+constexpr std::size_t max_streams = 108;
 constexpr std::size_t header_limit = 16 * 1024;
 using stream_handlers = std::array<std::optional<task_handle<void>>, max_streams>;
 
@@ -1052,7 +1053,7 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
             if (!acquired) break;
             permit = std::move(*acquired);
         }
-        // Handler slots cover every stream QUIC admits (32 bidirectional and
+        // Handler slots cover every stream QUIC admits (100 bidirectional and
         // 8 unidirectional), so exhaustion here is a capacity bug.
         auto slot = std::find_if(handlers.begin(), handlers.end(),
             [](const auto& handler) { return !handler || handler->done(); });

@@ -135,6 +135,12 @@ public:
     [[nodiscard]] auto next_deadline(lifecycle_duration current_pto) const noexcept
         -> std::optional<lifecycle_time_point>;
     [[nodiscard]] auto failure() const noexcept -> std::optional<connection_error>;
+    // The RFC 9000 20.1 code behind a protocol_violation failure, when one
+    // more specific than PROTOCOL_VIOLATION is known. The first one sticks.
+    [[nodiscard]] auto transport_error() const noexcept -> std::optional<std::uint64_t>
+    { check_owner(); return transport_error_; }
+    auto note_transport_error(std::uint64_t code) noexcept -> void
+    { check_owner(); if (!transport_error_) transport_error_ = code; }
     // TLS alert raised by the local handshake, for CRYPTO_ERROR (0x100+alert).
     [[nodiscard]] auto tls_alert() const noexcept -> std::optional<std::uint8_t>
     { check_owner(); return tls_.alert(); }
@@ -185,6 +191,7 @@ private:
     tls_provider tls_ {{&initial_, &handshake_, &application_},
                        {this, send_crypto, install_secret}};
     std::optional<connection_error> failure_;
+    std::optional<std::uint64_t> transport_error_;
     std::uint32_t version_ {version_1};
     std::array<std::byte, 20> peer_initial_source_cid_ {};
     std::size_t peer_initial_source_cid_size_ {0};

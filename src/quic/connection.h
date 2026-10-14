@@ -13,6 +13,9 @@
 #include "quic/transport_parameters.h"
 #include "quic/connection_core.h"
 
+#include <memory>
+#include <new>
+
 namespace eventloop::quic::detail {
 
 // Fixed storage per connection. The endpoint owns routing, pacing and UDP.
@@ -22,7 +25,7 @@ class bounded_connection {
 public:
     // Each initiator has an active reservation, across both directions. Local
     // opens cannot consume storage promised to the peer in transport parameters.
-    static constexpr std::size_t bidi_stream_capacity = 32;
+    static constexpr std::size_t bidi_stream_capacity = 100;
     static constexpr std::size_t uni_stream_capacity = 8;
     static constexpr std::size_t stream_capacity =
         2 * (bidi_stream_capacity + uni_stream_capacity);
@@ -64,6 +67,8 @@ public:
         bool receive_abandoned {false};
         bool accepted {false};
         bool occupied {false};
+        // Position in slots_, which orders active_slots().
+        std::size_t index {0};
         // Ranges of this stream in occupied sent records; the slot cannot
         // retire while any are outstanding.
         std::size_t in_flight {0};
@@ -124,7 +129,7 @@ public:
         if (!recovery_.reset(1200)) return std::unexpected(connection_error::invalid_state);
         for (auto& record : sent_) record = {};
         sent_keys_.fill(no_record);
-        for (auto& slot : slots_) slot.in_flight = 0;
+        for (auto* slot : active_slots()) slot->in_flight = 0;
         return {};
     }
 
@@ -206,9 +211,8 @@ public:
             return std::unexpected(connection_error::capacity_exceeded);
         }
         std::size_t active = 0;
-        for (const auto& slot : slots_)
-            active += slot.occupied && stream_initiator(slot.id) == role &&
-                stream_type(slot.id) == direction;
+        for (const auto* slot : active_slots())
+            active += stream_initiator(slot->id) == role && stream_type(slot->id) == direction;
         if (active >= capacity)
             return std::unexpected(connection_error::capacity_exceeded);
         const auto id = registry_.open_local(direction);
@@ -237,15 +241,10 @@ public:
         check_owner();
         // Scan the compact id array rather than the large slots.
         for (std::size_t i = 0; i < slot_ids_.size(); ++i)
-            if (slot_ids_[i] == id) return &slots_[i];
+            if (slot_ids_[i] == id) return slots_[i].get();
         return nullptr;
     }
-    [[nodiscard]] auto stream_slots() noexcept -> std::span<stream_slot>
-    { check_owner(); return slots_; }
-    [[nodiscard]] auto stream_slots() const noexcept -> std::span<const stream_slot>
-    { check_owner(); return slots_; }
-    // Occupied slots in ascending slot order, so iterating matches a scan of
-    // stream_slots() that skips empty slots, but touches only active entries.
+    // Occupied slots in ascending slot order.
     [[nodiscard]] auto active_slots() noexcept -> std::span<stream_slot*>
     { check_owner(); return {active_slots_.data(), active_count_}; }
     using retirement_callback = void (*)(void*, tls_level, std::uint64_t,
@@ -373,7 +372,8 @@ public:
     [[nodiscard]] auto receive_abandoned(std::uint64_t id) const noexcept -> bool
     {
         check_owner();
-        for (const auto& s : slots_) if (s.occupied && s.id == id) return s.receive_abandoned;
+        for (std::size_t i = 0; i < slot_ids_.size(); ++i)
+            if (slot_ids_[i] == id) return slots_[i]->receive_abandoned;
         return false;
     }
     // Pending controls stay in fixed connection storage until copied into the
@@ -617,6 +617,7 @@ private:
         std::uint64_t data {}, bidi_local {}, bidi_remote {}, stream_uni {}, bidi {}, uni {}, datagram {};
         std::uint64_t udp_payload {65527};
         std::uint64_t ack_exponent {3}, ack_delay {25};
+        std::uint64_t cid_limit {2};
     };
     struct packet_record {
         packet_number_space space {};
@@ -649,6 +650,7 @@ private:
         result.udp_payload = get(parameter_id::max_udp_payload_size, 65527);
         result.ack_exponent = get(parameter_id::ack_delay_exponent, 3);
         result.ack_delay = get(parameter_id::max_ack_delay, 25);
+        result.cid_limit = get(parameter_id::active_connection_id_limit, 2);
         return result;
     }
     static auto validate_parameters(void* argument, std::span<const std::uint8_t> bytes) noexcept -> bool
@@ -662,6 +664,7 @@ private:
                 parameter_id::stateless_reset_token));
             token && !self.peer_ids_.set_initial_reset_token(token->value)) return false;
         self.peer_ = limits(*parsed);
+        if (!self.local_ids_.set_active_limit(self.peer_.cid_limit)) return false;
         const auto buffer_cap = static_cast<std::uint64_t>(datagram_buffer_size);
         const auto local_cap = std::clamp<std::uint64_t>(self.local_.udp_payload, 1200, buffer_cap);
         const auto peer_cap = std::clamp<std::uint64_t>(self.peer_.udp_payload, 1200, buffer_cap);
@@ -678,21 +681,41 @@ private:
     {
         if (auto* existing = stream(id)) return existing;
         const auto role = role_ == endpoint_role::client ? stream_role::client : stream_role::server;
-        if (!registry_.find(id) && !registry_.observe_peer(id)) return nullptr;
+        if (!registry_.find(id)) {
+            const auto observed = registry_.observe_peer(id);
+            if (!observed) {
+                // A peer stream beyond our limit, or a local one never opened.
+                if (observed.error() == stream_registry_error::stream_limit) violation(0x04);
+                if (observed.error() == stream_registry_error::wrong_initiator) violation(0x05);
+                return nullptr;
+            }
+        }
         const bool local = stream_initiator(id) == role;
         const bool bidi = stream_type(id) == stream_direction::bidirectional;
         const auto send_limit = bidi ? (local ? peer_.bidi_remote : peer_.bidi_local) : peer_.stream_uni;
         const auto receive_limit = bidi ? (local ? local_.bidi_local : local_.bidi_remote) : local_.stream_uni;
-        for (auto& s : slots_) {
-            if (s.occupied) continue;
+        for (std::size_t index = 0; index < slots_.size(); ++index) {
+            if (slot_ids_[index] != no_stream) continue;
+            // Slot storage (about 24 KiB) is allocated when concurrency first
+            // needs it, then kept for the connection's lifetime.
+            if (!slots_[index]) {
+                slots_[index].reset(new (std::nothrow) stream_slot);
+                if (!slots_[index]) {
+                    if (!local) violation(0x01); // INTERNAL_ERROR
+                    return nullptr;
+                }
+                slots_[index]->index = index;
+            }
+            auto& s = *slots_[index];
             if (!flow_.add_stream(id, send_limit, receive_limit)) return nullptr;
             s.id = id; s.occupied = true; s.state = *stream_state::create(id, role);
-            slot_ids_[static_cast<std::size_t>(&s - slots_.data())] = id;
+            slot_ids_[index] = id;
             s.receive_window = s.receive_limit = receive_limit;
             s.receive.emplace(s.bytes, s.coverage, receive_limit);
             (void)s.send.extend_flow_limit(send_limit);
             const auto position = std::lower_bound(active_slots_.begin(),
-                active_slots_.begin() + active_count_, &s);
+                active_slots_.begin() + active_count_, index,
+                [](const stream_slot* slot, std::size_t value) { return slot->index < value; });
             std::move_backward(position, active_slots_.begin() + active_count_,
                 active_slots_.begin() + active_count_ + 1);
             *position = &s;
@@ -746,7 +769,7 @@ private:
             slot.blocked_pending = false;
             slot.blocked_limit = ~std::uint64_t {0};
             slot.accepted = slot.occupied = false;
-            slot_ids_[static_cast<std::size_t>(&slot - slots_.data())] = no_stream;
+            slot_ids_[slot.index] = no_stream;
             std::move(active_slots_.begin() + active + 1,
                 active_slots_.begin() + active_count_,
                 active_slots_.begin() + active);
@@ -828,6 +851,22 @@ private:
         retire_closed_streams();
         return true;
     }
+    // A peer frame violation records its RFC 9000 20.1 code, which the
+    // driver sends in place of PROTOCOL_VIOLATION. Always returns false.
+    auto violation(std::uint64_t code) noexcept -> bool
+    { core_.note_transport_error(code); return false; }
+    auto violation(stream_state_error error) noexcept -> bool
+    {
+        if (const auto code = stream_state_transport_error(error)) core_.note_transport_error(*code);
+        return false;
+    }
+    auto violation(flow_control_error error) noexcept -> bool
+    {
+        if (error == flow_control_error::stream_limit ||
+            error == flow_control_error::connection_limit) return violation(0x03);
+        if (error == flow_control_error::final_size) return violation(0x06);
+        return false;
+    }
     static auto dispatch(void* argument, tls_level level, const decoded_frame& frame) noexcept -> bool
     { return static_cast<bounded_connection*>(argument)->on_frame(level, frame); }
     auto on_frame(tls_level level, const decoded_frame& frame) noexcept -> bool
@@ -839,7 +878,7 @@ private:
             stream_initiator(frame.stream_id) != local_role;
         if ((((frame.type >= 8 && frame.type <= 15) || frame.type == 4 ||
               frame.type == 0x15) && local_uni) ||
-            (frame.type == 5 && peer_uni)) return false;
+            (frame.type == 5 && peer_uni)) return violation(0x05);
         if (((frame.type >= 8 && frame.type <= 15) || frame.type == 4 ||
              frame.type == 5 || frame.type == 0x11 || frame.type == 0x15) &&
             registry_.is_retired(frame.stream_id)) return true;
@@ -855,8 +894,12 @@ private:
         }
         if (frame.type >= 8 && frame.type <= 15) {
             auto* s = admit(frame.stream_id);
-            if (!s || !s->state.receive_stream(frame.offset, frame.data.size(), frame.fin) ||
-                !flow_.receive_stream_range(frame.stream_id, frame.offset, frame.data.size(), frame.fin)) return false;
+            if (!s) return false;
+            if (const auto r = s->state.receive_stream(frame.offset, frame.data.size(), frame.fin); !r)
+                return violation(r.error());
+            if (const auto r = flow_.receive_stream_range(frame.stream_id, frame.offset,
+                    frame.data.size(), frame.fin); !r)
+                return violation(r.error());
             if (s->state.receiving() == stream_receive_state::reset_received ||
                 s->state.receiving() == stream_receive_state::reset_read) return true;
             if (!s->receive->insert(frame.offset, frame.data, frame.fin)) return false;
@@ -867,28 +910,36 @@ private:
         switch (frame.type) {
         case 4: {
             auto* s = admit(frame.stream_id);
-            if (!s || !flow_.set_receive_final_size(frame.stream_id, frame.final_size) ||
-                !s->state.receive_reset(frame.final_size)) return false;
+            if (!s) return false;
+            if (const auto r = flow_.set_receive_final_size(frame.stream_id, frame.final_size); !r)
+                return violation(r.error());
+            if (const auto r = s->state.receive_reset(frame.final_size); !r)
+                return violation(r.error());
             return !s->receive_abandoned || drain_abandoned(*s);
         }
         case 5: {
             auto* s = admit(frame.stream_id);
-            if (!s || !s->state.receive_stop_sending(frame.error_code)) return false;
+            if (!s) return false;
+            if (const auto r = s->state.receive_stop_sending(frame.error_code); !r)
+                return violation(r.error());
             if (!s->state.reset_required()) return true;
             return queue_reset(*s, frame.error_code);
         }
         case 0x10: return flow_.update_send_max_data(frame.limit).has_value();
         case 0x11: {
             auto* s = admit(frame.stream_id);
-            return s && s->state.receive_max_stream_data() &&
-                flow_.update_send_stream_limit(frame.stream_id, frame.limit) &&
+            if (!s) return false;
+            if (const auto r = s->state.receive_max_stream_data(); !r) return violation(r.error());
+            return flow_.update_send_stream_limit(frame.stream_id, frame.limit) &&
                 (frame.limit <= s->send.flow_limit() || s->send.extend_flow_limit(frame.limit).has_value());
         }
         case 0x12: case 0x13:
             return registry_.set_peer_limit(frame.type == 0x12 ? stream_direction::bidirectional : stream_direction::unidirectional, frame.limit).has_value();
         case 0x18:
-            if (!peer_ids_.add(frame.sequence_number, frame.retire_prior_to, frame.connection_id,
-                    frame.stateless_reset_token)) return false;
+            if (const auto added = peer_ids_.add(frame.sequence_number, frame.retire_prior_to,
+                    frame.connection_id, frame.stateless_reset_token); !added)
+                return added.error() == connection_id_registry_error::connection_id_limit
+                    ? violation(0x09) : false;
             peer_id_retirement_pending_ = peer_ids_.next_retirement().has_value();
             return true;
         case 0x19: return local_ids_.retire(frame.sequence_number, destination_).has_value();
@@ -904,7 +955,12 @@ private:
               return r.has_value() || r.error() == datagram_queue_error::full ||
                      r.error() == datagram_queue_error::frame_too_large; }
         case 0x14: case 0x16: case 0x17: return true;
-        case 0x15: { auto* s = admit(frame.stream_id); return s && s->state.receive_data_blocked(); }
+        case 0x15: {
+            auto* s = admit(frame.stream_id);
+            if (!s) return false;
+            const auto r = s->state.receive_data_blocked();
+            return r || violation(r.error());
+        }
         default: return callbacks_.frame && callbacks_.frame(callbacks_.argument, level, frame);
         }
     }
@@ -931,7 +987,7 @@ private:
     std::size_t mtu_probe_size_ {0};
     stream_registry<stream_capacity> registry_;
     flow_control<stream_capacity> flow_;
-    std::array<stream_slot, stream_capacity> slots_;
+    std::array<std::unique_ptr<stream_slot>, stream_capacity> slots_;
     std::array<stream_slot*, stream_capacity> active_slots_ {};
     // Stream id of each occupied slot, no_stream otherwise (ids stay below 2^62).
     static constexpr std::uint64_t no_stream = ~std::uint64_t {0};

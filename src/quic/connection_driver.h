@@ -30,6 +30,8 @@ public:
             {this,enqueue,authenticate_changed_peer,stateless_reset},validated);
         if (!route) throw std::runtime_error("QUIC driver route capacity");
         route_=*route;
+        if (!connection_.local_ids().set_initial(std::as_bytes(local_cid)))
+            throw std::invalid_argument("QUIC driver CID");
         // Start from a 1500-byte MTU and probe upward only when datagrams
         // cannot be fragmented; IPv6 headers are 20 bytes longer.
         mtu_search_=dont_fragment_=endpoint_.dont_fragment();
@@ -359,7 +361,47 @@ private:
                     return std::unexpected(queued.error());
                 handshake_done_=true;
             }
+            if (!refresh_connection_ids()) return std::unexpected(connection_error::capacity_exceeded);
         return {};
+    }
+    // Keeps spare connection IDs with the peer so it can migrate or rotate
+    // (RFC 9000 5.1.1): up to three active, within the peer's
+    // active_connection_id_limit and the registry's lifetime capacity of 8.
+    // IDs the peer retires stop routing at once.
+    [[nodiscard]] auto refresh_connection_ids() -> bool
+    {
+        auto& ids=connection_.local_ids();
+        for (std::size_t sequence=0; sequence<ids.size(); ++sequence) {
+            const auto* record=ids.find(sequence);
+            if (!record->retired || !(routed_ids_ & (1u<<sequence))) continue;
+            routed_ids_&=static_cast<std::uint8_t>(~(1u<<sequence));
+            (void)endpoint_.router().remove_cid(route_,record->id());
+        }
+        if (!connection_.core().handshake_confirmed()) return true;
+        constexpr std::size_t spare_limit=3;
+        while (ids.active_count()<std::min<std::uint64_t>(ids.active_limit(),spare_limit) &&
+               ids.size()<8) {
+            std::array<std::byte,20> id {};
+            stateless_reset_token token {};
+            if (RAND_bytes(reinterpret_cast<unsigned char*>(id.data()),static_cast<int>(local_size_))!=1 ||
+                RAND_bytes(reinterpret_cast<unsigned char*>(token.data()),static_cast<int>(token.size()))!=1)
+                return false;
+            if (const auto worker=endpoint_.worker_index();
+                worker && endpoint_.router().role()==path_endpoint_role::server)
+                id[0]=static_cast<std::byte>(*worker);
+            const auto cid=std::span(id).first(local_size_);
+            // A full router or control queue retries on a later tick.
+            if (!endpoint_.router().add_cid(route_,cid)) return true;
+            decoded_frame frame; frame.type=0x18; frame.sequence_number=ids.size();
+            frame.connection_id=cid; frame.stateless_reset_token=token;
+            if (!scheduler_.queue_control(tls_level::application,frame)) {
+                (void)endpoint_.router().remove_cid(route_,cid);
+                return true;
+            }
+            if (!ids.issue(cid,token)) return false;
+            routed_ids_|=static_cast<std::uint8_t>(1u<<frame.sequence_number);
+        }
+        return true;
     }
 #if defined(_MSC_VER)
     __declspec(noinline)
@@ -646,15 +688,16 @@ private:
             if (!co_await idle_wait(self,deadline)) break;
         }
     }
-    // RFC 9000 20.1 codes for local failures. Stream and flow violations in
-    // peer frames are reported as PROTOCOL_VIOLATION, which 20.1 permits when
-    // no more specific code is tracked. A UDP failure sends nothing.
+    // RFC 9000 20.1 codes for local failures. A peer violation carries the
+    // specific code the connection recorded, else PROTOCOL_VIOLATION. A UDP
+    // failure sends nothing.
     [[nodiscard]] static auto transport_close_code(connection_driver& self,
         connection_error error) noexcept -> std::optional<std::uint64_t>
     {
         switch (error) {
         case connection_error::provider_failure: return std::nullopt;
         case connection_error::protocol_violation:
+            return self.connection_.core().transport_error().value_or(0x0a);
         case connection_error::malformed_packet:
         case connection_error::authentication_failed: return 0x0a;
         case connection_error::unsupported_frame: return 0x07;
@@ -863,5 +906,7 @@ private:
     bool work_pending_ {};
     bool reply_due_ {}; // a received 1-RTT packet asked for an ACK
     bool running_{},stopped_{},started_{},handshake_done_{},candidate_challenge_active_{};
+    // Bit per local connection ID sequence still routed to this connection.
+    std::uint8_t routed_ids_ {1};
 };
 } // namespace eventloop::quic::detail

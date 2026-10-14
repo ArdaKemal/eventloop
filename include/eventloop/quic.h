@@ -57,7 +57,7 @@ namespace eventloop {
 // windows are capped to reserved storage: 4 KiB per stream and 128 KiB per
 // connection. Smaller requests are preserved. Consuming data replenishes these
 // windows, so they do not limit the total stream or connection transfer size.
-// Active streams are capped to 32 bidirectional and 8 unidirectional streams
+// Active streams are capped to 100 bidirectional and 8 unidirectional streams
 // per initiator. Local opens also obey the peer's cumulative MAX_STREAMS grant.
 // Completed streams release storage after final ACK and receive completion;
 // the endpoint sends new MAX_STREAMS credit for retired peer streams once the
@@ -67,7 +67,7 @@ struct quic_transport_limits {
     std::uint64_t max_idle_timeout_ms {30000};
     std::uint64_t max_data {1024 * 1024};
     std::uint64_t max_stream_data {64 * 1024};
-    std::uint64_t max_streams_bidi {32};
+    std::uint64_t max_streams_bidi {100};
     std::uint64_t max_streams_uni {8};
     std::uint64_t max_datagram_frame_size {0};
     // Maximum UDP payload advertised and used for application packets, clamped
