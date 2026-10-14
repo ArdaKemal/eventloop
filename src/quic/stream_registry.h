@@ -159,6 +159,10 @@ public:
         noexcept -> std::uint64_t
     { return local_limit_[index(direction)]; }
 
+    [[nodiscard]] constexpr auto peer_limit(stream_direction direction) const
+        noexcept -> std::uint64_t
+    { return peer_limit_[index(direction)]; }
+
     [[nodiscard]] constexpr auto is_retired(std::uint64_t id) const noexcept -> bool
     {
         if (id > max_varint_value || find(id)) return false;

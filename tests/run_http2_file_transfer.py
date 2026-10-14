@@ -33,18 +33,11 @@ def request(stream, path, byte_range=None, head=False):
     return frame(1, 5, stream, block)
 
 
-FALLBACK_SUITE = "ECDHE-RSA-AES256-SHA384"
-
-
-def client_context(fallback):
+def client_context():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     context.set_alpn_protocols(["h2"])
-    if fallback:
-        # CBC is unsupported by Linux kTLS, even on hosts with TLS offload.
-        context.maximum_version = ssl.TLSVersion.TLSv1_2
-        context.set_ciphers(FALLBACK_SUITE)
     return context
 
 
@@ -54,44 +47,11 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def system_server_accepts_fallback(openssl, root):
-    """Whether a server with this host's default OpenSSL cipher settings,
-    which the library leaves unchanged, negotiates the CBC suite. Some
-    distribution builds (Fedora 44 with OpenSSL 3.5) leave TLS 1.2 CBC suites
-    out of server defaults."""
-    port = free_port()
-    server = subprocess.Popen([openssl, "s_server", "-accept", str(port), "-naccept", "1", "-quiet",
-                               "-cert", str(root / "cert.pem"), "-key", str(root / "key.pem")],
-                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        for _ in range(100):
-            try:
-                connection = socket.create_connection(("127.0.0.1", port), timeout=3)
-                break
-            except OSError:
-                time.sleep(0.02)
-        else:
-            raise AssertionError("openssl s_server did not start")
-        context = client_context(True)
-        context.set_alpn_protocols([])
-        try:
-            with context.wrap_socket(connection, server_hostname="localhost") as tls:
-                return tls.cipher()[0] == FALLBACK_SUITE
-        except ssl.SSLError:
-            return False
-    finally:
-        server.kill()
-        server.wait()
-
-
 class Peer:
-    def __init__(self, port, fallback):
-        context = client_context(fallback)
+    def __init__(self, port):
+        context = client_context()
         self.socket = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=3), server_hostname="localhost")
         assert self.socket.selected_alpn_protocol() == "h2"
-        if fallback:
-            assert self.socket.version() == "TLSv1.2"
-            assert self.socket.cipher()[0] == "ECDHE-RSA-AES256-SHA384"
         self.socket.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, payload=struct.pack("!HI", 4, 1024)))
 
     def exact(self, size):
@@ -134,8 +94,8 @@ class Peer:
         self.socket.close()
 
 
-def exercise(port, payload, fallback):
-    peer = Peer(port, fallback)
+def exercise(port, payload):
+    peer = Peer(port)
     try:
         expected = {1: payload, 3: payload[173:20174]}
         received = {stream: bytearray() for stream in expected}
@@ -209,7 +169,7 @@ def exercise(port, payload, fallback):
                 if flags & 1:
                     break
         assert bytes(tiny) == payload[:97]
-        print("HTTP/2 file framing, ranges, windows, multiplexing, HEAD, reset:", "TLS 1.2 CBC fallback" if fallback else "default TLS (kTLS when available)")
+        print("HTTP/2 file framing, ranges, windows, multiplexing, HEAD, reset: passed")
     finally:
         peer.close()
 
@@ -239,12 +199,7 @@ def main():
                         time.sleep(0.02)
                 else:
                     raise AssertionError("server did not start")
-                exercise(https_port, payload, False)
-                if system_server_accepts_fallback(args.openssl, root):
-                    exercise(https_port, payload, True)
-                else:
-                    print(f"skipped the userspace TLS fallback: this host's OpenSSL server "
-                          f"defaults refuse {FALLBACK_SUITE}")
+                exercise(https_port, payload)
             except Exception:
                 log.flush()
                 log.seek(0)

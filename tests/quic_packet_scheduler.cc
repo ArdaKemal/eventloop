@@ -180,6 +180,7 @@ int main()
             const auto opened=to.receive(std::span(buffer.encoded).first(*size),0,dcid.size(),
                 buffer.packet_scratch,buffer.plaintext,buffer.auth_scratch,now,std::chrono::milliseconds(10));
             check(opened.has_value());
+            receiver.packet_received(level,opened->packet_number,now);
             last_plaintext_size=opened->plaintext_size;
             bool eliciting=false;
             std::size_t cursor=0;
@@ -264,7 +265,12 @@ int main()
         check(client->flow().sent_total()==sent_credit);
         const auto probe_frame=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(last_plaintext_size)));
         check(probe_frame && probe_frame->type==15 && probe_frame->stream_id==*id && probe_frame->fin);
+        // The ACK reports the time since the largest packet arrived, in
+        // 8-microsecond units (RFC 9000 13.2.5).
+        now+=std::chrono::microseconds(800);
         check(send(*server,*client,incoming,outgoing,tls_level::application));
+        const auto delayed_ack=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(last_plaintext_size)));
+        check(delayed_ack && (delayed_ack->type==2 || delayed_ack->type==3) && delayed_ack->ack_delay==100);
         check(client->stream(*id)->send.complete());
         check(client->stream(*id)->send.next_unacknowledged(100).data.empty());
         check(!client->stream(*id)->send.next_unacknowledged(100).fin);
@@ -436,6 +442,33 @@ int main()
             }
             check(retired && !client->peer_ids().next_retirement());
             check(server->local_ids().find(0)->retired);
+        }
+        // Data held back by peer credit, and a refused open, draw one
+        // DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED per limit
+        // (RFC 9000 4.1, 4.6).
+        {
+            const auto data_limit=client->flow().send_max_data();
+            check(data_limit-client->flow().sent_total()<1024);
+            const auto blocked=client->open_stream(stream_direction::bidirectional);
+            check(blocked.has_value());
+            const std::array<std::byte,1100> bytes {};
+            check(client->stream(*blocked)->send.append(bytes).has_value());
+            std::optional<std::uint64_t> uni_limit;
+            while (!uni_limit)
+                if (!client->open_stream(stream_direction::unidirectional))
+                    uni_limit=client->streams().local_opened(stream_direction::unidirectional);
+            std::size_t data_blocked=0,stream_blocked=0,streams_blocked=0;
+            while (send(*client,*server,outgoing,incoming,tls_level::application))
+                for (std::size_t cursor=0; cursor<last_plaintext_size;) {
+                    const auto frame=decode_frame(std::as_bytes(std::span(buffer.plaintext)
+                        .first(last_plaintext_size)).subspan(cursor));
+                    check(frame.has_value()); cursor+=frame->encoded_size;
+                    data_blocked+=frame->type==0x14 && frame->limit==data_limit;
+                    stream_blocked+=frame->type==0x15 && frame->stream_id==*blocked && frame->limit==1024;
+                    streams_blocked+=frame->type==0x17 && frame->limit==*uni_limit;
+                }
+            check(data_blocked==1 && stream_blocked==1 && streams_blocked==1);
+            check(send(*server,*client,incoming,outgoing,tls_level::application));
         }
         // A packet that preflight refuses (full window or sent history) must
         // not consume its packet number: each gap permanently uses one

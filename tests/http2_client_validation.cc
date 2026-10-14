@@ -86,6 +86,10 @@ constexpr unsigned end_headers = 4;
     return out;
 }
 
+// Bytes the scripted server read after its script, and whether it is done.
+std::string server_received;
+bool server_finished = false;
+
 auto scripted_server(event_loop& loop, tcp_acceptor& listener,
                      std::shared_ptr<tls_context> context, std::string script) -> task<void>
 {
@@ -107,20 +111,25 @@ auto scripted_server(event_loop& loop, tcp_acceptor& listener,
         for (;;) {
             const auto received = flatten(co_await peer->async_read_some(buffer));
             if (!received || *received == 0) break;
+            server_received.append(reinterpret_cast<const char*>(buffer.data()), *received);
         }
     }
     peer->close();
+    server_finished = true;
 }
 
 using outcome = std::expected<http2::client_response, std::error_code>;
 
 auto client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
-            http2::client_request request, std::optional<outcome>& result,
+            bool wait_for_server, http2::client_request request, std::optional<outcome>& result,
             http2::response_sink sink, http2::response_header_sink header_sink) -> task<void>
 {
     result = flatten(co_await http2::async_request(loop, ip_endpoint::loopback_v4(port),
         std::move(context), "localhost", std::move(request), std::move(sink),
         std::move(header_sink)));
+    // Let a scripted server read what the client sent before closing.
+    for (int turn = 0; turn < 100 && wait_for_server && !server_finished; ++turn)
+        (void)co_await sleep_for(loop, 1ms);
     loop.stop();
 }
 
@@ -157,8 +166,11 @@ struct certificate_files {
                   tls_context::make_server(files.certificate, files.key), std::move(*script))) ==
               task_spawn_result::accepted, "spawn server");
     std::optional<outcome> result;
+    server_received.clear();
+    server_finished = false;
     check(loop.spawn(client(loop, ntohs(address.sin_port),
-              tls_context::make_client(files.certificate), std::move(request), result,
+              tls_context::make_client(files.certificate), script.has_value(),
+              std::move(request), result,
               std::move(sink), std::move(header_sink))) ==
           task_spawn_result::accepted, "spawn client");
     bool timed_out = false;
@@ -294,6 +306,11 @@ auto shutdown_frames(const certificate_files& files) -> void
     const auto completed = exchange(files, get(), finishing);
     check(completed && completed->status == 200 && completed->body == bytes("ok"),
           "GOAWAY covering the request");
+    // The client answers with its own GOAWAY: last stream 0, NO_ERROR.
+    check(server_received.size() >= 17 &&
+          server_received.substr(server_received.size() - 17) ==
+              std::string("\0\0\x08\x07\0\0\0\0\0", 9) + std::string(8, '\0'),
+          "client closes with GOAWAY");
 
     check(fails_with(exchange(files, get(), settings + goaway(0)), std::errc::connection_reset),
           "GOAWAY before the request");

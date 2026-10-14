@@ -72,6 +72,11 @@ follows the capacities above.
 - After response, unread bodies end with STOP_SENDING H3_NO_ERROR (RFC 9114 4.1).
 - Without content-length, finish ends the stream. Response trailers are always
   sent. Sections/trailers allow 61/64 fields; overflow is `message_size`.
+  A routed section or trailer section larger than the client's
+  SETTINGS_MAX_FIELD_SECTION_SIZE (names + values + 32 bytes per field,
+  RFC 9114 4.2.2) is also `message_size` and is not sent; an unstarted
+  response then gets the fallback 500. The limit applies once the client's
+  SETTINGS have been read. Built-in static responses are not checked.
   Returning after start without finish resets with H3_INTERNAL_ERROR.
 
 With routes, SETTINGS_ENABLE_CONNECT_PROTOCOL enables RFC 9220
@@ -104,7 +109,9 @@ Cancellation (`QPACK_DECODER_STREAM_ERROR`). Unknown stream types are
 refused with STOP_SENDING `H3_STREAM_CREATION_ERROR`. Each violation closes
 the connection with that code in CONNECTION_CLOSE, as does a client whose stream limit leaves no room for the
 server's three unidirectional streams (`H3_GENERAL_PROTOCOL_ERROR`). A
-connection that ends normally is closed with `H3_NO_ERROR`.
+connection that ends normally is closed with `H3_NO_ERROR`. The server sends
+no GOAWAY: server close and loop shutdown cancel connections at once (RFC 9114
+5.2 graceful shutdown is not implemented).
 
 ## Request framing and protocol errors
 

@@ -33,6 +33,15 @@ public:
     auto begin_probes() noexcept -> void { probe_next_ = {}; }
     auto request_ack(tls_level level) noexcept -> void
     { if (static_cast<std::size_t>(level) < 3) ++ack_pending_[static_cast<std::size_t>(level)]; }
+    // Notes when the largest 1-RTT packet number arrived, so ACKs report the
+    // delay since then (RFC 9000 13.2.5). Peers ignore the field in Initial
+    // and Handshake ACKs (RFC 9002 5.3), which keep sending zero.
+    auto packet_received(tls_level level, std::uint64_t number, lifecycle_time_point now) noexcept -> void
+    {
+        if (level != tls_level::application || (largest_received_ && number <= *largest_received_)) return;
+        largest_received_ = number;
+        largest_received_time_ = now;
+    }
     // Control frames are copied and bounded. The connection retirement
     // observer drives their retransmission. One scheduler owns that observer
     // and must be destroyed before its connection.
@@ -46,8 +55,7 @@ public:
         if (level != tls_level::application && frame.type != 1 && frame.type != 0x1c)
             return std::unexpected(connection_error::invalid_configuration);
         for (auto& slot : controls_) if (!slot.occupied ||
-            ((frame.type == 0x10 || frame.type == 0x11 || frame.type == 0x12 ||
-              frame.type == 0x13 || frame.type == 4 || frame.type == 5) &&
+            (((frame.type >= 0x10 && frame.type <= 0x17) || frame.type == 4 || frame.type == 5) &&
              slot.type == frame.type && slot.stream_id == frame.stream_id)) {
             const auto size = encode_frame(frame, slot.bytes);
             if (!size) return std::unexpected(connection_error::output_too_small);
@@ -101,7 +109,14 @@ public:
         bool eliciting = false;
         std::size_t ack_size = 0;
         if (ack_pending_[index]) {
-            const auto ack = connection_.core().make_ack(level, 0, ack_storage_);
+            // Units of 8 microseconds: the default ack_delay_exponent of 3,
+            // since the endpoint does not advertise one.
+            const auto delay = level == tls_level::application && largest_received_
+                ? static_cast<std::uint64_t>(std::max<std::int64_t>(0,
+                      std::chrono::duration_cast<std::chrono::microseconds>(
+                          now - largest_received_time_).count())) >> 3
+                : 0;
+            const auto ack = connection_.core().make_ack(level, delay, ack_storage_);
             if (ack && append(*ack)) {
                 ack_ = true; ack_largest_ = ack->largest_acknowledged; ack_size = used_;
                 const auto peer_update = connection_.core().peer_update_packet();
@@ -158,9 +173,12 @@ public:
                         chunk = stream.send.next_pending(remaining());
                     }
                 } else chunk = stream.send.next_pending(remaining());
+                if (stream.send.next_offset() > stream.send.flow_limit())
+                    connection_.stream_data_blocked(stream);
                 if (chunk.data.empty() && !chunk.fin) continue;
                 const auto retransmitted = stream.sent_highest > chunk.offset ? stream.sent_highest - chunk.offset : 0;
                 const auto allowed = std::min<std::uint64_t>(chunk.data.size(), credit + retransmitted);
+                if (allowed < chunk.data.size()) connection_.data_blocked(flow.send_max_data());
                 if (allowed < chunk.data.size()) { chunk.data = chunk.data.first(static_cast<std::size_t>(allowed)); chunk.fin = false; }
                 if (chunk.data.empty() && !chunk.fin) continue;
                 decoded_frame frame; frame.type = 0x0e | (chunk.fin ? 1 : 0);
@@ -285,7 +303,8 @@ private:
     sent_packet packet_{};
     std::size_t used_{},range_count_{},control_count_{};
     std::uint64_t ack_largest_{}, ack_generation_{};
-    std::optional<std::uint64_t> acknowledged_peer_update_;
+    std::optional<std::uint64_t> acknowledged_peer_update_, largest_received_;
+    lifecycle_time_point largest_received_time_{};
     tls_level level_{};
     bool pending_{},probe_{},datagram_{},ack_{};
 };

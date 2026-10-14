@@ -54,6 +54,16 @@ auto hello(event_loop&, http::request& request, http::response& response) -> tas
     (void)co_await response.async_send(200, fields, text("hello"));
 }
 
+// A section the client's 300-byte SETTINGS_MAX_FIELD_SECTION_SIZE refuses.
+auto big(event_loop&, http::request&, http::response& response) -> task<void>
+{
+    const std::string value(300, 'v');
+    const std::array<http::header, 1> fields {{{"x-big", value}}};
+    const auto sent = co_await response.async_send(200, fields, text("big"));
+    check(sent && !*sent && sent->error() == std::make_error_code(std::errc::message_size),
+          "oversized response section fails with message_size");
+}
+
 auto cookies(event_loop&, http::request& request, http::response& response) -> task<void>
 {
     ++*static_cast<std::size_t*>(request.route_context());
@@ -308,14 +318,13 @@ auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::by
 auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
             std::vector<std::vector<std::byte>>& requests, const std::vector<request_spec>& specs,
             std::vector<response_view>& responses,
-            bool& done) -> task<void>
+            std::span<const std::byte> settings, bool& done) -> task<void>
 {
     auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
     check(connected.has_value(), "connect");
     auto connection = std::move(*connected);
     const auto control = flatten_result(co_await connection.async_open_stream(
         quic_stream_direction::unidirectional));
-    const std::array<std::byte, 3> settings {std::byte {0}, std::byte {4}, std::byte {0}};
     check(control && sent(co_await send_all(loop, connection, *control, settings, false)),
           "client control stream");
     for (std::size_t index = 0; index < requests.size(); ++index)
@@ -333,8 +342,12 @@ auto watch(event_loop& loop, http::http3_server& server, quic_endpoint& endpoint
     loop.shutdown(event_loop::clock::duration::zero());
 }
 
+// Client control stream: type 0 and an empty SETTINGS frame.
+constexpr std::array<std::byte, 3> empty_settings {std::byte {0}, std::byte {4}, std::byte {0}};
+
 auto serve(const std::filesystem::path& directory, http::server_options options,
-           std::vector<request_spec> specs) -> std::vector<response_view>
+           std::vector<request_spec> specs,
+           std::span<const std::byte> settings = empty_settings) -> std::vector<response_view>
 {
     std::vector<std::vector<std::byte>> requests;
     for (const auto& spec : specs) requests.push_back(encode(spec));
@@ -352,7 +365,7 @@ auto serve(const std::filesystem::path& directory, http::server_options options,
         task_handle<void> serving;
         check(loop.spawn(server.run(), serving) == task_spawn_result::accepted, "spawn server");
         check(loop.spawn(client(loop, endpoint, server.local_endpoint(), requests, specs, responses,
-                                done)) == task_spawn_result::accepted, "spawn client");
+                                settings, done)) == task_spawn_result::accepted, "spawn client");
         check(loop.spawn(watch(loop, server, endpoint, done)) == task_spawn_result::accepted,
               "spawn watch");
         (void)loop.run();
@@ -404,6 +417,7 @@ auto main() -> int
           routes->add(http::method_type::post, "/upload", upload, &upload_calls).has_value() &&
           routes->add(http::method_type::post, "/partial", partial).has_value() &&
           routes->add(http::method_type::get, "/stream", stream).has_value() &&
+          routes->add(http::method_type::get, "/big", big).has_value() &&
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
           routes->add(http::method_type::get, "/short", short_body).has_value() &&
           routes->add(http::method_type::get, "/file", file,
@@ -486,6 +500,18 @@ auto main() -> int
     check(responses[16].body == "a=1; b=2; c=3; d=4", "split Cookies joined in wire order");
     check(responses[17].body == "single=1", "single Cookie preserved");
     check(responses[18].body == "<none>", "absent Cookie preserved");
+
+    // SETTINGS_MAX_FIELD_SECTION_SIZE = 300 (RFC 9114 4.2.2). The fallback
+    // 500 and /hello fit; /big's 300-byte header does not. /hello goes first
+    // so the server has read the client's SETTINGS before /big.
+    constexpr std::array<std::byte, 6> limited_settings {std::byte {0}, std::byte {4},
+        std::byte {3}, std::byte {6}, std::byte {0x41}, std::byte {0x2c}};
+    const auto limited = serve(directory.path(), {.routes = routes},
+        {{.path = "/hello"}, {.path = "/big"}}, limited_settings);
+    check(limited[0].status == 200 && limited[0].body == "hello",
+          "responses within the peer field section limit are sent");
+    check(limited[1].status == 500 && limited[1].field("x-big") == "<none>",
+          "peer field section limit replaces the oversized response with 500");
 
     const auto uploads_before = upload_calls;
     const auto large_lengths = serve(directory.path(),

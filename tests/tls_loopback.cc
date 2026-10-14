@@ -18,7 +18,10 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
+
+#include <openssl/ssl.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -483,6 +486,53 @@ struct stream_pair {
     if (!failed) std::cerr << "TLS plaintext peer handshake did not fail\n";
     return failed;
 }
+[[nodiscard]] auto server_handshake(event_loop& loop, tls_stream& stream,
+                                    bool& accepted) -> task<void>
+{
+    auto handshake = co_await stream.async_handshake();
+    accepted = handshake && *handshake;
+    loop.stop();
+}
+
+// A TLS 1.2 peer offering only the given suites; the server handshake
+// reports whether one of them was accepted.
+[[nodiscard]] auto run_cipher_case(const std::filesystem::path& certificate,
+                                   const std::filesystem::path& key,
+                                   const char* ciphers) -> bool
+{
+    auto sockets = connect_loopback();
+    const int descriptor = sockets.client.get();
+    if (fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) & ~O_NONBLOCK) == -1)
+        throw system_error("fcntl");
+    std::thread peer([descriptor, ciphers] {
+        SSL_CTX* context = SSL_CTX_new(TLS_client_method());
+        if (context == nullptr) return;
+        SSL_CTX_set_max_proto_version(context, TLS1_2_VERSION);
+        if (SSL_CTX_set_cipher_list(context, ciphers) == 1) {
+            if (SSL* ssl = SSL_new(context)) {
+                SSL_set_fd(ssl, descriptor);
+                (void)SSL_connect(ssl);
+                SSL_free(ssl);
+            }
+        }
+        SSL_CTX_free(context);
+        shutdown(descriptor, SHUT_RDWR);
+    });
+    event_loop loop;
+    auto server = std::make_unique<tls_stream>(
+        loop, std::move(sockets.server), tls_context::make_server(certificate, key),
+        tls_server_options {.application_protocols = {}});
+    auto* stream = server.get();
+    loop.add(std::move(server));
+    bool accepted = false;
+    if (loop.spawn(server_handshake(loop, *stream, accepted)) !=
+        task_spawn_result::accepted) {
+        throw std::runtime_error("cannot start cipher handshake task");
+    }
+    (void)loop.run();
+    peer.join();
+    return accepted;
+}
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
@@ -502,6 +552,11 @@ auto main(int argc, char* argv[]) -> int
                             run_case(certificate, key, trusted_ca, 4) &&
                             run_case(certificate, key, trusted_ca, 6) &&
                             run_plaintext_peer_case(trusted_ca) &&
+                            // RFC 9113 9.2.2: suites prohibited for HTTP/2
+                            // are refused; a forward-secret AEAD suite works.
+                            !run_cipher_case(certificate, key,
+                                             "AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256") &&
+                            run_cipher_case(certificate, key, "ECDHE-RSA-AES128-GCM-SHA256") &&
                             run_outbound_case(certificate, key, trusted_ca,
                                               false, false) &&
                             run_outbound_case(certificate, key, trusted_ca,

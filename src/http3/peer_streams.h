@@ -23,10 +23,12 @@ inline constexpr std::uint64_t qpack_decoder_stream_type = 0x03;
 
 // Connection-wide record of the peer's critical streams (RFC 9114 6.2.1,
 // RFC 9204 4.2). A second stream of the same type is a connection error.
+// Also carries the peer's SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 4.2.2).
 struct peer_critical_streams {
     bool control {false};
     bool qpack_encoder {false};
     bool qpack_decoder {false};
+    std::uint64_t max_field_section_size {UINT64_MAX};
 };
 
 // Incremental validator for one client-initiated unidirectional stream as
@@ -59,7 +61,7 @@ public:
                 break;
             }
             case kind::control:
-                if (const auto parsed = control(input); !parsed) return parsed;
+                if (const auto parsed = control(input, critical); !parsed) return parsed;
                 break;
             case kind::qpack_encoder: {
                 // With our advertised capacity of zero, the only valid encoder
@@ -134,7 +136,7 @@ private:
         return true;
     }
 
-    auto control(std::span<const std::byte>& input) noexcept
+    auto control(std::span<const std::byte>& input, peer_critical_streams& critical) noexcept
         -> std::expected<void, h3_error>
     {
         switch (control_state_) {
@@ -178,6 +180,7 @@ private:
                 if ((identifier == enable_connect_protocol_setting ||
                      identifier == h3_datagram_setting) && *value > 1)
                     return std::unexpected(h3_error::settings_error);
+                if (identifier == max_field_section_size) critical.max_field_section_size = *value;
                 control_state_ = payload_remaining_ == 0 ? control_state::frame_type
                                                          : control_state::setting_identifier;
             }

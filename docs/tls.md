@@ -17,6 +17,9 @@ Setup/inherited operations: [TCP](tcp.md). Names below are in `eventloop`.
   Raw TCP send-file is hidden because it bypasses TLS framing.
 - A `tls_context` is immutable once created (session cache and tickets are
   off), so streams on different loops and threads may share one.
+- Contexts require TLS 1.2 or later. TLS 1.2 offers only ECDHE/DHE suites
+  with AES-GCM or ChaCha20-Poly1305, so no suite RFC 9113 prohibits for
+  HTTP/2 is negotiated.
 - OpenSSL allocates a read or write record buffer (about 16.5 KiB each) while
   a record is in flight and frees it once drained, so an idle stream holds
   none. A failed allocation fails the operation with `ENOMEM` and closes the
