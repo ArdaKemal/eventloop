@@ -228,6 +228,7 @@ private:
     [[nodiscard]] auto closed_reason_of(std::uint32_t id) const noexcept
         -> std::optional<closed_reason>;
     auto stream_error(std::uint32_t id, std::uint32_t error) -> void;
+    auto send_goaway(std::uint32_t error) -> void;
     auto connection_error(std::uint32_t error) -> void;
     auto send_window_update(std::uint32_t id, std::uint32_t increment) -> void;
     auto complete_frame() -> void;

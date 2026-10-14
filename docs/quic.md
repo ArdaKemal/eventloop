@@ -18,6 +18,9 @@ is unknown (RFC 9000 3.2). Bounded ordinal ranges retain retired IDs
 against delayed reopening; sparse retirement can exhaust ranges and delay
 reclamation. Aggregate receive window <=128 KiB, per-stream buffering <=4 KiB;
 no unbounded fallback. These windows bound buffered data, not total transfers.
+Data held back by peer credit draws DATA_BLOCKED or STREAM_DATA_BLOCKED, and an
+open refused by the peer's stream limit draws STREAMS_BLOCKED (RFC 9000 4.1,
+4.6), once per limit value.
 
 `quic_endpoint::async_accept()` returns an early failure/peer-close as that
 connection's error; accept again to continue. Endpoint close or accept-task
@@ -33,7 +36,10 @@ Pending operations resume on connection progress or at once on cancellation.
 They share 256 waiters per connection slot; an operation that finds the pool
 full returns `capacity_exceeded`; a cancelled operation returns its waiter at
 once. After 1-RTT packets that want an ACK, the driver lets woken tasks run
-for one loop turn before sending, so the ACK rides on their replies. An idle
+for one loop turn before sending, so the ACK rides on their replies. 1-RTT
+ACKs report that wait as ACK Delay, measured from the arrival of the largest
+acknowledged packet (default exponent 3); Initial and Handshake ACKs send 0,
+which peers ignore (RFC 9002 5.3). An idle
 connection's driver sleeps until its
 next loss, PTO, idle, key-retirement or path-probe deadline.
 
@@ -92,8 +98,8 @@ resends the cached close on incoming packets, at most once/PTO and <=3 times
 received bytes; draining discards without sending. Both reuse driver storage
 and its frame-local timer. Deadlines saturate; packets do not extend retention.
 A server endpoint keeps one slot free: when a connection enters retention and
-no slot is free, the oldest retained connection's period ends early (RFC 9000
-10.2 permits this; a late packet for it draws a stateless reset). Live
+no slot is free, the oldest retained connection's period ends early, and a
+late packet for it is dropped (the endpoint sends no stateless resets). Live
 connections are never reclaimed, so capacity exhaustion by them is unchanged.
 
 Endpoint close keeps UDP open until running connections send close and retire,

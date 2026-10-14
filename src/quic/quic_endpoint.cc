@@ -841,7 +841,11 @@ auto open_stream_task(event_loop&, quic_endpoint::implementation& impl,
     const auto internal = direction == quic_stream_direction::bidirectional
         ? stream_direction::bidirectional : stream_direction::unidirectional;
     const auto id = slot.connection->open_stream(internal);
-    if (!id) co_return std::unexpected(make_error_code(quic_errc::stream_limit));
+    if (!id) {
+        // The driver sends any STREAMS_BLOCKED the refusal queued.
+        if (slot.driver) slot.driver->notify();
+        co_return std::unexpected(make_error_code(quic_errc::stream_limit));
+    }
     co_return *id;
 }
 

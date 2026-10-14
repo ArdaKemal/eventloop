@@ -83,10 +83,16 @@ request bodies end with RST_STREAM NO_ERROR after the response (RFC 9113 8.1).
 `src/http2/session.h` retains 64 closure reasons. For retired-stream DATA/HEADERS:
 normal completion of both directions gives a STREAM_CLOSED connection error;
 peer RST_STREAM gives a STREAM_CLOSED stream error; frames racing a local reset
-are discarded. Lower IDs skipped by the peer give PROTOCOL_ERROR. Evicted IDs
+are discarded. Lower IDs skipped by the peer give PROTOCOL_ERROR. A malformed
+request header block gets a 400 HEADERS frame without END_STREAM, then
+RST_STREAM PROTOCOL_ERROR (RFC 9113 8.1.1, 8.2.1). Evicted IDs
 at/below the closure floor are treated as local resets. DATA after END_STREAM
 on a still-active stream is a stream error; Content-Length overrun is stream
-PROTOCOL_ERROR. Regression coverage: [http2_hardening](../tests/http2_hardening.cc).
+PROTOCOL_ERROR. A peer GOAWAY draws one GOAWAY NO_ERROR naming the highest
+peer stream seen; the connection closes once active streams finish. Connection
+errors send GOAWAY with their code. Idle timeout, server close and loop shutdown
+cancel the connection without a GOAWAY.
+Regression coverage: [http2_hardening](../tests/http2_hardening.cc).
 
 CMake registers `http2_h2spec` when h2spec is on PATH or
 `-DH2SPEC_EXECUTABLE=/path/to/h2spec` is set; the binary is not vendored.
@@ -151,6 +157,8 @@ content on HEAD/204/304, or SETTINGS_ENABLE_PUSH=1. Bodyless Content-Length is
 not compared. Request-stream
 RST_STREAM or GOAWAY with last stream 0 returns `connection_reset`; other GOAWAY
 permits completion. Malformed RST_STREAM/GOAWAY is `protocol_error`.
+The client ends every connection with GOAWAY (last stream 0; PROTOCOL_ERROR
+after a protocol failure, otherwise NO_ERROR).
 Limits return `message_size`; TLS errors pass through. Cancellation closes the
 owned transport. Each request allocates bounded frame/header/response storage;
 OpenSSL may allocate separately. Outer task results remain distinct from I/O

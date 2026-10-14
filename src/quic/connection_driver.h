@@ -290,6 +290,7 @@ private:
                     return std::unexpected(connection_error::invalid_state);
                 const auto level=received->kind==packet_kind::initial ? tls_level::initial :
                     received->kind==packet_kind::handshake ? tls_level::handshake : tls_level::application;
+                scheduler_.packet_received(level,received->packet_number,now);
                 bool eliciting=false;
                 const auto payload=std::as_bytes(std::span(plaintext_).first(received->plaintext_size));
                 for (std::size_t cursor=0;cursor<payload.size();) {

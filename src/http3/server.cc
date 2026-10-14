@@ -51,6 +51,8 @@ struct stream_storage {
     bool in_use {false};
     // Returned after in_use clears, so a waiting connection finds this slot.
     semaphore::permit permit;
+    // The connection's peer state, which outlives every request task.
+    const h3::peer_critical_streams* peer {nullptr};
     // Kept here, not in serve_request's frame, so that frame stays in its
     // size class; its views point into strings.
     h3::request_head head {};
@@ -357,6 +359,8 @@ public:
             const auto size = detail::format_http_time(std::time(nullptr), date);
             fields[count++] = {"date", {date.data(), size}};
         }
+        if (!self.fits_peer(fields.first(count)))
+            co_return std::unexpected(failure(std::errc::message_size));
         if (!(co_await write_section(loop, self, fields.first(count), false)).value_or(false)) {
             self.broken_ = true;
             if (websocket) self.abort_websocket();
@@ -378,6 +382,15 @@ private:
         auto operator=(const busy&) -> busy& = delete;
         bool& flag;
     };
+
+    // RFC 9114 4.2.2: a section counts each field's name and value plus 32
+    // bytes against the peer's SETTINGS_MAX_FIELD_SECTION_SIZE.
+    [[nodiscard]] auto fits_peer(std::span<const h3::field> fields) const noexcept -> bool
+    {
+        std::uint64_t size = 0;
+        for (const auto& field : fields) size += field.name.size() + field.value.size() + 32;
+        return size <= storage_.peer->max_field_section_size;
+    }
 
     // Encodes fields as one HEADERS frame in storage.body and writes it.
     static auto write_section(event_loop& loop, http3_exchange& self,
@@ -562,6 +575,8 @@ private:
             auto fields = std::span(self.storage_.fields.items).first(response_fields);
             for (std::size_t index = 0; index < trailers.size(); ++index)
                 fields[index] = {trailers[index].name, trailers[index].value};
+            if (!self.fits_peer(fields.first(trailers.size())))
+                co_return std::unexpected(failure(std::errc::message_size));
             written = (co_await write_section(loop, self, fields.first(trailers.size()), true))
                 .value_or(false);
         } else {
@@ -1044,7 +1059,10 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
         stream_storage* storage = request ? pool.acquire() : nullptr;
         auto spawned = task_spawn_result::invalid_task;
         if (slot != handlers.end() && (!request || storage)) {
-            if (storage) storage->permit = std::move(permit);
+            if (storage) {
+                storage->permit = std::move(permit);
+                storage->peer = &critical;
+            }
             slot->reset();
             slot->emplace();
             spawned = request

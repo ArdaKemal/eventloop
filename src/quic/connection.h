@@ -56,6 +56,9 @@ public:
         std::uint64_t reset_error {}, stop_sending_error {};
         bool credit_pending {false}, reset_pending {false};
         bool stop_sending_pending {false};
+        // STREAM_DATA_BLOCKED is queued once per peer limit (RFC 9000 4.1).
+        bool blocked_pending {false};
+        std::uint64_t blocked_limit {~std::uint64_t {0}};
         // The application stopped reading: data and a peer reset are consumed
         // here so the slot can retire without further application reads.
         bool receive_abandoned {false};
@@ -192,6 +195,16 @@ public:
         const auto capacity = direction == stream_direction::bidirectional
             ? bidi_stream_capacity : uni_stream_capacity;
         const auto role = role_ == endpoint_role::client ? stream_role::client : stream_role::server;
+        // STREAMS_BLOCKED tells the peer its limit stopped us (RFC 9000 4.6).
+        if (const auto limit = registry_.peer_limit(direction);
+            registry_.local_opened(direction) == limit) {
+            const auto type = direction == stream_direction::bidirectional ? 0 : 1;
+            if (streams_blocked_[type] != limit) {
+                streams_blocked_[type] = limit;
+                streams_blocked_pending_[type] = true;
+            }
+            return std::unexpected(connection_error::capacity_exceeded);
+        }
         std::size_t active = 0;
         for (const auto& slot : slots_)
             active += slot.occupied && stream_initiator(slot.id) == role &&
@@ -202,6 +215,22 @@ public:
         if (!id) return std::unexpected(connection_error::capacity_exceeded);
         if (!admit(*id)) return std::unexpected(connection_error::capacity_exceeded);
         return *id;
+    }
+    // The scheduler reports data held back by peer credit; each limit is
+    // signalled once with DATA_BLOCKED or STREAM_DATA_BLOCKED (RFC 9000 4.1).
+    auto data_blocked(std::uint64_t limit) noexcept -> void
+    {
+        check_owner();
+        if (data_blocked_ == limit) return;
+        data_blocked_ = limit;
+        data_blocked_pending_ = true;
+    }
+    auto stream_data_blocked(stream_slot& s) noexcept -> void
+    {
+        check_owner();
+        if (s.blocked_limit == s.send.flow_limit()) return;
+        s.blocked_limit = s.send.flow_limit();
+        s.blocked_pending = stream_control_pending_ = true;
     }
     [[nodiscard]] auto stream(std::uint64_t id) noexcept -> stream_slot*
     {
@@ -355,7 +384,8 @@ public:
         // Fast path: most application packets carry no pending control frame.
         if (!stream_control_pending_ && !data_credit_pending_ &&
             !stream_credit_pending_[0] && !stream_credit_pending_[1] &&
-            !peer_id_retirement_pending_)
+            !peer_id_retirement_pending_ && !data_blocked_pending_ &&
+            !streams_blocked_pending_[0] && !streams_blocked_pending_[1])
             return {};
         decoded_frame frame;
         if (peer_id_retirement_pending_) {
@@ -381,7 +411,19 @@ public:
             }
             frame.type = 0x11; frame.stream_id = s.id; frame.limit = s.receive_limit; return frame;
         }
+        if (data_blocked_pending_) { frame.type = 0x14; frame.limit = data_blocked_; return frame; }
+        for (auto* active : active_slots()) if (auto& s = *active; s.blocked_pending) {
+            if (!s.state.send_data_blocked()) {
+                s.blocked_pending = false;
+                continue;
+            }
+            frame.type = 0x15; frame.stream_id = s.id; frame.limit = s.blocked_limit; return frame;
+        }
         stream_control_pending_ = false;
+        for (std::size_t i = 0; i < streams_blocked_pending_.size(); ++i)
+            if (streams_blocked_pending_[i]) {
+                frame.type = i == 0 ? 0x16 : 0x17; frame.limit = streams_blocked_[i]; return frame;
+            }
         for (std::size_t i = 0; i < stream_credit_pending_.size(); ++i)
             if (stream_credit_pending_[i]) {
                 frame.type = i == 0 ? 0x12 : 0x13;
@@ -396,6 +438,9 @@ public:
         check_owner();
         if (frame.type == 0x19) (void)peer_ids_.mark_retirement_queued(frame.sequence_number);
         else if (frame.type == 0x10) data_credit_pending_ = false;
+        else if (frame.type == 0x14) data_blocked_pending_ = false;
+        else if (frame.type == 0x16 || frame.type == 0x17)
+            streams_blocked_pending_[frame.type == 0x16 ? 0 : 1] = false;
         else if (frame.type == 0x12 || frame.type == 0x13) {
             stream_credit_pending_[frame.type == 0x12 ? 0 : 1] = false;
             advertised_streams_[frame.type == 0x12 ? 0 : 1] = frame.limit;
@@ -404,6 +449,7 @@ public:
             if (frame.type == 4) s->reset_pending = false;
             if (frame.type == 5) s->stop_sending_pending = false;
             if (frame.type == 0x11) s->credit_pending = false;
+            if (frame.type == 0x15) s->blocked_pending = false;
         }
     }
     auto control_acked(std::uint64_t type, std::uint64_t id) noexcept -> void
@@ -697,6 +743,8 @@ private:
             slot.credit_pending = slot.reset_pending = false;
             slot.reset_error = slot.stop_sending_error = 0;
             slot.stop_sending_pending = slot.receive_abandoned = false;
+            slot.blocked_pending = false;
+            slot.blocked_limit = ~std::uint64_t {0};
             slot.accepted = slot.occupied = false;
             slot_ids_[static_cast<std::size_t>(&slot - slots_.data())] = no_stream;
             std::move(active_slots_.begin() + active + 1,
@@ -866,6 +914,11 @@ private:
     bool data_credit_pending_ {false};
     bool stream_control_pending_ {false};
     std::array<bool, 2> stream_credit_pending_ {};
+    // Last blocked limits signalled; all-ones means none yet.
+    std::uint64_t data_blocked_ {~std::uint64_t {0}};
+    std::array<std::uint64_t, 2> streams_blocked_ {~std::uint64_t {0}, ~std::uint64_t {0}};
+    bool data_blocked_pending_ {false};
+    std::array<bool, 2> streams_blocked_pending_ {};
     // Last MAX_STREAMS values queued for bidirectional and unidirectional.
     std::array<std::uint64_t, 2> advertised_streams_ {};
     void* retirement_argument_ {};

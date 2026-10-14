@@ -1004,7 +1004,7 @@ if(BUILD_TESTING)
     set_tests_properties(tls_openssl PROPERTIES TIMEOUT 10)
 
     add_executable(tls_loopback_test tests/tls_loopback.cc)
-    target_link_libraries(tls_loopback_test PRIVATE eventloop::eventloop)
+    target_link_libraries(tls_loopback_test PRIVATE eventloop::eventloop OpenSSL::SSL)
     target_compile_options(tls_loopback_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(
         NAME tls_loopback

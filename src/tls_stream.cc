@@ -172,6 +172,11 @@ public:
         if (!context) throw std::bad_alloc();
         require_ssl(SSL_CTX_set_min_proto_version(context.get(), TLS1_2_VERSION), "TLS minimum version");
         SSL_CTX_set_options(context.get(), SSL_OP_NO_RENEGOTIATION | SSL_OP_NO_COMPRESSION);
+        // TLS 1.2 uses forward-secret AEAD suites only, which excludes every
+        // suite RFC 9113 Appendix A prohibits for HTTP/2.
+        require_ssl(SSL_CTX_set_cipher_list(context.get(),
+                        "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20"),
+                    "TLS 1.2 cipher list");
 #ifdef __linux__
         SSL_CTX_set_options(context.get(), SSL_OP_ENABLE_KTLS);
 #endif

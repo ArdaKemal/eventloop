@@ -251,6 +251,56 @@ auto priority_length_is_stream_error() -> void
     check(state.pop_request(incoming) && incoming.stream_id == 3, "later stream serves");
 }
 
+// A malformed request draws a 400 before its PROTOCOL_ERROR reset
+// (RFC 9113 8.1.1, 8.2.1).
+auto malformed_request_gets_400() -> void
+{
+    session state;
+    connect(state);
+    std::vector<std::byte> block;
+    const std::array<field, 3> fields {{{":method", "GET"}, {":scheme", "https"},
+        {":authority", "localhost"}}};
+    check(hpack_encode(fields, block) == hpack_error::none, "encode request");
+    std::vector<std::byte> input;
+    frame(input, 1, 5, 1, block);
+    feed(state, input);
+    const auto out = state.output();
+    const auto length = std::to_integer<std::size_t>(out[2]);
+    const auto block_end = reinterpret_cast<const char*>(out.data()) + 9 + length;
+    check(out.size() >= 9 + length && std::to_integer<std::uint8_t>(out[3]) == 1 &&
+          (std::to_integer<std::uint8_t>(out[4]) & 1) == 0 && u32(out.subspan(5, 4)) == 1 &&
+          std::string_view(block_end - 3, 3) == "400", "400 HEADERS without END_STREAM");
+    check(error_of(state, 3, 1) == protocol_error, "then RST_STREAM PROTOCOL_ERROR");
+}
+
+auto peer_goaway_is_answered() -> void
+{
+    // A GOAWAY receiver still sends its own before closing (RFC 9113 6.8),
+    // naming the last stream it processed; a repeated GOAWAY draws no second.
+    session state;
+    connect(state);
+    get(state, 1);
+    drain(state);
+    const std::array<std::byte, 8> payload {std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{1}};
+    std::vector<std::byte> input;
+    frame(input, 7, 0, 0, payload);
+    frame(input, 7, 0, 0, payload);
+    feed(state, input);
+    auto out = state.output();
+    std::size_t goaways = 0;
+    while (out.size() >= 9) {
+        const auto length = std::to_integer<std::size_t>(out[2]);
+        if (std::to_integer<std::uint8_t>(out[3]) == 7) {
+            ++goaways;
+            check(u32(out.subspan(9, 4)) == 1 && u32(out.subspan(13, 4)) == 0,
+                  "GOAWAY names stream 1 with NO_ERROR");
+        }
+        out = out.subspan(9 + length);
+    }
+    check(goaways == 1, "one GOAWAY answers the peer's");
+}
+
 auto window_overflow_error_scope() -> void
 {
     // WINDOW_UPDATE overflow is confined to its stream; a SETTINGS change
@@ -420,6 +470,8 @@ int main()
     frames_racing_local_reset_are_discarded();
     skipped_stream_id_is_protocol_error();
     priority_length_is_stream_error();
+    malformed_request_gets_400();
+    peer_goaway_is_answered();
     window_overflow_error_scope();
     extended_connect();
 }

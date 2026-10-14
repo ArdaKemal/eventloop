@@ -580,6 +580,12 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     if (!error && (!initial_headers || continuation || response.status == 0 ||
                    (response_length && response_bytes != *response_length)))
         error = failure(std::errc::protocol_error);
+    // End with GOAWAY (RFC 9113 6.8, 9.1); no pushed stream was accepted, so
+    // the last stream is 0. A dead transport just fails this write.
+    outgoing.assign(17, std::byte {0});
+    frame_header(outgoing.data(), 8, 7, 0, 0);
+    if (error == failure(std::errc::protocol_error)) outgoing[16] = std::byte {1};
+    (void)co_await write_all(loop, *stream, outgoing);
     detail::client_access::remove(loop, socket_id);
     if (error) co_return std::unexpected(error);
     co_return response;

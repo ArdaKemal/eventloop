@@ -30,6 +30,7 @@ constexpr std::uint8_t flag_ack = 0x1;
 constexpr std::uint8_t flag_end_headers = 0x4;
 constexpr std::uint8_t flag_padded = 0x8;
 constexpr std::uint8_t flag_priority = 0x20;
+constexpr std::uint32_t no_error = 0;
 constexpr std::uint32_t protocol_error = 1;
 constexpr std::uint32_t internal_error = 2;
 constexpr std::uint32_t flow_control_error = 3;
@@ -674,8 +675,11 @@ auto session::dispatch_frame() -> void
             connection_error(protocol_error);
         } else if (frame_payload_size_ < 8) {
             connection_error(frame_size_error);
-        } else {
+        } else if (!peer_goaway_) {
+            // Answer with our own GOAWAY so the peer learns which of its
+            // streams were processed before the close (RFC 9113 6.8).
             peer_goaway_ = true;
+            send_goaway(no_error);
         }
         break;
     case window_update_frame: dispatch_window_update(); break;
@@ -1097,8 +1101,12 @@ auto session::finish_header_block() -> void
         } else {
             finish_request(*value);
         }
-    } else if (value->initial_headers ||
-               !validate_initial_headers(*value, decoded_fields_)) {
+    } else if (value->initial_headers) {
+        stream_error(header_stream_id_, protocol_error);
+    } else if (!validate_initial_headers(*value, decoded_fields_)) {
+        // A malformed request is a stream error (RFC 9113 8.1.1). A 400
+        // without END_STREAM goes first so the client learns why (8.2.1).
+        (void)append_header_block(*value, 400, {}, {}, false);
         stream_error(header_stream_id_, protocol_error);
     } else {
         value->initial_headers = true;
@@ -1604,13 +1612,18 @@ auto session::stream_error(std::uint32_t id, std::uint32_t error) -> void
     if (auto* value = find_stream(id)) reset_stream(*value, closed_reason::local_reset);
 }
 
-auto session::connection_error(std::uint32_t error) -> void
+auto session::send_goaway(std::uint32_t error) -> void
 {
-    if (fatal_) return;
     std::array<std::byte, 8> payload {};
     write_u32(payload.data(), last_stream_id_ & 0x7fffffffu);
     write_u32(payload.data() + 4, error);
     (void)append_frame(goaway_frame, 0, 0, payload);
+}
+
+auto session::connection_error(std::uint32_t error) -> void
+{
+    if (fatal_) return;
+    send_goaway(error);
     requests_.clear();
     fatal_ = true;
 }
