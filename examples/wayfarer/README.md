@@ -55,8 +55,11 @@ bytes are usage errors. It uses the same replacement policy.
 
 ## Redirects
 
-All versions resolve relative/absolute Location, reject HTTPS downgrades, and
-use one connection per hop. POST changes to GET on 301/302; 303 changes all
+All versions resolve relative/absolute Location and reject HTTPS downgrades.
+HTTP/1.1 and HTTP/3 use one connection per hop. HTTP/2 reuses its connection
+when the next host resolves to the connected address and port and the
+certificate covers it (RFC 9113 9.1.1); a 421 on a reused connection, or a
+failure before any output, retries on a new connection. POST changes to GET on 301/302; 303 changes all
 but HEAD to GET; 307/308 preserve method/body. Cross-origin redirects drop
 Authorization, Cookie, and Proxy-Authorization. HTTP/1.1 replays its buffered
 file body; HTTP/2 reopens files per attempt/hop. Intermediate bodies are
@@ -73,7 +76,7 @@ HTTP/2/3 require HTTPS targets throughout; HTTP/1.1 can upgrade HTTP to HTTPS.
   decoding, proxies, cookie management, or multipart generation.
 - HTTP/2: HTTPS/ALPN h2, general methods, literal bodies <=4 MiB, file uploads
   and sink output <=1 TiB. Uploads obey flow control; output streams as received.
-  Headers <=64 KiB/128 fields, frames <=16 KiB. No h2c, reuse, or push.
+  Headers <=64 KiB/128 fields, frames <=16 KiB. No h2c or push.
   Ownership/errors follow the [client contract](../../docs/http2.md#outbound-client).
 - HTTP/3: HTTPS GET/HEAD, request HEADERS <=4 KiB. Response QPACK supports
   static indices, static-name literals, literal names/values, and Huffman;
@@ -86,7 +89,8 @@ HTTP/2/3 require HTTPS targets throughout; HTTP/1.1 can upgrade HTTP to HTTPS.
 
 Standalone checks are opt-in; the root suite does not build Wayfarer.
 `run_w3_aioquic.py` tests HTTP/3 with aioquic 1.3.0; `run_w4.py` adds HTTP/1.1,
-TLS HTTP/2, and `-I`/`-O`. Without Python h2, CMake skips W4.
+TLS HTTP/2 (including redirect connection reuse and 421 retry), and `-I`/`-O`.
+Without Python h2, CMake skips W4.
 
 ```sh
 python3 -m venv /tmp/wayfarer-aioquic

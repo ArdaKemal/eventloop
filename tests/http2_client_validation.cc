@@ -413,6 +413,129 @@ auto requests(const certificate_files& files) -> void
     check(sourced("3", 3).has_value(), "source matches Content-Length");
 }
 
+[[nodiscard]] auto response_on(unsigned stream, std::string_view body) -> std::string
+{
+    std::string out;
+    append_frame(out, 1, end_headers, stream, literal(":status", "200"));
+    append_frame(out, 0, end_stream, stream, body);
+    return out;
+}
+
+struct reuse_record {
+    std::vector<outcome> results;
+    bool alias = false, unrelated = false, other_port = false, numeric = false;
+    bool after = false, closed = false;
+};
+
+// Sends one GET per authority over one connection, then closes it and tries
+// one more request.
+auto reusing_client(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_context> context,
+                    std::vector<std::string> authorities, reuse_record& record) -> task<void>
+{
+    const auto endpoint = ip_endpoint::loopback_v4(port);
+    http2::client_connection connection(loop, endpoint, std::move(context), "localhost");
+    if (flatten(co_await connection.async_connect())) {
+        record.alias = connection.can_reuse_for("ALIAS.test", endpoint);
+        record.unrelated = connection.can_reuse_for("other.test", endpoint);
+        record.other_port = connection.can_reuse_for("alias.test",
+            ip_endpoint::loopback_v4(static_cast<std::uint16_t>(port + 1)));
+        record.numeric = connection.can_reuse_for("127.0.0.1", endpoint);
+        for (auto& authority : authorities) {
+            auto request = get();
+            request.authority = std::move(authority);
+            record.results.push_back(flatten(co_await connection.async_request(std::move(request))));
+        }
+        record.after = connection.can_reuse_for("localhost", endpoint);
+        record.closed = flatten(co_await connection.async_close()).has_value();
+        record.results.push_back(flatten(co_await connection.async_request(get())));
+    }
+    for (int turn = 0; turn < 100 && !server_finished; ++turn)
+        (void)co_await sleep_for(loop, 1ms);
+    loop.stop();
+}
+
+[[nodiscard]] auto reuse_exchange(const certificate_files& files, std::string script,
+                                  std::vector<std::string> authorities) -> reuse_record
+{
+    event_loop loop;
+    auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4(0));
+    sockaddr_in address {};
+    socklen_t length = sizeof(address);
+    check(::getsockname(listener->descriptor(), reinterpret_cast<sockaddr*>(&address),
+                        &length) == 0, "getsockname");
+    auto* acceptor = listener.get();
+    loop.add(std::move(listener));
+    server_received.clear();
+    server_finished = false;
+    check(loop.spawn(scripted_server(loop, *acceptor,
+              tls_context::make_server(files.certificate, files.key), std::move(script))) ==
+          task_spawn_result::accepted, "spawn server");
+    reuse_record record;
+    check(loop.spawn(reusing_client(loop, ntohs(address.sin_port),
+              tls_context::make_client(files.certificate), std::move(authorities), record)) ==
+          task_spawn_result::accepted, "spawn client");
+    bool timed_out = false;
+    task_handle<void> timer;
+    check(loop.spawn(watchdog(loop, timed_out), timer) == task_spawn_result::accepted,
+          "spawn watchdog");
+    (void)loop.run();
+    if (!timer.done()) (void)timer.cancel();
+    loop.shutdown(0ms);
+    (void)loop.run();
+    check(!timed_out && server_finished, "reuse exchange did not complete");
+    return record;
+}
+
+// Frame types and stream IDs the client sent after its connection preface.
+[[nodiscard]] auto sent_frames() -> std::vector<std::pair<unsigned, unsigned>>
+{
+    std::vector<std::pair<unsigned, unsigned>> frames;
+    for (std::size_t at = 24; at + 9 <= server_received.size();) {
+        const auto byte = [&](std::size_t i) {
+            return static_cast<unsigned>(static_cast<unsigned char>(server_received[at + i]));
+        };
+        frames.emplace_back(byte(3), (byte(5) & 0x7fu) << 24 | byte(6) << 16 | byte(7) << 8 |
+                                         byte(8));
+        at += 9 + (byte(0) << 16 | byte(1) << 8 | byte(2));
+    }
+    return frames;
+}
+
+// RFC 9113 section 9.1.1: one connection carries requests for every origin
+// its certificate covers, on successive client streams.
+auto connection_reuse(const certificate_files& files) -> void
+{
+    std::string settings;
+    append_frame(settings, 4, 0, 0, {});
+    // Late RST_STREAM and WINDOW_UPDATE on the closed stream 1 are ignored.
+    std::string script = settings + response_on(1, "a") + reset(1);
+    append_frame(script, 8, 0, 1, std::string_view("\0\0\0\1", 4));
+    script += response_on(3, "b");
+    auto record = reuse_exchange(files, script, {"", "alias.test"});
+    check(record.alias && record.numeric, "certificate names permit reuse");
+    check(!record.unrelated, "a name outside the certificate prevents reuse");
+    check(!record.other_port, "another endpoint prevents reuse");
+    check(record.results.size() == 3 && record.results[0] && record.results[0]->body == bytes("a") &&
+          record.results[1] && record.results[1]->body == bytes("b"),
+          "sequential requests share one connection");
+    check(record.after && record.closed, "connection stays reusable until closed");
+    check(fails_with(record.results[2], std::errc::not_connected), "request after close");
+    const auto frames = sent_frames();
+    std::vector<unsigned> header_streams;
+    for (const auto& [type, stream] : frames) if (type == 1) header_streams.push_back(stream);
+    check(header_streams == std::vector<unsigned> {1, 3}, "requests use streams 1 and 3");
+    check(!frames.empty() && frames.back() == std::pair {7u, 0u}, "close sends GOAWAY");
+
+    // A GOAWAY read while sending stream 3 excludes it: the server did not
+    // process that request, and the connection is no longer reusable.
+    record = reuse_exchange(files, settings + response_on(1, "a") + goaway(1), {"", ""});
+    check(record.results.size() == 3 && record.results[0] &&
+          fails_with(record.results[1], std::errc::connection_reset),
+          "GOAWAY excluding the next stream");
+    check(!record.after && fails_with(record.results[2], std::errc::not_connected),
+          "GOAWAY ends reuse");
+}
+
 class temporary_directory {
 public:
     temporary_directory()
@@ -450,4 +573,9 @@ auto main() -> int
     frame_header_bits(files);
     server_push_setting(files);
     requests(files);
+    const certificate_files shared {directory.path() / "shared.pem",
+                                    directory.path() / "shared-key.pem"};
+    test::make_localhost_certificate(shared.certificate, shared.key,
+                                     "DNS:localhost,DNS:alias.test,IP:127.0.0.1");
+    connection_reuse(shared);
 }

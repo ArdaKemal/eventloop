@@ -21,6 +21,11 @@ public:
     {
         loop.remove(descriptor);
     }
+    static auto certificate_matches(const tls_stream& stream, std::string_view hostname)
+        -> bool
+    {
+        return stream.certificate_matches(hostname);
+    }
 };
 } // namespace detail
 namespace {
@@ -213,82 +218,223 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
     return {};
 }
 
-} // namespace
+struct prepared_request {
+    std::vector<std::byte> block;
+    std::optional<std::uint64_t> length;
+};
 
-auto async_request(event_loop& loop, ip_endpoint endpoint,
-                   std::shared_ptr<tls_context> context,
-                   std::string hostname, client_request request,
-                   response_sink sink, response_header_sink header_sink)
-    -> task<std::expected<client_response, std::error_code>>
+// Validates the request and encodes its header block; request headers are
+// moved into the block's fields.
+[[nodiscard]] auto prepare(client_request& request, std::string_view hostname)
+    -> std::expected<prepared_request, std::error_code>
 {
-    if (!context || hostname.empty() || !valid_target(request.target) ||
+    if (!valid_target(request.target) ||
         (!request.authority.empty() && !valid_value(request.authority)) ||
         !valid_method(request.method) ||
         (request.body_source && !request.body.empty()))
-        co_return std::unexpected(failure(std::errc::invalid_argument));
+        return std::unexpected(failure(std::errc::invalid_argument));
     // A CONNECT tunnel (RFC 9113 section 8.5) does not fit one buffered exchange.
     if (request.method == "CONNECT")
-        co_return std::unexpected(failure(std::errc::operation_not_supported));
+        return std::unexpected(failure(std::errc::operation_not_supported));
     if (request.body.size() > max_body ||
         request.headers.size() > detail::hpack_max_fields - 4)
-        co_return std::unexpected(failure(std::errc::message_size));
+        return std::unexpected(failure(std::errc::message_size));
     std::vector<detail::field> fields;
     fields.reserve(request.headers.size() + 4);
     fields.push_back({":method", request.method});
     fields.push_back({":scheme", "https"});
-    fields.push_back({":authority", request.authority.empty() ? hostname : request.authority});
+    fields.push_back({":authority", request.authority.empty() ? std::string(hostname)
+                                                               : request.authority});
     fields.push_back({":path", request.target});
     for (auto& item : request.headers) {
         // A Host field must repeat :authority (RFC 9113 8.3.1).
         if (!valid_name(item.name) || !valid_value(item.value) ||
             connection_specific(item.name) || (item.name == "te" && item.value != "trailers") ||
             (item.name == "host" && item.value != fields[2].value))
-            co_return std::unexpected(failure(std::errc::invalid_argument));
+            return std::unexpected(failure(std::errc::invalid_argument));
     }
     // A declared request length must match the owned body, or the source total.
     const auto request_length = content_length(request.headers);
     if (!request_length ||
         (*request_length && !request.body_source && **request_length != request.body.size()))
-        co_return std::unexpected(failure(std::errc::invalid_argument));
+        return std::unexpected(failure(std::errc::invalid_argument));
     for (auto& item : request.headers)
         fields.push_back({std::move(item.name), std::move(item.value)});
-    std::vector<std::byte> block;
-    const auto encoded = detail::hpack_encode(fields, block);
+    request.headers.clear();
+    prepared_request prepared {.block = {}, .length = *request_length};
+    const auto encoded = detail::hpack_encode(fields, prepared.block);
     if (encoded != detail::hpack_error::none)
-        co_return std::unexpected(failure(encoded == detail::hpack_error::limit_exceeded
+        return std::unexpected(failure(encoded == detail::hpack_error::limit_exceeded
             ? std::errc::message_size : std::errc::invalid_argument));
+    return prepared;
+}
 
-    auto owned = std::make_unique<tls_stream>(loop, endpoint, std::move(context),
-        tls_client_options{.hostname = std::move(hostname),
-                           .application_protocols = {"h2"}});
-    auto* stream = owned.get();
-    const auto socket_id = stream->descriptor();
+[[nodiscard]] auto equal_hostnames(std::string_view left, std::string_view right) -> bool
+{
+    return std::ranges::equal(left, right, [](unsigned char a, unsigned char b) {
+        return (a >= 'A' && a <= 'Z' ? a + 32 : a) == (b >= 'A' && b <= 'Z' ? b + 32 : b);
+    });
+}
+
+constexpr std::uint32_t max_stream_id = 0x7fffffff;
+
+} // namespace
+
+struct client_connection::state {
+    state(event_loop& owner, ip_endpoint peer, std::shared_ptr<tls_context> tls,
+          std::string name)
+        : loop(owner), endpoint(peer), context(std::move(tls)), hostname(std::move(name)) {}
+
+    struct operation_guard {
+        explicit operation_guard(bool& active) noexcept : active(active) { active = true; }
+        ~operation_guard() { active = false; }
+        operation_guard(const operation_guard&) = delete;
+        auto operator=(const operation_guard&) -> operation_guard& = delete;
+        bool& active;
+    };
+
+    event_loop& loop;
+    ip_endpoint endpoint;
+    std::shared_ptr<tls_context> context;
+    std::string hostname;
+    tls_stream* stream {nullptr};
+    native_socket socket_id {};
+    bool started {false};
+    bool busy {false};
+    bool preface_sent {false};
+    bool settings_received {false};
+    bool goaway {false};
+    // Client streams are odd; each request takes the next one.
+    std::uint32_t next_stream {1};
+    // Connection-level state persists across requests.
+    std::int64_t connection_send_window {65535};
+    std::uint32_t peer_initial_window {65535};
+    detail::hpack_decoder decoder;
+    std::unique_ptr<std::array<std::byte, max_frame>> payload;
+
+    [[nodiscard]] auto usable() const noexcept -> bool
+    {
+        return stream != nullptr && !goaway && next_stream <= max_stream_id;
+    }
+
+    auto retire() -> void
+    {
+        if (stream == nullptr) return;
+        detail::client_access::remove(loop, socket_id);
+        stream = nullptr;
+    }
+
+    [[nodiscard]] static auto connect(event_loop& loop, state& self)
+        -> task<std::expected<void, std::error_code>>;
+    [[nodiscard]] static auto request(event_loop& loop, state& self, client_request request,
+                                      response_sink sink, response_header_sink header_sink)
+        -> task<std::expected<client_response, std::error_code>>;
+    [[nodiscard]] static auto exchange(event_loop& loop, state& self,
+                                       prepared_request prepared, client_request request,
+                                       response_sink sink, response_header_sink header_sink)
+        -> task<std::expected<client_response, std::error_code>>;
+    [[nodiscard]] static auto close(event_loop& loop, state& self)
+        -> task<std::expected<void, std::error_code>>;
+    // Ends with GOAWAY when the preface was sent (RFC 9113 6.8, 9.1). No pushed
+    // stream was accepted, so the last stream is 0. A dead transport just fails
+    // this write.
+    [[nodiscard]] static auto close_transport(event_loop& loop, state& self,
+                                              bool protocol_error)
+        -> task<std::expected<void, std::error_code>>;
+};
+
+auto client_connection::state::connect(event_loop& loop, state& self)
+    -> task<std::expected<void, std::error_code>>
+{
+    if (self.busy) co_return std::unexpected(failure(std::errc::device_or_resource_busy));
+    if (self.started) co_return std::unexpected(failure(std::errc::already_connected));
+    if (!self.context || self.hostname.empty())
+        co_return std::unexpected(failure(std::errc::invalid_argument));
+    self.started = true;
+    operation_guard guard(self.busy);
+    auto owned = std::make_unique<tls_stream>(loop, self.endpoint, self.context,
+        tls_client_options{.hostname = self.hostname, .application_protocols = {"h2"}});
+    self.stream = owned.get();
+    self.socket_id = self.stream->descriptor();
     loop.add(std::move(owned));
-    auto connected = co_await stream->async_connect();
+    auto connected = co_await self.stream->async_connect();
     if (!connected) {
-        const auto error = connected.error();
-        detail::client_access::remove(loop, socket_id);
-        co_return std::unexpected(error);
+        self.retire();
+        co_return std::unexpected(connected.error());
     }
-    auto handshaken = unwrap(co_await stream->async_handshake());
+    auto handshaken = unwrap(co_await self.stream->async_handshake());
     if (!handshaken) {
-        const auto error = handshaken.error();
-        detail::client_access::remove(loop, socket_id);
-        co_return std::unexpected(error);
+        self.retire();
+        co_return std::unexpected(handshaken.error());
     }
-    if (stream->application_protocol() != "h2") {
-        detail::client_access::remove(loop, socket_id);
+    if (self.stream->application_protocol() != "h2") {
+        self.retire();
         co_return std::unexpected(failure(std::errc::protocol_not_supported));
     }
+    self.payload = std::make_unique<std::array<std::byte, max_frame>>();
+    co_return std::expected<void, std::error_code>{};
+}
+
+auto client_connection::state::request(event_loop& loop, state& self,
+                                       client_request request, response_sink sink,
+                                       response_header_sink header_sink)
+    -> task<std::expected<client_response, std::error_code>>
+{
+    if (self.busy) co_return std::unexpected(failure(std::errc::device_or_resource_busy));
+    if (!self.usable()) co_return std::unexpected(failure(std::errc::not_connected));
+    auto prepared = prepare(request, self.hostname);
+    if (!prepared) co_return std::unexpected(prepared.error());
+    co_return unwrap(co_await exchange(loop, self, std::move(*prepared), std::move(request),
+                                       std::move(sink), std::move(header_sink)));
+}
+
+auto client_connection::state::close(event_loop& loop, state& self)
+    -> task<std::expected<void, std::error_code>>
+{
+    if (self.busy) co_return std::unexpected(failure(std::errc::device_or_resource_busy));
+    if (self.stream == nullptr) co_return std::expected<void, std::error_code>{};
+    operation_guard guard(self.busy);
+    co_return unwrap(co_await close_transport(loop, self, false));
+}
+
+auto client_connection::state::close_transport(event_loop& loop, state& self,
+                                               bool protocol_error)
+    -> task<std::expected<void, std::error_code>>
+{
+    std::expected<void, std::error_code> result;
+    if (self.preface_sent && self.stream != nullptr) {
+        std::array<std::byte, 17> goaway {};
+        frame_header(goaway.data(), 8, 7, 0, 0);
+        if (protocol_error) goaway[16] = std::byte {1};
+        result = unwrap(co_await write_all(loop, *self.stream, goaway));
+    }
+    self.retire();
+    co_return result;
+}
+
+auto client_connection::state::exchange(event_loop& loop, state& self,
+                                        prepared_request prepared, client_request request,
+                                        response_sink sink, response_header_sink header_sink)
+    -> task<std::expected<client_response, std::error_code>>
+{
+    operation_guard guard(self.busy);
+    auto* stream = self.stream;
+    const auto stream_id = self.next_stream;
+    self.next_stream += 2;
+    const auto& block = prepared.block;
+    const auto& request_length = prepared.length;
 
     std::vector<std::byte> outgoing;
-    outgoing.resize(preface.size() + 15);
-    std::memcpy(outgoing.data(), preface.data(), preface.size());
-    auto* p = outgoing.data() + preface.size();
-    frame_header(p, 6, 4, 0, 0);
-    p[9] = std::byte{0};
-    p[10] = std::byte{2}; // SETTINGS_ENABLE_PUSH = 0
-    put_u32(p + 11, 0);
+    if (!self.preface_sent) {
+        outgoing.resize(preface.size() + 15);
+        std::memcpy(outgoing.data(), preface.data(), preface.size());
+        auto* p = outgoing.data() + preface.size();
+        frame_header(p, 6, 4, 0, 0);
+        p[9] = std::byte{0};
+        p[10] = std::byte{2}; // SETTINGS_ENABLE_PUSH = 0
+        put_u32(p + 11, 0);
+        self.preface_sent = true;
+    }
     for (std::size_t offset = 0; offset < block.size() || offset == 0;) {
         const auto count = std::min(max_frame, block.size() - offset);
         const auto first = offset == 0;
@@ -297,7 +443,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
         outgoing.resize(old_size + 9 + count);
         frame_header(outgoing.data() + old_size, count, first ? 1 : 9,
                      (first && request.body.empty() && !request.body_source ? 1u : 0u) |
-                         (last ? 4u : 0u), 1);
+                         (last ? 4u : 0u), stream_id);
         std::copy_n(block.begin() + static_cast<std::ptrdiff_t>(offset), count,
                     outgoing.begin() + static_cast<std::ptrdiff_t>(old_size + 9));
         offset += count;
@@ -305,16 +451,15 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     auto written = unwrap(co_await write_all(loop, *stream, outgoing));
     if (!written) {
         const auto error = written.error();
-        detail::client_access::remove(loop, socket_id);
+        (void)co_await close_transport(loop, self, false);
         co_return std::unexpected(error);
     }
 
     client_response response;
-    detail::hpack_decoder decoder;
+    auto& decoder = self.decoder;
     std::array<std::byte, 9> header_bytes{};
-    auto payload = std::make_unique<std::array<std::byte, max_frame>>();
+    auto& payload = self.payload;
     std::vector<std::byte> header_block;
-    bool first_settings = false;
     bool initial_headers = false;
     bool continuation = false;
     bool end_stream_on_headers = false;
@@ -327,9 +472,8 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     std::size_t body_offset = 0;
     std::uint64_t sourced_bytes = 0;
     bool upload_finished = request.body.empty() && !request.body_source;
-    std::int64_t connection_send_window = 65535;
-    std::int64_t stream_send_window = 65535;
-    std::uint32_t peer_initial_window = 65535;
+    auto& connection_send_window = self.connection_send_window;
+    std::int64_t stream_send_window = self.peer_initial_window;
     std::vector<std::byte> upload_frame;
     std::error_code error;
     while (!finished && !error) {
@@ -361,8 +505,8 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 if (count > max_streamed_body - sourced_bytes) {
                     error = failure(std::errc::message_size); break;
                 }
-                if (*request_length && (count > **request_length - sourced_bytes ||
-                                        (count == 0 && sourced_bytes != **request_length))) {
+                if (request_length && (count > *request_length - sourced_bytes ||
+                                       (count == 0 && sourced_bytes != *request_length))) {
                     error = failure(std::errc::invalid_argument); break;
                 }
                 sourced_bytes += count;
@@ -374,7 +518,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                             upload_frame.data() + 9);
                 body_offset += count;
             }
-            frame_header(upload_frame.data(), count, 0, last ? 1 : 0, 1);
+            frame_header(upload_frame.data(), count, 0, last ? 1 : 0, stream_id);
             written = unwrap(co_await write_all(loop, *stream,
                 std::span(upload_frame).first(9 + count)));
             if (!written) { error = written.error(); break; }
@@ -395,10 +539,10 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
         if (length > max_frame) {
             error = failure(std::errc::message_size); break;
         }
-        if (!first_settings && (type != 4 || id != 0 || (flags & 1) != 0)) {
+        if (!self.settings_received && (type != 4 || id != 0 || (flags & 1) != 0)) {
             error = failure(std::errc::protocol_error); break;
         }
-        if (continuation && (type != 9 || id != 1)) {
+        if (continuation && (type != 9 || id != stream_id)) {
             error = failure(std::errc::protocol_error); break;
         }
         read = unwrap(co_await read_exact(loop, *stream,
@@ -409,7 +553,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
             if (id != 0 || ((flags & 1u) ? length != 0 : length % 6 != 0)) {
                 error = failure(std::errc::protocol_error); break;
             }
-            first_settings = true;
+            self.settings_received = true;
             if (!(flags & 1u)) {
                 for (std::size_t i = 0; i < length; i += 6) {
                     const auto key = (unsigned(std::to_integer<unsigned char>(data[i])) << 8) |
@@ -423,8 +567,8 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                     }
                     if (key == 4) {
                         stream_send_window += static_cast<std::int64_t>(value) -
-                            static_cast<std::int64_t>(peer_initial_window);
-                        peer_initial_window = value;
+                            static_cast<std::int64_t>(self.peer_initial_window);
+                        self.peer_initial_window = value;
                         if (stream_send_window > 0x7fffffff) {
                             error = failure(std::errc::protocol_error); break;
                         }
@@ -436,7 +580,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 if (!written) error = written.error();
             }
         } else if (type == 1 || type == 9) {
-            if (id != 1 || (type == 9 && !continuation) ||
+            if (id != stream_id || (type == 9 && !continuation) ||
                 (type == 1 && initial_headers && !(flags & 1u))) {
                 error = failure(std::errc::protocol_error); break;
             }
@@ -497,7 +641,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 if (end_stream_on_headers) finished = true;
             }
         } else if (type == 0) {
-            if (id != 1 || !initial_headers) {
+            if (id != stream_id || !initial_headers) {
                 error = failure(std::errc::protocol_error); break;
             }
             std::size_t padding = 0;
@@ -534,7 +678,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 std::array<std::byte, 26> updates{};
                 frame_header(updates.data(), 4, 8, 0, 0);
                 put_u32(updates.data() + 9, static_cast<std::uint32_t>(length));
-                frame_header(updates.data() + 13, 4, 8, 0, 1);
+                frame_header(updates.data() + 13, 4, 8, 0, stream_id);
                 put_u32(updates.data() + 22, static_cast<std::uint32_t>(length));
                 written = unwrap(co_await write_all(loop, *stream, updates));
                 if (!written) { error = written.error(); break; }
@@ -551,9 +695,12 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
                 if (!written) error = written.error();
             }
         } else if (type == 8) {
-            if (length != 4 || (id != 0 && id != 1)) {
+            // RFC 9113 section 5.1: an earlier closed stream may still see
+            // WINDOW_UPDATE; ignore it. Later streams are idle.
+            if (length != 4 || (id != 0 && (id > stream_id || id % 2 == 0))) {
                 error = failure(std::errc::protocol_error); break;
             }
+            if (id != 0 && id != stream_id) continue;
             const auto increment = u32(data.data()) & 0x7fffffffu;
             if (increment == 0) {
                 error = failure(std::errc::protocol_error); break;
@@ -562,16 +709,20 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
             window += increment;
             if (window > 0x7fffffff) error = failure(std::errc::protocol_error);
         } else if (type == 3) {
-            // RFC 9113 section 6.4. Every stream other than 1 is idle here.
-            if (id != 1) { error = failure(std::errc::protocol_error); break; }
-            if (length != 4) { error = failure(std::errc::protocol_error); break; }
-            error = failure(std::errc::connection_reset);
+            // RFC 9113 section 6.4. Earlier streams are closed, so a late
+            // RST_STREAM is ignored; even and later streams are idle.
+            if (id == 0 || id > stream_id || id % 2 == 0 || length != 4) {
+                error = failure(std::errc::protocol_error); break;
+            }
+            if (id == stream_id) error = failure(std::errc::connection_reset);
         } else if (type == 7) {
-            // RFC 9113 section 6.8. Stream 1 still completes if the peer
-            // processed it; otherwise the request was not handled.
+            // RFC 9113 section 6.8. The request still completes if the peer
+            // processed its stream; otherwise it was not handled. No new
+            // request may use this connection.
             if (id != 0) { error = failure(std::errc::protocol_error); break; }
             if (length < 8) { error = failure(std::errc::protocol_error); break; }
-            if ((u32(data.data()) & 0x7fffffffu) == 0)
+            self.goaway = true;
+            if ((u32(data.data()) & 0x7fffffffu) < stream_id)
                 error = failure(std::errc::connection_reset);
         } else if (type == 5) {
             error = failure(std::errc::protocol_error);
@@ -580,14 +731,81 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     if (!error && (!initial_headers || continuation || response.status == 0 ||
                    (response_length && response_bytes != *response_length)))
         error = failure(std::errc::protocol_error);
-    // End with GOAWAY (RFC 9113 6.8, 9.1); no pushed stream was accepted, so
-    // the last stream is 0. A dead transport just fails this write.
-    outgoing.assign(17, std::byte {0});
-    frame_header(outgoing.data(), 8, 7, 0, 0);
-    if (error == failure(std::errc::protocol_error)) outgoing[16] = std::byte {1};
-    (void)co_await write_all(loop, *stream, outgoing);
-    detail::client_access::remove(loop, socket_id);
-    if (error) co_return std::unexpected(error);
+    if (error) {
+        (void)co_await close_transport(loop, self, error == failure(std::errc::protocol_error));
+        co_return std::unexpected(error);
+    }
+    // A complete response can precede the whole request (RFC 9113 8.1); end
+    // the unfinished upload so the stream closes and the connection stays usable.
+    if (!upload_finished) {
+        std::array<std::byte, 13> cancel {};
+        frame_header(cancel.data(), 4, 3, 0, stream_id);
+        put_u32(cancel.data() + 9, 8); // CANCEL
+        if (!unwrap(co_await write_all(loop, *stream, cancel))) self.retire();
+    }
+    if (self.goaway && self.stream != nullptr)
+        (void)co_await close_transport(loop, self, false);
+    co_return response;
+}
+
+client_connection::client_connection(event_loop& loop, ip_endpoint endpoint,
+                                     std::shared_ptr<tls_context> context,
+                                     std::string hostname)
+    : state_(std::make_unique<state>(loop, endpoint, std::move(context), std::move(hostname)))
+{
+}
+
+client_connection::~client_connection()
+{
+    state_->retire();
+}
+
+auto client_connection::async_connect() -> task<std::expected<void, std::error_code>>
+{
+    return state::connect(state_->loop, *state_);
+}
+
+auto client_connection::async_request(client_request request, response_sink sink,
+                                      response_header_sink header_sink)
+    -> task<std::expected<client_response, std::error_code>>
+{
+    return state::request(state_->loop, *state_, std::move(request), std::move(sink),
+                          std::move(header_sink));
+}
+
+auto client_connection::can_reuse_for(std::string_view hostname,
+                                      const ip_endpoint& endpoint) const -> bool
+{
+    const auto& self = *state_;
+    if (!self.usable() || endpoint != self.endpoint) return false;
+    return equal_hostnames(hostname, self.hostname) ||
+           detail::client_access::certificate_matches(*self.stream, hostname);
+}
+
+auto client_connection::async_close() -> task<std::expected<void, std::error_code>>
+{
+    return state::close(state_->loop, *state_);
+}
+
+auto async_request(event_loop& loop, ip_endpoint endpoint,
+                   std::shared_ptr<tls_context> context,
+                   std::string hostname, client_request request,
+                   response_sink sink, response_header_sink header_sink)
+    -> task<std::expected<client_response, std::error_code>>
+{
+    if (!context || hostname.empty())
+        co_return std::unexpected(failure(std::errc::invalid_argument));
+    // Validation fails before connecting.
+    auto prepared = prepare(request, hostname);
+    if (!prepared) co_return std::unexpected(prepared.error());
+    client_connection connection(loop, endpoint, std::move(context), std::move(hostname));
+    auto& self = *connection.state_;
+    auto connected = unwrap(co_await client_connection::state::connect(loop, self));
+    if (!connected) co_return std::unexpected(connected.error());
+    auto response = unwrap(co_await client_connection::state::exchange(loop, self,
+        std::move(*prepared), std::move(request), std::move(sink), std::move(header_sink)));
+    if (self.stream != nullptr) (void)co_await client_connection::state::close_transport(
+        loop, self, false);
     co_return response;
 }
 

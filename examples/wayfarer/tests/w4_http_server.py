@@ -2,12 +2,16 @@
 
 Only the surface Wayfarer needs is implemented: a per-target 200 body with a
 Content-Length, HEAD without a body, and a /stall target that never answers so
-the client deadline and output-preservation paths can be exercised.
+the client deadline and output-preservation paths can be exercised. HTTP/2
+requests also record their connection: /coalesce/<rest> redirects to
+https://localhost:<port>/<rest>, and /misdirected/... answers 421 unless it is
+the first request on its connection.
 
 Invoked by run_w4.py; emits one JSON object per line on stdout.
 """
 
 import argparse
+import itertools
 import json
 import socket
 import ssl
@@ -70,8 +74,12 @@ def serve_h1(port):
 
 
 class H2Handler:
+    connections = itertools.count(1)
+
     def __init__(self, tls):
         self.tls = tls
+        self.connection = next(H2Handler.connections)
+        self.served = 0
         self.conn = h2.connection.H2Connection(
             config=h2.config.H2Configuration(client_side=False, header_encoding=None))
         self.conn.initiate_connection()
@@ -92,8 +100,22 @@ class H2Handler:
                         path = urlsplit(target).path
                         emit(event="request", mode="h2",
                              method=method.decode("latin-1", "replace"),
-                             path=path, target=target)
+                             path=path, target=target, connection=self.connection)
+                        self.served += 1
                         if path == "/stall":
+                            continue
+                        if path.startswith("/coalesce/"):
+                            port = headers.get(b":authority", b"").rpartition(b":")[2]
+                            location = (b"https://localhost:" + port +
+                                        target[len("/coalesce"):].encode("latin-1"))
+                            self.conn.send_headers(event.stream_id, [
+                                (b":status", b"302"), (b"location", location),
+                                (b"content-length", b"0")], end_stream=True)
+                            continue
+                        if path.startswith("/misdirected/") and self.served > 1:
+                            self.conn.send_headers(event.stream_id, [
+                                (b":status", b"421"), (b"content-length", b"0")],
+                                end_stream=True)
                             continue
                         body = body_for(target)
                         self.conn.send_headers(event.stream_id, [
