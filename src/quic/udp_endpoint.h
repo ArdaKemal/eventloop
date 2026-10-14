@@ -78,6 +78,10 @@ public:
     // Flush queued datagrams with one offload/syscall batch. Always clears the
     // pending batch, even on failure.
     [[nodiscard]] auto flush_send() -> std::error_code;
+    // The index a server's connection IDs carry in their first byte inside a
+    // worker group.
+    [[nodiscard]] auto worker_index() const noexcept -> std::optional<std::uint8_t>
+    { return group_ ? std::optional<std::uint8_t>(worker_index_) : std::nullopt; }
     // Owner loop: a datagram another endpoint in the worker group received for
     // a connection ID carrying this endpoint's index.
     auto deliver_forwarded(std::span<const std::byte>, ip_endpoint source) noexcept -> void;

@@ -8,8 +8,12 @@ Shared async rules: [coroutines](coroutines.md). HTTP/3 behavior:
 Endpoints own connections in bounded slots. `quic_connection` is a move-only
 handle that must not outlive its endpoint; it does not own the connection.
 
-Endpoints reserve 80 active slots per connection: 32 bidirectional and eight
-unidirectional for each initiator. Advertised counts cap to peer reservations;
+Endpoints reserve 216 active slots per connection: 100 bidirectional and eight
+unidirectional for each initiator. A slot's storage (about 24 KiB of stream
+buffers) is allocated when concurrency first needs it and kept for the
+connection's lifetime, so an idle connection holds about 400 KiB. If that
+allocation fails, a local open returns a capacity error and a peer stream
+closes the connection with INTERNAL_ERROR. Advertised counts cap to peer reservations;
 local opens obey peer cumulative grants and local active reservations. Slots
 retire after both directions finish and sent data is acknowledged; peer
 retirement replenishes MAX_STREAMS, advertised once the peer has opened half
@@ -65,6 +69,13 @@ the server's, and drops server Initials that carry a token. PATH_CHALLENGE and
 PATH_RESPONSE datagrams are padded to 1200 bytes when the path's
 anti-amplification credit allows (RFC 9000 8.2).
 
+Once the handshake is confirmed each side issues NEW_CONNECTION_ID so the peer
+holds up to three of its connection IDs, within the peer's
+`active_connection_id_limit` (default 2). Each connection issues at most eight
+IDs in its lifetime; a retired ID stops routing at once and is replaced while
+that budget lasts. A server in a worker group keeps its index in the first
+byte of every ID.
+
 On Linux, endpoints enable UDP_GRO and request a 2 MiB socket receive buffer,
 which the kernel caps at `net.core.rmem_max`. With the 208 KiB default, a
 burst of 64 handshakes on one loop overflowed the buffer and the losses left
@@ -89,8 +100,10 @@ in fixed stream slots on the owner loop; retransmit until acknowledged.
 Local close sends CONNECTION_CLOSE at the highest keyed encryption level:
 `close()`/endpoint close use transport NO_ERROR; `close_application()` uses its
 code (APPLICATION_ERROR before 1-RTT); protocol failures use RFC 9000 codes
-(PROTOCOL_VIOLATION for stream/flow violations, CRYPTO_ERROR plus TLS alert
-for handshake failure). Initial closes are padded to 1200 bytes.
+(FLOW_CONTROL_ERROR, STREAM_LIMIT_ERROR, STREAM_STATE_ERROR, FINAL_SIZE_ERROR,
+FRAME_ENCODING_ERROR, TRANSPORT_PARAMETER_ERROR and CONNECTION_ID_LIMIT_ERROR
+where they apply, PROTOCOL_VIOLATION otherwise, CRYPTO_ERROR plus TLS alert for
+handshake failure). Initial closes are padded to 1200 bytes.
 
 While the endpoint stays open, a closed connection retains driver/route/capacity
 for three current PTOs. Application operations finish promptly. Closing only

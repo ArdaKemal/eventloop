@@ -261,6 +261,9 @@ auto send_all(event_loop&, quic_connection& connection, std::uint64_t id,
 auto sent(const std::expected<std::error_code, task_result>& result) -> bool
 { return result && !*result; }
 
+// Client control stream: type 0 and an empty SETTINGS frame.
+constexpr std::array<std::byte, 3> empty_settings {std::byte {0}, std::byte {4}, std::byte {0}};
+
 auto exchange(event_loop& loop, quic_connection& connection, std::vector<std::byte> request,
               const request_spec& spec, response_view& view) -> task<void>
 {
@@ -333,6 +336,43 @@ auto client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
     done = true;
 }
 
+// Opens 100 request streams before reading any response: RFC 9114 6.1 asks
+// servers to allow at least 100 concurrent requests.
+auto concurrent_client(event_loop& loop, quic_endpoint& endpoint, ip_endpoint server,
+                       std::size_t& answered, bool& done) -> task<void>
+{
+    auto connected = flatten_result(co_await endpoint.async_connect(server, "localhost"));
+    check(connected.has_value(), "connect");
+    auto connection = std::move(*connected);
+    const auto control = flatten_result(co_await connection.async_open_stream(
+        quic_stream_direction::unidirectional));
+    check(control && sent(co_await send_all(loop, connection, *control, empty_settings, false)),
+          "client control stream");
+    const auto request = encode({.path = "/hello"});
+    std::vector<std::uint64_t> ids;
+    for (std::size_t i = 0; i < 100; ++i) {
+        const auto id = flatten_result(co_await connection.async_open_stream(
+            quic_stream_direction::bidirectional));
+        check(id.has_value(), "open one of 100 concurrent request streams");
+        check(sent(co_await send_all(loop, connection, *id, request, true)), "send request");
+        ids.push_back(*id);
+    }
+    std::array<std::byte, 1024> buffer {};
+    for (const auto id : ids) {
+        std::vector<std::byte> bytes;
+        for (;;) {
+            const auto got = flatten_result(co_await connection.async_read(id, buffer));
+            check(got.has_value(), "read concurrent response");
+            if (*got == 0) break;
+            bytes.insert(bytes.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*got));
+        }
+        response_view view;
+        parse_response(bytes, view);
+        answered += view.status == 200 && view.body == "hello";
+    }
+    done = true;
+}
+
 auto watch(event_loop& loop, http::http3_server& server, quic_endpoint& endpoint,
            bool& done) -> task<void>
 {
@@ -342,8 +382,6 @@ auto watch(event_loop& loop, http::http3_server& server, quic_endpoint& endpoint
     loop.shutdown(event_loop::clock::duration::zero());
 }
 
-// Client control stream: type 0 and an empty SETTINGS frame.
-constexpr std::array<std::byte, 3> empty_settings {std::byte {0}, std::byte {4}, std::byte {0}};
 
 auto serve(const std::filesystem::path& directory, http::server_options options,
            std::vector<request_spec> specs,
@@ -372,6 +410,34 @@ auto serve(const std::filesystem::path& directory, http::server_options options,
     }
     check(done, "requests did not complete");
     return responses;
+}
+
+auto serve_concurrent(const std::filesystem::path& directory,
+                      std::shared_ptr<http::router> routes) -> std::size_t
+{
+    std::size_t answered = 0;
+    bool done = false;
+    {
+        event_loop loop;
+        http::http3_server server(loop, ip_endpoint::loopback_v4(0),
+            directory / "cert.pem", directory / "key.pem",
+            http::server_options {.routes = std::move(routes), .connection_capacity = 1,
+                                  .request_capacity = 100});
+        quic_client_options client_options;
+        constexpr std::array<std::uint8_t, 2> alpn {'h', '3'};
+        client_options.alpn = alpn;
+        client_options.trusted_ca = directory / "cert.pem";
+        quic_endpoint endpoint(loop, ip_endpoint::loopback_v4(0), std::move(client_options));
+        task_handle<void> serving;
+        check(loop.spawn(server.run(), serving) == task_spawn_result::accepted, "spawn server");
+        check(loop.spawn(concurrent_client(loop, endpoint, server.local_endpoint(), answered,
+                                           done)) == task_spawn_result::accepted, "spawn client");
+        check(loop.spawn(watch(loop, server, endpoint, done)) == task_spawn_result::accepted,
+              "spawn watch");
+        (void)loop.run();
+    }
+    check(done, "concurrent requests did not complete");
+    return answered;
 }
 
 class temporary_directory {
@@ -512,6 +578,8 @@ auto main() -> int
           "responses within the peer field section limit are sent");
     check(limited[1].status == 500 && limited[1].field("x-big") == "<none>",
           "peer field section limit replaces the oversized response with 500");
+
+    check(serve_concurrent(directory.path(), routes) == 100, "100 concurrent requests");
 
     const auto uploads_before = upload_calls;
     const auto large_lengths = serve(directory.path(),

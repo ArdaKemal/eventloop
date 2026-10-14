@@ -45,7 +45,7 @@ struct contexts {
 
 
 static constexpr std::array<std::uint8_t, 4> protocol {'t','e','s','t'};
-static constexpr std::array<std::uint8_t, 29> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,1,32,9,1,8,0x20,2,0x44,0xb0};
+static constexpr std::array<std::uint8_t, 30> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,2,0x40,100,9,1,8,0x20,2,0x44,0xb0};
 static constexpr std::array<std::uint8_t, 8> dcid {1,2,3,4,5,6,7,8};
 static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcept
 {
@@ -96,9 +96,18 @@ static auto transfer(bounded_connection& sender, bounded_connection& receiver,
 int main()
 {
     contexts context;
-    for (const auto index : {21u, 24u}) {
+    {
         auto unsafe = parameters;
-        unsafe[index] = index == 21 ? 33 : 9;
+        unsafe[25] = 9; // one unidirectional stream beyond the cap of 8
+        connection_callbacks callbacks {nullptr, valid_parameters, nullptr};
+        auto connection = std::make_unique<bounded_connection>(endpoint_role::client, callbacks);
+        const auto initialized = connection->initialize(context.client.get(),
+            {false,"localhost",protocol,unsafe},version_1,dcid);
+        check(!initialized && initialized.error() == connection_error::invalid_configuration);
+    }
+    {
+        auto unsafe = parameters;
+        unsafe[22] = 101; // one bidirectional stream beyond the cap of 100
         connection_callbacks callbacks {nullptr, valid_parameters, nullptr};
         auto connection = std::make_unique<bounded_connection>(endpoint_role::client, callbacks);
         const auto initialized = connection->initialize(context.client.get(),
@@ -302,7 +311,8 @@ int main()
         check(server->consume_stream(*buffered_id, 64).has_value());
         check(buffered->receive->readable().empty());
         check(server->flow().receive_max_data() == 8192 + 3 + 4160);
-        for (int i = 3; i < 32; ++i) check(client->open_stream(stream_direction::bidirectional).has_value());
+        for (std::size_t i = 3; i < bounded_connection::bidi_stream_capacity; ++i)
+            check(client->open_stream(stream_direction::bidirectional).has_value());
         check(!client->open_stream(stream_direction::bidirectional));
         // Path migration: an unvalidated candidate cannot be promoted; promotion
         // resets path-specific RTT/congestion state while cancellation and
@@ -353,7 +363,7 @@ int main()
         // Even larger authenticated peer grants cannot expand local storage or
         // consume the independently reserved peer slots.
         for (const auto type : {0x12u, 0x13u}) {
-            decoded_frame grant; grant.type = type; grant.limit = 100;
+            decoded_frame grant; grant.type = type; grant.limit = 200;
             check(deliver_frame(*server, *client, grant).has_value());
             check(deliver_frame(*client, *server, grant).has_value());
         }
@@ -393,9 +403,7 @@ int main()
         deliver_streams(*server, *client, 1);
         for (auto* connection : {client.get(), server.get()}) {
             check(connection->streams().size() == bounded_connection::stream_capacity);
-            check(std::ranges::count_if(connection->stream_slots(),
-                [](const auto& slot) { return slot.occupied; }) ==
-                bounded_connection::stream_capacity);
+            check(connection->active_slots().size() == bounded_connection::stream_capacity);
             // FIN-complete peer streams retain their lifetime reservation.
             check(!connection->open_stream(stream_direction::bidirectional));
             check(!connection->open_stream(stream_direction::unidirectional));

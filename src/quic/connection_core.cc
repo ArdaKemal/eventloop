@@ -143,8 +143,10 @@ auto connection_core::advance(lifecycle_time_point now)
     const auto result = tls_.advance();
     if (!result) return fail(connection_error::tls_failure);
     if (*result == tls_progress::complete && lifecycle_.state() == connection_state::handshake) {
-        if (!callbacks_.validate_parameters(callbacks_.argument, tls_.peer_transport_parameters()))
+        if (!callbacks_.validate_parameters(callbacks_.argument, tls_.peer_transport_parameters())) {
+            note_transport_error(0x08); // TRANSPORT_PARAMETER_ERROR
             return fail(connection_error::protocol_violation);
+        }
         const auto peer_parameters = decode_transport_parameters(
             std::as_bytes(tls_.peer_transport_parameters()),
             role_ == endpoint_role::client ? parameter_sender::server : parameter_sender::client);
@@ -395,6 +397,9 @@ auto connection_core::dispatch(tls_level level, packet_kind kind,
     // Validate the complete frame sequence before delivering any borrowed views.
     for (std::size_t cursor = 0; cursor < payload.size();) {
         const auto frame = decode_frame(payload.subspan(cursor));
+        // A frame that does not decode is FRAME_ENCODING_ERROR (RFC 9000
+        // 12.4); one not allowed in this packet type stays PROTOCOL_VIOLATION.
+        if (!frame) note_transport_error(0x07);
         if (!frame || !validate_frame_policy(kind, *frame, role_))
             return fail(connection_error::protocol_violation);
         if (frame->type == 0x1e && lifecycle_.state() != connection_state::active)

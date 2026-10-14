@@ -516,5 +516,16 @@ int main()
         check(opened.has_value());
         const auto frame=decode_frame(std::as_bytes(std::span(buffer.plaintext).first(opened->plaintext_size)));
         check(frame && (frame->type==2 || frame->type==3) && frame->encoded_size==opened->plaintext_size);
+        // A peer violation closes with its specific code, not the generic
+        // PROTOCOL_VIOLATION: STOP_SENDING for a stream the client cannot send
+        // on is STREAM_STATE_ERROR (RFC 9000 19.5).
+        decoded_frame wrong_stop; wrong_stop.type=5; wrong_stop.stream_id=3;
+        check(incoming.queue_control(tls_level::application,wrong_stop).has_value());
+        const auto violating=incoming.prepare(tls_level::application,blocked_fields,now,
+            buffer.encoded,buffer.build_scratch);
+        check(violating && incoming.complete(true,now).has_value());
+        check(!client->receive(std::span(buffer.encoded).first(*violating),0,dcid.size(),
+            buffer.packet_scratch,buffer.plaintext,buffer.auth_scratch,now,std::chrono::milliseconds(10)));
+        check(client->core().transport_error()==0x05);
     }
 }

@@ -653,6 +653,18 @@ int main()
         (void)loop.run();
         if (!delivered) std::fprintf(stderr,"delivery failure state %d/%d dropped %zu/%zu\n",static_cast<int>(client->core().state()),static_cast<int>(server->core().state()),client_driver->dropped_packets(),server_driver->dropped_packets()); check(delivered && client_clean && server_clean);
         check(loop.coroutine_statistics().live==0);
+        // Each side issues a spare connection ID up to the peer's default
+        // active_connection_id_limit of 2 (RFC 9000 5.1.1), routes it, and
+        // the peer records it.
+        for (auto* side : {client.get(),server.get()}) {
+            const auto* spare=side->local_ids().find(1);
+            check(side->local_ids().size()==2 && spare && !spare->retired);
+            auto& endpoint=side==client.get() ? client_endpoint : server_endpoint;
+            check(endpoint.router().lookup(spare->id())!=0);
+            auto* peer=side==client.get() ? server.get() : client.get();
+            const auto* learned=peer->peer_ids().find(1);
+            check(learned && std::ranges::equal(learned->id(),spare->id()));
+        }
         // Queued data with available congestion/flow credit must make more
         // than one packet of progress before the pump retries on a timer.
         // This checks scheduling behavior without a wall-clock threshold.
