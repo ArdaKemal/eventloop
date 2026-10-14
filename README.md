@@ -98,8 +98,9 @@ large files; TLS HTTP/1.1 and HTTP/2 can use transmit kTLS, with bounded
 buffered fallback. See [shared HTTP](docs/http.md) and
 [HTTP/1.1](docs/http1.1.md), [HTTP/2](docs/http2.md), or [HTTP/3](docs/http3.md).
 
-The HTTP/2 client performs one HTTPS request per connection with ALPN `h2`,
-bounded owned bodies or streamed uploads/responses. QUIC exposes v1/v2
+The HTTP/2 client performs HTTPS requests with ALPN `h2`, bounded owned bodies
+or streamed uploads/responses, one-shot or as sequential requests on a
+connection reused across origins its certificate covers (RFC 9113 9.1.1). QUIC exposes v1/v2
 endpoints, streams, and DATAGRAMs; Wayfarer's HTTP/3 codec has narrower limits
 than the server. WebSocket framing is bounded; HTTP/2 and HTTP/3 CONNECT routes
 can accept RFC 8441/9220 WebSockets. The

@@ -528,13 +528,30 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
     std::string body = options.body;
     std::filesystem::path body_file = options.body_file;
     auto custom_headers = options.headers;
+    std::optional<http2::client_connection> connection;
     for (unsigned hop = 0; hop <= 10 && !state.expired; ++hop) {
         auto addresses = co_await run_blocking(loop, [host = current.hostname, port = current.port]() noexcept {
             return http_client_example::resolve_addresses(host, port);
         });
         if (!addresses || addresses->error || addresses->count == 0) { fail("DNS lookup failed"); co_return; }
+        // RFC 9113 9.1.1: a redirect to a host the open connection is
+        // authoritative for, at one of the host's addresses, reuses it.
+        const auto endpoints = std::span(addresses->endpoints).first(addresses->count);
+        const bool reused = connection && std::any_of(endpoints.begin(), endpoints.end(),
+            [&](const ip_endpoint& endpoint) { return connection->can_reuse_for(current.hostname, endpoint); });
+        if (connection && !reused) { (void)co_await connection->async_close(); connection.reset(); }
         bool redirected = false;
-        for (std::size_t i = 0; i < addresses->count && !state.expired; ++i) {
+        // Attempt 0 uses the reused connection; attempt i connects to address i - 1.
+        for (std::size_t attempt = reused ? 0 : 1; attempt <= addresses->count && !state.expired; ++attempt) {
+            if (attempt != 0) {
+                connection.reset();
+                connection.emplace(loop, endpoints[attempt - 1], tls, current.hostname);
+                auto connected = io_result(co_await connection->async_connect());
+                if (!connected) {
+                    if (!state.expired) fail("HTTP/2 request failed: " + connected.error().message());
+                    continue;
+                }
+            }
             http2::client_request request;
             request.method = method;
             request.target = current.target;
@@ -554,10 +571,12 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
                     return static_cast<std::size_t>(file->gcount());
                 };
             }
-            bool wrote_output = false, redirect_response = false;
+            // 421 on a reused connection: the server is not authoritative for
+            // this host there, so retry on a new connection (RFC 9110 15.5.20).
+            bool wrote_output = false, redirect_response = false, misdirected = false;
             std::string location;
             http2::response_sink sink = [&](std::span<const std::byte> chunk) -> std::error_code {
-                if (chunk.empty() || redirect_response) return {};
+                if (chunk.empty() || redirect_response || misdirected) return {};
                 wrote_output = true;
                 if (std::fwrite(chunk.data(), 1, chunk.size(), output) != chunk.size())
                     return std::make_error_code(std::errc::io_error);
@@ -565,6 +584,8 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
             };
             http2::response_header_sink headers_sink = [&](unsigned status,
                 std::span<const http2::header> fields) -> std::error_code {
+                if (status == 421 && attempt == 0) misdirected = true;
+                if (misdirected) return {};
                 if (options.follow_redirects && redirect_status(status)) {
                     for (const auto& field : fields)
                         if (field.name == "location") { location = field.value; break; }
@@ -586,19 +607,21 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
                     return std::make_error_code(std::errc::io_error);
                 return {};
             };
-            auto response = io_result(co_await http2::async_request(
-                loop, addresses->endpoints[i], tls, current.hostname, std::move(request),
-                std::move(sink), std::move(headers_sink)));
+            auto response = io_result(co_await connection->async_request(
+                std::move(request), std::move(sink), std::move(headers_sink)));
             if (!response) {
-                if (!state.expired) fail("HTTP/2 request failed: " + response.error().message());
+                if (!state.expired && (attempt != 0 || wrote_output))
+                    fail("HTTP/2 request failed: " + response.error().message());
                 if (wrote_output) co_return;
                 continue;
             }
+            if (misdirected) continue;
             std::cerr << "HTTP/2 " << response->status << '\n';
             if (!redirect_response) {
                 if (std::fflush(output) != 0) { fail("output flush failed"); co_return; }
                 final_status = response->status;
                 success = true;
+                (void)co_await connection->async_close();
                 co_return;
             }
             if (hop == 10) { fail("redirect limit of 10 reached"); co_return; }

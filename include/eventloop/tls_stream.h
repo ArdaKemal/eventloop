@@ -8,11 +8,14 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <vector>
 
 namespace eventloop {
+
+namespace http2::detail { class client_access; }
 
 enum class tls_errc {
     truncated = 1000,
@@ -81,6 +84,9 @@ public:
         -> task<std::expected<void, std::error_code>>;
 
 private:
+    friend class http2::detail::client_access;
+    // Applies handshake hostname checks to the verified peer certificate.
+    [[nodiscard]] auto certificate_matches(std::string_view hostname) const -> bool;
     // Raw sendfile would put unencrypted bytes on the TLS transport.
     using tcp_stream::async_send_file;
     class flush_waiter;

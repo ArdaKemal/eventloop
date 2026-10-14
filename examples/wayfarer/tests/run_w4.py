@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 sys.dont_write_bytecode = True
 from run_w3_aioquic import certificate
@@ -239,6 +240,42 @@ def check_http3_extras(checks, wayfarer, mode, port, ca, directory):
                   f"rc={result.returncode}, stderr={result.stderr!r}")
 
 
+def requests_for(records, prefix, count):
+    """Waits briefly for the fixture's output reader to record count requests."""
+    deadline = time.monotonic() + 2
+    while True:
+        matches = [record for record in list(records) if record.get("event") == "request"
+                   and record.get("target", "").startswith(prefix)]
+        if len(matches) >= count or time.monotonic() > deadline:
+            return matches
+        time.sleep(0.01)
+
+
+def check_http2_reuse(checks, wayfarer, mode, port, ca, records):
+    """RFC 9113 9.1.1: a redirect to another host covered by the certificate,
+    at the same address, reuses the connection; 421 forces a new one."""
+    if mode != "h2":
+        return
+    result = invoke(wayfarer, mode, port, ca, "/coalesce/reuse.txt", ["-L"])
+    seen = requests_for(records, "/coalesce/reuse.txt", 1) + requests_for(records, "/reuse.txt", 1)
+    checks.expect("h2 -L reuses the connection for a covered host",
+                  result.returncode == 0 and result.stdout == expected_body(mode, "/reuse.txt")
+                  and len(seen) == 2 and seen[0]["connection"] == seen[1]["connection"],
+                  f"rc={result.returncode}, stdout={result.stdout!r}, seen={seen}")
+
+    result = invoke(wayfarer, mode, port, ca, "/coalesce/misdirected/x", ["-L"])
+    first = requests_for(records, "/coalesce/misdirected/x", 1)
+    retried = requests_for(records, "/misdirected/x", 2)
+    checks.expect("h2 421 retries on a new connection",
+                  result.returncode == 0
+                  and result.stdout == expected_body(mode, "/misdirected/x")
+                  and len(first) == 1 and len(retried) == 2
+                  and retried[0]["connection"] == first[0]["connection"]
+                  and retried[1]["connection"] != first[0]["connection"],
+                  f"rc={result.returncode}, stdout={result.stdout!r}, "
+                  f"first={first}, retried={retried}")
+
+
 def run(wayfarer, modes):
     checks = Checks()
     help_result = subprocess.run([str(wayfarer), "--help"], capture_output=True, timeout=10)
@@ -259,6 +296,7 @@ def run(wayfarer, modes):
                 check_head(checks, wayfarer, mode, port, ca, directory)
                 check_rejections(checks, wayfarer, mode, port, ca)
                 check_http3_extras(checks, wayfarer, mode, port, ca, directory)
+                check_http2_reuse(checks, wayfarer, mode, port, ca, records)
                 methods = {record.get("method") for record in records
                            if record.get("event") == "request"}
                 checks.expect(f"{mode} server saw HEAD and GET requests",

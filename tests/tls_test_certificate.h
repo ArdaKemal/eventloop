@@ -9,8 +9,10 @@
 #include <openssl/x509v3.h>
 
 namespace eventloop::test {
+// names is the subjectAltName list, in OpenSSL configuration syntax.
 inline auto make_localhost_certificate(const std::filesystem::path& certificate_path,
-                                       const std::filesystem::path& key_path) -> void
+                                       const std::filesystem::path& key_path,
+                                       const char* names = "DNS:localhost") -> void
 {
     auto check = [](bool ok) {
         if (!ok) throw std::runtime_error("generate TLS test certificate");
@@ -34,7 +36,7 @@ inline auto make_localhost_certificate(const std::filesystem::path& certificate_
     check(X509_set_issuer_name(cert, subject.get()) == 1);
     std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> san {
         X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
-                          const_cast<char*>("DNS:localhost")), X509_EXTENSION_free};
+                          const_cast<char*>(names)), X509_EXTENSION_free};
     check(san && X509_add_ext(cert, san.get(), -1) == 1);
     check(X509_sign(cert, key.get(), EVP_sha256()) > 0);
     // Write directly to file BIOs; no intermediate PEM strings or memory BIOs.

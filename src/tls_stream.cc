@@ -451,6 +451,23 @@ auto tls_stream::application_protocol() const -> std::string
     return {reinterpret_cast<const char*>(protocol), size};
 }
 
+auto tls_stream::certificate_matches(std::string_view hostname) const -> bool
+{
+    if (!implementation_ || !implementation_->active() || hostname.empty() ||
+        hostname.size() > 255 || hostname.find('\0') != std::string_view::npos)
+        return false;
+    auto* ssl = implementation_->ssl_.get();
+    auto* certificate = SSL_get0_peer_certificate(ssl);
+    if (certificate == nullptr || SSL_get_verify_result(ssl) != X509_V_OK) return false;
+    // Numeric hosts use iPAddress SANs, as in the client constructor.
+    const std::string name(hostname);
+    const auto ip = X509_check_ip_asc(certificate, name.c_str(), 0);
+    if (ip != -2) return ip == 1;
+    ERR_clear_error();
+    return X509_check_host(certificate, name.data(), name.size(),
+                           X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, nullptr) == 1;
+}
+
 auto tls_stream::async_handshake()
     -> task<std::expected<void, std::error_code>>
 {

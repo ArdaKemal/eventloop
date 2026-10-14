@@ -123,7 +123,43 @@ context, hostname, request, sink = {}, header_sink = {})` performs one HTTPS
 request on one owned TLS connection. Numeric endpoint resolution belongs to
 the caller; hostname supplies verification, SNI, and default `:authority`.
 ALPN must select h2. General token methods work; CONNECT returns
-`operation_not_supported`. No connection reuse or push.
+`operation_not_supported`. No push.
+
+### Connection reuse
+
+`http2::client_connection(loop, endpoint, context, hostname)` carries
+sequential requests on one connection (RFC 9113 9.1.1). `async_connect()`
+connects, handshakes, and requires ALPN h2; `async_request()` takes the same
+request/sink arguments, limits, and errors as `async_request`, on client
+streams 1, 3, 5, and so on; `async_close()` sends GOAWAY and closes.
+Connection state (HPACK decoder table, peer SETTINGS, connection send window)
+persists across requests; the connection preface is sent with the first.
+An empty `:authority` uses the connection hostname.
+
+`can_reuse_for(hostname, endpoint)` is true while the connection is open, has
+seen no GOAWAY, was made to `endpoint` (same address and port), and its
+verified certificate is valid for `hostname` under the handshake's own checks
+(DNS name without partial wildcards, or iPAddress SAN for numeric hosts).
+Callers check it before sending a request for another origin; the library does
+not pool connections. A server that is not authoritative there answers 421
+(Misdirected Request), which is returned as a response; retry it on a new
+connection.
+
+| Situation | Result |
+| --- | --- |
+| Second operation while one is pending | `device_or_resource_busy` |
+| Request before connect, after close/failure/GOAWAY, or after stream IDs run out | `not_connected` |
+| Second `async_connect()` | `already_connected` |
+| GOAWAY whose last stream precedes the request's | `connection_reset` (not processed) |
+| Request failure after validation, including cancellation | Closes the connection |
+
+Late RST_STREAM and WINDOW_UPDATE frames for earlier streams are ignored. A
+response completed before its upload ends that stream with RST_STREAM
+(CANCEL), keeping the connection usable. Idle connections read nothing, so a
+GOAWAY or close that arrives while idle is seen by the next request.
+Construct, use, and destroy a connection on its loop thread; keep it alive
+and unmoved while an operation is pending, and destroy it before loop
+shutdown. Destruction closes an open transport without GOAWAY.
 
 Requests own method/target/authority/header strings and either body bytes or a
 `request_body_source`. Requests/callbacks are move-only: move named values.
@@ -155,8 +191,9 @@ Malformed responses return `protocol_error`: connection-specific fields or any
 TE, nonnumeric/conflicting Content-Length, mismatched DATA totals, DATA
 content on HEAD/204/304, or SETTINGS_ENABLE_PUSH=1. Bodyless Content-Length is
 not compared. Request-stream
-RST_STREAM or GOAWAY with last stream 0 returns `connection_reset`; other GOAWAY
-permits completion. Malformed RST_STREAM/GOAWAY is `protocol_error`.
+RST_STREAM, or GOAWAY whose last stream precedes the request's (last stream 0
+for a one-shot request), returns `connection_reset`; other GOAWAY permits
+completion. Malformed RST_STREAM/GOAWAY is `protocol_error`.
 The client ends every connection with GOAWAY (last stream 0; PROTOCOL_ERROR
 after a protocol failure, otherwise NO_ERROR).
 Limits return `message_size`; TLS errors pass through. Cancellation closes the

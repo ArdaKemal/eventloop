@@ -29,6 +29,8 @@ struct ip_endpoint {
     std::uint16_t port {0};
     std::uint32_t scope_id {0};
 
+    [[nodiscard]] constexpr auto operator==(const ip_endpoint&) const -> bool = default;
+
     [[nodiscard]] static constexpr auto from_ipv4(
         std::array<std::uint8_t, 4> bytes, std::uint16_t port = 0) noexcept
         -> ip_endpoint
