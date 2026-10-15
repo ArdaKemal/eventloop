@@ -16,6 +16,11 @@ namespace eventloop::http3::detail {
 
 constexpr std::uint64_t max_stream_data = (std::uint64_t {1} << 62) - 1;
 
+// WebTransport over HTTP/3 (draft-16, "Bidirectional Streams"): the WT_STREAM
+// signal 0x41 is a frame type that is valid only as the first varint of a
+// client-initiated bidirectional stream.
+inline constexpr std::uint64_t wt_stream_signal = 0x41;
+
 // Incremental parser for a client request stream (RFC 9114 4.1 and 7.1):
 // HEADERS, then DATA frames, then at most one trailing HEADERS. Unknown and
 // reserved extension frames may appear anywhere and are skipped by length.
@@ -23,11 +28,17 @@ constexpr std::uint64_t max_stream_data = (std::uint64_t {1} << 62) - 1;
 // parser. DATA payloads are delivered as views of the input and counted. No
 // other input is buffered.
 //
+// With set_webtransport(true), a stream whose first frame type is 0x41 yields
+// event::webtransport_stream once its session ID varint is complete. Input
+// after that point is stream data rather than HTTP/3 framing: the caller takes
+// over at the first body byte, and later receive() calls consume nothing and
+// return need_input. A 0x41 frame type anywhere else is H3_FRAME_ERROR.
+//
 // Errors are RFC codes; stream_scoped() tells whether to reset the stream or
 // close the connection.
 class request_frames {
 public:
-    enum class event { need_input, header_block, data };
+    enum class event { need_input, header_block, data, webtransport_stream };
 
     explicit request_frames(std::span<std::byte> block_storage) noexcept
         : storage_(block_storage) {}
@@ -44,10 +55,27 @@ public:
             case state::frame_type: {
                 const auto type = varint_.feed(input);
                 if (!type) break;
+                const bool first = !frame_started_;
+                frame_started_ = true;
                 frame_type_ = *type;
+                if (webtransport_ && *type == wt_stream_signal) {
+                    if (!first) return std::unexpected(h3_error::frame_error);
+                    state_ = state::wt_session_id;
+                    break;
+                }
                 state_ = state::frame_length;
                 break;
             }
+            case state::wt_session_id: {
+                const auto id = varint_.feed(input);
+                if (!id) break;
+                session_id_ = *id;
+                state_ = state::wt_body;
+                return event::webtransport_stream;
+            }
+            case state::wt_body:
+                // Stream data belongs to the caller; nothing is consumed here.
+                return event::need_input;
             case state::frame_length: {
                 const auto length = varint_.feed(input);
                 if (!length) break;
@@ -86,6 +114,10 @@ public:
     // stream ending before its request HEADERS is incomplete (4.1).
     [[nodiscard]] auto finish() const noexcept -> std::expected<void, h3_error>
     {
+        // A WebTransport stream that ends before its session ID is incomplete;
+        // after it, the stream data may end at any point.
+        if (state_ == state::wt_session_id) return std::unexpected(h3_error::request_incomplete);
+        if (state_ == state::wt_body) return {};
         if (state_ != state::frame_type || varint_.partial())
             return std::unexpected(h3_error::frame_error);
         if (phase_ == phase::request_headers)
@@ -102,6 +134,12 @@ public:
 
     auto accept_connect() noexcept -> void
     { tunnel_ = true; content_length_.reset(); content_length_too_large_ = false; }
+
+    // Recognizes WT_STREAM (0x41) as the first frame of this stream. Off by
+    // default, in which case 0x41 is an unknown frame type.
+    auto set_webtransport(bool enabled) noexcept -> void { webtransport_ = enabled; }
+    // Session ID of a webtransport_stream event; meaningless for other events.
+    [[nodiscard]] auto session_id() const noexcept -> std::uint64_t { return session_id_; }
 
     [[nodiscard]] auto block() const noexcept -> std::span<const std::byte>
     { return std::span<const std::byte>(storage_).first(block_size_); }
@@ -120,6 +158,7 @@ public:
 private:
     enum class state : std::uint8_t {
         frame_type, frame_length, header_payload, skip_payload, data_payload,
+        wt_session_id, wt_body,
     };
     enum class phase : std::uint8_t { request_headers, body, complete };
 
@@ -172,11 +211,14 @@ private:
     std::uint64_t remaining_ {0};
     std::uint64_t data_received_ {0};
     std::size_t block_size_ {0};
+    std::uint64_t session_id_ {0};
     varint_accumulator varint_ {};
     state state_ {state::frame_type};
     phase phase_ {phase::request_headers};
     bool tunnel_ {false};
     bool content_length_too_large_ {false};
+    bool webtransport_ {false};
+    bool frame_started_ {false};
 };
 
 // HTTP field names, methods, and Extended CONNECT protocol values are tokens.

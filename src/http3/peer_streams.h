@@ -16,19 +16,45 @@ namespace eventloop::http3::detail {
 
 inline constexpr std::uint64_t enable_connect_protocol_setting = 0x08;
 inline constexpr std::uint64_t h3_datagram_setting = 0x33;
+inline constexpr std::uint64_t wt_enabled_setting = 0x2c7cf000; // draft-16 codepoint
+inline constexpr std::uint64_t wt_initial_max_streams_uni_setting = 0x2b64;
+inline constexpr std::uint64_t wt_initial_max_streams_bidi_setting = 0x2b65;
+inline constexpr std::uint64_t wt_initial_max_data_setting = 0x2b61;
 inline constexpr std::uint64_t control_stream_type = 0x00;
 inline constexpr std::uint64_t push_stream_type = 0x01;
 inline constexpr std::uint64_t qpack_encoder_stream_type = 0x02;
 inline constexpr std::uint64_t qpack_decoder_stream_type = 0x03;
+inline constexpr std::uint64_t webtransport_stream_type = 0x54; // draft-16 "Unidirectional streams"
 
 // Connection-wide record of the peer's critical streams (RFC 9114 6.2.1,
 // RFC 9204 4.2). A second stream of the same type is a connection error.
 // Also carries the peer's SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 4.2.2).
+//
+// max_field_section_size is written as each setting arrives. The fields after
+// it are written only when the whole SETTINGS frame has been parsed.
+// settings_received then becomes true and on_settings is invoked once, so a
+// consumer that waits on the hook never sees a partial SETTINGS. Until then
+// they keep their defaults. wt_enabled is true only for
+// the value 1. A server receiving a larger value treats WebTransport as not
+// enabled rather than raising H3_SETTINGS_ERROR; the draft's "MUST be
+// H3_SETTINGS_ERROR" rule applies to clients receiving the setting.
 struct peer_critical_streams {
     bool control {false};
     bool qpack_encoder {false};
     bool qpack_decoder {false};
     std::uint64_t max_field_section_size {UINT64_MAX};
+
+    bool settings_received {false};
+    bool h3_datagram {false};      // SETTINGS_H3_DATAGRAM == 1 (RFC 9297 2.1.1)
+    bool connect_protocol {false}; // SETTINGS_ENABLE_CONNECT_PROTOCOL == 1
+    bool wt_enabled {false};       // SETTINGS_WT_ENABLED == 1 (draft-16)
+    std::uint64_t wt_initial_max_streams_bidi {0};
+    std::uint64_t wt_initial_max_streams_uni {0};
+    std::uint64_t wt_initial_max_data {0};
+
+    // Called with settings_context once SETTINGS completes. Both may be null.
+    void (*on_settings)(void* context) noexcept {nullptr};
+    void* settings_context {nullptr};
 };
 
 // Incremental validator for one client-initiated unidirectional stream as
@@ -39,17 +65,70 @@ struct peer_critical_streams {
 //
 // Feed received bytes in order with receive(); report a FIN or peer reset
 // with finish(). Any error is a connection error to close with.
+//
+// With WebTransport enabled, a 0x54 stream is kind::webtransport. Its session
+// ID is parsed and then parsing stops: receive() never consumes bytes past the
+// session ID, and the rest of the stream is application data for the caller.
+// The caller reads bytes_consumed() to find where that data begins and feeds
+// no further input to this parser.
 class peer_uni_stream {
 public:
     // Distinct SETTINGS identifiers accepted, including GREASE entries.
     static constexpr std::size_t max_settings = 32;
 
-    enum class kind { pending, control, qpack_encoder, qpack_decoder, unknown };
+    enum class kind { pending, control, qpack_encoder, qpack_decoder, unknown, webtransport };
+
+    // webtransport enables stream type 0x54. When disabled, 0x54 is unknown.
+    explicit peer_uni_stream(bool webtransport = false) noexcept
+        : webtransport_(webtransport) {}
 
     [[nodiscard]] auto stream_kind() const noexcept -> kind { return kind_; }
 
+    // Session ID of a kind::webtransport stream, once its varint is complete.
+    [[nodiscard]] auto session_id() const noexcept -> std::optional<std::uint64_t>
+    { return session_id_; }
+
+    // Bytes of the input passed to the last receive() call that were consumed.
+    [[nodiscard]] auto bytes_consumed() const noexcept -> std::size_t { return consumed_; }
+
     [[nodiscard]] auto receive(std::span<const std::byte> input,
                                peer_critical_streams& critical) noexcept
+        -> std::expected<void, h3_error>
+    {
+        const auto size = input.size();
+        const auto parsed = parse(input, critical);
+        consumed_ = size - input.size();
+        return parsed;
+    }
+
+    // Critical streams must stay open for the connection's lifetime. Other
+    // streams, including ones closed before their type arrived, may end. A
+    // WebTransport stream may end anywhere, including before its session ID.
+    [[nodiscard]] auto finish() const noexcept -> std::expected<void, h3_error>
+    {
+        if (kind_ == kind::control || kind_ == kind::qpack_encoder ||
+            kind_ == kind::qpack_decoder)
+            return std::unexpected(h3_error::closed_critical_stream);
+        return {};
+    }
+
+private:
+    enum class control_state : std::uint8_t {
+        frame_type, frame_length, setting_identifier, setting_value,
+        push_id, skip_payload,
+    };
+
+    // SETTINGS values held until the frame completes (see peer_critical_streams).
+    struct settings_values {
+        bool h3_datagram {false};
+        bool connect_protocol {false};
+        bool wt_enabled {false};
+        std::uint64_t wt_initial_max_streams_bidi {0};
+        std::uint64_t wt_initial_max_streams_uni {0};
+        std::uint64_t wt_initial_max_data {0};
+    };
+
+    auto parse(std::span<const std::byte>& input, peer_critical_streams& critical) noexcept
         -> std::expected<void, h3_error>
     {
         while (!input.empty()) {
@@ -79,26 +158,16 @@ public:
             case kind::unknown:
                 input = {};
                 break;
+            case kind::webtransport:
+                // Once the session ID is known, leave the remaining input for
+                // the caller: it is stream data, not HTTP/3 framing.
+                if (session_id_) return {};
+                if (const auto id = varint_.feed(input)) session_id_ = *id;
+                break;
             }
         }
         return {};
     }
-
-    // Critical streams must stay open for the connection's lifetime. Other
-    // streams, including ones closed before their type arrived, may end.
-    [[nodiscard]] auto finish() const noexcept -> std::expected<void, h3_error>
-    {
-        if (kind_ == kind::control || kind_ == kind::qpack_encoder ||
-            kind_ == kind::qpack_decoder)
-            return std::unexpected(h3_error::closed_critical_stream);
-        return {};
-    }
-
-private:
-    enum class control_state : std::uint8_t {
-        frame_type, frame_length, setting_identifier, setting_value,
-        push_id, skip_payload,
-    };
 
     auto claim(std::uint64_t type, peer_critical_streams& critical) noexcept
         -> std::expected<void, h3_error>
@@ -119,6 +188,8 @@ private:
         } else if (type == qpack_decoder_stream_type) {
             if (!take(critical.qpack_decoder)) return std::unexpected(h3_error::stream_creation_error);
             kind_ = kind::qpack_decoder;
+        } else if (type == webtransport_stream_type && webtransport_) {
+            kind_ = kind::webtransport;
         } else {
             // Reserved and unknown types are ignored (RFC 9114 6.2.3).
             kind_ = kind::unknown;
@@ -151,7 +222,7 @@ private:
             const auto length = varint_.feed(input);
             if (!length) return {};
             payload_remaining_ = *length;
-            return begin_frame();
+            return begin_frame(critical);
         }
         case control_state::setting_identifier:
         case control_state::setting_value: {
@@ -181,6 +252,17 @@ private:
                      identifier == h3_datagram_setting) && *value > 1)
                     return std::unexpected(h3_error::settings_error);
                 if (identifier == max_field_section_size) critical.max_field_section_size = *value;
+                if (identifier == wt_enabled_setting) pending_.wt_enabled = *value == 1;
+                else if (identifier == wt_initial_max_streams_bidi_setting)
+                    pending_.wt_initial_max_streams_bidi = *value;
+                else if (identifier == wt_initial_max_streams_uni_setting)
+                    pending_.wt_initial_max_streams_uni = *value;
+                else if (identifier == wt_initial_max_data_setting)
+                    pending_.wt_initial_max_data = *value;
+                else if (identifier == enable_connect_protocol_setting)
+                    pending_.connect_protocol = *value == 1;
+                else if (identifier == h3_datagram_setting) pending_.h3_datagram = *value == 1;
+                if (payload_remaining_ == 0) commit_settings(critical);
                 control_state_ = payload_remaining_ == 0 ? control_state::frame_type
                                                          : control_state::setting_identifier;
             }
@@ -212,14 +294,30 @@ private:
         return {};
     }
 
-    auto begin_frame() noexcept -> std::expected<void, h3_error>
+    // Publishes the staged SETTINGS. Only one control stream exists per
+    // connection and a second SETTINGS frame is rejected, so this runs once.
+    auto commit_settings(peer_critical_streams& critical) noexcept -> void
     {
-        const bool first = !settings_received_;
+        critical.h3_datagram = pending_.h3_datagram;
+        critical.connect_protocol = pending_.connect_protocol;
+        critical.wt_enabled = pending_.wt_enabled;
+        critical.wt_initial_max_streams_bidi = pending_.wt_initial_max_streams_bidi;
+        critical.wt_initial_max_streams_uni = pending_.wt_initial_max_streams_uni;
+        critical.wt_initial_max_data = pending_.wt_initial_max_data;
+        critical.settings_received = true;
+        if (critical.on_settings) critical.on_settings(critical.settings_context);
+    }
+
+    auto begin_frame(peer_critical_streams& critical) noexcept -> std::expected<void, h3_error>
+    {
+        const bool first = !settings_started_;
         if (first && frame_type_ != settings_frame)
             return std::unexpected(h3_error::missing_settings);
         if (frame_type_ == settings_frame) {
             if (!first) return std::unexpected(h3_error::frame_unexpected);
-            settings_received_ = true;
+            settings_started_ = true;
+            // An empty SETTINGS frame is complete as soon as it begins.
+            if (payload_remaining_ == 0) commit_settings(critical);
             control_state_ = payload_remaining_ == 0 ? control_state::frame_type
                                                      : control_state::setting_identifier;
             return {};
@@ -288,6 +386,9 @@ private:
     }
 
     std::array<std::uint64_t, max_settings> settings_ {};
+    settings_values pending_ {};
+    std::optional<std::uint64_t> session_id_;
+    std::size_t consumed_ {0};
     std::uint64_t frame_type_ {0};
     std::uint64_t payload_remaining_ {0};
     std::uint64_t max_push_id_ {0};
@@ -297,7 +398,8 @@ private:
     std::uint8_t continuation_ {0};
     kind kind_ {kind::pending};
     control_state control_state_ {control_state::frame_type};
-    bool settings_received_ {false};
+    bool webtransport_ {false};
+    bool settings_started_ {false};
     bool max_push_id_received_ {false};
     bool goaway_received_ {false};
     bool in_integer_ {false};

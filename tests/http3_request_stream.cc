@@ -412,6 +412,138 @@ auto fields() -> void
     check(stream_scoped(h3_error::message_error) && !stream_scoped(h3_error::frame_unexpected),
           "stream and connection scope");
 }
+
+// QUIC varint, minimal encoding.
+auto append_varint(std::vector<std::byte>& out, std::uint64_t value) -> void
+{
+    const unsigned length = value < 64 ? 1 : value < 16384 ? 2 : value < (1ull << 30) ? 4 : 8;
+    const unsigned prefix = length == 1 ? 0 : length == 2 ? 1 : length == 4 ? 2 : 3;
+    const auto start = out.size();
+    for (unsigned i = length; i-- > 0;)
+        out.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xff));
+    out[start] |= static_cast<std::byte>(prefix << 6);
+}
+
+struct wt_result {
+    std::optional<h3_error> error;
+    std::size_t blocks {0};
+    std::optional<std::uint64_t> session; // set by webtransport_stream
+    std::size_t body_offset {0};          // first stream data octet after the signal
+    bool finished {false};
+    auto operator==(const wt_result&) const -> bool = default;
+};
+
+// Feeds input in steps of `step` octets. Stops at the WebTransport signal, after
+// which the caller owns the stream data, or at the first error. FIN is applied
+// only if no error occurred.
+auto feed_request(std::span<const std::byte> input, std::size_t step, bool enabled, bool fin)
+    -> wt_result
+{
+    std::array<std::byte, 16> storage {};
+    request_frames frames(storage);
+    frames.set_webtransport(enabled);
+    wt_result result;
+    std::size_t offset = 0;
+    bool handed_off = false;
+    while (offset < input.size() && !handed_off) {
+        auto chunk = input.subspan(offset, std::min(step, input.size() - offset));
+        const auto before = chunk.size();
+        const auto event = frames.receive(chunk);
+        offset += before - chunk.size();
+        if (!event) {
+            result.error = event.error();
+            break;
+        }
+        if (*event == request_frames::event::header_block) ++result.blocks;
+        if (*event == request_frames::event::webtransport_stream) {
+            result.session = frames.session_id();
+            result.body_offset = offset;
+            handed_off = true;
+        }
+    }
+    if (!result.error && fin) {
+        const auto finished = frames.finish();
+        if (!finished) result.error = finished.error();
+        else result.finished = true;
+    }
+    return result;
+}
+
+auto run_wt(std::span<const std::byte> input, bool enabled = true, bool fin = true) -> wt_result
+{
+    const auto whole = feed_request(input, input.empty() ? 1 : input.size(), enabled, fin);
+    check(whole == feed_request(input, 1, enabled, fin),
+          "split delivery changes the WebTransport verdict");
+    return whole;
+}
+
+// Signal value 0x41 (65) is a two-octet varint, 0x40 0x41, on the wire.
+auto webtransport_streams() -> void
+{
+    {
+        // Signal, session ID 4, then body octets in the same read.
+        const auto input = bytes({0x40, 0x41, 0x04, 0x68, 0x69});
+        const auto result = run_wt(input);
+        check(!result.error && result.session == 4 && result.body_offset == 3 && result.finished,
+              "WT_STREAM with body in the same read");
+    }
+    check(run_wt(bytes({0x40, 0x41, 0x52, 0x34, 0x7a})) ==
+          wt_result {{}, 0, 0x1234, 4, true}, "two-octet session ID across reads");
+    {
+        std::vector<std::byte> input = bytes({0x40, 0x41});
+        append_varint(input, 1ull << 40);
+        input.push_back(std::byte {0x78});
+        check(run_wt(input) == wt_result {{}, 0, 1ull << 40, 10, true},
+              "eight-octet session ID");
+    }
+    check(run_wt(bytes({0x40, 0x41, 0x04})) == wt_result {{}, 0, 4, 3, true},
+          "session ID without body");
+    {
+        // After the event the parser consumes nothing further.
+        std::array<std::byte, 16> storage {};
+        request_frames frames(storage);
+        frames.set_webtransport(true);
+        const auto head = bytes({0x40, 0x41, 0x04});
+        auto input = std::span<const std::byte>(head);
+        check(frames.receive(input) == request_frames::event::webtransport_stream &&
+              input.empty() && frames.session_id() == 4, "signal and session ID");
+        const auto body = bytes({0x68});
+        auto rest = std::span<const std::byte>(body);
+        check(frames.receive(rest) == request_frames::event::need_input && rest.size() == 1,
+              "stream data is not parsed as frames");
+    }
+    check(run_wt(bytes({0x40, 0x41})).error == h3_error::request_incomplete,
+          "FIN before the session ID");
+    check(run_wt(bytes({0x40, 0x41, 0x52})).error == h3_error::request_incomplete,
+          "FIN inside the session ID");
+    check(run_wt(bytes({0x40, 0x41})).session == std::nullopt,
+          "incomplete signal reports no session");
+    check(run_wt(bytes({0x40, 0x41, 0x04})).error == std::nullopt, "FIN after the session ID");
+
+    // 0x41 is only valid as the first frame type.
+    check(run_wt(bytes({0x01, 0x02, 0x00, 0x00, 0x40, 0x41, 0x04})).error == h3_error::frame_error,
+          "WT_STREAM after HEADERS");
+    check(run_wt(bytes({0x01, 0x02, 0x00, 0x00, 0x00, 0x01, 0x61, 0x40, 0x41, 0x04})).error ==
+          h3_error::frame_error, "WT_STREAM after DATA");
+    check(run_wt(bytes({0x21, 0x00, 0x40, 0x41, 0x04})).error == h3_error::frame_error,
+          "WT_STREAM after an unknown frame");
+    check(run_wt(bytes({0x01, 0x02, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x40, 0x41, 0x04})).error ==
+          h3_error::frame_error, "WT_STREAM after trailers");
+    check(run_wt(bytes({0x21, 0x01, 0x41, 0x01, 0x02, 0x00, 0x00})) ==
+          wt_result {{}, 1, {}, 0, true}, "0x41 as a payload octet is not a frame type");
+    check(run_wt(bytes({0x01, 0x02, 0x00})).error == h3_error::frame_error,
+          "FIN inside HEADERS still closes the connection");
+
+    // Disabled: 0x41 is an unknown frame type, as before.
+    check(run_wt(bytes({0x40, 0x41, 0x01, 0x00, 0x01, 0x02, 0x00, 0x00}), false) ==
+          wt_result {{}, 1, {}, 0, true}, "disabled 0x41 is an unknown frame");
+    check(run_wt(bytes({0x01, 0x02, 0x00, 0x00, 0x40, 0x41, 0x00}), false) ==
+          wt_result {{}, 1, {}, 0, true}, "disabled 0x41 after HEADERS is unknown");
+    check(run_wt(bytes({0x40, 0x41, 0x04, 0x61, 0x62, 0x63, 0x64, 0x01, 0x02, 0x00, 0x00}), false) ==
+          wt_result {{}, 1, {}, 0, true}, "disabled 0x41 skips its payload by length");
+    check(run_wt(bytes({0x40, 0x41, 0x04}), false).error == h3_error::frame_error,
+          "disabled 0x41 cut off inside its payload is a frame error");
+}
 } // namespace
 
 auto main() -> int
@@ -423,4 +555,5 @@ auto main() -> int
     field_values();
     request_authority();
     fields();
+    webtransport_streams();
 }

@@ -1,10 +1,12 @@
 #include "http3/peer_streams.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -144,6 +146,228 @@ auto push_ids() -> void
           "oversized MAX_PUSH_ID payload");
 }
 
+// QUIC varint, minimal encoding.
+auto append_varint(std::vector<std::byte>& out, std::uint64_t value) -> void
+{
+    const unsigned length = value < 64 ? 1 : value < 16384 ? 2 : value < (1ull << 30) ? 4 : 8;
+    const unsigned prefix = length == 1 ? 0 : length == 2 ? 1 : length == 4 ? 2 : 3;
+    const auto start = out.size();
+    for (unsigned i = length; i-- > 0;)
+        out.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xff));
+    out[start] |= static_cast<std::byte>(prefix << 6);
+}
+
+// Control stream: type 0, then one SETTINGS frame with the given pairs.
+auto settings_stream(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& pairs)
+    -> std::vector<std::byte>
+{
+    std::vector<std::byte> payload;
+    for (const auto& [identifier, value] : pairs) {
+        append_varint(payload, identifier);
+        append_varint(payload, value);
+    }
+    std::vector<std::byte> stream = bytes({0x00, 0x04});
+    append_varint(stream, payload.size());
+    stream.insert(stream.end(), payload.begin(), payload.end());
+    return stream;
+}
+
+struct settings_probe {
+    int calls {0};
+};
+
+auto count_settings(void* context) noexcept -> void
+{
+    ++static_cast<settings_probe*>(context)->calls;
+}
+
+auto settings_recording() -> void
+{
+    const auto stream_bytes = settings_stream({{enable_connect_protocol_setting, 1},
+        {h3_datagram_setting, 1}, {wt_enabled_setting, 1},
+        {wt_initial_max_streams_uni_setting, 5}, {wt_initial_max_streams_bidi_setting, 7},
+        {wt_initial_max_data_setting, 1000}, {0x21, 7}});
+    const auto check_recorded = [](const peer_critical_streams& critical, std::string_view when) {
+        check(critical.settings_received && critical.h3_datagram && critical.connect_protocol &&
+              critical.wt_enabled, when);
+        check(critical.wt_initial_max_streams_uni == 5 &&
+              critical.wt_initial_max_streams_bidi == 7 &&
+              critical.wt_initial_max_data == 1000, "initial WebTransport limits");
+    };
+
+    {
+        settings_probe probe;
+        peer_critical_streams critical {.on_settings = count_settings, .settings_context = &probe};
+        peer_uni_stream stream;
+        check(stream.receive(stream_bytes, critical).has_value(), "SETTINGS with WebTransport");
+        check_recorded(critical, "whole SETTINGS recorded");
+        check(probe.calls == 1, "hook fires once for whole SETTINGS");
+    }
+    {
+        // Octet by octet: nothing is visible and the hook stays silent until the
+        // final octet completes the frame.
+        settings_probe probe;
+        peer_critical_streams critical {.on_settings = count_settings, .settings_context = &probe};
+        peer_uni_stream stream;
+        for (std::size_t i = 0; i < stream_bytes.size(); ++i) {
+            const auto octet = std::span<const std::byte>(stream_bytes).subspan(i, 1);
+            check(stream.receive(octet, critical).has_value(), "fragmented SETTINGS parses");
+            const bool last = i + 1 == stream_bytes.size();
+            check(critical.settings_received == last, "settings_received only when complete");
+            check(probe.calls == (last ? 1 : 0), "hook only after the full payload");
+            if (!last)
+                check(!critical.wt_enabled && !critical.h3_datagram && !critical.connect_protocol &&
+                      critical.wt_initial_max_data == 0, "no partial SETTINGS values visible");
+        }
+        check_recorded(critical, "fragmented SETTINGS recorded");
+    }
+    {
+        // An empty SETTINGS frame completes at its header.
+        settings_probe probe;
+        peer_critical_streams critical {.on_settings = count_settings, .settings_context = &probe};
+        peer_uni_stream stream;
+        const auto empty = bytes({0x00, 0x04, 0x00});
+        check(stream.receive(empty, critical).has_value() && critical.settings_received &&
+              probe.calls == 1 && !critical.wt_enabled, "empty SETTINGS completes");
+    }
+    {
+        // Values of SETTINGS_WT_ENABLED other than 1 mean not enabled. A server
+        // does not reject them here.
+        for (const std::uint64_t value : {0ull, 2ull, 3ull}) {
+            peer_critical_streams critical;
+            peer_uni_stream stream;
+            const auto frame = settings_stream({{wt_enabled_setting, value}});
+            check(stream.receive(frame, critical).has_value(), "WT_ENABLED value accepted");
+            check(critical.settings_received && !critical.wt_enabled,
+                  "WT_ENABLED other than 1 is not enabled");
+        }
+    }
+    {
+        // Unknown identifiers and a non-boolean flag still behave as before.
+        peer_critical_streams critical;
+        peer_uni_stream stream;
+        check(stream.receive(settings_stream({{0x21, 0}, {0x2b64, 1}}), critical).has_value() &&
+              critical.wt_initial_max_streams_uni == 1 && !critical.wt_enabled,
+              "unknown identifiers ignored; WebTransport limit recorded alone");
+        peer_critical_streams other;
+        peer_uni_stream bad;
+        check(bad.receive(settings_stream({{wt_enabled_setting, 1}, {wt_enabled_setting, 1}}),
+                          other) == std::unexpected(h3_error::settings_error),
+              "duplicate WT_ENABLED is a settings error");
+    }
+    {
+        // The 32-identifier cap counts WebTransport identifiers too.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs {{wt_enabled_setting, 1}};
+        for (std::uint64_t id = 0x21; pairs.size() < peer_uni_stream::max_settings; ++id)
+            pairs.push_back({id, 0});
+        peer_critical_streams critical;
+        peer_uni_stream stream;
+        check(stream.receive(settings_stream(pairs), critical).has_value(),
+              "32 identifiers including WebTransport are accepted");
+        pairs.push_back({wt_initial_max_data_setting, 1});
+        peer_critical_streams over;
+        peer_uni_stream overflow;
+        check(overflow.receive(settings_stream(pairs), over) == std::unexpected(h3_error::excessive_load),
+              "33rd identifier is excessive load");
+    }
+}
+
+// Feeds input in steps of `step` octets, stopping once the session ID is known as
+// the caller would. Returns the body offset or the error.
+struct wt_uni_result {
+    std::optional<h3_error> error;
+    std::optional<std::uint64_t> session;
+    std::size_t body_offset {0};
+    peer_uni_stream::kind stream_kind {peer_uni_stream::kind::pending};
+    auto operator==(const wt_uni_result&) const -> bool = default;
+};
+
+auto feed_uni(std::span<const std::byte> input, bool enabled, std::size_t step) -> wt_uni_result
+{
+    peer_uni_stream stream(enabled);
+    peer_critical_streams critical;
+    wt_uni_result result;
+    std::size_t offset = 0;
+    while (offset < input.size() && !stream.session_id()) {
+        const auto chunk = input.subspan(offset, std::min(step, input.size() - offset));
+        if (const auto parsed = stream.receive(chunk, critical); !parsed) {
+            result.error = parsed.error();
+            break;
+        }
+        offset += stream.bytes_consumed();
+    }
+    result.session = stream.session_id();
+    result.body_offset = offset;
+    result.stream_kind = stream.stream_kind();
+    return result;
+}
+
+auto run_uni(std::span<const std::byte> input, bool enabled = true) -> wt_uni_result
+{
+    const auto whole = feed_uni(input, enabled, input.empty() ? 1 : input.size());
+    check(whole == feed_uni(input, enabled, 1), "split delivery changes the WebTransport verdict");
+    return whole;
+}
+
+auto webtransport_streams() -> void
+{
+    // Stream type 0x54 is 84, a two-octet varint (0x40 0x54) on the wire.
+    // Enabled: then session ID 4; the body octets are not consumed.
+    {
+        const auto input = bytes({0x40, 0x54, 0x04, 0x61, 0x62});
+        const auto result = run_uni(input);
+        check(!result.error && result.session == 4 && result.body_offset == 3 &&
+              result.stream_kind == peer_uni_stream::kind::webtransport,
+              "WebTransport stream session ID and body offset");
+    }
+    {
+        // A session ID fragmented across reads, and a body in the same read.
+        const auto input = bytes({0x40, 0x54, 0x52, 0x34, 0x7a});
+        check(run_uni(input) == wt_uni_result {{}, 0x1234, 4,
+              peer_uni_stream::kind::webtransport}, "two-octet session ID across reads");
+    }
+    {
+        std::vector<std::byte> input = bytes({0x40, 0x54});
+        append_varint(input, 1ull << 40);
+        input.push_back(std::byte {0x78});
+        check(run_uni(input) == wt_uni_result {{}, 1ull << 40, 10,
+              peer_uni_stream::kind::webtransport}, "eight-octet session ID");
+    }
+    {
+        // The stream stops at the session ID even if more input arrives later.
+        peer_uni_stream stream(true);
+        peer_critical_streams critical;
+        const auto head = bytes({0x40, 0x54, 0x04});
+        check(stream.receive(head, critical).has_value() && stream.bytes_consumed() == 3,
+              "head consumed exactly");
+        const auto body = bytes({0x61, 0x62});
+        check(stream.receive(body, critical).has_value() && stream.bytes_consumed() == 0 &&
+              stream.session_id() == 4, "no bytes consumed after the session ID");
+        check(!critical.control && !critical.wt_enabled, "WebTransport stream leaves SETTINGS alone");
+    }
+    {
+        // A FIN before the session ID completes is not a connection error.
+        peer_uni_stream type_only(true), partial(true);
+        peer_critical_streams critical;
+        check(type_only.receive(bytes({0x40, 0x54}), critical).has_value() &&
+              type_only.finish().has_value() && !type_only.session_id(),
+              "FIN after the stream type");
+        check(partial.receive(bytes({0x40, 0x54, 0x52}), critical).has_value() &&
+              partial.finish().has_value() && !partial.session_id() &&
+              partial.stream_kind() == peer_uni_stream::kind::webtransport,
+              "FIN inside the session ID");
+    }
+    {
+        // Disabled: 0x54 is an unknown stream type, consumed whole.
+        const auto input = bytes({0x40, 0x54, 0x04, 0x61});
+        const auto result = run_uni(input, false);
+        check(!result.error && !result.session && result.body_offset == 4 &&
+              result.stream_kind == peer_uni_stream::kind::unknown,
+              "disabled 0x54 is unknown");
+        check(!run({0x40, 0x54, 0x04, 0x61}), "default constructor leaves 0x54 unknown");
+    }
+}
+
 auto qpack_streams() -> void
 {
     check(!run({0x02, 0x20, 0x20}), "encoder sets zero capacity");
@@ -180,4 +404,6 @@ auto main() -> int
     control_stream();
     push_ids();
     qpack_streams();
+    settings_recording();
+    webtransport_streams();
 }

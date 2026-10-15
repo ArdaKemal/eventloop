@@ -26,6 +26,14 @@ enum class h3_error : std::uint64_t {
     qpack_decompression_failed = 0x0200,
     qpack_encoder_stream_error = 0x0201,
     qpack_decoder_stream_error = 0x0202,
+    datagram_error = 0x33,                   // RFC 9297 2.1.1
+    // WebTransport over HTTP/3 (draft-16 registry; WT_APPLICATION_ERROR is
+    // the separate application range and is mapped by the session layer).
+    wt_buffered_stream_rejected = 0x3994bd84,
+    wt_session_gone = 0x170d7b68,
+    wt_flow_control_error = 0x045d4487,
+    wt_alpn_error = 0x0817b3dd,
+    wt_requirements_not_met = 0x212c0d48,
 };
 
 // Errors this server raises against one request stream (reset plus
@@ -63,6 +71,12 @@ enum class h3_error : std::uint64_t {
             case h3_error::qpack_decompression_failed: return "QPACK_DECOMPRESSION_FAILED";
             case h3_error::qpack_encoder_stream_error: return "QPACK_ENCODER_STREAM_ERROR";
             case h3_error::qpack_decoder_stream_error: return "QPACK_DECODER_STREAM_ERROR";
+            case h3_error::datagram_error: return "H3_DATAGRAM_ERROR";
+            case h3_error::wt_buffered_stream_rejected: return "WT_BUFFERED_STREAM_REJECTED";
+            case h3_error::wt_session_gone: return "WT_SESSION_GONE";
+            case h3_error::wt_flow_control_error: return "WT_FLOW_CONTROL_ERROR";
+            case h3_error::wt_alpn_error: return "WT_ALPN_ERROR";
+            case h3_error::wt_requirements_not_met: return "WT_REQUIREMENTS_NOT_MET";
             }
             return "unknown HTTP/3 error";
         }

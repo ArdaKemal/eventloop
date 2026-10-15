@@ -1643,6 +1643,14 @@ if(BUILD_TESTING)
         -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http3_request_stream COMMAND http3_request_stream_test)
 
+    add_executable(http3_webtransport_wire_test tests/http3_webtransport_wire.cc)
+    target_include_directories(http3_webtransport_wire_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(http3_webtransport_wire_test PRIVATE eventloop::eventloop)
+    target_compile_options(http3_webtransport_wire_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http3_webtransport_wire COMMAND http3_webtransport_wire_test)
+
     add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
     target_include_directories(quic_udp_endpoint_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
