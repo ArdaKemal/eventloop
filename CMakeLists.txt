@@ -915,6 +915,10 @@ add_executable(websocket_echo_server examples/websocket_echo_server.cc)
 target_link_libraries(websocket_echo_server PRIVATE eventloop::eventloop OpenSSL::Crypto)
 target_compile_options(websocket_echo_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
 
+add_executable(webtransport_echo_server examples/webtransport_echo_server.cc)
+target_link_libraries(webtransport_echo_server PRIVATE eventloop::eventloop OpenSSL::Crypto)
+target_compile_options(webtransport_echo_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+
 add_executable(quic_echo_server examples/quic_echo_server.cc)
 target_link_libraries(quic_echo_server PRIVATE eventloop::eventloop)
 target_compile_options(quic_echo_server PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
@@ -1662,6 +1666,52 @@ if(BUILD_TESTING)
         -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME http3_webtransport_engine COMMAND http3_webtransport_engine_test)
     set_tests_properties(http3_webtransport_engine PROPERTIES TIMEOUT 120)
+
+    add_executable(http3_webtransport_client_test tests/http3_webtransport_client.cc
+        tests/fixtures/webtransport_client.cc src/http3/qpack.cc)
+    target_include_directories(http3_webtransport_client_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(http3_webtransport_client_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(http3_webtransport_client_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(http3_webtransport_client_test PRIVATE
+            -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME http3_webtransport_client COMMAND http3_webtransport_client_test)
+    set_tests_properties(http3_webtransport_client PROPERTIES TIMEOUT 20)
+
+    add_executable(http3_webtransport_test tests/http3_webtransport.cc
+        tests/fixtures/webtransport_client.cc src/http3/qpack.cc)
+    target_include_directories(http3_webtransport_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(http3_webtransport_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(http3_webtransport_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(http3_webtransport_test PRIVATE
+            -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME http3_webtransport COMMAND http3_webtransport_test)
+    set_tests_properties(http3_webtransport PROPERTIES TIMEOUT 120)
+
+    add_executable(http3_webtransport_example_test tests/http3_webtransport_example.cc
+        tests/fixtures/webtransport_client.cc src/http3/qpack.cc)
+    target_include_directories(http3_webtransport_example_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples)
+    target_link_libraries(http3_webtransport_example_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(http3_webtransport_example_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(http3_webtransport_example_test PRIVATE
+            -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME webtransport_example COMMAND http3_webtransport_example_test)
+    set_tests_properties(webtransport_example PROPERTIES TIMEOUT 60)
 
     add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
     target_include_directories(quic_udp_endpoint_test PRIVATE
