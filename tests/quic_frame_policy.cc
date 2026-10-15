@@ -40,7 +40,7 @@ constexpr std::array cases {
     frame_case {0x18, 10, true}, frame_case {0x19, 8, true},
     frame_case {0x1a, 10, true}, frame_case {0x1b, 8, true},
     frame_case {0x1c, 15, true}, frame_case {0x1d, 10, true},
-    frame_case {0x1e, 8, false},
+    frame_case {0x1e, 8, false}, frame_case {0x24, 10, true},
     frame_case {0x30, 10, true}, frame_case {0x31, 10, true},
 };
 

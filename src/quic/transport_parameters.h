@@ -29,6 +29,7 @@ enum class parameter_id : std::uint64_t {
     initial_source_connection_id = 0x0f,
     retry_source_connection_id = 0x10,
     version_information = 0x11,
+    reset_stream_at = 0x1d,
     max_datagram_frame_size = 0x20,
     grease_quic_bit = 0x2ab2,
 };
@@ -104,7 +105,8 @@ struct transport_parameters {
             value.size() != std::size_t{25} + cid_size + 16) {
             return std::unexpected(parameter_error::invalid_value);
         }
-    } else if (id == 0x0c || id == 0x2ab2) {
+    } else if (id == 0x0c || id == 0x1d || id == 0x2ab2) {
+        // Empty flags: disable_active_migration, reset_stream_at, grease_quic_bit.
         if (!value.empty()) {
             return std::unexpected(parameter_error::invalid_value);
         }

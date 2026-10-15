@@ -746,6 +746,9 @@ private:
             !add_number(static_cast<std::uint64_t>(parameter_id::max_datagram_frame_size),
                 settings.max_datagram_frame_size))
             return false;
+        if (settings.reset_stream_at &&
+            !add_bytes(static_cast<std::uint64_t>(parameter_id::reset_stream_at), {}))
+            return false;
         // A v2-capable endpoint sends this on v1 sessions too (RFC 9369 Section 4).
         std::array<std::byte, 12> version_information {};
         const auto version_size = encode_fixed_version_information(entry.version, client,
@@ -918,7 +921,8 @@ auto write_stream(event_loop&, quic_endpoint::implementation& impl,
         if (stream == nullptr || stream->state.sending() == stream_send_state::absent)
             co_return std::unexpected(make_error_code(quic_errc::invalid_argument));
         if (stream->state.sending() == stream_send_state::reset_sent ||
-            stream->state.sending() == stream_send_state::reset_received)
+            stream->state.sending() == stream_send_state::reset_received ||
+            stream->send.reliable_end())
             co_return std::unexpected(make_error_code(quic_errc::stream_reset));
         if (buffer.empty() && !fin) co_return std::size_t {0};
         const auto writable = stream->send.writable_bytes();
@@ -1192,15 +1196,15 @@ auto quic_connection::async_receive_datagram(std::span<std::byte> buffer)
 }
 
 namespace {
+template<typename Operation>
 auto stream_control(quic_endpoint::implementation& impl, std::size_t slot_index,
-    std::uint32_t generation, std::uint64_t stream_id, std::uint64_t error_code,
-    bool reset) noexcept -> std::expected<void, std::error_code>
+    std::uint32_t generation, Operation operation) noexcept
+    -> std::expected<void, std::error_code>
 {
     auto& slot = impl.slots_[slot_index];
     if (!slot.occupied || !slot.connection || slot.generation != generation || slot.closing)
         return std::unexpected(make_error_code(quic_errc::not_connected));
-    const auto result = reset ? slot.connection->reset_stream(stream_id, error_code)
-                              : slot.connection->stop_sending(stream_id, error_code);
+    const auto result = operation(*slot.connection);
     if (!result)
         return std::unexpected(make_error_code(
             result.error() == connection_error::invalid_configuration
@@ -1217,7 +1221,62 @@ auto quic_connection::reset_stream(std::uint64_t stream_id,
 {
     if (!valid()) return std::unexpected(make_error_code(quic_errc::not_connected));
     return stream_control(*endpoint_->implementation_, slot_, generation_,
-                          stream_id, error_code, true);
+        [&](quic::detail::bounded_connection& connection) {
+            return connection.reset_stream(stream_id, error_code);
+        });
+}
+
+auto quic_connection::reset_stream_at(std::uint64_t stream_id, std::uint64_t error_code,
+                                      std::uint64_t reliable_size) noexcept
+    -> std::expected<void, std::error_code>
+{
+    if (!valid()) return std::unexpected(make_error_code(quic_errc::not_connected));
+    return stream_control(*endpoint_->implementation_, slot_, generation_,
+        [&](quic::detail::bounded_connection& connection) {
+            return connection.reset_stream_at(stream_id, error_code, reliable_size);
+        });
+}
+
+auto quic_connection::peer_reset_stream_at() const noexcept -> bool
+{
+    if (!valid()) return false;
+    const auto& slot = endpoint_->implementation_->slots_[slot_];
+    return slot.connection && slot.connection->peer_reset_stream_at();
+}
+
+auto quic_connection::peer_max_datagram_frame_size() const noexcept -> std::uint64_t
+{
+    if (!valid()) return 0;
+    const auto& slot = endpoint_->implementation_->slots_[slot_];
+    return slot.connection ? slot.connection->peer_datagram_frame_size() : 0;
+}
+
+auto quic_connection::peer_facts(std::uint64_t stream_id) const noexcept -> peer_stream_facts
+{
+    if (!valid()) return {};
+    const auto& slot = endpoint_->implementation_->slots_[slot_];
+    if (!slot.connection) return {};
+    const auto* stream = slot.connection->peer_stream(stream_id);
+    if (stream == nullptr) return {};
+    return {stream->peer_reset_error, stream->peer_stop_error, stream->peer_final_size};
+}
+
+auto quic_connection::stream_reset_code(std::uint64_t stream_id) const noexcept
+    -> std::optional<std::uint64_t>
+{
+    return peer_facts(stream_id).reset_code;
+}
+
+auto quic_connection::stream_stop_sending_code(std::uint64_t stream_id) const noexcept
+    -> std::optional<std::uint64_t>
+{
+    return peer_facts(stream_id).stop_sending_code;
+}
+
+auto quic_connection::stream_final_size(std::uint64_t stream_id) const noexcept
+    -> std::optional<std::uint64_t>
+{
+    return peer_facts(stream_id).final_size;
 }
 
 auto quic_connection::stop_sending(std::uint64_t stream_id,
@@ -1226,7 +1285,9 @@ auto quic_connection::stop_sending(std::uint64_t stream_id,
 {
     if (!valid()) return std::unexpected(make_error_code(quic_errc::not_connected));
     return stream_control(*endpoint_->implementation_, slot_, generation_,
-                          stream_id, error_code, false);
+        [&](quic::detail::bounded_connection& connection) {
+            return connection.stop_sending(stream_id, error_code);
+        });
 }
 
 auto quic_connection::close(std::error_code) noexcept -> void

@@ -55,10 +55,18 @@ public:
         std::optional<stream_receive_buffer> receive;
         stream_state state;
         std::uint64_t sent_highest {}, receive_window {}, receive_limit {}, consumed {};
-        // Application codes carried by queued RESET_STREAM and STOP_SENDING.
+        // Application codes carried by queued RESET_STREAM/RESET_STREAM_AT and STOP_SENDING.
         std::uint64_t reset_error {}, stop_sending_error {};
         bool credit_pending {false}, reset_pending {false};
         bool stop_sending_pending {false};
+        // Acknowledgement of the current RESET_STREAM_AT frame; cleared when it lowers.
+        bool reset_frame_acked {false};
+        // Peer facts (reset and STOP_SENDING codes, final size) and the stream ID
+        // last admitted here. They survive retirement and are replaced only when
+        // the slot serves another stream, so accessors can read them after a
+        // stream_reset result.
+        std::optional<std::uint64_t> peer_id {}, peer_reset_error {}, peer_stop_error {},
+            peer_final_size {};
         // STREAM_DATA_BLOCKED is queued once per peer limit (RFC 9000 4.1).
         bool blocked_pending {false};
         std::uint64_t blocked_limit {~std::uint64_t {0}};
@@ -294,7 +302,9 @@ public:
         flow_ = next_flow;
         if (!s->state.receive_contiguous(s->receive->next_offset() + s->receive->readable().size()))
             return std::unexpected(connection_error::invalid_state);
-        if (s->receive->complete() && !s->state.read_all_data())
+        s->state.receive_reset_progress(s->consumed);
+        if (s->receive->complete() && s->state.receiving() != stream_receive_state::reset_received &&
+            !s->state.read_all_data())
             return std::unexpected(connection_error::invalid_state);
         retire_closed_streams();
         return {};
@@ -337,12 +347,45 @@ public:
         auto* s = stream(id);
         if (!s || s->state.sending() == stream_send_state::absent || error > max_varint_value)
             return std::unexpected(connection_error::invalid_configuration);
+        // A reliable reset keeps its RESET_STREAM_AT frame and lowers the reliable size to zero.
+        if (s->send.reliable_end()) return lower_reset_at(*s, error, 0);
         const auto sending = s->state.sending();
         if (sending == stream_send_state::reset_sent || sending == stream_send_state::reset_received ||
             sending == stream_send_state::data_received) return {};
         return queue_reset(*s, error)
             ? std::expected<void, connection_error> {}
             : std::unexpected(connection_error::invalid_state);
+    }
+    // RESET_STREAM_AT (RSA 4-5). The reliable prefix below `reliable` is sent and
+    // retransmitted until acknowledged; bytes above it are discarded. The final
+    // size is the highest byte already sent, or the reliable size if larger.
+    // Requires the peer's reset_stream_at parameter and a reliable size no larger
+    // than the bytes accepted so far.
+    [[nodiscard]] auto reset_stream_at(std::uint64_t id, std::uint64_t error, std::uint64_t reliable)
+        -> std::expected<void, connection_error>
+    {
+        check_owner();
+        if (!peer_.reset_stream_at) return std::unexpected(connection_error::invalid_state);
+        auto* s = stream(id);
+        if (!s || s->state.sending() == stream_send_state::absent || error > max_varint_value ||
+            reliable > s->send.next_offset())
+            return std::unexpected(connection_error::invalid_configuration);
+        if (s->state.sending() == stream_send_state::data_received) return {};
+        if (s->send.reliable_end()) return lower_reset_at(*s, error, reliable);
+        const auto sending = s->state.sending();
+        if (sending == stream_send_state::reset_sent || sending == stream_send_state::reset_received)
+            return reliable == 0 ? std::expected<void, connection_error> {}
+                                 : std::unexpected(connection_error::invalid_configuration);
+        const auto committed = (std::max)(s->sent_highest, reliable);
+        const auto final = s->state.send_final_size().value_or(committed);
+        if (!s->state.send_reset_at(final) || !s->send.discard_after(committed, reliable))
+            return std::unexpected(connection_error::invalid_state);
+        // The frame reaches the flow controller when it is emitted (pending_control).
+        s->reset_error = error;
+        s->reset_pending = true;
+        s->reset_frame_acked = false;
+        stream_control_pending_ = true;
+        return {};
     }
     // Local STOP_SENDING (RFC 9000 3.5). Buffered and later data are discarded,
     // and the peer's answering RESET_STREAM is consumed without an application
@@ -369,6 +412,18 @@ public:
             ? std::expected<void, connection_error> {}
             : std::unexpected(connection_error::invalid_state);
     }
+    // Peer facts of an admitted stream, or nullptr. Lifetime: see stream_slot.
+    [[nodiscard]] auto peer_stream(std::uint64_t id) const noexcept -> const stream_slot*
+    {
+        check_owner();
+        for (const auto& slot : slots_)
+            if (slot && slot->peer_id && *slot->peer_id == id) return slot.get();
+        return nullptr;
+    }
+    [[nodiscard]] auto peer_reset_stream_at() const noexcept -> bool
+    { check_owner(); return peer_.reset_stream_at; }
+    [[nodiscard]] auto peer_datagram_frame_size() const noexcept -> std::uint64_t
+    { check_owner(); return peer_.datagram; }
     [[nodiscard]] auto receive_abandoned(std::uint64_t id) const noexcept -> bool
     {
         check_owner();
@@ -394,7 +449,16 @@ public:
             }
             peer_id_retirement_pending_ = false;
         }
+        bool reset_blocked = false;
         for (auto* active : active_slots()) if (auto& s = *active; s.reset_pending) {
+            if (s.send.reliable_end()) {
+                // The final size must fit flow credit before the frame is sent (RSA 4).
+                const auto final = *s.state.send_final_size();
+                if (!flow_.set_send_final_size(s.id, final)) { reset_blocked = true; continue; }
+                frame.type = 0x24; frame.stream_id = s.id; frame.final_size = final;
+                frame.error_code = s.reset_error; frame.reliable_size = *s.send.reliable_end();
+                return frame;
+            }
             frame.type = 4; frame.stream_id = s.id;
             frame.final_size = *s.state.send_final_size();
             frame.error_code = s.reset_error; return frame;
@@ -419,7 +483,7 @@ public:
             }
             frame.type = 0x15; frame.stream_id = s.id; frame.limit = s.blocked_limit; return frame;
         }
-        stream_control_pending_ = false;
+        stream_control_pending_ = reset_blocked;
         for (std::size_t i = 0; i < streams_blocked_pending_.size(); ++i)
             if (streams_blocked_pending_[i]) {
                 frame.type = i == 0 ? 0x16 : 0x17; frame.limit = streams_blocked_[i]; return frame;
@@ -446,15 +510,25 @@ public:
             advertised_streams_[frame.type == 0x12 ? 0 : 1] = frame.limit;
         }
         else if (auto* s = stream(frame.stream_id)) {
-            if (frame.type == 4) s->reset_pending = false;
+            if (frame.type == 4 || frame.type == 0x24) s->reset_pending = false;
             if (frame.type == 5) s->stop_sending_pending = false;
             if (frame.type == 0x11) s->credit_pending = false;
             if (frame.type == 0x15) s->blocked_pending = false;
         }
     }
     auto control_acked(std::uint64_t type, std::uint64_t id) noexcept -> void
-    { check_owner(); if (type == 4) if (auto* s = stream(id)) {
-        (void)s->state.reset_acked(); retire_closed_streams(); } }
+    {
+        check_owner();
+        if (type == 4) {
+            if (auto* s = stream(id)) { (void)s->state.reset_acked(); retire_closed_streams(); }
+        } else if (type == 0x24) {
+            if (auto* s = stream(id)) {
+                s->reset_frame_acked = true;
+                settle_reset_at(*s);
+                retire_closed_streams();
+            }
+        }
+    }
 
     // Synchronize packet-number-space retirement with TLS key retirement.
     // Call after core.advance(), receive(), and a successful Handshake send.
@@ -615,6 +689,7 @@ public:
 private:
     struct parameter_limits {
         std::uint64_t data {}, bidi_local {}, bidi_remote {}, stream_uni {}, bidi {}, uni {}, datagram {};
+        bool reset_stream_at {false};
         std::uint64_t udp_payload {65527};
         std::uint64_t ack_exponent {3}, ack_delay {25};
         std::uint64_t cid_limit {2};
@@ -647,6 +722,8 @@ private:
         result.bidi = get(parameter_id::initial_max_streams_bidi);
         result.uni = get(parameter_id::initial_max_streams_uni);
         result.datagram = get(parameter_id::max_datagram_frame_size);
+        result.reset_stream_at = parameters.find(static_cast<std::uint64_t>(
+            parameter_id::reset_stream_at)) != nullptr;
         result.udp_payload = get(parameter_id::max_udp_payload_size, 65527);
         result.ack_exponent = get(parameter_id::ack_delay_exponent, 3);
         result.ack_delay = get(parameter_id::max_ack_delay, 25);
@@ -709,6 +786,8 @@ private:
             auto& s = *slots_[index];
             if (!flow_.add_stream(id, send_limit, receive_limit)) return nullptr;
             s.id = id; s.occupied = true; s.state = *stream_state::create(id, role);
+            s.peer_id = id; s.peer_reset_error.reset(); s.peer_stop_error.reset();
+            s.peer_final_size.reset(); s.reset_frame_acked = false;
             slot_ids_[index] = id;
             s.receive_window = s.receive_limit = receive_limit;
             s.receive.emplace(s.bytes, s.coverage, receive_limit);
@@ -723,6 +802,29 @@ private:
             return &s;
         }
         return nullptr;
+    }
+    // A later reset may only lower an established reliable size, with the same
+    // application code (RSA 5.2). Lowering re-sends the frame with the new size.
+    [[nodiscard]] auto lower_reset_at(stream_slot& s, std::uint64_t error, std::uint64_t reliable)
+        noexcept -> std::expected<void, connection_error>
+    {
+        if (s.state.sending() == stream_send_state::data_received) return {};
+        if (error != s.reset_error || reliable > *s.send.reliable_end())
+            return std::unexpected(connection_error::invalid_configuration);
+        if (reliable == *s.send.reliable_end()) return {};
+        s.send.lower_reliable_end(reliable);
+        s.reset_frame_acked = false;
+        s.reset_pending = true;
+        stream_control_pending_ = true;
+        return {};
+    }
+    // Data Recvd for a RESET_STREAM_AT stream once its frame and the reliable
+    // prefix are acknowledged (RSA 5.3). Ordinary streams use FIN acknowledgement.
+    auto settle_reset_at(stream_slot& s) noexcept -> void
+    {
+        const auto reliable = s.send.reliable_end();
+        if (reliable && s.reset_frame_acked && s.send.base_offset() >= *reliable)
+            (void)s.state.all_data_acked();
     }
     auto queue_reset(stream_slot& s, std::uint64_t error) noexcept -> bool
     {
@@ -743,8 +845,11 @@ private:
         if (!s.receive) return true;
         if (const auto readable = s.receive->readable().size(); readable != 0)
             if (!consume_stream(id, readable)) return false;
-        if (auto* current = stream(id); current && current->receive && current->receive->complete())
-            (void)finish_read(id);
+        auto* current = stream(id);
+        if (current == nullptr) return true;
+        if (current->state.receiving() == stream_receive_state::reset_received)
+            return consume_reset(id).has_value();
+        if (current->receive && current->receive->complete()) (void)finish_read(id);
         return true;
     }
     auto retire_closed_streams() noexcept -> void
@@ -839,7 +944,9 @@ private:
                             s->state.sending() == stream_send_state::reset_received) continue;
                         if (!(ack ? s->send.acknowledge(range.offset, range.size, range.fin) :
                                     s->send.mark_lost(range.offset, range.size, range.fin))) return false;
-                        if (s->send.complete() && !s->state.all_data_acked()) return false;
+                        if (!s->send.reliable_end() && s->send.complete() && !s->state.all_data_acked())
+                            return false;
+                        settle_reset_at(*s);
                     }
                 }
                 release(record);
@@ -869,17 +976,37 @@ private:
     }
     static auto dispatch(void* argument, tls_level level, const decoded_frame& frame) noexcept -> bool
     { return static_cast<bounded_connection*>(argument)->on_frame(level, frame); }
+    // RESET_STREAM (reliable size zero) and RESET_STREAM_AT (RSA 4-5). The
+    // application code is fixed for the stream, and the final size is checked
+    // against flow control and received data by the stream and flow state.
+    auto on_peer_reset(const decoded_frame& frame, std::uint64_t reliable) noexcept -> bool
+    {
+        auto* s = admit(frame.stream_id);
+        if (!s) return false;
+        if (const auto r = flow_.set_receive_final_size(frame.stream_id, frame.final_size); !r)
+            return violation(r.error());
+        if (const auto r = s->state.receive_reset(frame.final_size, reliable); !r)
+            return violation(r.error());
+        if (s->peer_reset_error && *s->peer_reset_error != frame.error_code)
+            return violation(stream_state_error::stream_state);
+        s->peer_reset_error = frame.error_code;
+        s->peer_final_size = frame.final_size;
+        s->state.receive_reset_progress(s->consumed);
+        return !s->receive_abandoned || drain_abandoned(*s);
+    }
     auto on_frame(tls_level level, const decoded_frame& frame) noexcept -> bool
     {
+        // Without the transport parameter, RESET_STREAM_AT is an unknown frame type (RFC 9000 12.4).
+        if (frame.type == 0x24 && !local_.reset_stream_at) return violation(0x07);
         const auto local_role = role_ == endpoint_role::client ? stream_role::client : stream_role::server;
         const bool local_uni = stream_type(frame.stream_id) == stream_direction::unidirectional &&
             stream_initiator(frame.stream_id) == local_role;
         const bool peer_uni = stream_type(frame.stream_id) == stream_direction::unidirectional &&
             stream_initiator(frame.stream_id) != local_role;
-        if ((((frame.type >= 8 && frame.type <= 15) || frame.type == 4 ||
+        if ((((frame.type >= 8 && frame.type <= 15) || frame.type == 4 || frame.type == 0x24 ||
               frame.type == 0x15) && local_uni) ||
             (frame.type == 5 && peer_uni)) return violation(0x05);
-        if (((frame.type >= 8 && frame.type <= 15) || frame.type == 4 ||
+        if (((frame.type >= 8 && frame.type <= 15) || frame.type == 4 || frame.type == 0x24 ||
              frame.type == 5 || frame.type == 0x11 || frame.type == 0x15) &&
             registry_.is_retired(frame.stream_id)) return true;
         if (frame.type == 2 || frame.type == 3) {
@@ -897,6 +1024,7 @@ private:
             if (!s) return false;
             if (const auto r = s->state.receive_stream(frame.offset, frame.data.size(), frame.fin); !r)
                 return violation(r.error());
+            if (frame.fin) s->peer_final_size = frame.offset + frame.data.size();
             if (const auto r = flow_.receive_stream_range(frame.stream_id, frame.offset,
                     frame.data.size(), frame.fin); !r)
                 return violation(r.error());
@@ -908,21 +1036,17 @@ private:
             return !s->receive_abandoned || drain_abandoned(*s);
         }
         switch (frame.type) {
-        case 4: {
-            auto* s = admit(frame.stream_id);
-            if (!s) return false;
-            if (const auto r = flow_.set_receive_final_size(frame.stream_id, frame.final_size); !r)
-                return violation(r.error());
-            if (const auto r = s->state.receive_reset(frame.final_size); !r)
-                return violation(r.error());
-            return !s->receive_abandoned || drain_abandoned(*s);
-        }
+        case 4: return on_peer_reset(frame, 0);
+        case 0x24: return on_peer_reset(frame, frame.reliable_size);
         case 5: {
             auto* s = admit(frame.stream_id);
             if (!s) return false;
             if (const auto r = s->state.receive_stop_sending(frame.error_code); !r)
                 return violation(r.error());
+            if (!s->peer_stop_error) s->peer_stop_error = frame.error_code;
             if (!s->state.reset_required()) return true;
+            // A reliable reset answers STOP_SENDING with reliable size zero (RSA 5.4).
+            if (s->send.reliable_end()) return lower_reset_at(*s, s->reset_error, 0).has_value();
             return queue_reset(*s, frame.error_code);
         }
         case 0x10: return flow_.update_send_max_data(frame.limit).has_value();

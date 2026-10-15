@@ -90,6 +90,64 @@ void fin_and_gaps()
     error(s.read_reset(), stream_state_error::invalid_transition, "read nonexistent reset");
 }
 
+void reliable_resets()
+{
+    // RESET_STREAM_AT keeps receiving until the reader has consumed the reliable prefix.
+    auto r = make(0, stream_role::server);
+    ok(r.receive_stream(0, 10), "prefix data");
+    ok(r.receive_contiguous(10), "prefix contiguous");
+    ok(r.receive_reset(20, 6), "reliable reset");
+    check(r.receiving() == stream_receive_state::receive && r.reliable_size() == 6 &&
+          r.receive_final_size() == 20, "reset waits for the reliable prefix");
+    r.receive_reset_progress(5);
+    check(r.receiving() == stream_receive_state::receive, "partial prefix keeps waiting");
+    r.receive_reset_progress(6);
+    check(r.receiving() == stream_receive_state::reset_received, "prefix read surfaces the reset");
+
+    // The smallest reliable size wins, and a larger one is ignored.
+    auto m = make(0, stream_role::server);
+    ok(m.receive_reset(20, 6), "first reliable reset");
+    ok(m.receive_reset(20, 9), "later larger reliable size");
+    check(m.reliable_size() == 6, "reliable size only decreases");
+    ok(m.receive_reset(20, 2), "later smaller reliable size");
+    m.receive_reset_progress(2);
+    check(m.receiving() == stream_receive_state::reset_received, "smaller size surfaces sooner");
+
+    // A reliable size above the final size is malformed; the final size is fixed.
+    auto bad = make(0, stream_role::server);
+    error(bad.receive_reset(10, 11), stream_state_error::frame_encoding, "reliable above final");
+    ok(bad.receive_reset(10, 4), "valid reliable reset after rejection");
+    error(bad.receive_reset(11, 4), stream_state_error::final_size, "final size cannot change");
+
+    // Fully received data stays readable until the reliable prefix. A zero reliable size
+    // keeps RESET_STREAM's suppression of a reset after complete data.
+    auto d = make(0, stream_role::server);
+    ok(d.receive_stream(0, 10, true), "FIN");
+    ok(d.receive_contiguous(10), "all data");
+    ok(d.receive_reset(10, 4), "reset after complete data");
+    check(d.receiving() == stream_receive_state::data_received, "prefix keeps data readable");
+    d.receive_reset_progress(4);
+    check(d.receiving() == stream_receive_state::reset_received, "complete prefix surfaces reset");
+    auto e = make(0, stream_role::server);
+    ok(e.receive_stream(0, 10, true), "FIN for plain reset");
+    ok(e.receive_contiguous(10), "all data for plain reset");
+    ok(e.receive_reset(10), "plain reset after complete data");
+    e.receive_reset_progress(0);
+    check(e.receiving() == stream_receive_state::data_received, "plain reset is suppressed");
+
+    // Send side: the reliable reset commits the final size and keeps Data Sent until
+    // the data and the reset are acknowledged.
+    auto t = make(0);
+    ok(t.send_stream(0, 8), "reliable data");
+    ok(t.send_reset_at(8), "commit final size");
+    check(t.sending() == stream_send_state::data_sent, "reliable reset keeps data sent");
+    error(t.send_reset_at(7), stream_state_error::final_size, "final size below data");
+    error(t.send_reset_at(9), stream_state_error::final_size, "final size changed");
+    ok(t.all_data_acked(), "reliable data acknowledged");
+    check(t.sending() == stream_send_state::data_received, "terminal after acknowledgement");
+    error(t.send_reset_at(8), stream_state_error::invalid_transition, "no reset after completion");
+}
+
 void resets_and_stop()
 {
     for (int phase = 0; phase != 3; ++phase) {
@@ -171,6 +229,7 @@ int main()
     directions();
     fin_and_gaps();
     resets_and_stop();
+    reliable_resets();
     limits_and_empty();
     std::cout << "QUIC stream state tests passed\n";
 }

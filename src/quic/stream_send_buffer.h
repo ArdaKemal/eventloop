@@ -45,6 +45,7 @@ public:
         bytes_.reset();
         flow_limit_ = 0;
         final_size_.reset();
+        reliable_end_.reset();
         fin_pending_ = fin_sent_ = fin_acked_ = false;
     }
 
@@ -138,19 +139,7 @@ public:
     [[nodiscard]] constexpr auto next_pending(std::size_t max_size) const noexcept
         -> stream_send_chunk
     {
-        const auto chunk = bytes_.next_pending(max_size);
-        if (!chunk.data.empty() && chunk.offset < flow_limit_) {
-            const auto allowed = static_cast<std::size_t>(
-                std::min<std::uint64_t>(chunk.data.size(),
-                                        flow_limit_ - chunk.offset));
-            const auto fin = fin_pending_ && final_size_ &&
-                             chunk.offset + allowed == *final_size_;
-            return {chunk.offset, chunk.data.first(allowed), fin};
-        }
-        if (fin_pending_ && final_size_ && *final_size_ <= flow_limit_) {
-            return {*final_size_, {}, true};
-        }
-        return {};
+        return clip_reliable(pending_chunk(max_size));
     }
 
     [[nodiscard]] constexpr auto next_unacknowledged(std::size_t max_size) const noexcept
@@ -158,10 +147,37 @@ public:
     {
         const auto chunk = bytes_.next_unacknowledged(max_size);
         if (!chunk.data.empty())
-            return {chunk.offset, chunk.data, fin_sent_ && !fin_acked_ && final_size_ &&
-                chunk.offset + chunk.data.size() == *final_size_};
-        if (fin_sent_ && !fin_acked_ && final_size_) return {*final_size_, {}, true};
+            return clip_reliable({chunk.offset, chunk.data, fin_sent_ && !fin_acked_ && final_size_ &&
+                chunk.offset + chunk.data.size() == *final_size_});
+        if (fin_sent_ && !fin_acked_ && final_size_)
+            return clip_reliable({*final_size_, {}, true});
         return {};
+    }
+
+    // RESET_STREAM_AT (RSA 5): queued bytes at or above `end` are discarded and
+    // only bytes below `reliable` are ever retransmitted. The caller commits
+    // `end` at or above every transmitted byte, and reliable <= end.
+    [[nodiscard]] constexpr auto discard_after(std::uint64_t end,
+                                               std::uint64_t reliable) noexcept
+        -> std::expected<void, stream_send_error>
+    {
+        if (reliable > end || !bytes_.truncate(end))
+            return std::unexpected(stream_send_error::invalid_range);
+        fin_pending_ = false;
+        reliable_end_ = reliable;
+        return {};
+    }
+
+    [[nodiscard]] constexpr auto reliable_end() const noexcept
+        -> std::optional<std::uint64_t>
+    {
+        return reliable_end_;
+    }
+
+    // RSA 4: a later reset may only lower the reliable size.
+    constexpr auto lower_reliable_end(std::uint64_t reliable) noexcept -> void
+    {
+        if (!reliable_end_ || reliable < *reliable_end_) reliable_end_ = reliable;
     }
 
     // Read-only validation for owner-thread packet submission preflight.
@@ -243,6 +259,35 @@ public:
     }
 
 private:
+    [[nodiscard]] constexpr auto pending_chunk(std::size_t max_size) const noexcept
+        -> stream_send_chunk
+    {
+        const auto chunk = bytes_.next_pending(max_size);
+        if (!chunk.data.empty() && chunk.offset < flow_limit_) {
+            const auto allowed = static_cast<std::size_t>(
+                std::min<std::uint64_t>(chunk.data.size(),
+                                        flow_limit_ - chunk.offset));
+            const auto fin = fin_pending_ && final_size_ &&
+                             chunk.offset + allowed == *final_size_;
+            return {chunk.offset, chunk.data.first(allowed), fin};
+        }
+        if (fin_pending_ && final_size_ && *final_size_ <= flow_limit_) {
+            return {*final_size_, {}, true};
+        }
+        return {};
+    }
+
+    [[nodiscard]] constexpr auto clip_reliable(stream_send_chunk chunk) const noexcept
+        -> stream_send_chunk
+    {
+        if (!reliable_end_) return chunk;
+        if (chunk.offset >= *reliable_end_) return {};
+        const auto room = *reliable_end_ - chunk.offset;
+        if (chunk.data.size() > room)
+            return {chunk.offset, chunk.data.first(static_cast<std::size_t>(room)), false};
+        return chunk;
+    }
+
     [[nodiscard]] constexpr auto validate_sent_range(std::uint64_t offset,
         std::size_t length, bool fin) const noexcept
         -> std::expected<void, stream_send_error>
@@ -277,6 +322,7 @@ private:
 
     std::uint64_t flow_limit_ {0};
     std::optional<std::uint64_t> final_size_ {};
+    std::optional<std::uint64_t> reliable_end_ {};
     bool fin_pending_ {false};
     bool fin_sent_ {false};
     bool fin_acked_ {false};

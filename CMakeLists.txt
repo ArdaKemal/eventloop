@@ -412,6 +412,15 @@ if(WIN32)
         set_tests_properties(quic_public_api PROPERTIES TIMEOUT 20
             ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
 
+        add_executable(quic_reset_stream_at_test tests/quic_reset_stream_at.cc)
+        target_include_directories(quic_reset_stream_at_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(quic_reset_stream_at_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME quic_reset_stream_at COMMAND quic_reset_stream_at_test)
+        set_tests_properties(quic_reset_stream_at PROPERTIES TIMEOUT 20
+            ENVIRONMENT_MODIFICATION "${EVENTLOOP_QUIC_TEST_ENV}")
+
         add_executable(http3_server_errors_test tests/http3_server_errors.cc
             src/http3/qpack.cc)
         target_include_directories(http3_server_errors_test PRIVATE
@@ -1451,6 +1460,20 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME quic_public_api COMMAND quic_public_api_test)
     set_tests_properties(quic_public_api PROPERTIES TIMEOUT 20)
+
+    add_executable(quic_reset_stream_at_test tests/quic_reset_stream_at.cc)
+    target_include_directories(quic_reset_stream_at_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(quic_reset_stream_at_test PRIVATE
+        eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(quic_reset_stream_at_test PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(quic_reset_stream_at_test PRIVATE
+            -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME quic_reset_stream_at COMMAND quic_reset_stream_at_test)
+    set_tests_properties(quic_reset_stream_at PROPERTIES TIMEOUT 20)
 
     add_executable(http3_server_errors_test tests/http3_server_errors.cc
         src/http3/qpack.cc)

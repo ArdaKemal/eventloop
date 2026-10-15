@@ -2,6 +2,7 @@
 
 #include "quic/stream_registry.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -61,6 +62,8 @@ public:
     [[nodiscard]] constexpr auto receiving() const noexcept { return receive_; }
     [[nodiscard]] constexpr auto send_final_size() const noexcept { return send_final_; }
     [[nodiscard]] constexpr auto receive_final_size() const noexcept { return receive_final_; }
+    // Smallest reliable size from RESET_STREAM_AT, zero for RESET_STREAM.
+    [[nodiscard]] constexpr auto reliable_size() const noexcept { return reliable_; }
     [[nodiscard]] constexpr auto reset_required() const noexcept { return reset_required_; }
     [[nodiscard]] constexpr auto stop_error() const noexcept { return stop_error_; }
     [[nodiscard]] constexpr auto stop_sending_pending() const noexcept -> bool
@@ -91,6 +94,21 @@ public:
         if (end > send_highest_) send_highest_ = end;
         if (fin) send_final_ = end;
         send_ = send_final_ ? stream_send_state::data_sent : stream_send_state::send;
+        return {};
+    }
+
+    // RESET_STREAM_AT (RSA 4): commits the final size but keeps Data Sent, so
+    // the reliable prefix can still be transmitted. Terminal state follows
+    // all_data_acked() once the frame and that prefix are acknowledged.
+    [[nodiscard]] constexpr auto send_reset_at(std::uint64_t final_size) noexcept -> result
+    {
+        if (send_ != stream_send_state::ready && send_ != stream_send_state::send &&
+            send_ != stream_send_state::data_sent) return fail(stream_state_error::invalid_transition);
+        if (final_size > max_varint_value) return fail(stream_state_error::invalid_value);
+        if ((send_final_ && final_size != *send_final_) || final_size < send_highest_)
+            return fail(stream_state_error::final_size);
+        send_final_ = final_size;
+        send_ = stream_send_state::data_sent;
         return {};
     }
 
@@ -176,19 +194,39 @@ public:
         return {};
     }
 
-    // Policy: preserve fully received data, suppress a late reset. Otherwise
-    // discard buffered data and expose reset. Final-size validation always runs.
-    [[nodiscard]] constexpr auto receive_reset(std::uint64_t final_size) noexcept -> result
+    // RESET_STREAM (reliable size 0) and RESET_STREAM_AT (RSA 4-5). The final
+    // size is fixed, and the smallest reliable size seen is kept. A zero reliable
+    // size with no fully received data surfaces the reset at once; otherwise
+    // receive_reset_progress() surfaces it after the reliable prefix is consumed.
+    [[nodiscard]] constexpr auto receive_reset(std::uint64_t final_size,
+        std::uint64_t reliable_size = 0) noexcept -> result
     {
         if (receive_ == stream_receive_state::absent) return fail(stream_state_error::stream_state);
-        if (final_size > max_varint_value) return fail(stream_state_error::frame_encoding);
+        if (final_size > max_varint_value || reliable_size > final_size)
+            return fail(stream_state_error::frame_encoding);
         if ((receive_final_ && final_size != *receive_final_) || final_size < receive_highest_)
             return fail(stream_state_error::final_size);
         receive_final_ = final_size;
         reset_received_ = true;
-        if (receive_ == stream_receive_state::receive || receive_ == stream_receive_state::size_known)
+        reliable_ = reliable_ ? std::min(*reliable_, reliable_size) : reliable_size;
+        if (*reliable_ == 0 && (receive_ == stream_receive_state::receive ||
+                                receive_ == stream_receive_state::size_known))
             receive_ = stream_receive_state::reset_received;
         return {};
+    }
+
+    // Call after the reader's consumed offset advances and after a reset arrives.
+    // Once the reliable prefix is consumed the reader sees stream_reset; bytes
+    // beyond it that already arrived may still be read first (RSA 5 allows
+    // delivering them). A fully received stream keeps its data (suppressed
+    // reset) only when the reliable size is zero.
+    constexpr auto receive_reset_progress(std::uint64_t consumed) noexcept -> void
+    {
+        if (!reliable_ || consumed < *reliable_) return;
+        if (receive_ == stream_receive_state::receive ||
+            receive_ == stream_receive_state::size_known ||
+            (receive_ == stream_receive_state::data_received && *reliable_ > 0))
+            receive_ = stream_receive_state::reset_received;
     }
 
     [[nodiscard]] constexpr auto read_all_data() noexcept -> result
@@ -237,7 +275,7 @@ private:
             receive_contiguous_ == *receive_final_) receive_ = stream_receive_state::data_received;
     }
     std::uint64_t id_ {0}, send_highest_ {0}, receive_highest_ {0}, receive_contiguous_ {0};
-    std::optional<std::uint64_t> send_final_, receive_final_, stop_error_;
+    std::optional<std::uint64_t> send_final_, receive_final_, stop_error_, reliable_;
     stream_send_state send_ {stream_send_state::absent};
     stream_receive_state receive_ {stream_receive_state::absent};
     bool reset_required_ {false}, stop_sent_ {false}, reset_received_ {false};

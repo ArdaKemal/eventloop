@@ -27,7 +27,7 @@ enum class frame_policy_error {
         packet == packet_kind::version_negotiation)
         return std::unexpected(frame_policy_error::packet_has_no_frames);
 
-    if (type > 0x1e && type != 0x30 && type != 0x31)
+    if (type > 0x1e && type != 0x24 && type != 0x30 && type != 0x31)
         return std::unexpected(frame_policy_error::unknown_frame_type);
 
     if (packet == packet_kind::zero_rtt && receiver != endpoint_role::server)

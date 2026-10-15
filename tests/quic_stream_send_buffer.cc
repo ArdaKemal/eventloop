@@ -268,6 +268,27 @@ auto send_preflight_preserves_pending_bytes_and_fin() -> void
           "preflight rejects selectively ACKed bytes without consuming retransmissions");
 }
 
+auto reliable_prefix() -> void
+{
+    // RESET_STREAM_AT drops unsent bytes at or above the commit point, and only
+    // the reliable prefix is retransmitted until it is acknowledged.
+    stream_send_buffer<64> stream(100);
+    check(stream.append(input("0123456789abcdefghij")).has_value(), "append");
+    check(stream.mark_sent(0, 10).has_value(), "send first ten bytes");
+    check(stream.discard_after(12, 8).has_value(), "discard unsent tail");
+    check(stream.next_offset() == 12 && stream.reliable_end() == std::optional<std::uint64_t> {8},
+          "commit point and reliable size");
+    check(stream.next_pending(64).data.empty(), "bytes above the reliable size are not sent");
+    check(stream.mark_lost(0, 10).has_value(), "loss of sent bytes");
+    check(equals(stream.next_pending(64), 0, "01234567"),
+          "lost bytes retransmit only below the reliable size");
+    check(stream.acknowledge(0, 8).has_value(), "reliable prefix acknowledged");
+    check(stream.base_offset() == 8 && stream.next_pending(64).data.empty(),
+          "nothing above the reliable prefix retransmits");
+    stream.lower_reliable_end(4);
+    check(stream.reliable_end() == std::optional<std::uint64_t> {4}, "reliable size lowers");
+}
+
 } // namespace
 
 auto main() -> int
@@ -279,4 +300,5 @@ auto main() -> int
     invalid_reports_and_empty_stream();
     fin_report_ordering();
     fin_only_after_data_ack();
+    reliable_prefix();
 }

@@ -50,6 +50,13 @@ auto valid_forms() -> void
     check(decode_frame(reset)->final_size == 4, "RESET_STREAM");
     const auto stop = bytes({0x05, 2, 3});
     check(decode_frame(stop)->error_code == 3, "STOP_SENDING");
+    const auto reset_at = bytes({0x24, 2, 3, 9, 4});
+    const auto r = decode_frame(reset_at);
+    check(r && r->encoded_size == reset_at.size() && r->stream_id == 2 &&
+          r->error_code == 3 && r->final_size == 9 && r->reliable_size == 4,
+          "RESET_STREAM_AT fields");
+    check(decode_frame(bytes({0x24, 2, 3, 4, 4}))->reliable_size == 4,
+          "RESET_STREAM_AT reliable size equal to final size");
     const auto crypto = bytes({0x06, 4, 2, 0xaa, 0xbb, 0x01});
     const auto c = decode_frame(crypto);
     check(c && c->offset == 4 && c->encoded_size == 5 &&
@@ -150,6 +157,12 @@ auto malformed_forms() -> void
     const auto missing_ecn = bytes({0x03, 0, 0, 0, 0, 1, 2});
     check(decode_frame(missing_ecn).error() == frame_error::truncated,
           "ACK_ECN counters truncated");
+    const auto reliable_above_final = bytes({0x24, 2, 3, 4, 5});
+    check(decode_frame(reliable_above_final).error() == frame_error::invalid_value,
+          "RESET_STREAM_AT reliable size above final size");
+    const auto short_reset_at = bytes({0x24, 2, 3, 4});
+    check(decode_frame(short_reset_at).error() == frame_error::truncated,
+          "RESET_STREAM_AT truncated");
     const auto zero_cid = bytes({0x18, 0, 0, 0});
     check(decode_frame(zero_cid).error() == frame_error::invalid_connection_id,
           "zero CID length");

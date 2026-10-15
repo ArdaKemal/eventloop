@@ -77,6 +77,9 @@ struct quic_transport_limits {
     // acknowledged. Handshake packets remain bounded at 1200 so
     // anti-amplification is unaffected.
     std::uint64_t max_udp_payload_size {8192};
+    // Advertises the reset_stream_at transport parameter, enabling RESET_STREAM_AT
+    // in both directions (see quic_connection::reset_stream_at()).
+    bool reset_stream_at {false};
 };
 
 namespace quic::detail { struct worker_group_access; }
@@ -140,6 +143,21 @@ public:
 
     [[nodiscard]] auto valid() const noexcept -> bool;
     [[nodiscard]] auto remote_endpoint() const noexcept -> ip_endpoint;
+    // Peer transport parameters; valid after the handshake.
+    [[nodiscard]] auto peer_reset_stream_at() const noexcept -> bool;
+    [[nodiscard]] auto peer_max_datagram_frame_size() const noexcept -> std::uint64_t;
+    // Peer facts for a stream, valid while the connection is. A value stays
+    // readable after a stream_reset or stop-sending result until the stream's
+    // slot serves another stream; unknown streams and reused slots give nullopt.
+    // stream_reset_code: the peer's RESET_STREAM or RESET_STREAM_AT application code.
+    // stream_stop_sending_code: the peer's STOP_SENDING application code.
+    // stream_final_size: the receive-side final size, once a FIN or reset fixes it.
+    [[nodiscard]] auto stream_reset_code(std::uint64_t stream_id) const noexcept
+        -> std::optional<std::uint64_t>;
+    [[nodiscard]] auto stream_stop_sending_code(std::uint64_t stream_id) const noexcept
+        -> std::optional<std::uint64_t>;
+    [[nodiscard]] auto stream_final_size(std::uint64_t stream_id) const noexcept
+        -> std::optional<std::uint64_t>;
 
     // Client-initiated streams only. Server-initiated streams arrive through
     // async_accept_stream().
@@ -177,6 +195,18 @@ public:
     [[nodiscard]] auto reset_stream(std::uint64_t stream_id,
                                     std::uint64_t error_code) noexcept
         -> std::expected<void, std::error_code>;
+    // Abandons the send side like reset_stream(), but the first reliable_size
+    // bytes still reach the peer: they are retransmitted until acknowledged, and
+    // the peer reads them before stream_reset. Bytes beyond that are discarded.
+    // Fails with quic_errc::invalid_state unless the peer advertised
+    // reset_stream_at, and with quic_errc::invalid_argument when reliable_size
+    // exceeds the bytes accepted by async_write or the stream cannot be reset.
+    // A later reset on the stream may only lower the reliable size, with the same
+    // error code; reset_stream() lowers it to zero.
+    [[nodiscard]] auto reset_stream_at(std::uint64_t stream_id,
+                                       std::uint64_t error_code,
+                                       std::uint64_t reliable_size) noexcept
+        -> std::expected<void, std::error_code>;
     // Asks the peer to stop sending with STOP_SENDING and an application error
     // code. Buffered and later data on the stream are discarded, the peer's
     // RESET_STREAM is consumed internally, and later reads fail with
@@ -201,6 +231,14 @@ public:
 
 private:
     friend class quic_endpoint;
+
+    struct peer_stream_facts {
+        std::optional<std::uint64_t> reset_code {};
+        std::optional<std::uint64_t> stop_sending_code {};
+        std::optional<std::uint64_t> final_size {};
+    };
+    [[nodiscard]] auto peer_facts(std::uint64_t stream_id) const noexcept
+        -> peer_stream_facts;
 
     quic_endpoint* endpoint_ {};
     std::size_t slot_ {};

@@ -51,6 +51,8 @@ auto supported_forms() -> void
     round_trip(bytes({0x03, 10, 3, 1, 1, 0, 2, 1, 2, 3}));
     round_trip(bytes({0x04, 2, 3, 4}));
     round_trip(bytes({0x05, 2, 3}));
+    round_trip(bytes({0x24, 2, 3, 9, 4}));
+    round_trip(bytes({0x24, 2, 3, 4, 4}));
     round_trip(bytes({0x06, 4, 2, 0xaa, 0xbb}));
     round_trip(bytes({0x07, 2, 0xaa, 0xbb}));
     for (std::uint8_t type = 0x08; type <= 0x0f; ++type) {
@@ -147,6 +149,21 @@ auto failures_are_atomic() -> void
     reject(frame_error::invalid_ack_range);
 }
 
+auto reliable_size_bounds() -> void
+{
+    // The encoder refuses a reliable size above the final size, as the decoder does.
+    decoded_frame frame;
+    frame.type = 0x24;
+    frame.stream_id = 2;
+    frame.error_code = 3;
+    frame.final_size = 4;
+    frame.reliable_size = 5;
+    std::array<std::byte, 32> output {};
+    const auto encoded = encode_frame(frame, output);
+    check(!encoded && encoded.error() == frame_error::invalid_value,
+          "encoder rejects reliable size above final size");
+}
+
 } // namespace
 
 auto main() -> int
@@ -154,4 +171,5 @@ auto main() -> int
     supported_forms();
     canonical_ack_ranges();
     failures_are_atomic();
+    reliable_size_bounds();
 }

@@ -199,6 +199,18 @@ public:
         lost_.clear();
     }
 
+    // Drops queued bytes at or above end, which must not be transmitted yet
+    // (RESET_STREAM_AT discards them). Every transmitted byte must lie below end.
+    [[nodiscard]] constexpr auto truncate(std::uint64_t end) noexcept -> bool
+    {
+        if (end < base_ || end > end_) return false;
+        if (!sent_.empty() && sent_.ranges_[sent_.size_ - 1].end > end) return false;
+        acked_.remove(end, end_);
+        lost_.remove(end, end_);
+        end_ = end;
+        return true;
+    }
+
     // Retry occurs before any authenticated response can acknowledge CRYPTO.
     // Preserve the exact TLS bytes while making the whole first flight pending.
     [[nodiscard]] constexpr auto retransmit_initial() noexcept -> bool

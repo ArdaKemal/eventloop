@@ -168,6 +168,11 @@ auto invalid_values() -> void
            parameter_error::invalid_value);
     expect({0x6a, 0xb2, 0x01, 0x00}, parameter_sender::client,
            parameter_error::invalid_value); // grease_quic_bit, nonempty
+    expect({0x1d, 0x01, 0x00}, parameter_sender::server,
+           parameter_error::invalid_value); // reset_stream_at, nonempty
+    const std::array<std::byte, 2> empty_flag {std::byte {0x1d}, std::byte {0x00}};
+    const auto flag = decode_transport_parameters(empty_flag, parameter_sender::client);
+    check(flag && flag->find(0x1d) != nullptr, "empty reset_stream_at accepted");
 }
 
 auto bounds() -> void

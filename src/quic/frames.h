@@ -27,6 +27,7 @@ struct decoded_frame {
     std::uint64_t error_code {0};
     std::uint64_t frame_type {0};
     std::uint64_t final_size {0};
+    std::uint64_t reliable_size {0};
     std::uint64_t sequence_number {0};
     std::uint64_t retire_prior_to {0};
     std::uint64_t largest_acknowledged {0};
@@ -121,6 +122,12 @@ struct decoded_frame {
         break;
     case 0x05:
         if (!add_number(frame.stream_id) || !add_number(frame.error_code))
+            return std::unexpected(frame_error::invalid_value);
+        break;
+    case 0x24: // RESET_STREAM_AT (RSA 4)
+        if (frame.reliable_size > frame.final_size ||
+            !add_number(frame.stream_id) || !add_number(frame.error_code) ||
+            !add_number(frame.final_size) || !add_number(frame.reliable_size))
             return std::unexpected(frame_error::invalid_value);
         break;
     case 0x06:
@@ -238,6 +245,12 @@ struct decoded_frame {
         write_number(frame.stream_id);
         write_number(frame.error_code);
         break;
+    case 0x24:
+        write_number(frame.stream_id);
+        write_number(frame.error_code);
+        write_number(frame.final_size);
+        write_number(frame.reliable_size);
+        break;
     case 0x06:
         write_number(frame.offset);
         write_length_payload(frame.data);
@@ -346,6 +359,13 @@ struct decoded_frame {
     case 0x05: // STOP_SENDING
         if (!number(frame.stream_id) || !number(frame.error_code))
             return std::unexpected(frame_error::truncated);
+        break;
+    case 0x24: // RESET_STREAM_AT; a reliable size above the final size is a frame error.
+        if (!number(frame.stream_id) || !number(frame.error_code) ||
+            !number(frame.final_size) || !number(frame.reliable_size))
+            return std::unexpected(frame_error::truncated);
+        if (frame.reliable_size > frame.final_size)
+            return std::unexpected(frame_error::invalid_value);
         break;
     case 0x06: // CRYPTO
         if (!number(frame.offset) || !number(length) ||

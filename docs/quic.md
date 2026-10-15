@@ -94,6 +94,26 @@ in fixed stream slots on the owner loop; retransmit until acknowledged.
   direction returns `invalid_argument`; closing connection returns
   `not_connected`; writing a retired stream returns `invalid_argument`.
   These errors are `quic_errc`.
+- `reset_stream_at()` sends RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset):
+  the first `reliable_size` bytes stay reliable, sent and retransmitted until
+  acknowledged, and the peer reads them before `stream_reset`. Later bytes are
+  discarded, and the final size is the highest byte already sent or the reliable
+  size. The send side completes once the frame and the reliable prefix are
+  acknowledged. It needs the peer's `reset_stream_at` parameter (0x1d, empty) and
+  is refused with `invalid_state` otherwise; a reliable size beyond the accepted
+  bytes is `invalid_argument`. A later reset may only lower the reliable size,
+  with the same code, and `reset_stream()` or a peer STOP_SENDING lowers it to
+  zero. The frame waits until its final size fits flow credit.
+- RESET_STREAM_AT on the receive side is valid only when this endpoint advertised
+  `reset_stream_at`, and is otherwise FRAME_ENCODING_ERROR. A reliable size above
+  the final size is FRAME_ENCODING_ERROR, a changed application code is
+  STREAM_STATE_ERROR, and the smallest reliable size seen wins. Reads return data
+  up to the reliable size, then `stream_reset`.
+- Peer facts: `stream_reset_code()`, `stream_stop_sending_code()` and
+  `stream_final_size()` stay readable after a `stream_reset` or stop-sending result
+  until the stream's slot serves another stream; then, like unknown streams, they
+  return nullopt. `peer_reset_stream_at()` and `peer_max_datagram_frame_size()`
+  report the peer's transport parameters.
 
 ## Connection and endpoint close
 
