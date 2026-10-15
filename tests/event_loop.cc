@@ -413,6 +413,75 @@ auto interrupted_wait_test() -> bool
            finished >= deadline && finished - deadline < 2s;
 }
 
+#ifdef __FreeBSD__
+// One process signal is reported by both kqueues. Neither owner may block
+// while another owner consumes the pending signal first.
+auto shared_signal_test() -> bool
+{
+    sigset_t signals {};
+    sigset_t previous {};
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGTERM);
+    if (pthread_sigmask(SIG_BLOCK, &signals, &previous) != 0) return false;
+    struct mask_scope {
+        sigset_t signals;
+        sigset_t previous;
+        ~mask_scope()
+        {
+            sigset_t pending {};
+            int received = 0;
+            while (sigpending(&pending) == 0 &&
+                   sigismember(&pending, SIGTERM) == 1)
+                (void)sigwait(&signals, &received);
+            (void)pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+        }
+    } mask {signals, previous};
+
+    std::atomic<int> ready {0};
+    std::atomic<int> finished {0};
+    std::atomic<bool> failed {false};
+    std::array<event_loop_result, 2> results {
+        event_loop_result::stopped, event_loop_result::stopped};
+    auto owner = [&](std::size_t index) {
+        bool announced = false;
+        try {
+            event_loop loop;
+            ready.fetch_add(1, std::memory_order_release);
+            announced = true;
+            results[index] = loop.run();
+        } catch (...) {
+            failed.store(true, std::memory_order_release);
+            if (!announced) ready.fetch_add(1, std::memory_order_release);
+        }
+        finished.fetch_add(1, std::memory_order_release);
+    };
+    std::jthread first(owner, 0);
+    std::jthread second(owner, 1);
+    while (ready.load(std::memory_order_acquire) != 2)
+        std::this_thread::yield();
+    if (::kill(::getpid(), SIGTERM) != 0)
+        failed.store(true, std::memory_order_release);
+
+    const auto deadline = event_loop::clock::now() + 1s;
+    while (finished.load(std::memory_order_acquire) != 2 &&
+           event_loop::clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+    const bool timed_out = finished.load(std::memory_order_acquire) != 2;
+    if (timed_out) {
+        // Release each old blocking sigwait independently. A second
+        // process-directed SIGTERM could coalesce with the first before either
+        // owner consumes it and leave one join blocked.
+        (void)pthread_kill(first.native_handle(), SIGTERM);
+        (void)pthread_kill(second.native_handle(), SIGTERM);
+    }
+    first.join();
+    second.join();
+    return !timed_out && !failed.load(std::memory_order_acquire) &&
+           results[0] == event_loop_result::interrupted &&
+           results[1] == event_loop_result::interrupted;
+}
+#endif
+
 // About 200 descriptors stay ready, more than one poll batch returns. Work
 // that becomes due or is posted while a batch is dispatched must run within
 // a batch or two instead of waiting for the poller to return its descriptor
@@ -700,6 +769,9 @@ auto main() -> int
     if (!posted_deadline_test()) return 1;
 #ifndef _WIN32
     if (!interrupted_wait_test()) return 1;
+#ifdef __FreeBSD__
+    if (!shared_signal_test()) return 1;
+#endif
     if (!ready_ring_timer_test()) return 1;
     if (!ready_ring_post_test()) return 1;
 #endif

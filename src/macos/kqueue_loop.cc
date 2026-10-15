@@ -10,6 +10,7 @@
 #include <system_error>
 
 #include <fcntl.h>
+#include <sys/types.h>
 #include <sys/event.h>
 #include <sys/time.h>
 
@@ -38,7 +39,14 @@ auto change_filter(int queue, uintptr_t identifier, short filter,
     // No eventlist: registration errors are reported by the syscall, and this
     // cannot consume an unrelated pending readiness or wake notification.
     while (::kevent(queue, &change, 1, nullptr, 0, nullptr) == -1) {
-        if (errno == EINTR) continue;
+        if (errno == EINTR) {
+#ifdef __FreeBSD__
+            // FreeBSD applies every changelist entry before returning EINTR.
+            return;
+#else
+            continue;
+#endif
+        }
         throw system_error("kevent change");
     }
 }
@@ -198,20 +206,32 @@ auto kqueue_loop::poll(std::span<ready_event> events, bool nonblocking)
             // EVFILT_SIGNAL observes a blocked signal without consuming it.
             // Retire the pending signal before restoring the owner's mask,
             // otherwise its default disposition would run on loop destruction.
+            const int signal = static_cast<int>(native.ident);
+            sigset_t selected {};
+            sigemptyset(&selected);
+            sigaddset(&selected, signal);
+#ifdef __FreeBSD__
+            // Multiple kqueues can observe one process-directed signal. Avoid
+            // blocking if another owner loop consumed it after this event fired.
+            timespec timeout {};
+            int received;
+            do {
+                received = ::sigtimedwait(&selected, nullptr, &timeout);
+            } while (received == -1 && errno == EINTR);
+            if (received == -1 && errno != EAGAIN)
+                throw system_error("sigtimedwait");
+#else
             // Darwin has no sigtimedwait; only call sigwait after sigpending
             // confirms this blocked signal is already available.
             sigset_t pending {};
-            const int signal = static_cast<int>(native.ident);
             if (::sigpending(&pending) == -1) throw system_error("sigpending");
             if (sigismember(&pending, signal) == 1) {
-                sigset_t selected {};
-                sigemptyset(&selected);
-                sigaddset(&selected, signal);
                 int received = 0;
                 const int error = ::sigwait(&selected, &received);
                 if (error != 0)
                     throw std::system_error(error, std::system_category(), "sigwait");
             }
+#endif
             result.signal_requested = true;
             continue;
         }

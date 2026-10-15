@@ -1,13 +1,19 @@
 # eventloop
 
 C++23 coroutine networking with explicit ownership and bounded resource use.
-Linux uses epoll, macOS kqueue, and Windows IOCP. I/O, cancellation, and
-coroutine resumption run on the owning event-loop thread; workers return
-completions to it.
+Linux uses epoll, macOS and FreeBSD use kqueue, and Windows uses IOCP. I/O,
+cancellation, and coroutine resumption run on the owning event-loop thread;
+workers return completions to it.
 
 ## Build and run
 
 Requires a C++23 compiler, CMake 3.20+, OpenSSL 3.5+, and threads.
+On FreeBSD, use GCC 15 with the base OpenSSL 3.5.6: install the build and test
+tools with `pkg install bash cmake curl gcc15 ninja`, then add `-G Ninja
+-DCMAKE_CXX_COMPILER=g++15` to the configure command below. The base Clang 19
+libc++ lacks C++23 library features used by eventloop.
+The full HTTP/3 interop test needs an HTTP/3-capable curl; FreeBSD's package
+lacks it, so configure with `-DCURL_EXECUTABLE=/path/to/curl`.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -19,7 +25,8 @@ ctest --test-dir build --output-on-failure
 [TCP echo](examples/tcp_echo.cc) is a complete public-header server: it accepts
 an owning `unique_fd`, transfers the stream to the loop, handles partial I/O
 with a frame-local buffer, and closes sessions on completion or failure.
-[Unix echo](examples/unix_echo.cc) uses filesystem-path sockets on Linux/macOS.
+[Unix echo](examples/unix_echo.cc) uses filesystem-path sockets on FreeBSD,
+Linux, and macOS.
 On Windows, use a Visual Studio CMake generator and run executables from the
 build configuration directory. `EVENTLOOP_WINDOWS_TLS` defaults to `ON`;
 turning it off omits TLS/WebSocket and HTTP/2 support, but still requires
@@ -48,7 +55,7 @@ Public headers are under `include/eventloop/`; readiness APIs remain private.
 | Scoped concurrency permits | `semaphore.h` | [Semaphore](docs/semaphore.md) |
 | TCP | `tcp_acceptor.h`, `tcp_stream.h`, `ip_endpoint.h` | [TCP](docs/tcp.md), [echo](examples/tcp_echo.cc) |
 | TLS | `tls_stream.h`, `tls_context.h` | [TLS](docs/tls.md), [echo](examples/tls_echo.cc) |
-| Unix streams (Linux/macOS) | `unix_socket.h` | [Unix sockets](docs/unix-sockets.md), [echo](examples/unix_echo.cc) |
+| Unix streams (FreeBSD/Linux/macOS) | `unix_socket.h` | [Unix sockets](docs/unix-sockets.md), [echo](examples/unix_echo.cc) |
 | UDP | `udp_socket.h` | [UDP](docs/udp.md) |
 | QUIC v1/v2 streams and DATAGRAMs | `quic.h` | [QUIC](docs/quic.md), [echo](examples/quic_echo_server.cc) |
 | HTTP servers and routing | `http/server.h`, `http/http3_server.h`, `http/router.h` | [Shared HTTP](docs/http.md), [routing server](examples/routing_server.cc) |

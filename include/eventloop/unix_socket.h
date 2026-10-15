@@ -1,7 +1,7 @@
 #pragma once
 
 #ifdef _WIN32
-#error "eventloop Unix domain sockets are supported on Linux and macOS only"
+#error "eventloop Unix domain sockets are supported on Linux, macOS, and FreeBSD only"
 #endif
 
 #include "eventloop/tcp_acceptor.h"

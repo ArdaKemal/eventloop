@@ -805,19 +805,28 @@ auto timer_heap_stress_test() -> bool
     event_loop_options options;
     options.coroutine_frame_capacities = {4096, 4096, 4096, 10240, 4, 2};
     event_loop loop(options);
-    const auto base = event_loop::clock::now() + std::chrono::milliseconds {30};
     std::vector<fired_timer> fired;
     fired.reserve(count);
     std::vector<event_loop::clock::time_point> deadlines;
+    deadlines.reserve(count);
     std::vector<task_handle<void>> handles(count);
     std::vector<bool> cancelled(count);
+    auto latest_deadline = event_loop::clock::time_point::min();
     std::uint32_t state = 7;
     auto next = [&state](std::uint32_t bound) {
         state = state * 1664525u + 1013904223u;
         return (state >> 8) % bound;
     };
     for (int id = 0; id < count; ++id) {
-        deadlines.push_back(base + std::chrono::milliseconds {next(40)});
+        // Give each registration its own headroom; rounding preserves collisions.
+        const auto registration_base =
+            std::chrono::ceil<std::chrono::milliseconds>(
+                event_loop::clock::now()) + std::chrono::milliseconds {30};
+        deadlines.push_back(
+            registration_base + std::chrono::milliseconds {next(40)});
+        if (deadlines.back() > latest_deadline) {
+            latest_deadline = deadlines.back();
+        }
         if (loop.spawn(recorded_sleeper(loop, deadlines.back(), id, fired),
                        handles[static_cast<std::size_t>(id)]) != task_spawn_result::accepted)
             return false;
@@ -827,7 +836,8 @@ auto timer_heap_stress_test() -> bool
             if (!cancelled[victim] && handles[victim].cancel()) cancelled[victim] = true;
         }
     }
-    if (loop.spawn(stop_at(loop, base + std::chrono::milliseconds {80})) !=
+    const auto stop_deadline = latest_deadline + std::chrono::milliseconds {40};
+    if (loop.spawn(stop_at(loop, stop_deadline)) !=
         task_spawn_result::accepted)
         return false;
     (void)loop.run();

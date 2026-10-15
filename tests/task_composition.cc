@@ -70,11 +70,10 @@ auto release_after(event_loop& loop, std::atomic<bool>& release,
         release.store(true, std::memory_order_release);
     }
 }
-auto stop_after(event_loop& loop, std::chrono::milliseconds delay) -> task<void>
+auto stop_when_done(event_loop& loop, task<void> operation) -> task<void>
 {
-    if (co_await sleep_for(loop, delay) == timer_wait_result::expired) {
-        loop.stop();
-    }
+    (void)co_await std::move(operation);
+    loop.stop();
 }
 auto error_value(event_loop&) -> task<std::expected<int, std::error_code>>
 {
@@ -192,11 +191,14 @@ auto worker_race_test() -> bool
     std::atomic<bool> release {false};
     bool cancelled = false;
     bool passed = false;
-    auto root = worker_race_root(loop, release, cancelled, passed);
+    auto root = stop_when_done(
+        loop, worker_race_root(loop, release, cancelled, passed));
     if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
     if (loop.spawn(release_after(loop, release, 5ms)) !=
-            task_spawn_result::accepted ||
-        loop.spawn(stop_after(loop, 50ms)) != task_spawn_result::accepted) {
+        task_spawn_result::accepted) {
+        release.store(true, std::memory_order_release);
+        loop.shutdown(event_loop::clock::duration::zero());
+        (void)loop.run();
         return false;
     }
     (void)loop.run();
@@ -219,11 +221,14 @@ auto worker_timeout_test() -> bool
     std::atomic<bool> release {false};
     bool cancelled = false;
     bool passed = false;
-    if (loop.spawn(worker_timeout_root(loop, release, cancelled, passed)) !=
-            task_spawn_result::accepted ||
-        loop.spawn(release_after(loop, release, 5ms)) !=
-            task_spawn_result::accepted ||
-        loop.spawn(stop_after(loop, 50ms)) != task_spawn_result::accepted) {
+    auto root = stop_when_done(
+        loop, worker_timeout_root(loop, release, cancelled, passed));
+    if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
+    if (loop.spawn(release_after(loop, release, 5ms)) !=
+        task_spawn_result::accepted) {
+        release.store(true, std::memory_order_release);
+        loop.shutdown(event_loop::clock::duration::zero());
+        (void)loop.run();
         return false;
     }
     (void)loop.run();
@@ -355,11 +360,9 @@ auto run_case(auto factory) -> bool
 {
     event_loop loop;
     bool passed = false;
-    auto root = factory(loop, passed);
+    auto root = stop_when_done(loop, factory(loop, passed));
     if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
     if (loop.coroutine_statistics().active_roots != 0) {
-        if (loop.spawn(stop_after(loop, 10ms)) !=
-            task_spawn_result::accepted) return false;
         (void)loop.run();
     }
     return passed && loop.coroutine_statistics().live == 0;

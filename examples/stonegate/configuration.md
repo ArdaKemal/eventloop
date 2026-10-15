@@ -88,7 +88,8 @@ configuration/TLS setup may allocate; parsed views are copied into owned
 settings before parser buffers expire. Includes use ordinary filesystem access;
 only load trusted configuration files.
 
-All servers share one loop on its owning thread on Linux, macOS, and Windows.
+All servers share one loop on its owning thread on FreeBSD, Linux, macOS, and
+Windows.
 With `workers` above 1, each worker thread runs its own loop; the router and
 TLS contexts are shared, and HTTP/3 capacities and coroutine pools apply per
 worker. `worker_mode` picks how connections reach workers; `auto` is

@@ -14,7 +14,7 @@
 #endif
 #ifdef _WIN32
 #include "windows/iocp_loop.h"
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__FreeBSD__)
 #include "macos/kqueue_loop.h"
 #else
 #include "linux/epoll_loop.h"
@@ -102,7 +102,7 @@ constexpr std::size_t max_timers_per_iteration = 64;
 // timers are checked without the poller; readiness, signals, cross-thread
 // stops, and IOCP packets wait at most this many passes.
 constexpr std::size_t max_skipped_polls = 8;
-#if defined(_WIN32) || defined(__APPLE__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__FreeBSD__)
 constexpr std::size_t coroutine_frame_alignment =
     std::max<std::size_t>(alignof(std::max_align_t), 16);
 #else
@@ -898,7 +898,7 @@ public:
     coroutine_frame_pool coroutine_frames;
 #ifdef _WIN32
     iocp_loop poller;
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__FreeBSD__)
     kqueue_loop poller;
 #else
     epoll_loop poller;
