@@ -69,7 +69,9 @@ public:
     }
     auto acknowledge_control(tls_level level, std::uint64_t number) noexcept -> void
     { for (auto& c : controls_) if (c.occupied && c.transmitted && c.level == level && c.sent == number) {
-        connection_.control_acked(c.type, c.stream_id); c = {}; } }
+        if (c.type == 4 || c.type == 0x24)
+            connection_.control_acked(*decode_frame(std::span(c.bytes).first(c.size)));
+        c = {}; } }
     auto lose_control(tls_level level, std::uint64_t number) noexcept -> void
     { for (auto& c : controls_) if (c.occupied && c.transmitted && c.level == level && c.sent == number) c.ready = true; }
     [[nodiscard]] auto prepare(tls_level level, protected_packet_fields fields,

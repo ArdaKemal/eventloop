@@ -45,7 +45,7 @@ struct contexts {
 
 
 static constexpr std::array<std::uint8_t, 4> protocol {'t','e','s','t'};
-static constexpr std::array<std::uint8_t, 30> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,2,0x40,100,9,1,8,0x20,2,0x44,0xb0};
+static constexpr std::array<std::uint8_t, 32> parameters {15,1,42,4,2,0x60,0,5,2,0x50,0,6,2,0x50,0,7,2,0x50,0,8,2,0x40,100,9,1,8,0x20,2,0x44,0xb0,0x1d,0};
 static constexpr std::array<std::uint8_t, 8> dcid {1,2,3,4,5,6,7,8};
 static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcept
 {
@@ -179,6 +179,23 @@ int main()
         }
         check(client->core().state() == connection_state::active);
         check(server->core().state() == connection_state::active);
+        // An ACK for the old reliable size must not retire a lowered reset.
+        const auto resetting = client->open_stream(stream_direction::unidirectional);
+        check(resetting.has_value());
+        const std::array<std::byte, 2048> prefix {};
+        check(client->stream(*resetting)->send.append(prefix).has_value());
+        check(client->reset_stream_at(*resetting, 7, prefix.size()).has_value());
+        const auto old_reset = client->pending_control();
+        check(old_reset && old_reset->type == 0x24);
+        client->control_queued(*old_reset);
+        check(client->reset_stream_at(*resetting, 7, 0).has_value());
+        client->control_acked(*old_reset);
+        check(client->stream(*resetting) != nullptr);
+        const auto lowered = client->pending_control();
+        check(lowered && lowered->type == 0x24 && lowered->reliable_size == 0);
+        client->control_queued(*lowered);
+        client->control_acked(*lowered);
+        check(client->stream(*resetting) == nullptr);
         const auto id = client->open_stream(stream_direction::bidirectional);
         check(id && *id == 0);
         auto* send = client->stream(*id);

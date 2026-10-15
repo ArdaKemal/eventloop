@@ -108,7 +108,7 @@ public:
     auto release(std::uint32_t slot) noexcept -> void;
     // The route handler returned. An open session closes as with code 0 (FIN
     // on the CONNECT stream; streams reset with WT_SESSION_GONE). The slot is
-    // reused once its reader and writer tasks retire. Never blocks.
+    // reused once its handle, reader, writer, and pending operations retire. Never blocks.
     auto handler_returned(std::uint32_t slot) noexcept -> void;
 
 private:

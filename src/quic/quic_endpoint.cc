@@ -1237,6 +1237,21 @@ auto quic_connection::reset_stream_at(std::uint64_t stream_id, std::uint64_t err
         });
 }
 
+auto quic_connection::set_stream_reset_handler(void* context,
+    void (*handler)(void*, std::uint64_t, std::uint64_t, std::uint64_t) noexcept) noexcept -> void
+{
+    if (!valid()) return;
+    auto& connection = endpoint_->implementation_->slots_[slot_].connection;
+    if (connection) connection->set_stream_reset_handler(context, handler);
+}
+
+auto quic_connection::max_datagram_payload() const noexcept -> std::size_t
+{
+    if (!valid()) return 0;
+    const auto& connection = endpoint_->implementation_->slots_[slot_].connection;
+    return connection ? connection->max_datagram_payload() : 0;
+}
+
 auto quic_connection::peer_reset_stream_at() const noexcept -> bool
 {
     if (!valid()) return false;

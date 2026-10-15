@@ -46,26 +46,22 @@ inline auto echo_stream(eventloop::event_loop& loop, eventloop::http::webtranspo
                         eventloop::http::webtransport_stream stream) -> eventloop::task<void>
 {
     std::vector<std::byte> buffer(2048);
+    eventloop::http::webtransport_stream reply;
     if (stream.direction() == eventloop::quic_stream_direction::unidirectional) {
-        std::vector<std::byte> data;
-        for (;;) {
-            auto count = eventloop::flatten_result(co_await stream.async_read(buffer));
-            if (!count || *count == 0) break;
-            data.insert(data.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(*count));
-        }
-        auto reply = eventloop::flatten_result(
+        auto opened = eventloop::flatten_result(
             co_await session.async_open_stream(eventloop::quic_stream_direction::unidirectional));
-        if (reply) (void)co_await write_all(loop, *reply, data, true);
-        co_return;
+        if (!opened) co_return;
+        reply = std::move(*opened);
     }
+    auto& output = reply.valid() ? reply : stream;
     for (;;) {
         auto count = eventloop::flatten_result(co_await stream.async_read(buffer));
         if (!count) co_return;
         if (*count == 0) {
-            (void)co_await write_all(loop, stream, {}, true);
+            (void)co_await write_all(loop, output, {}, true);
             co_return;
         }
-        auto written = co_await write_all(loop, stream, std::span<const std::byte>(buffer).first(*count), false);
+        auto written = co_await write_all(loop, output, std::span<const std::byte>(buffer).first(*count), false);
         if (!written || !*written) co_return;
     }
 }

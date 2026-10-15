@@ -789,7 +789,7 @@ auto basic_server(event_loop& loop, server_side& sv, scenario& s) -> task<void>
     WT_REQUIRE(s, settle(co_await accept_connect(loop, sv, id, session, slot)));
     auto& ses = *session;
     WT_REQUIRE(s, ses.valid() && ses.id() == id && ses.protocol() == "chat");
-    WT_REQUIRE(s, ses.max_datagram_size() == 1200);
+    WT_REQUIRE(s, ses.max_datagram_size() == 1199);
 
     // Peer bidirectional stream: the header and "hello" arrive together.
     auto peer = flatten_result(co_await ses.async_accept_stream());
@@ -1282,7 +1282,14 @@ auto shutdown_server(event_loop& loop, server_side& sv, scenario& s) -> task<voi
     WT_REQUIRE(s, loop.spawn(session->async_receive_datagram(datagram_buffer), datagram_task) ==
                       task_spawn_result::accepted);
     (void)co_await sleep_for(loop, 30ms);
+    // Start with the QUIC queue full, then terminate before the send can complete.
+    for (int i = 0; i < 8; ++i)
+        WT_REQUIRE(s, flatten_result(co_await sv.connection.async_send_datagram(datagram_buffer)).has_value());
+    auto sending = session->async_send_datagram(datagram_buffer);
+    WT_REQUIRE(s, sending.start() == task_state::suspended);
     co_await sv.wt.shutdown();
+    const auto sent = flatten_result(sending.result());
+    WT_REQUIRE(s, !sent && sent.error() == webtransport_errc::session_closed);
     const auto accepted = co_await accept_task;
     WT_REQUIRE(s, accepted.has_value() && !accepted->has_value() &&
                       accepted->error() == make_error_code(webtransport_errc::session_closed));
@@ -1302,7 +1309,7 @@ auto shutdown_client(event_loop& loop, client_side& cs, scenario& s) -> task<voi
     (void)loop;
 }
 
-// A closed session's slot is reused for a new CONNECT; the old handle sees session_closed.
+// A closed session retains its slot until both its handler and handle retire.
 auto reuse_server(event_loop& loop, server_side& sv, scenario& s) -> task<void>
 {
     const auto first = settle(co_await next_request(loop, sv));
@@ -1315,11 +1322,14 @@ auto reuse_server(event_loop& loop, server_side& sv, scenario& s) -> task<void>
     const auto second = settle(co_await next_request(loop, sv));
     std::optional<session_t> session;
     std::uint32_t slot = 0;
+    WT_REQUIRE(s, (co_await sv.wt.admit(second, slot)).value_or(admission::cancelled) == admission::rejected);
+    sv.wt.handler_returned(old_slot);
+    WT_REQUIRE(s, (co_await sv.wt.admit(second, slot)).value_or(admission::cancelled) == admission::rejected);
+    WT_REQUIRE(s, old_session->close_info() && old_session->close_info()->code == 3);
+    old_session.reset();
     WT_REQUIRE(s, settle(co_await accept_connect(loop, sv, second, session, slot)));
     WT_REQUIRE(s, session->id() == second);
-    auto stale = flatten_result(co_await old_session->async_accept_stream());
-    WT_REQUIRE(s, !stale && stale.error() == make_error_code(webtransport_errc::session_closed));
-    WT_REQUIRE(s, !old_session->close_info());
+    sv.wt.handler_returned(slot);
     co_await keep_open(loop, s);
 }
 

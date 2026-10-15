@@ -53,8 +53,10 @@ auto session_handler(event_loop&, http::request& request, http::response& respon
 The session handle is borrowed from the handler: returning from the handler or
 destroying the handle ends the session like `async_close(0)`. Session and
 stream handles are move-only, loop-affine, and generation checked: operations on
-a handle whose session ended return `session_closed`. Using a default-
-constructed or moved-from handle's `async_*` operations is a programming error.
+a handle whose session ended return `session_closed`. A closed session retains
+its slot and close information until its handler and session handle retire.
+Using a default-constructed or moved-from handle's `async_*` operations is a
+programming error.
 
 ## Negotiation and admission
 
@@ -138,8 +140,9 @@ and discarded on rejection.
 When enabled, session data counts stream body bytes (not stream headers or
 capsules) across all streams of the session. Writes take at most the peer's
 remaining `WT_MAX_DATA` credit and wait for more (`WT_DATA_BLOCKED` is sent once
-per limit); credit not accepted by QUIC is returned. Received body bytes are
-counted when the application reads them, and the final size of a reset stream
+per limit); credit not accepted by QUIC or discarded by a reset is returned.
+Peer STOP_SENDING wakes writes even while they await session credit. Received
+body bytes are counted when the application reads them, and the final size of a reset stream
 counts in full. `WT_MAX_DATA` and `WT_MAX_STREAMS` are renewed (consumed or
 closed + initial window) once half the window is used; peer streams count as
 closed when their handle is destroyed. Receiving more data or streams than

@@ -775,6 +775,12 @@ public:
         return true;
     }
 
+    // Roll back a reservation when QUIC refused to create the stream.
+    auto release_stream(bool bidirectional) noexcept -> void
+    {
+        if (enabled_) --local_opened_[stream_index(bidirectional)];
+    }
+
     // WT_STREAMS_BLOCKED value to send after open_stream was refused. Reported
     // once per peer limit value.
     [[nodiscard]] auto take_streams_blocked(bool bidirectional) noexcept

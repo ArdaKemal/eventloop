@@ -84,6 +84,7 @@ struct quic_transport_limits {
 };
 
 namespace quic::detail { struct worker_group_access; }
+namespace http::detail { class webtransport_connection; }
 
 // Connects server endpoints on different loops that share a port, so each
 // forwards packets for connections another endpoint owns (see docs/quic.md).
@@ -232,6 +233,11 @@ public:
 
 private:
     friend class quic_endpoint;
+    friend class http::detail::webtransport_connection;
+
+    auto set_stream_reset_handler(void* context,
+        void (*handler)(void*, std::uint64_t, std::uint64_t, std::uint64_t) noexcept) noexcept -> void;
+    [[nodiscard]] auto max_datagram_payload() const noexcept -> std::size_t;
 
     struct peer_stream_facts {
         std::optional<std::uint64_t> reset_code {};

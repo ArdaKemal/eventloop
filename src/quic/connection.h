@@ -378,6 +378,7 @@ public:
                                  : std::unexpected(connection_error::invalid_configuration);
         const auto committed = (std::max)(s->sent_highest, reliable);
         const auto final = s->state.send_final_size().value_or(committed);
+        const auto queued = s->send.next_offset();
         if (!s->state.send_reset_at(final) || !s->send.discard_after(committed, reliable))
             return std::unexpected(connection_error::invalid_state);
         // The frame reaches the flow controller when it is emitted (pending_control).
@@ -385,8 +386,14 @@ public:
         s->reset_pending = true;
         s->reset_frame_acked = false;
         stream_control_pending_ = true;
+        if (on_stream_reset_) on_stream_reset_(reset_context_, id, final, queued);
         return {};
     }
+    // Reset observers run on the owner loop and must defer resumption. Offsets
+    // delimit the discarded suffix; final-size bytes still consume flow credit.
+    auto set_stream_reset_handler(void* context,
+        void (*handler)(void*, std::uint64_t, std::uint64_t, std::uint64_t) noexcept) noexcept -> void
+    { check_owner(); reset_context_ = context; on_stream_reset_ = handler; }
     // Local STOP_SENDING (RFC 9000 3.5). Buffered and later data are discarded,
     // and the peer's answering RESET_STREAM is consumed without an application
     // read. A receive side that already finished is left unchanged.
@@ -516,13 +523,13 @@ public:
             if (frame.type == 0x15) s->blocked_pending = false;
         }
     }
-    auto control_acked(std::uint64_t type, std::uint64_t id) noexcept -> void
+    auto control_acked(const decoded_frame& frame) noexcept -> void
     {
         check_owner();
-        if (type == 4) {
-            if (auto* s = stream(id)) { (void)s->state.reset_acked(); retire_closed_streams(); }
-        } else if (type == 0x24) {
-            if (auto* s = stream(id)) {
+        if (frame.type == 4) {
+            if (auto* s = stream(frame.stream_id)) { (void)s->state.reset_acked(); retire_closed_streams(); }
+        } else if (frame.type == 0x24) {
+            if (auto* s = stream(frame.stream_id); s && s->send.reliable_end() == frame.reliable_size) {
                 s->reset_frame_acked = true;
                 settle_reset_at(*s);
                 retire_closed_streams();
@@ -572,6 +579,14 @@ public:
             1 + varint_size(data.size()) + data.size() > send_datagram_size_ - packet_overhead)
             return std::unexpected(datagram_queue_error::frame_too_large);
         return outgoing_datagrams_.push(data);
+    }
+    [[nodiscard]] auto max_datagram_payload() const noexcept -> std::size_t
+    {
+        check_owner();
+        const auto limit = std::min<std::uint64_t>(peer_.datagram, send_datagram_size_ - packet_overhead);
+        auto size = std::min<std::uint64_t>(outgoing_datagram_bytes_[0].size(), limit > 1 ? limit - 1 : 0);
+        while (size && 1 + varint_size(size) + size > limit) --size;
+        return static_cast<std::size_t>(size);
     }
     // Remove only after a successful UDP send. DATAGRAMs are never retransmitted.
     [[nodiscard]] auto outgoing_datagrams() noexcept -> datagram_queue&
@@ -833,6 +848,7 @@ private:
         s.reset_error = error;
         s.reset_pending = true;
         stream_control_pending_ = true;
+        if (on_stream_reset_) on_stream_reset_(reset_context_, s.id, final, s.send.next_offset());
         return true;
     }
     // Consume everything an abandoned receive side holds. This may retire the
@@ -1104,6 +1120,8 @@ private:
     void* retirement_argument_ {};
     retirement_callback retirement_callback_ {};
     parameter_limits local_, peer_;
+    void* reset_context_ {nullptr};
+    void (*on_stream_reset_)(void*, std::uint64_t, std::uint64_t, std::uint64_t) noexcept {nullptr};
     std::size_t send_datagram_size_ {1200};
     std::size_t datagram_ceiling_ {1200};
     std::size_t datagram_base_ {1472};

@@ -65,12 +65,15 @@ auto echo_example(event_loop& loop, webtransport_client& client, http::http3_ser
 
     auto uni = flatten_result(co_await client.async_open_stream(id, false));
     check(uni.has_value(), "open uni");
-    check(flatten_result(co_await client.async_write_all(*uni, to_bytes("uni!"), true)).has_value(), "write uni");
+    check(flatten_result(co_await client.async_write_all(*uni, to_bytes("uni!"))).has_value(), "write uni");
     auto peer = flatten_result(co_await client.async_accept_peer_stream());
     check(peer.has_value() && peer->session_id == id, "uni echo on a server uni stream");
     std::vector<std::byte> reply(4);
     count = flatten_result(co_await client.async_read_all(peer->id, reply));
     check(count.has_value() && to_text(reply) == "uni!", "uni echoed");
+    check(flatten_result(co_await client.async_write_all(*uni, {}, true)).has_value(), "finish uni");
+    count = flatten_result(co_await client.connection().async_read(peer->id, reply));
+    check(count && *count == 0, "uni echo FIN");
 
     check(flatten_result(co_await client.async_send_datagram(id, to_bytes("dgram"))).has_value(), "send datagram");
     auto datagram = flatten_result(co_await client.async_receive_datagram());

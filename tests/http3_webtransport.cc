@@ -241,6 +241,34 @@ auto open_session(event_loop& loop, http::request& request, http::response&) -> 
     obs->finished = true;
 }
 
+auto open_limited_session(event_loop&, http::request& request, http::response&) -> task<void>
+{
+    auto* obs = static_cast<observation*>(request.route_context());
+    auto session = flatten_result(co_await request.async_accept_webtransport());
+    check(session.has_value(), "accept stream-limit session");
+    for (int i = 0; i < 2; ++i) {
+        auto opened = flatten_result(co_await session->async_open_stream(quic_stream_direction::bidirectional));
+        check(!opened && opened.error() == webtransport_errc::capacity_exceeded,
+              "QUIC refusal does not consume session stream quota");
+    }
+    obs->finished = true;
+    (void)co_await session->async_accept_stream();
+}
+
+auto reverse_reset_session(event_loop&, http::request& request, http::response&) -> task<void>
+{
+    auto* obs = static_cast<observation*>(request.route_context());
+    auto session = flatten_result(co_await request.async_accept_webtransport());
+    check(session.has_value(), "accept reverse-reset session");
+    auto stream = flatten_result(co_await session->async_open_stream(quic_stream_direction::bidirectional));
+    check(stream.has_value(), "open reverse-reset stream");
+    std::vector<std::byte> buffer(256);
+    const auto read = flatten_result(co_await stream->async_read(buffer));
+    if (!read) obs->read_error = read.error();
+    obs->finished = true;
+    (void)co_await session->async_accept_stream();
+}
+
 // Opens a server uni stream and writes 1 MiB; the client's window paces the writer.
 auto bulk_session(event_loop& loop, http::request& request, http::response&) -> task<void>
 {
@@ -291,6 +319,11 @@ auto reset_session(event_loop& loop, http::request& request, http::response&) ->
     if (!opened) co_return;
     (void)co_await send_all(loop, *opened, to_bytes("x"), false);
     (void)opened->reset(7);
+    auto next = flatten_result(co_await session.async_open_stream(quic_stream_direction::unidirectional));
+    check(next.has_value(), "open after reset");
+    *opened = std::move(*next);
+    check(flatten_result(co_await opened->async_write(to_bytes("y"), true)).has_value(),
+          "reset returns unused session credit");
     (void)co_await session.async_accept_stream();
     obs->finished = true;
 }
@@ -341,6 +374,12 @@ auto stop_session(event_loop& loop, http::request& request, http::response&) -> 
         }
     }
     obs->stream_error = opened->error_code();
+    *opened = webtransport_stream {};
+    auto next = flatten_result(co_await session.async_open_stream(quic_stream_direction::bidirectional));
+    check(next.has_value(), "open after peer STOP_SENDING");
+    auto sent = flatten_result(co_await next->async_write(chunk, true));
+    check(sent && *sent == chunk.size(), "peer reset returns discarded session credit");
+    obs->write_done = true;
     (void)co_await session.async_accept_stream();
     obs->finished = true;
 }
@@ -457,6 +496,8 @@ auto oversize_session(event_loop&, http::request& request, http::response&) -> t
     std::vector<std::byte> big(session.max_datagram_size() + 1, std::byte {0x41});
     auto sent = flatten_result(co_await session.async_send_datagram(big));
     if (!sent) obs->datagram_error = sent.error();
+    big.pop_back();
+    obs->write_done = flatten_result(co_await session.async_send_datagram(big)).has_value();
     const auto small = to_bytes("ok");
     (void)co_await session.async_send_datagram(small);
     (void)co_await session.async_accept_stream();
@@ -502,6 +543,8 @@ auto make_routes(observation* obs) -> std::shared_ptr<http::router>
     add(http::method_type::connect, "/reject", reject_session, obs);
     add(http::method_type::connect, "/reject-404", reject_missing_session, obs);
     add(http::method_type::connect, "/open", open_session, obs);
+    add(http::method_type::connect, "/open-limited", open_limited_session, obs);
+    add(http::method_type::connect, "/reverse-reset", reverse_reset_session, obs);
     add(http::method_type::connect, "/flow", flow_session, obs);
     add(http::method_type::connect, "/bulk", bulk_session, obs);
     add(http::method_type::connect, "/reset", reset_session, obs);
@@ -1032,6 +1075,8 @@ auto t_oversize_send([[maybe_unused]] event_loop& loop, env& e) -> task<void>
 {
     auto session = flatten_result(co_await connect_to(loop, e, "/oversize"));
     check(session.has_value() && session->head.status == 200, "session accepted");
+    auto maximum = flatten_result(co_await e.client.async_receive_datagram());
+    check(maximum && e.obs.write_done, "maximum-sized datagram sent");
     auto small = flatten_result(co_await e.client.async_receive_datagram());
     check(small.has_value() && to_text(small->payload) == "ok", "small datagram after the failed send");
     check(e.obs.datagram_error == make_error_code(webtransport_errc::datagram_size),
@@ -1194,6 +1239,8 @@ auto t_flow_client_exceeds_data(event_loop& loop, env& e) -> task<void>
 // Opening a second bidi stream beyond the server's WT_INITIAL_MAX_STREAMS_BIDI is a flow-control error.
 auto t_flow_client_exceeds_streams(event_loop& loop, env& e) -> task<void>
 {
+    auto healthy = flatten_result(co_await connect_to(loop, e, "/echo"));
+    check(healthy.has_value() && healthy->head.status == 200, "healthy session accepted");
     auto session = flatten_result(co_await connect_to(loop, e, "/echo"));
     check(session.has_value() && session->head.status == 200, "session accepted");
     auto first = flatten_result(co_await open_bidi(loop, e, session->stream.id()));
@@ -1203,6 +1250,11 @@ auto t_flow_client_exceeds_streams(event_loop& loop, env& e) -> task<void>
     check(!next.has_value(), "CONNECT stream reset");
     check(e.client.connection().stream_reset_code(session->stream.id()) == wt_flow_control_error,
           "CONNECT reset with WT_FLOW_CONTROL_ERROR");
+    check(flatten_result(co_await e.client.async_send_datagram(healthy->stream.id(), to_bytes("alive"))).has_value(),
+          "send on healthy session");
+    auto reply = flatten_result(co_await e.client.async_receive_datagram());
+    check(reply && reply->session_id == healthy->stream.id() && to_text(reply->payload) == "alive",
+          "another session's violation preserves the healthy session");
 }
 
 // Streams beyond the initial limit open as WT_MAX_STREAMS arrives.
@@ -1234,7 +1286,7 @@ auto t_renew_data(event_loop& loop, env& e) -> task<void>
     task_handle<void> pump;
     check(loop.spawn(pump_capsules(loop, e, session->stream, credits), pump) == task_spawn_result::accepted,
           "spawn capsule pump");
-    constexpr std::size_t chunk = 2048;
+    constexpr std::size_t chunk = 1024;
     std::uint64_t sent = 0;
     for (int round = 0; round < 5; ++round) {
         co_await await_condition(loop, [&] { return credits.max_data >= sent + chunk; },
@@ -1402,6 +1454,10 @@ auto t_server_reset_code(event_loop& loop, env& e) -> task<void>
     check(error == make_error_code(quic_errc::stream_reset), "reset stream read fails");
     check(e.client.connection().stream_reset_code(peer->id) == webtransport_to_http3_error(7),
           "RESET_STREAM_AT carries WebTransport code 7");
+    auto next = flatten_result(co_await e.client.async_accept_peer_stream());
+    check(next.has_value(), "new stream after reset");
+    auto body = flatten_result(co_await read_text(loop, e, next->id, 1));
+    check(body && *body == "y", "discarded bytes do not consume session credit");
 }
 
 auto t_client_reset_code(event_loop& loop, env& e) -> task<void>
@@ -1434,6 +1490,50 @@ auto t_client_stop_sending(event_loop& loop, env& e) -> task<void>
     co_await await_condition(loop, [&] { return e.obs.write_error.value() != 0; }, "server write fails");
     check(e.obs.write_error == make_error_code(webtransport_errc::stream_reset), "write reports stream_reset");
     check(e.obs.stream_error == std::optional<std::uint32_t>(9), "server sees application code 9");
+    co_await await_condition(loop, [&] { return e.obs.write_done; }, "discarded credit available on next stream");
+    auto next = flatten_result(co_await e.client.async_accept_peer_stream());
+    check(next.has_value(), "next server stream after peer reset");
+    auto body = flatten_result(co_await read_text(loop, e, next->id, 1024));
+    check(body && body->size() == 1024, "next stream uses the refunded credit");
+}
+
+auto t_stop_credit_wait(event_loop& loop, env& e) -> task<void>
+{
+    auto session = flatten_result(co_await connect_to(loop, e, "/flow"));
+    check(session && session->head.status == 200, "session accepted");
+    auto peer = flatten_result(co_await e.client.async_accept_peer_stream());
+    check(peer.has_value(), "server uni stream");
+    std::vector<std::byte> body(4096);
+    const auto read = flatten_result(co_await e.client.async_read_all(peer->id, body));
+    check(read && *read == body.size(), "entire session grant reached the peer");
+    check(e.client.connection().stop_sending(peer->id, webtransport_to_http3_error(9)).has_value(),
+          "STOP_SENDING with no queued body to refund");
+    co_await await_condition(loop, [&] { return e.obs.write_error.value() != 0; }, "credit-blocked write wakes");
+    check(e.obs.write_error == make_error_code(webtransport_errc::stream_reset), "write reports peer reset");
+}
+
+auto t_quic_open_limit(event_loop& loop, env& e) -> task<void>
+{
+    auto session = flatten_result(co_await connect_to(loop, e, "/open-limited"));
+    check(session && session->head.status == 200, "session accepted");
+    co_await await_condition(loop, [&] { return e.obs.finished; }, "both opens return capacity_exceeded");
+}
+
+auto t_reverse_reset_flow(event_loop& loop, env& e) -> task<void>
+{
+    auto session = flatten_result(co_await connect_to(loop, e, "/reverse-reset"));
+    check(session && session->head.status == 200, "session accepted");
+    auto peer = flatten_result(co_await e.client.async_accept_peer_stream());
+    check(peer.has_value(), "server bidi stream");
+    check(flatten_result(co_await e.client.async_write_all(peer->id, to_bytes("abcdefghijkl"))).has_value(),
+          "queue twelve reverse-direction body bytes");
+    // Fix final size at 12, then discard the reliable prefix before transmission.
+    const auto code = webtransport_to_http3_error(7);
+    check(e.client.connection().reset_stream_at(peer->id, code, 12).has_value(), "fix reset final size");
+    check(e.client.connection().reset_stream_at(peer->id, code, 0).has_value(), "discard reset prefix");
+    co_await await_condition(loop, [&] { return e.obs.finished; }, "server observed reverse reset");
+    check(e.obs.read_error == make_error_code(webtransport_errc::flow_control_error),
+          "reverse-direction final size excludes no header and exceeds the ten-byte window");
 }
 
 // ---- Termination -------------------------------------------------------------
@@ -1731,6 +1831,8 @@ struct client_setup {
     std::uint64_t data {1024 * 1024};
     std::uint64_t bidi {16};
     std::uint64_t uni {16};
+    std::uint64_t stream_data {64 * 1024};
+    std::uint64_t quic_bidi {100};
 };
 
 auto make_client(client_setup setup) -> client_options
@@ -1740,6 +1842,8 @@ auto make_client(client_setup setup) -> client_options
     options.settings.wt_enabled = setup.wt_enabled;
     options.limits.reset_stream_at = setup.reset_stream_at;
     options.limits.max_datagram_frame_size = setup.max_datagram;
+    options.limits.max_stream_data = setup.stream_data;
+    options.limits.max_streams_bidi = setup.quic_bidi;
     if (setup.flow_control) {
         options.settings.initial_max_data = setup.data;
         options.settings.initial_max_streams_bidi = setup.bidi;
@@ -1797,6 +1901,7 @@ auto main() -> int
     // Datagrams
     run_case("datagram echo", make_wt({}), default_client(), t_datagram_echo);
     run_case("oversize datagram", make_wt({}), default_client(), t_oversize_send);
+    run_case("small peer datagram limit", make_wt({}), make_client({.max_datagram = 64}), t_oversize_send);
     // Sessions and regressions
     run_case("multiple sessions", make_wt({}), default_client(), t_multi_sessions);
     run_case("max sessions and GET", make_wt({.max_sessions = 2}), default_client(), t_max_sessions);
@@ -1824,9 +1929,12 @@ auto main() -> int
     run_case("HEADERS after WT_CLOSE_SESSION", make_wt({}), default_client(), t_headers_after_close);
     run_case("1 MiB through a 32 KiB client window", make_wt({}), make_client({.data = 32 * 1024}), t_bulk_transfer_credit);
     // Resets
-    run_case("server reset code 7", make_wt({}), default_client(), t_server_reset_code);
+    run_case("server reset code 7", make_wt({}), make_client({.data = 1}), t_server_reset_code);
     run_case("client reset code 7", make_wt({}), default_client(), t_client_reset_code);
-    run_case("client STOP_SENDING", make_wt({}), default_client(), t_client_stop_sending);
+    run_case("client STOP_SENDING", make_wt({}), make_client({.data = 4096, .stream_data = 4}), t_client_stop_sending);
+    run_case("STOP_SENDING wakes session-credit wait", make_wt({}), make_client({.data = 4096}), t_stop_credit_wait);
+    run_case("QUIC open failure preserves session quota", make_wt({}), make_client({.bidi = 1, .quic_bidi = 0}), t_quic_open_limit);
+    run_case("reverse reset session flow control", make_wt({.data = 10}), default_client(), t_reverse_reset_flow);
     // Termination
     run_case("client close capsule", make_wt({}), default_client(), t_client_close_capsule);
     run_case("server close capsule", make_wt({}), default_client(), t_server_close_capsule);

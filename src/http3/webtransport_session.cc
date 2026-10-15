@@ -156,9 +156,9 @@ auto map_quic(std::error_code error) noexcept -> std::error_code
 
 // The per-connection engine. Every table is reserved at construction and referenced
 // by index plus generation, so no per-stream, datagram, or capsule allocation occurs.
-// Sessions go through: free -> admitting -> reserved -> active -> terminated. A
-// terminated record is reusable once its reader and writer tasks have retired and
-// no operation still resumes against it.
+// Sessions go through: free -> admitting -> reserved -> active -> terminated.
+// A terminated record stays owned by its handler and handle until both retire;
+// its reader, writer, and pending operations must also finish before reuse.
 class webtransport_connection::state {
 public:
     enum class phase : std::uint8_t { free, admitting, reserved, active, terminated };
@@ -199,6 +199,8 @@ public:
         std::uint32_t generation {0};
         std::uint64_t id {0};
         std::uint32_t pending_ops {0};
+        bool handler_active {false};
+        bool handle_owned {false};
         bool open_busy {false};
         bool accept_busy {false};
         bool send_busy {false};
@@ -234,6 +236,7 @@ public:
         std::array<std::byte, datagram_scratch_size> datagram_scratch {};
         std::optional<task_handle<void>> reader;
         std::optional<task_handle<void>> writer;
+        std::optional<task_handle<std::expected<void, std::error_code>>> sender;
         std::unique_ptr<wakeup> accept_wakeup;
         std::unique_ptr<wakeup> open_wakeup;
         std::unique_ptr<wakeup> datagram_wakeup;
@@ -366,7 +369,8 @@ public:
 
     auto reusable(const session_record& record) const noexcept -> bool
     {
-        return record.phase_ == phase::terminated && record.pending_ops == 0 &&
+        return record.phase_ == phase::terminated && !record.handler_active &&
+               !record.handle_owned && record.pending_ops == 0 &&
                handle_idle(record.reader) && handle_idle(record.writer);
     }
 
@@ -409,9 +413,26 @@ public:
         record.send_busy = false;
         record.receive_busy = false;
         record.protocol_size = 0;
+        record.handler_active = true;
+        record.handle_owned = false;
     }
 
     // ---- Stream send and receive sides ----
+
+    static auto on_stream_reset(void* context, std::uint64_t id,
+                                std::uint64_t final, std::uint64_t queued) noexcept -> void
+    {
+        auto& s = *static_cast<state*>(context);
+        for (const auto& entry : s.streams_) {
+            if (!entry.in_use || entry.opening || entry.id != id) continue;
+            if (auto* record = s.session_of(entry)) {
+                const auto header = entry.local ? entry.header_length : 0;
+                record->flow.release_send(queued - std::max(final, header));
+                s.wake_streams(entry.session, entry.session_generation);
+            }
+            return;
+        }
+    }
 
     // Resets the send side. A local stream's header is reliable (draft-16 4.4), so
     // the reset keeps it; a peer stream has no header of ours to keep.
@@ -450,6 +471,7 @@ public:
         auto& record = sessions_[slot];
         if (record.phase_ != phase::active) return;
         record.phase_ = phase::terminated;
+        if (record.sender) (void)record.sender->cancel();
         if (!record.has_close_info) {
             record.has_close_info = true;
             record.close_remote = remote;
@@ -613,13 +635,22 @@ public:
         entry.peer_reset = true;
         entry.peer_code = code ? http3_to_webtransport_error(*code) : std::nullopt;
         const auto final_size = connection_->stream_final_size(entry.id);
-        if (final_size && *final_size >= entry.header_length) {
-            const auto body = *final_size - entry.header_length;
+        const auto header = entry.local ? 0 : entry.header_length;
+        if (final_size && *final_size >= header) {
+            const auto body = *final_size - header;
             if (body > entry.counted_bytes) {
                 auto counted = account_read(slot, entry, body - entry.counted_bytes);
                 if (!counted) return std::unexpected(counted.error());
             }
         }
+        return std::unexpected(make_error_code(webtransport_errc::stream_reset));
+    }
+
+    auto observe_peer_stop(stream_entry& entry) noexcept -> std::unexpected<std::error_code>
+    {
+        const auto code = connection_->stream_stop_sending_code(entry.id);
+        if (code && *code == gone_code()) return session_closed_error();
+        entry.peer_code = code ? http3_to_webtransport_error(*code) : std::nullopt;
         return std::unexpected(make_error_code(webtransport_errc::stream_reset));
     }
 
@@ -734,7 +765,7 @@ public:
     auto max_datagram_size(const session_record& record) const noexcept -> std::size_t
     {
         if (connection_ == nullptr) return 0;
-        const auto peer = connection_->peer_max_datagram_frame_size();
+        const auto peer = connection_->max_datagram_payload();
         const auto prefix = quic::detail::varint_size(record.id / 4);
         if (peer <= prefix) return 0;
         return static_cast<std::size_t>(std::min<std::uint64_t>(datagram_payload_limit, peer - prefix));
@@ -769,9 +800,8 @@ public:
             return false;
         }
         if (!record.flow.on_peer_stream_opened(bidirectional)) {
-            abort_connect(slot, code_of(http3::detail::h3_error::wt_flow_control_error));
             refuse_stream(entry.id, bidirectional, gone_code());
-            free_stream(index);
+            abort_connect(slot, code_of(http3::detail::h3_error::wt_flow_control_error));
             return false;
         }
         record.accept_queue[(record.accept_head + record.accept_count) % stream_table_size] = index;
@@ -1226,6 +1256,7 @@ struct webtransport_access {
         }
         auto opened = flatten_result(co_await s.connection_->async_open_stream(direction));
         if (!opened) {
+            record->flow.release_stream(bidirectional);
             s.free_stream(*index);
             co_return std::unexpected(map_quic(opened.error()));
         }
@@ -1262,7 +1293,6 @@ struct webtransport_access {
     static auto send_datagram(event_loop& loop, state& s, std::uint32_t slot, std::uint32_t generation,
                               std::span<const std::byte> payload) -> task<std::expected<void, std::error_code>>
     {
-        (void)loop;
         auto* record = s.active_record(slot, generation);
         if (record == nullptr) co_return session_closed_error();
         if (record->send_busy) co_return in_progress_error();
@@ -1272,12 +1302,19 @@ struct webtransport_access {
         const auto prefix = http3::detail::encode_http_datagram_prefix(record->id, record->datagram_scratch);
         if (!prefix) co_return invalid_argument_error();
         std::copy(payload.begin(), payload.end(), record->datagram_scratch.begin() + static_cast<std::ptrdiff_t>(*prefix));
-        record->send_busy = true;
-        auto sent = flatten_result(co_await s.connection_->async_send_datagram(
-            std::span<const std::byte>(record->datagram_scratch.data(), *prefix + payload.size())));
-        record->send_busy = false;
+        busy_guard busy(record->send_busy);
+        record->sender.emplace();
+        if (loop.spawn(s.connection_->async_send_datagram(
+                std::span<const std::byte>(record->datagram_scratch.data(), *prefix + payload.size())),
+                *record->sender) != task_spawn_result::accepted) {
+            record->sender.reset();
+            co_return std::unexpected(make_error_code(webtransport_errc::capacity_exceeded));
+        }
+        auto sent = flatten_result(co_await *record->sender);
+        record->sender.reset();
+        if (record->phase_ != state::phase::active) co_return session_closed_error();
         if (!sent) {
-            if (sent.error() == std::make_error_code(std::errc::invalid_argument))
+            if (sent.error() == quic_errc::invalid_argument)
                 co_return std::unexpected(make_error_code(webtransport_errc::datagram_size));
             co_return std::unexpected(map_quic(sent.error()));
         }
@@ -1392,6 +1429,8 @@ struct webtransport_access {
         for (;;) {
             if (record->phase_ != state::phase::active) co_return session_closed_error();
             if (entry->reset_sent || entry->write_finished) co_return stream_closed_error();
+            if (s.connection_->stream_stop_sending_code(entry->id))
+                co_return s.observe_peer_stop(*entry);
             if (buffer.empty()) {
                 if (!fin) co_return std::size_t {0};
                 auto finished = flatten_result(co_await s.connection_->async_write(entry->id, {}, true));
@@ -1400,8 +1439,7 @@ struct webtransport_access {
                 entry->write_finished = true;
                 co_return std::size_t {0};
             }
-            // Credit is reserved before the QUIC write. A short QUIC write keeps the
-            // unsent part reserved, which only delays later sends (never exceeds the peer).
+            // Reserve before the QUIC write, then return any credit it did not use.
             const auto allowed = record->flow.reserve_send(buffer.size());
             if (allowed == 0) {
                 if (auto value = record->flow.take_data_blocked()) {
@@ -1416,16 +1454,12 @@ struct webtransport_access {
             auto written = flatten_result(co_await s.connection_->async_write(entry->id, buffer.first(allowed), fin && whole));
             // Only the bytes QUIC accepted count against the peer's window.
             record->flow.release_send(allowed - (written ? *written : 0));
+            if (!written || *written != allowed)
+                s.wake_streams(entry->session, entry->session_generation);
             if (record->phase_ != state::phase::active) co_return session_closed_error();
             if (!written) {
                 if (entry->reset_sent) co_return stream_closed_error();
-                if (written.error() == quic_errc::stream_reset) {
-                    // The peer asked us to stop sending on this stream.
-                    const auto code = s.connection_->stream_stop_sending_code(entry->id);
-                    if (code && *code == gone_code()) co_return session_closed_error();
-                    entry->peer_code = code ? http3_to_webtransport_error(*code) : std::nullopt;
-                    co_return std::unexpected(make_error_code(webtransport_errc::stream_reset));
-                }
+                if (written.error() == quic_errc::stream_reset) co_return s.observe_peer_stop(*entry);
                 co_return std::unexpected(map_quic(written.error()));
             }
             if (fin && whole && *written == buffer.size()) entry->write_finished = true;
@@ -1463,11 +1497,13 @@ auto webtransport_connection::attach(quic_connection& connection,
         s.dispatcher_.reset();
         return false;
     }
+    connection.set_stream_reset_handler(&s, &state::on_stream_reset);
     return true;
 }
 
 auto webtransport_connection::shutdown() -> task<void>
 {
+    if (state_->connection_ != nullptr) state_->connection_->set_stream_reset_handler(nullptr, nullptr);
     return webtransport_access::shutdown(state_->loop_, *state_);
 }
 
@@ -1520,19 +1556,22 @@ auto webtransport_connection::establish(std::uint32_t slot, const http3::detail:
         record.connect_send_closed = true;
         return std::unexpected(make_error_code(webtransport_errc::capacity_exceeded));
     }
+    record.handle_owned = true;
     return webtransport_access::make_session(this, slot, record.generation);
 }
 
 auto webtransport_connection::release(std::uint32_t slot) noexcept -> void
 {
     auto& record = state_->sessions_[slot];
+    record.handler_active = false;
     if (record.phase_ == state::phase::reserved) record.phase_ = state::phase::free;
 }
 
 auto webtransport_connection::handler_returned(std::uint32_t slot) noexcept -> void
 {
     auto& s = *state_;
-    const auto& record = s.sessions_[slot];
+    auto& record = s.sessions_[slot];
+    record.handler_active = false;
     if (record.phase_ == state::phase::active)
         (void)s.begin_close(slot, record.generation, 0, {});
 }
@@ -1570,7 +1609,7 @@ webtransport_session::webtransport_session(webtransport_session&& other) noexcep
 auto webtransport_session::operator=(webtransport_session&& other) noexcept -> webtransport_session&
 {
     if (this != &other) {
-        this->~webtransport_session();
+        auto previous = std::move(*this);
         connection_ = std::exchange(other.connection_, nullptr);
         slot_ = other.slot_;
         generation_ = other.generation_;
@@ -1581,7 +1620,9 @@ auto webtransport_session::operator=(webtransport_session&& other) noexcept -> w
 webtransport_session::~webtransport_session()
 {
     if (connection_ == nullptr) return;
-    (void)detail::webtransport_access::engine(connection_).begin_close(slot_, generation_, 0, {});
+    auto& s = detail::webtransport_access::engine(connection_);
+    (void)s.begin_close(slot_, generation_, 0, {});
+    if (auto* record = s.record_for(slot_, generation_)) record->handle_owned = false;
     connection_ = nullptr;
 }
 
@@ -1690,7 +1731,7 @@ webtransport_stream::webtransport_stream(webtransport_stream&& other) noexcept
 auto webtransport_stream::operator=(webtransport_stream&& other) noexcept -> webtransport_stream&
 {
     if (this != &other) {
-        this->~webtransport_stream();
+        auto previous = std::move(*this);
         connection_ = std::exchange(other.connection_, nullptr);
         slot_ = other.slot_;
         generation_ = other.generation_;
