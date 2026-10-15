@@ -16,7 +16,7 @@ https_port, options)` returns 308 for every request and closes; it applies only
 
 ### Serving accepted connections on other loops
 
-Where the kernel does not spread a shared port across listeners (macOS,
+Where the application does not use shared-port listeners (macOS, FreeBSD,
 Windows), one TCP listener can feed several loops. `server`, `https_server`,
 and `redirect_server` hand accepted connections to the loops in
 `server_options::serving_loops` in turn; empty means the listener's own loop,

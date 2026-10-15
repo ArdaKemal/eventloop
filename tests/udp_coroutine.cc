@@ -360,8 +360,8 @@ auto send_errors(event_loop& loop, udp_socket& socket, ip_endpoint destination,
         std::array<std::byte, 1> {std::byte {'x'}},
         ip_endpoint::loopback_v4());
     passed = !too_large && too_large.error().value() == EMSGSIZE &&
-#ifdef __APPLE__
-             // Darwin accepts a UDP datagram addressed to port zero.
+#if defined(__APPLE__) || defined(__FreeBSD__)
+             // Darwin and FreeBSD accept a UDP datagram addressed to port zero.
              invalid && *invalid == 1;
 #else
              !invalid && invalid.error().value() == EINVAL;

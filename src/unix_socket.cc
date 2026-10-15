@@ -26,6 +26,10 @@ auto validate_path(std::string_view path) -> void
     validate_path(path);
     unique_fd descriptor(detail::socket_operations::create(AF_UNIX, SOCK_STREAM, 0));
     sockaddr_un address {};
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    address.sun_len = static_cast<decltype(address.sun_len)>(
+        offsetof(sockaddr_un, sun_path) + path.size() + 1);
+#endif
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, path.data(), path.size());
     const auto length = static_cast<socklen_t>(

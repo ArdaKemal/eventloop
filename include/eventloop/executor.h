@@ -37,7 +37,8 @@ public:
 
     template<typename Function>
     execution_task(Function&& function)
-        requires detail::inline_callable<std::decay_t<Function>>
+        requires (!std::same_as<std::remove_cvref_t<Function>, execution_task>) &&
+                 detail::inline_callable<std::decay_t<Function>>
     {
         using callable = std::decay_t<Function>;
 

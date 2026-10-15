@@ -36,6 +36,9 @@ struct native_ip_endpoint {
     native_ip_endpoint result;
     if (endpoint.address_family == ip_endpoint::family::ipv6) {
         sockaddr_in6 native {};
+#ifdef __FreeBSD__
+        native.sin6_len = sizeof(native);
+#endif
         native.sin6_family = AF_INET6;
         native.sin6_port = htons(endpoint.port);
         native.sin6_scope_id = endpoint.scope_id;
@@ -44,6 +47,9 @@ struct native_ip_endpoint {
         result.length = sizeof(native);
     } else {
         sockaddr_in native {};
+#ifdef __FreeBSD__
+        native.sin_len = sizeof(native);
+#endif
         native.sin_family = AF_INET;
         native.sin_port = htons(endpoint.port);
         std::memcpy(&native.sin_addr, endpoint.address.data(), 4);

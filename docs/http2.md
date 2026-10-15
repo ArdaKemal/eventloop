@@ -108,8 +108,8 @@ routed/static-file requests, counting general-heap and OpenSSL allocations.
 The general heap target is zero in these paths. With Linux transmit kTLS,
 OpenSSL's is too, except its record buffers, which it allocates while records
 are in flight and frees when the connection is idle. Userspace TLS, the only
-transport on Windows and macOS, also makes about 8 small OpenSSL allocations
-per request in record writes; the test bounds that path separately.
+transport on Windows, macOS, and FreeBSD, also makes about 8 small OpenSSL
+allocations per request in record writes; the test bounds that path separately.
 Request fields reuse existing strings;
 HPACK's dynamic table uses a 4 KiB ring allocated with its first entry;
 response fields encode from views into reused storage. Longer-than-warmed

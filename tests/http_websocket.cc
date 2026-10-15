@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 
 using namespace eventloop;

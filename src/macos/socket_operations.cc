@@ -8,10 +8,9 @@
 #include <fcntl.h>
 #include <limits>
 #include <netinet/tcp.h>
-#ifndef __APPLE__
-#include <sys/sendfile.h>
-#endif
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <cstring>
 #include <unistd.h>
@@ -27,7 +26,7 @@ namespace {
     switch (error) {
     case EINTR: case ECONNABORTED: case ENETDOWN: case EPROTO:
     case ENOPROTOOPT: case EHOSTDOWN: case EHOSTUNREACH:
-#ifndef __APPLE__
+#ifdef ENONET
     case ENONET:
 #endif
     case EOPNOTSUPP: case ENETUNREACH: return true;
@@ -47,11 +46,15 @@ auto socket_operations::create(int family, int type, int protocol)
         throw std::system_error(error, "activate socket");
     return descriptor.release();
 #else
-    const int descriptor = ::socket(family, type | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                                    protocol);
-    if (descriptor == -1)
+    unique_fd descriptor(::socket(family, type | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                                  protocol));
+    if (!descriptor)
         throw std::system_error(errno, std::system_category(), "socket");
-    return descriptor;
+#ifdef __FreeBSD__
+    if (const auto error = activate(descriptor.get()))
+        throw std::system_error(error, "activate socket");
+#endif
+    return descriptor.release();
 #endif
 }
 
@@ -139,7 +142,7 @@ auto socket_operations::activate(native_socket socket) noexcept
     const int flags = ::fcntl(socket, F_GETFL);
     if (flags == -1 || ::fcntl(socket, F_SETFL, flags | O_NONBLOCK) == -1)
         return code(errno);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
     const int descriptor_flags = ::fcntl(socket, F_GETFD);
     if (descriptor_flags == -1 ||
         ::fcntl(socket, F_SETFD, descriptor_flags | FD_CLOEXEC) == -1)
@@ -177,7 +180,7 @@ auto socket_operations::start_accept(native_socket listener, int unix_socket,
                                        SOCK_NONBLOCK | SOCK_CLOEXEC);
 #endif
         if (accepted >= 0) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
             if (const auto error = activate(accepted)) {
                 ::close(accepted);
                 return {.error = error};
@@ -216,6 +219,10 @@ auto socket_operations::start_unix_connect(native_socket socket,
     -> socket_result
 {
     sockaddr_un address {};
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    address.sun_len = static_cast<decltype(address.sun_len)>(
+        offsetof(sockaddr_un, sun_path) + path.size() + 1);
+#endif
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, path.data(), path.size());
     const auto length = static_cast<socklen_t>(
@@ -265,7 +272,7 @@ auto socket_operations::start_write(native_socket socket, const void* buffer,
         return {.error = code(EINVAL)};
     for (;;) {
         const auto result = ::send(socket, buffer, size,
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
                                    0); // SO_NOSIGPIPE is set by activate().
 #else
                                    MSG_NOSIGNAL);
@@ -282,7 +289,7 @@ auto socket_operations::start_send_file(native_socket socket,
                                         std::size_t size,
                                         socket_operation&) noexcept -> socket_result
 {
-    // Darwin interprets a zero sendfile length as "through EOF".
+    // BSD sendfile interprets a zero length as "through EOF".
     if (size == 0) return {};
     const auto limit = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
     if (size > limit || offset > limit - size) return {.error = code(EOVERFLOW)};
@@ -295,6 +302,21 @@ auto socket_operations::start_send_file(native_socket socket,
         const int error = result == -1 ? errno : 0;
         if (transferred > 0) {
             if (error != 0 && error != EINTR && error != EAGAIN && error != EWOULDBLOCK)
+                return {.error = code(error)};
+            return {.transferred = static_cast<std::size_t>(transferred)};
+        }
+        if (result == 0) return {};
+        if (error == EINTR) continue;
+        if (error == EAGAIN || error == EWOULDBLOCK) return {.pending = true};
+        return {.error = code(error)};
+#elif defined(__FreeBSD__)
+        off_t transferred = 0;
+        const int result = ::sendfile(file, socket, static_cast<off_t>(offset),
+                                      size, nullptr, &transferred, 0);
+        const int error = result == -1 ? errno : 0;
+        if (transferred > 0) {
+            if (error != 0 && error != EINTR && error != EAGAIN &&
+                error != EWOULDBLOCK)
                 return {.error = code(error)};
             return {.transferred = static_cast<std::size_t>(transferred)};
         }
@@ -361,7 +383,7 @@ auto socket_operations::start_send_to(native_socket socket,
     const auto address = native_endpoint(destination);
     for (;;) {
         const auto sent = ::sendto(socket, buffer, size,
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
                                    0,
 #else
                                    MSG_NOSIGNAL,

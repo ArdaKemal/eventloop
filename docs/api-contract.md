@@ -14,7 +14,7 @@ changes. Contracts describe behavior; current test runs establish status.
 | [TOML](toml.md) | Synchronous caller storage, views, parser limits/errors, traversal |
 | [TCP](tcp.md) | Numeric endpoints, owned sockets, partial I/O, connect failures, file sending |
 | [TLS](tls.md) | TCP plus handshake, ALPN, close, concurrency, buffers, kTLS |
-| [Unix sockets](unix-sockets.md) | Linux/macOS paths, listener cleanup, TCP-compatible operations |
+| [Unix sockets](unix-sockets.md) | FreeBSD/Linux/macOS paths, listener cleanup, TCP-compatible operations |
 | [UDP](udp.md) | Atomic datagrams, truncation, concurrency |
 | [QUIC](quic.md) | Stream reservations/windows, reset/stop-sending, connection retirement |
 | [WebSocket](websocket.md) | Framing, payload views, send buffers, broadcast, routed Extended CONNECT |

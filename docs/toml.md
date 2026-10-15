@@ -2,7 +2,7 @@
 
 Include `eventloop/util/toml.h`. `eventloop::util::parse_toml(input, nodes,
 decoded_strings)` synchronously parses [TOML 1.1.0](https://toml.io/en/v1.1.0)
-and returns `std::expected<toml_document, toml_error>`. Linux/macOS/Windows;
+and returns `std::expected<toml_document, toml_error>`. FreeBSD/Linux/macOS/Windows;
 no loop affinity or cancellation. Applications read files separately.
 
 - Input `string_view`, mutable `span<toml_value>`, and mutable `span<char>`

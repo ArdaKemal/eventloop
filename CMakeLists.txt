@@ -824,7 +824,7 @@ add_library(eventloop
     src/ws/web_socket.cpp
 )
 
-if(APPLE)
+if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     target_sources(eventloop PRIVATE
         src/macos/kqueue_loop.cc
         src/macos/socket_operations.cc
@@ -835,7 +835,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/linux/socket_operations.cc
     )
 else()
-    message(FATAL_ERROR "eventloop supports Linux, macOS, and Windows")
+    message(FATAL_ERROR "eventloop supports FreeBSD, Linux, macOS, and Windows")
 endif()
 
 add_library(eventloop::eventloop ALIAS eventloop)
