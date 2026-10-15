@@ -61,6 +61,7 @@ Public headers are under `include/eventloop/`; readiness APIs remain private.
 | HTTP servers and routing | `http/server.h`, `http/http3_server.h`, `http/router.h` | [Shared HTTP](docs/http.md), [routing server](examples/routing_server.cc) |
 | HTTPS HTTP/2 client | `http2/client.h` | [Client contract](docs/http2.md#outbound-client), Wayfarer below |
 | WebSocket | `ws/web_socket.h` | [WebSocket](docs/websocket.md), [client guide](examples/README-websocket-client.md) |
+| WebTransport over HTTP/3 (server, draft-16) | `http/webtransport.h` | [WebTransport](docs/webtransport.md), [echo](examples/webtransport_echo_server.cc) |
 | File I/O | `file_io.h` | [File I/O](docs/file-io.md) |
 | Synchronous TOML configuration | `util/toml.h` | [TOML](docs/toml.md) |
 
@@ -112,6 +113,8 @@ endpoints, streams, and DATAGRAMs; Wayfarer's HTTP/3 codec has narrower limits
 than the server. WebSocket framing is bounded; HTTP/2 and HTTP/3 CONNECT routes
 can accept RFC 8441/9220 WebSockets. The
 [routed echo example](examples/websocket_routing_server.cc) exercises both.
+HTTP/3 routes can also accept WebTransport sessions (draft-ietf-webtrans-http3-16)
+with streams, datagrams, and session flow control.
 Keep interoperability and performance claims scoped to the tested paths;
 local benchmark workloads are not throughput guarantees.
 

@@ -1,5 +1,6 @@
 #include "exchange.h"
 #include "parser.h"
+#include "../http3/webtransport_wire.h"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 namespace eventloop::http {
 namespace detail {
 namespace {
+namespace wire = eventloop::http3::detail;
 
 [[nodiscard]] auto failure(std::errc code) -> std::error_code
 {
@@ -71,6 +73,50 @@ auto accept_websocket_task(event_loop& loop, exchange& owner, const request& inc
         selected.empty() ? std::span<const header> {} : std::span<const header>(fields)));
     if (!accepted) co_return std::unexpected(accepted.error());
     co_return request_access::make_websocket(owner);
+}
+
+// WT-Available-Protocols is read from the first occurrence of the field; a
+// malformed field is absent. The selected member is the client's most
+// preferred one that the handler offered, and it is echoed as WT-Protocol.
+// When the echo cannot be formatted, the session has no protocol.
+auto accept_webtransport_task(event_loop& loop, exchange& owner, const request& incoming,
+                              std::span<const std::string_view> protocols)
+    -> task<std::expected<webtransport_session, std::error_code>>
+{
+    (void)loop;
+    if (incoming.protocol() == http::protocol::http1_1)
+        co_return std::unexpected(failure(std::errc::operation_not_supported));
+    if (owner.websocket_accepted || owner.body_read || incoming.method() != method_type::connect ||
+        incoming.connect_protocol() != "webtransport-h3")
+        co_return std::unexpected(failure(std::errc::invalid_argument));
+    std::array<std::string_view, 16> offered {};
+    std::optional<std::size_t> count;
+    for (const auto& field : incoming.headers()) {
+        if (field.name != "wt-available-protocols") continue;
+        count = wire::parse_available_protocols(field.value, offered);
+        break;
+    }
+    std::string_view selected;
+    for (std::size_t index = 0; count && index < *count && selected.empty(); ++index)
+        for (const auto candidate : protocols)
+            if (!candidate.empty() && candidate == offered[index]) {
+                selected = candidate;
+                break;
+            }
+    std::array<char, 160> encoded {};
+    std::array<header, 1> fields {};
+    std::span<const header> response {};
+    if (!selected.empty()) {
+        if (const auto size = wire::format_protocol(selected, encoded)) {
+            fields[0] = {"wt-protocol", std::string_view(encoded.data(), *size)};
+            response = fields;
+        } else {
+            selected = {};
+        }
+    }
+    auto accepted = flatten_result(co_await owner.accept_webtransport(response, selected));
+    if (!accepted) co_return std::unexpected(accepted.error());
+    co_return std::move(*accepted);
 }
 
 auto websocket_write_task(event_loop& loop, exchange* owner, std::span<const std::byte> data)
@@ -270,6 +316,12 @@ auto exchange::accept_websocket(std::span<const header>) -> task<void_result>
     return rejected<void>(loop(), std::errc::operation_not_supported);
 }
 
+auto exchange::accept_webtransport(std::span<const header>, std::string_view)
+    -> task<std::expected<webtransport_session, std::error_code>>
+{
+    return rejected<webtransport_session>(loop(), std::errc::operation_not_supported);
+}
+
 } // namespace detail
 
 auto request::header_value(std::string_view name) const noexcept
@@ -293,6 +345,12 @@ auto request::async_accept_websocket(std::string_view subprotocol)
     -> task<std::expected<websocket_stream, std::error_code>>
 {
     return detail::accept_websocket_task(exchange_->loop(), *exchange_, *this, subprotocol);
+}
+
+auto request::async_accept_webtransport(std::span<const std::string_view> protocols)
+    -> task<std::expected<webtransport_session, std::error_code>>
+{
+    return detail::accept_webtransport_task(exchange_->loop(), *exchange_, *this, protocols);
 }
 
 auto response::async_start(unsigned status, std::span<const header> headers)

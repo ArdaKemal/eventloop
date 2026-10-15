@@ -13,6 +13,7 @@
 #include "peer_streams.h"
 #include "request_stream.h"
 #include "qpack.h"
+#include "webtransport_session.h"
 
 #include <algorithm>
 #include <array>
@@ -54,6 +55,11 @@ struct stream_storage {
     semaphore::permit permit;
     // The connection's peer state, which outlives every request task.
     const h3::peer_critical_streams* peer {nullptr};
+    // The connection's WebTransport engine; nullptr when WebTransport is disabled.
+    detail::webtransport_connection* webtransport {nullptr};
+    // Bytes the request parser has consumed, which is the header length of a
+    // WebTransport stream.
+    std::size_t consumed {0};
     // Kept here, not in serve_request's frame, so that frame stays in its
     // size class; its views point into strings.
     h3::request_head head {};
@@ -169,25 +175,41 @@ constexpr std::size_t response_header_area = 1024;
 // reading with H3_NO_ERROR, as RFC 9114 4.1 permits for unneeded bodies.
 constexpr std::uint64_t request_body_limit = 1024 * 1024;
 
-enum class read_outcome { block, end, body_limit, failure, transport_failure };
+enum class read_outcome {
+    block, end, body_limit, failure, transport_failure, webtransport_stream,
+};
+
+// A WebTransport stream header is at most 9 bytes. Reads are capped at this
+// many bytes until the parser has consumed that much, so the stream data after
+// the header is at most this many bytes too.
+constexpr std::size_t webtransport_read_limit = 16;
 
 // Reads request frames until a complete HEADERS block, a clean FIN, or an
-// error. pending carries unparsed input in input_area between calls.
+// error. pending carries unparsed input in input_area between calls. consumed
+// counts the bytes the parser has consumed, and webtransport caps the reads
+// as described above.
 auto read_request_frames(event_loop& loop, quic_connection& connection, std::uint64_t id,
                          h3::request_frames& frames, std::span<std::byte> input_area,
-                         std::span<const std::byte>& pending, h3::h3_error& error)
+                         std::span<const std::byte>& pending, h3::h3_error& error,
+                         std::size_t& consumed, bool webtransport)
     -> task<read_outcome>
 {
     (void)loop;
     for (;;) {
         if (!pending.empty()) {
+            const auto before = pending.size();
             const auto parsed = frames.receive(pending);
+            consumed += before - pending.size();
             if (!parsed) { error = parsed.error(); co_return read_outcome::failure; }
             if (*parsed == h3::request_frames::event::header_block) co_return read_outcome::block;
+            if (*parsed == h3::request_frames::event::webtransport_stream)
+                co_return read_outcome::webtransport_stream;
             if (frames.data_received() > request_body_limit) co_return read_outcome::body_limit;
             continue;
         }
-        const auto got = flatten_result(co_await connection.async_read(id, input_area));
+        const auto limit = webtransport && consumed < webtransport_read_limit
+            ? webtransport_read_limit : input_area.size();
+        const auto got = flatten_result(co_await connection.async_read(id, input_area.first(limit)));
         if (!got) co_return read_outcome::transport_failure;
         if (*got == 0) {
             if (const auto finished = frames.finish(); !finished) {
@@ -210,7 +232,7 @@ auto finish_request(event_loop& loop, quic_connection& connection, std::uint64_t
     h3::h3_error error {};
     for (;;) {
         const auto outcome = (co_await read_request_frames(loop, connection, id, frames,
-            input_area, pending, error)).value_or(read_outcome::transport_failure);
+            input_area, pending, error, s.consumed, false)).value_or(read_outcome::transport_failure);
         switch (outcome) {
         case read_outcome::block: {
             const auto decoded = h3::qpack_decode(frames.block(), s.fields.items, s.strings);
@@ -226,6 +248,7 @@ auto finish_request(event_loop& loop, quic_connection& connection, std::uint64_t
             co_return;
         case read_outcome::failure: fail(connection, id, error); co_return;
         case read_outcome::end:
+        case read_outcome::webtransport_stream:
         case read_outcome::transport_failure: co_return;
         }
     }
@@ -274,13 +297,16 @@ constexpr std::size_t trailer_block = header_limit / 2;
 // connection, storage and parser outlive it.
 class http3_exchange final : public detail::exchange {
 public:
+    // engine and engine_slot name the reserved WebTransport session slot for
+    // an admitted CONNECT, or nullptr otherwise.
     http3_exchange(event_loop& loop, quic_connection& connection, std::uint64_t id,
                    stream_storage& storage, h3::request_frames& frames,
                    std::span<const std::byte>& pending, std::uint64_t max_request_body,
-                   bool head_only) noexcept
+                   bool head_only, detail::webtransport_connection* engine,
+                   std::uint32_t engine_slot) noexcept
         : loop_(loop), connection_(connection), storage_(storage), frames_(frames),
           pending_(pending), id_(id), max_request_body_(max_request_body),
-          head_only_(head_only)
+          head_only_(head_only), engine_(engine), engine_slot_(engine_slot)
     {
         frames_.set_block_storage(std::span(storage_.headers).first(trailer_block));
     }
@@ -310,6 +336,9 @@ public:
     [[nodiscard]] auto loop() noexcept -> event_loop& override { return loop_; }
     auto accept_websocket(std::span<const header> headers) -> task<void_result> override
     { return start_task(loop_, *this, 200, headers, std::nullopt, true); }
+    auto accept_webtransport(std::span<const header> headers, std::string_view protocol)
+        -> task<std::expected<webtransport_session, std::error_code>> override
+    { return accept_webtransport_task(loop_, *this, headers, protocol); }
     auto abort_websocket() noexcept -> void override
     {
         if (websocket_aborted || (finished_ && body_ended_)) return;
@@ -325,6 +354,8 @@ public:
     bool broken_ {false};
     bool body_ended_ {false};
     bool too_large_ {false};
+    // The engine accepted the CONNECT stream: the stream is no longer HTTP.
+    bool webtransport_established_ {false};
 
     static auto start_task(event_loop& loop, http3_exchange& self, unsigned status,
                            std::span<const header> headers, std::optional<std::uint64_t> length,
@@ -375,6 +406,28 @@ public:
         co_return void_result {};
     }
 
+    // Sends the 200 in tunnel mode, then hands the stream to the engine. Only a
+    // reserved, unstarted CONNECT whose body was not read can be accepted.
+    static auto accept_webtransport_task(event_loop& loop, http3_exchange& self,
+                                         std::span<const header> headers, std::string_view protocol)
+        -> task<std::expected<webtransport_session, std::error_code>>
+    {
+        if (self.engine_ == nullptr || self.started_ || self.body_read)
+            co_return std::unexpected(failure(std::errc::invalid_argument));
+        auto started = co_await start_task(loop, self, 200, headers, std::nullopt);
+        if (!started) co_return std::unexpected(failure(std::errc::operation_canceled));
+        if (!*started) co_return std::unexpected(started->error());
+        self.frames_.accept_connect();
+        auto session = self.engine_->establish(self.engine_slot_, self.frames_, self.pending_, protocol);
+        if (!session) {
+            self.broken_ = true;
+            fail(self.connection_, self.id_, h3::h3_error::internal_error);
+            co_return std::unexpected(session.error());
+        }
+        self.webtransport_established_ = true;
+        co_return std::move(*session);
+    }
+
 private:
     struct busy {
         explicit busy(bool& flag) noexcept : flag(flag) { flag = true; }
@@ -422,6 +475,7 @@ private:
         -> task<size_result>
     {
         (void)loop;
+        if (self.webtransport_established_) co_return std::unexpected(failure(std::errc::invalid_argument));
         if (self.reading_) co_return std::unexpected(failure(std::errc::operation_in_progress));
         if (self.too_large_) co_return std::unexpected(failure(std::errc::message_size));
         busy reading(self.reading_);
@@ -500,6 +554,7 @@ private:
         -> task<void_result>
     {
         (void)loop;
+        if (self.webtransport_established_) co_return std::unexpected(failure(std::errc::invalid_argument));
         if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
         if (self.websocket_aborted)
             co_return std::unexpected(failure(std::errc::operation_canceled));
@@ -553,6 +608,7 @@ private:
     static auto finish_task(event_loop& loop, http3_exchange& self, std::span<const header> trailers)
         -> task<void_result>
     {
+        if (self.webtransport_established_) co_return std::unexpected(failure(std::errc::invalid_argument));
         if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
         if (self.websocket_aborted)
             co_return std::unexpected(failure(std::errc::operation_canceled));
@@ -596,6 +652,7 @@ private:
                                std::span<const header> headers, unique_fd file,
                                std::uint64_t offset, std::uint64_t size) -> task<void_result>
     {
+        if (self.webtransport_established_) co_return std::unexpected(failure(std::errc::invalid_argument));
         auto started = co_await start_task(loop, self, status, headers, size);
         if (!started) co_return std::unexpected(failure(std::errc::operation_canceled));
         if (!*started) co_return std::unexpected(started->error());
@@ -645,6 +702,8 @@ private:
     bool continue_checked_ {false};
     bool reading_ {false};
     bool writing_ {false};
+    detail::webtransport_connection* engine_;
+    std::uint32_t engine_slot_;
 };
 
 // Join split Cookie lines for the generic HTTP application (RFC 9114 4.2.1).
@@ -707,8 +766,27 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
         fail(connection, id, h3::h3_error::excessive_load);
         co_return;
     }
+    // A webtransport-h3 CONNECT is admitted before the handler runs: the engine
+    // waits for the client's SETTINGS and reserves a session slot.
+    detail::webtransport_connection* engine =
+        head.connect_protocol == "webtransport-h3" ? s.webtransport : nullptr;
+    std::uint32_t engine_slot = 0;
+    if (engine != nullptr) {
+        const auto admitted = co_await engine->admit(id, engine_slot);
+        if (!admitted) co_return;
+        using admission = detail::webtransport_connection::admission;
+        if (*admitted == admission::rejected) {
+            fail(connection, id, h3::h3_error::request_rejected);
+            co_return;
+        }
+        if (*admitted == admission::malformed) {
+            fail(connection, id, h3::h3_error::message_error);
+            co_return;
+        }
+        if (*admitted == admission::cancelled) co_return;
+    }
     http3_exchange exchange(loop, connection, id, s, frames, pending, max_request_body,
-                            head.method == "HEAD");
+                            head.method == "HEAD", engine, engine_slot);
     const detail::request_fields request {
         .headers = std::span<const header>(s.request_headers.items).first(count),
         .method_name = head.method,
@@ -722,6 +800,14 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
     detail::request_access::bind(exchange.request_, exchange, request, match.context);
     detail::request_access::bind(exchange.response_, exchange);
     const auto handled = co_await match.function(loop, exchange.request_, exchange.response_);
+    // An established session owns the CONNECT stream, so nothing below applies.
+    if (engine != nullptr) {
+        if (exchange.webtransport_established_) {
+            engine->handler_returned(engine_slot);
+            co_return;
+        }
+        engine->release(engine_slot);
+    }
     if (handled == task_result::cancelled) co_return;
     if (!exchange.started_ && !exchange.broken_) {
         const unsigned status = exchange.too_large_ ? 413
@@ -745,6 +831,7 @@ struct request_settings {
     const router* routes {nullptr};
     std::uint64_t max_request_body {0};
     bool directory_listing {false};
+    webtransport_options webtransport {};
 };
 
 // Answers a request whose path has routes. Returns false when no route
@@ -758,11 +845,16 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     const auto match = detail::router_access::match(*settings.routes,
         detail::method_from_name(head.method), head.path.substr(0, head.path.find('?')));
     const bool extended = !head.connect_protocol.empty();
-    const bool unsupported = extended && head.connect_protocol != "websocket";
+    const bool webtransport = s.webtransport != nullptr &&
+        head.connect_protocol == "webtransport-h3";
+    const bool unsupported = extended && head.connect_protocol != "websocket" && !webtransport;
     if (match.allowed == 0 && !extended) co_return false;
-    const bool too_large = match.function != nullptr && (head.content_length_too_large ||
-        (head.connect_protocol.empty() && head.content_length &&
-         *head.content_length > settings.max_request_body));
+    // The body limit does not apply to a WebTransport CONNECT: its stream
+    // carries session data, not a request body.
+    const bool too_large = match.function != nullptr && !webtransport &&
+        (head.content_length_too_large ||
+         (head.connect_protocol.empty() && head.content_length &&
+          *head.content_length > settings.max_request_body));
     if (match.function != nullptr && !too_large && !unsupported) {
         (void)co_await serve_route(loop, connection, id, s, frames, pending, head, fields,
                                    match, settings.max_request_body);
@@ -802,6 +894,15 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
                    const request_settings& settings)
     -> task<void>
 {
+    // Declared first so it runs last, after the storage is released.
+    struct request_finished_guard {
+        detail::webtransport_connection* engine;
+        std::uint64_t request;
+        ~request_finished_guard()
+        {
+            if (engine != nullptr) engine->request_finished(request);
+        }
+    } finished {storage->webtransport, id};
     struct release_storage {
         stream_storage* storage;
         ~release_storage()
@@ -815,11 +916,20 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     // section is decoded (strings live in s.strings), s.headers is reused for
     // If-None-Match and response DATA, and later for any trailers.
     h3::request_frames frames(s.headers);
+    frames.set_webtransport(s.webtransport != nullptr);
     std::span<const std::byte> pending;
     h3::h3_error error {};
     const auto input_area = std::span(s.io).subspan(response_header_area);
+    s.consumed = 0;
     const auto outcome = (co_await read_request_frames(loop, connection, id, frames,
-        input_area, pending, error)).value_or(read_outcome::transport_failure);
+        input_area, pending, error, s.consumed, s.webtransport != nullptr))
+        .value_or(read_outcome::transport_failure);
+    // A client bidirectional WT_STREAM: the engine takes the stream data after
+    // the header, which is what the parser consumed so far.
+    if (outcome == read_outcome::webtransport_stream) {
+        s.webtransport->peer_bidirectional(id, frames.session_id(), s.consumed, pending);
+        co_return;
+    }
     if (outcome == read_outcome::failure) fail(connection, id, error);
     if (outcome != read_outcome::block) co_return;
     const auto decoded = h3::qpack_decode(frames.block(), s.fields.items, s.strings);
@@ -836,7 +946,9 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     const auto method = s.head.method;
     const auto path = s.head.path;
     const bool https = h3::ascii_equal(s.head.scheme, "https");
-    if (s.head.connect_protocol == "websocket" && !https) {
+    const bool webtransport = s.webtransport != nullptr &&
+        s.head.connect_protocol == "webtransport-h3";
+    if ((s.head.connect_protocol == "websocket" || webtransport) && !https) {
         fail(connection, id, h3::h3_error::message_error);
         co_return;
     }
@@ -985,24 +1097,43 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
 // push streams, and refused unknown types. Validation state lives in this
 // frame; a reset or FIN of a critical stream closes the connection.
 auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t id,
-                   h3::peer_critical_streams& critical) -> task<void>
+                   h3::peer_critical_streams& critical,
+                   detail::webtransport_connection* webtransport) -> task<void>
 {
     (void)loop;
-    h3::peer_uni_stream stream;
+    h3::peer_uni_stream stream(webtransport != nullptr);
     std::array<std::byte, 256> input {};
+    // Bytes the parser has consumed so far: a WebTransport stream's header.
+    std::size_t header = 0;
     while (connection.valid()) {
-        const auto got = flatten_result(co_await connection.async_read(id, input));
+        // While the stream type or a WebTransport session ID is incomplete,
+        // reads are capped at 16 bytes so the stream data after the header is too.
+        const bool header_pending = webtransport != nullptr &&
+            (stream.stream_kind() == h3::peer_uni_stream::kind::pending ||
+             (stream.stream_kind() == h3::peer_uni_stream::kind::webtransport &&
+              !stream.session_id()));
+        const auto limit = header_pending ? std::size_t {16} : input.size();
+        const auto got = flatten_result(co_await connection.async_read(id,
+            std::span(input).first(limit)));
         if (!got && got.error() != make_error_code(quic_errc::stream_reset)) co_return;
         const bool ended = !got || *got == 0;
-        const auto checked = ended ? stream.finish()
-                                   : stream.receive(std::span(input).first(*got), critical);
+        const auto chunk = ended ? std::span<const std::byte> {}
+                                 : std::span<const std::byte>(input).first(*got);
+        const auto checked = ended ? stream.finish() : stream.receive(chunk, critical);
         // Every error on a critical stream closes the connection, including
         // EXCESSIVE_LOAD from too many SETTINGS (RFC 9114 6.2.1).
         if (!checked) {
             connection.close_application(static_cast<std::uint64_t>(checked.error()));
             co_return;
         }
+        // A FIN or reset before the session ID ends the stream with nothing to route.
         if (ended) co_return;
+        header += stream.bytes_consumed();
+        if (stream.stream_kind() == h3::peer_uni_stream::kind::webtransport && stream.session_id()) {
+            webtransport->peer_unidirectional(id, *stream.session_id(), header,
+                chunk.subspan(stream.bytes_consumed()));
+            co_return;
+        }
         // Unknown and reserved types are refused rather than drained
         // (RFC 9114 6.2); the transport discards anything still arriving.
         if (stream.stream_kind() == h3::peer_uni_stream::kind::unknown) {
@@ -1013,23 +1144,84 @@ auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t 
     }
 }
 
-auto serve_connection(event_loop& loop, quic_connection& connection,
-                      std::shared_ptr<http::detail::document_root> root,
-                      stream_handlers& handlers, storage_pool& pool,
-                      const request_settings& settings) -> task<void>
+// The server control stream (stream type 0) and its SETTINGS frame. The
+// QPACK settings are always present; ENABLE_CONNECT_PROTOCOL with routes; the
+// WebTransport settings when enabled. Returns the bytes written, or zero.
+auto encode_control_stream(bool extended, const webtransport_options* webtransport,
+                           std::span<std::byte> output) noexcept -> std::size_t
 {
+    std::array<h3::setting, 8> settings {};
+    std::size_t count = 0;
+    settings[count++] = {h3::qpack_max_table_capacity, 0};
+    settings[count++] = {h3::qpack_blocked_streams, 0};
+    if (extended) settings[count++] = {h3::enable_connect_protocol_setting, 1};
+    if (webtransport != nullptr) {
+        settings[count++] = {h3::h3_datagram_setting, 1};
+        settings[count++] = {h3::wt_enabled_setting, 1};
+        settings[count++] = {h3::wt_initial_max_streams_uni_setting,
+                             webtransport->initial_max_streams_uni};
+        settings[count++] = {h3::wt_initial_max_streams_bidi_setting,
+                             webtransport->initial_max_streams_bidi};
+        settings[count++] = {h3::wt_initial_max_data_setting, webtransport->initial_max_data};
+    }
+    // The worst case is 43 bytes: five settings with eight-byte values.
+    std::array<std::byte, 64> payload {};
+    const auto payload_size = h3::encode_settings(
+        std::span<const h3::setting>(settings).first(count), payload, settings.size());
+    if (!payload_size || output.empty()) return 0;
+    output[0] = std::byte{0};
+    const auto framed = h3::encode_frame(h3::settings_frame,
+        std::span<const std::byte>(payload).first(*payload_size), output.subspan(1));
+    return framed ? std::size_t {1} + *framed : std::size_t {0};
+}
+
+// The per-connection request-stream table. Its handler IDs let WebTransport ask
+// whether a session's CONNECT stream is still being served.
+struct connection_streams {
+    stream_handlers handlers;
+    std::array<std::uint64_t, max_streams> ids {};
+    // One past the highest client bidirectional stream QUIC has accepted.
+    std::uint64_t next_request_id {0};
+    // The engine was attached for this connection, so it must be shut down.
+    bool attached {false};
+    // The control stream's SETTINGS, encoded here so serve_connection's frame
+    // stays in its 1 KiB size class.
+    std::array<std::byte, 64> control_settings {};
+    // The peer's critical stream state. The WebTransport engine keeps a pointer to
+    // it until shutdown, which runs after serve_connection_tasks has returned, so it
+    // lives with the connection rather than in that frame.
     h3::peer_critical_streams critical;
+};
+
+// The engine's request_open callback. A client request stream that QUIC has not
+// accepted yet may still arrive, and one whose handler is running is live.
+auto request_open(void* context, std::uint64_t id) noexcept -> bool
+{
+    const auto& streams = *static_cast<const connection_streams*>(context);
+    if ((id & 3u) == 0u && id >= streams.next_request_id) return true;
+    for (std::size_t index = 0; index < max_streams; ++index)
+        if (streams.handlers[index] && !streams.handlers[index]->done() &&
+            streams.ids[index] == id) return true;
+    return false;
+}
+
+auto serve_connection_tasks(event_loop& loop, quic_connection& connection,
+                           std::shared_ptr<http::detail::document_root> root,
+                           connection_streams& streams, storage_pool& pool,
+                           const request_settings& settings,
+                           detail::webtransport_connection* webtransport) -> task<void>
+{
+    auto& critical = streams.critical;
+    critical = {};
     auto control = flatten_result(co_await connection.async_open_stream(quic_stream_direction::unidirectional));
     // RFC 9114 6.2 requires room for the three server critical streams.
     const auto general = static_cast<std::uint64_t>(h3::h3_error::general_protocol_error);
     if (!control) { connection.close_application(general); co_return; }
-    // Server control stream: stream type 0, SETTINGS with zero QPACK dynamic table.
-    const bool extended = settings.routes != nullptr;
-    const std::array<std::byte, 9> control_settings {std::byte{0}, std::byte{4},
-        extended ? std::byte{6} : std::byte{4}, std::byte{1}, std::byte{0}, std::byte{7},
-        std::byte{0}, std::byte{8}, std::byte{1}};
-    if (!(co_await write_all(loop, connection, *control,
-            std::span(control_settings).first(extended ? 9 : 7), false)).value_or(false)) {
+    // Server control stream: stream type 0, then SETTINGS.
+    const auto control_size = encode_control_stream(settings.routes != nullptr,
+        webtransport != nullptr ? &settings.webtransport : nullptr, streams.control_settings);
+    if (control_size == 0 || !(co_await write_all(loop, connection, *control,
+            std::span(streams.control_settings).first(control_size), false)).value_or(false)) {
         connection.close(); co_return;
     }
     // Required QPACK encoder and decoder streams. No dynamic entries are sent.
@@ -1040,11 +1232,21 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
             connection.close(); co_return;
         }
     }
+    // The engine's datagram dispatcher and session tasks run until shutdown,
+    // which serve_connection calls once attach has run.
+    if (webtransport != nullptr) {
+        streams.attached = true;
+        if (!webtransport->attach(connection, critical, &request_open, &streams)) {
+            connection.close_application(static_cast<std::uint64_t>(h3::h3_error::internal_error));
+            co_return;
+        }
+    }
     while (connection.valid()) {
         auto accepted = flatten_result(co_await connection.async_accept_stream());
         if (!accepted) break;
         const auto id = *accepted;
         const bool request = (id & 3u) == 0u;
+        if (request) streams.next_request_id = id + 4;
         // A request waits for a free slot, and later streams wait behind it
         // in QUIC's bounded buffers, instead of being refused.
         semaphore::permit permit;
@@ -1055,21 +1257,23 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
         }
         // Handler slots cover every stream QUIC admits (100 bidirectional and
         // 8 unidirectional), so exhaustion here is a capacity bug.
-        auto slot = std::find_if(handlers.begin(), handlers.end(),
+        auto slot = std::find_if(streams.handlers.begin(), streams.handlers.end(),
             [](const auto& handler) { return !handler || handler->done(); });
         stream_storage* storage = request ? pool.acquire() : nullptr;
         auto spawned = task_spawn_result::invalid_task;
-        if (slot != handlers.end() && (!request || storage)) {
+        if (slot != streams.handlers.end() && (!request || storage)) {
             if (storage) {
                 storage->permit = std::move(permit);
                 storage->peer = &critical;
+                storage->webtransport = webtransport;
             }
             slot->reset();
             slot->emplace();
+            streams.ids[static_cast<std::size_t>(slot - streams.handlers.begin())] = id;
             spawned = request
                 ? loop.spawn(serve_request(loop, connection, id, root->descriptor.get(),
                       root->cache.get(), storage, settings), **slot)
-                : loop.spawn(read_peer_uni(loop, connection, id, critical), **slot);
+                : loop.spawn(read_peer_uni(loop, connection, id, critical, webtransport), **slot);
             if (spawned != task_spawn_result::accepted) slot->reset();
         }
         if (spawned == task_spawn_result::accepted) continue;
@@ -1087,12 +1291,27 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
         }
     }
     connection.close_application(static_cast<std::uint64_t>(h3::h3_error::no_error));
-    for (auto& handler : handlers) {
+    for (auto& handler : streams.handlers) {
         if (!handler) continue;
         (void)handler->cancel();
         (void)co_await *handler;
         handler.reset();
     }
+}
+
+auto serve_connection(event_loop& loop, quic_connection& connection,
+                      std::shared_ptr<http::detail::document_root> root,
+                      connection_streams& streams, storage_pool& pool,
+                      const request_settings& settings,
+                      detail::webtransport_connection* webtransport) -> task<void>
+{
+    streams.next_request_id = 0;
+    streams.attached = false;
+    (void)co_await serve_connection_tasks(loop, connection, std::move(root), streams, pool,
+                                          settings, webtransport);
+    // After every request task has been cancelled and awaited (draft-16
+    // session teardown), the engine ends its sessions and tasks.
+    if (streams.attached) (void)co_await webtransport->shutdown();
 }
 } // namespace
 
@@ -1101,15 +1320,24 @@ public:
     // The slot owns the connection handle, so a connection task whose frame
     // cannot be allocated leaves it here to close.
     struct connection_slot {
-        stream_handlers handlers;
+        connection_streams streams;
         quic_connection connection;
         std::optional<task_handle<void>> handle;
+        // One engine per slot, reserved with the server when WebTransport is enabled.
+        std::unique_ptr<detail::webtransport_connection> webtransport;
     };
 
-    static auto make_limits(std::size_t max_udp_payload_size) -> quic_transport_limits
+    // WebTransport needs the datagram frame size of a 1200-byte payload plus
+    // the quarter stream ID, and RESET_STREAM_AT for reliable resets.
+    static auto make_limits(std::size_t max_udp_payload_size, bool webtransport)
+        -> quic_transport_limits
     {
         quic_transport_limits limits;
         limits.max_udp_payload_size = max_udp_payload_size;
+        if (webtransport) {
+            limits.max_datagram_frame_size = 1232;
+            limits.reset_stream_at = true;
+        }
         return limits;
     }
 
@@ -1119,6 +1347,8 @@ public:
     {
         if (!options.routes && options.document_root.empty())
             throw std::invalid_argument("server needs routes or a document root");
+        if (options.webtransport.enabled && !options.routes)
+            throw std::invalid_argument("WebTransport needs routes");
         auto root = std::make_shared<http::detail::document_root>();
         if (options.document_root.empty()) return root;
         root->descriptor = http::detail::open_root(options.document_root.string());
@@ -1132,14 +1362,21 @@ public:
                    std::filesystem::path key, const server_options& options)
         : loop_(loop), root_(open_document_root(options)),
           endpoint_(loop, local, quic_server_options{std::move(cert), std::move(key),
-              std::span(alpn_), make_limits(options.max_udp_payload_size),
+              std::span(alpn_),
+              make_limits(options.max_udp_payload_size, options.webtransport.enabled),
               options.connection_capacity, options.reuse_port, options.worker_index,
               options.worker_group}),
           routes_(options.routes),
-          settings_ {routes_.get(), options.max_request_body, options.directory_listing},
+          settings_ {routes_.get(), options.max_request_body, options.directory_listing,
+                     options.webtransport},
           connections_(options.connection_capacity),
           request_storage_(loop, options.request_capacity == 0 ? options.connection_capacity * 10
-                                                         : options.request_capacity) {}
+                                                         : options.request_capacity) {
+        if (options.webtransport.enabled)
+            for (auto& slot : connections_)
+                slot.webtransport = std::make_unique<detail::webtransport_connection>(
+                    loop, options.webtransport);
+    }
 
     event_loop& loop_;
     std::shared_ptr<http::detail::document_root> root_;
@@ -1178,7 +1415,8 @@ auto http3_server::run_loop(event_loop& loop, http3_server& server) -> task<void
         slot->handle.emplace();
         slot->connection = std::move(*accepted);
         const auto spawned = loop.spawn(serve_connection(loop, slot->connection, impl.root_,
-                slot->handlers, impl.request_storage_, impl.settings_), *slot->handle);
+                slot->streams, impl.request_storage_, impl.settings_,
+                slot->webtransport.get()), *slot->handle);
         if (spawned != task_spawn_result::accepted) {
             slot->handle.reset();
             slot->connection.close();

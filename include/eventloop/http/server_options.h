@@ -1,6 +1,7 @@
 #pragma once
 
 #include "eventloop/http/router.h"
+#include "eventloop/http/webtransport.h"
 
 #include <chrono>
 #include <cstddef>
@@ -64,6 +65,11 @@ struct server_options {
     // worker_group.
     std::optional<std::uint8_t> worker_index {};
     std::shared_ptr<quic_worker_group> worker_group {};
+    // http3_server only, and only with routes: Extended CONNECT
+    // webtransport-h3 sessions. Enabling it raises the QUIC datagram and
+    // reset_stream_at transport parameters and the HTTP/3 SETTINGS listed in
+    // docs/webtransport.md. See request::async_accept_webtransport().
+    webtransport_options webtransport {};
 };
 
 } // namespace eventloop::http

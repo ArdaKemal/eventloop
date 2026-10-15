@@ -2,6 +2,7 @@
 
 #include "eventloop/http/request.h"
 #include "eventloop/http/response.h"
+#include "eventloop/http/webtransport.h"
 #include "eventloop/http/router.h"
 
 #include <cstdint>
@@ -32,6 +33,10 @@ public:
     // Each implementation owns the loop its tasks run on.
     [[nodiscard]] virtual auto loop() noexcept -> event_loop& = 0;
     virtual auto accept_websocket(std::span<const header> headers) -> task<void_result>;
+    // Accepts a webtransport-h3 CONNECT with a 2xx response and returns the
+    // session. Only HTTP/3 implements it; the default is operation_not_supported.
+    virtual auto accept_webtransport(std::span<const header> headers, std::string_view protocol)
+        -> task<std::expected<webtransport_session, std::error_code>>;
     virtual auto abort_websocket() noexcept -> void {}
     bool websocket_accepted {false};
     bool websocket_aborted {false};

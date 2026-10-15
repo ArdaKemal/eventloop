@@ -1,4 +1,5 @@
 #include "eventloop/event_loop.h"
+#include "eventloop/http/http3_server.h"
 #include "eventloop/http/server.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/tcp_stream.h"
@@ -626,6 +627,21 @@ auto main() -> int
         require(h2_advertised.find("\x07" "alt-svc\x14h3=\":8444\"; ma=86400") !=
                     std::string::npos, "HTTP/2 static Alt-Svc");
 #endif
+        // WebTransport needs routes. The check runs before the certificate is
+        // read, so placeholder paths are enough.
+        {
+            event_loop loop;
+            http::server_options options;
+            options.webtransport.enabled = true;
+            bool refused = false;
+            try {
+                http::http3_server server(loop, ip_endpoint::loopback_v4(0),
+                    "unused.pem", "unused.key", options);
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            require(refused, "WebTransport without routes");
+        }
     } catch (const std::exception& error) {
         std::cerr << "HTTP API test failed: " << error.what() << '\n';
         return 1;

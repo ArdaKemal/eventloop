@@ -20,7 +20,8 @@ namespace eventloop {
 // endpoint in bounded slots; quic_connection is a move-only handle that
 // must not outlive the endpoint. Caller buffers passed to stream/datagram
 // operations remain valid until the awaited operation completes, including
-// cancellation. H3/WebTransport/0-RTT are out of scope.
+// cancellation. HTTP/3 and WebTransport live in eventloop/http; 0-RTT is out
+// of scope.
 enum class quic_role { client, server };
 
 enum class quic_version { v1, v2 };

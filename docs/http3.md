@@ -85,6 +85,21 @@ Unsupported Extended CONNECT protocols answer 501. Accepted tunnels allow DATA
 and unknown extension frames; trailing HEADERS is a connection
 H3_FRAME_UNEXPECTED.
 
+With `server_options::webtransport` enabled (routes required), `webtransport-h3`
+CONNECTs are routed rather than answered 501. The control stream's SETTINGS
+additionally carry SETTINGS_H3_DATAGRAM = 1 (0x33), SETTINGS_WT_ENABLED = 1
+(0x2c7cf000), and SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, _UNI, and _MAX_DATA
+(0x2b65, 0x2b64, 0x2b61) from the options. The QUIC transport parameters add
+max_datagram_frame_size 1232 and reset_stream_at. With WebTransport disabled
+the SETTINGS bytes are unchanged. Session behavior is in
+[WebTransport](webtransport.md).
+
+With WebTransport enabled, each request stream's reads return at most 16 bytes
+until 16 bytes have been parsed, so the stream data after a WT_STREAM header is
+at most 16 bytes. A client unidirectional stream is read in at most 16-byte
+pieces until its type and session ID are complete, and the rest of that read
+is handed to the session. Disabled, reads are unchanged.
+
 ## Control streams and QPACK
 
 Each peer unidirectional stream is parsed by type with about 300 bytes of
@@ -97,7 +112,13 @@ PUSH_PROMISE, or reserved HTTP/2 frame is `H3_FRAME_UNEXPECTED`. SETTINGS
 accepts at most 32 distinct identifiers (`H3_EXCESSIVE_LOAD` beyond that)
 and rejects duplicate or HTTP/2-only identifiers, and
 `ENABLE_CONNECT_PROTOCOL` or `H3_DATAGRAM` values above 1
-(`H3_SETTINGS_ERROR`).
+(`H3_SETTINGS_ERROR`). The parser also records the WebTransport settings in
+`peer_critical_streams`: `SETTINGS_WT_ENABLED` (draft-16 0x2c7cf000) is enabled
+only for value 1, and a larger value means not enabled rather than an error, so
+the server never rejects it there. The initial `WT_MAX_STREAMS` and `WT_MAX_DATA`
+limits are stored as parsed. These fields and `settings_received` change only
+when the whole SETTINGS frame has been parsed. The `on_settings` hook then runs
+once.
 GOAWAY, MAX_PUSH_ID, and CANCEL_PUSH must hold exactly one push ID
 (`H3_FRAME_ERROR`); an increasing GOAWAY, decreasing MAX_PUSH_ID, or
 CANCEL_PUSH for an ID not previously sent in PUSH_PROMISE is `H3_ID_ERROR`.
@@ -106,7 +127,11 @@ Unknown frames are skipped by length. Because the server advertises a zero-capac
 dynamic table, the encoder stream accepts only Set Dynamic Table Capacity 0
 (`QPACK_ENCODER_STREAM_ERROR`), and the decoder stream accepts only Stream
 Cancellation (`QPACK_DECODER_STREAM_ERROR`). Unknown stream types are
-refused with STOP_SENDING `H3_STREAM_CREATION_ERROR`. Each violation closes
+refused with STOP_SENDING `H3_STREAM_CREATION_ERROR`. With WebTransport
+enabled, type 0x54 is a `webtransport` stream instead. Its session ID varint is
+parsed, possibly across reads, and parsing stops after it. `bytes_consumed()`
+gives the octets used, and the caller takes the rest as stream data. A FIN
+before the session ID is not a connection error. Each violation closes
 the connection with that code in CONNECTION_CLOSE, as does a client whose stream limit leaves no room for the
 server's three unidirectional streams (`H3_GENERAL_PROTOCOL_ERROR`). A
 connection that ends normally is closed with `H3_NO_ERROR`. The server sends
@@ -139,7 +164,12 @@ connection-specific fields, TE other than
 `trailers`, a Content-Length that is non-numeric or conflicting,
 DATA whose total differs from Content-Length, or a pseudo-header
 in trailers. A stream ending before its request HEADERS is
-`H3_REQUEST_INCOMPLETE`. A field
+`H3_REQUEST_INCOMPLETE`. With WebTransport enabled, a stream whose first frame
+type is WT_STREAM (0x41) yields a `webtransport_stream` event once its session
+ID varint is complete. The caller takes the following octets as stream data,
+and later `receive()` calls consume nothing. A 0x41 frame type anywhere else is
+`H3_FRAME_ERROR`, and a FIN before the session ID is `H3_REQUEST_INCOMPLETE`.
+A field
 section above the 16 KiB header cap or the decode limits, or If-None-Match
 values that do not fit request storage, is `H3_EXCESSIVE_LOAD`. A file read
 failure is `H3_INTERNAL_ERROR`, and a response write that fails because the
@@ -153,7 +183,8 @@ whose response may already be complete. After 1 MiB of request DATA the
 server stops reading with STOP_SENDING `H3_NO_ERROR` (RFC 9114 4.1), so
 Content-Length is not checked past that point. Routed bodies follow handler
 rules above. Shared bounded listings preserve GET length on HEAD without DATA. Static/automatic responses include Date.
-HTTP/3 server push and WebTransport are not supported.
+HTTP/3 server push is not supported. WebTransport over HTTP/3 is described in
+[WebTransport](webtransport.md).
 
 ## Allocation measurements
 

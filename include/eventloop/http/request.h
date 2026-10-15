@@ -1,6 +1,7 @@
 #pragma once
 
 #include "eventloop/task.h"
+#include "eventloop/http/webtransport.h"
 #include "eventloop/http/websocket_stream.h"
 
 #include <cstddef>
@@ -83,6 +84,18 @@ public:
     // this handler. Ordinary HTTP I/O is invalid after acceptance.
     [[nodiscard]] auto async_accept_websocket(std::string_view subprotocol = {})
         -> task<std::expected<websocket_stream, std::error_code>>;
+
+    // Accept an Extended CONNECT whose :protocol is webtransport-h3 before
+    // starting the response or reading the body, on an http3_server with
+    // server_options::webtransport enabled. The session borrows this handler:
+    // keep it inside the handler, and returning ends it. The first
+    // WT-Available-Protocols member, in client order, that appears in
+    // protocols is selected and returned as WT-Protocol; with no match, the
+    // session has no protocol. Invalid requests (not CONNECT, other
+    // :protocol, already accepted or started) return invalid_argument without
+    // a response. HTTP/1.1 and HTTP/2 return operation_not_supported.
+    [[nodiscard]] auto async_accept_webtransport(std::span<const std::string_view> protocols = {})
+        -> task<std::expected<webtransport_session, std::error_code>>;
 
 private:
     friend struct detail::request_access;
