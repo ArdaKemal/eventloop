@@ -85,7 +85,8 @@ public:
     [[nodiscard]] auto async_accept_websocket(std::string_view subprotocol = {})
         -> task<std::expected<websocket_stream, std::error_code>>;
 
-    // Accept an Extended CONNECT whose :protocol is webtransport-h3 before
+    // Accept an Extended CONNECT whose :protocol is webtransport-h3 (draft-16)
+    // or webtransport (browser draft-07) before
     // starting the response or reading the body, on an http3_server with
     // server_options::webtransport enabled. The session borrows this handler:
     // keep it inside the handler, and returning ends it. The first

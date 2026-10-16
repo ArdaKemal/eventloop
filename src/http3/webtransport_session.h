@@ -1,6 +1,6 @@
 #pragma once
 
-// Per-connection WebTransport engine (draft-ietf-webtrans-http3-16), server
+// Per-connection WebTransport engine (draft-16 and browser draft-07), server
 // role. server.cc owns one per connection slot, created with the server when
 // server_options::webtransport.enabled, and drives it through the methods
 // below; the public webtransport_session / webtransport_stream handles
@@ -73,14 +73,15 @@ public:
     // refused with WT_SESSION_GONE / dropped.
     auto request_finished(std::uint64_t request_id) noexcept -> void;
 
-    // --- Session establishment (route path for :protocol webtransport-h3) ---
+    // --- Session establishment (negotiated WebTransport CONNECT protocol) ---
 
     enum class admission {
         accepted,
         // Session table full, or a second session while flow control is
         // disabled: reset the CONNECT stream with H3_REQUEST_REJECTED.
         rejected,
-        // Client SETTINGS or transport parameters do not meet draft-16 3.1:
+        // Client SETTINGS, transport parameters, or CONNECT token do not
+        // meet the negotiated version's requirements:
         // the request is malformed, H3_MESSAGE_ERROR.
         malformed,
         // The connection ended or the waiting task was cancelled.
@@ -90,8 +91,10 @@ public:
     // SETTINGS have arrived (draft-16 3.1, draft-version negotiation rule),
     // and checks the requirements and session limits. On accepted, *slot
     // holds the reservation, which the caller must hand to establish() or
-    // release().
-    [[nodiscard]] auto admit(std::uint64_t connect_id, std::uint32_t& slot) -> task<admission>;
+    // release(). draft07 requires the legacy token/settings and no mutual
+    // draft-16 support; otherwise draft-16's RESET_STREAM_AT is mandatory.
+    [[nodiscard]] auto admit(std::uint64_t connect_id, std::uint32_t& slot,
+                              bool draft07 = false) -> task<admission>;
     // The route handler accepted: the 2xx response has been written.
     // request_frames holds the CONNECT stream parser (already switched to
     // accept_connect()) and pending the unparsed bytes already read after the

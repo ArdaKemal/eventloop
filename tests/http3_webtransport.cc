@@ -1,4 +1,4 @@
-// WebTransport over HTTP/3 (draft-16) end to end: a real http::http3_server with
+// WebTransport over HTTP/3 (draft-16 and draft-07) end to end: a real http::http3_server with
 // routes and WebTransport enabled, driven by the raw client fixture in
 // tests/fixtures/webtransport_client.h. Each case runs on its own event loop.
 #include "eventloop/event_loop.h"
@@ -498,8 +498,8 @@ auto oversize_session(event_loop&, http::request& request, http::response&) -> t
     if (!sent) obs->datagram_error = sent.error();
     big.pop_back();
     obs->write_done = flatten_result(co_await session.async_send_datagram(big)).has_value();
-    const auto small = to_bytes("ok");
-    (void)co_await session.async_send_datagram(small);
+    const auto small_payload = to_bytes("ok");
+    (void)co_await session.async_send_datagram(small_payload);
     (void)co_await session.async_accept_stream();
     obs->finished = true;
 }
@@ -860,6 +860,7 @@ auto t_settings_enabled([[maybe_unused]] event_loop& loop, env& e) -> task<void>
     check(peer.connect_protocol.value_or(0) == 1, "SETTINGS_ENABLE_CONNECT_PROTOCOL is 1");
     check(peer.h3_datagram.value_or(0) == 1, "SETTINGS_H3_DATAGRAM is 1");
     check(peer.wt_enabled.value_or(0) == 1, "SETTINGS_WT_ENABLED is 1");
+    check(peer.max_sessions_draft07 == 1, "draft-07 advertises one session");
     check(peer.initial_max_data.value_or(0) == 12345, "WT_INITIAL_MAX_DATA as configured");
     check(peer.initial_max_streams_bidi.value_or(0) == 7, "WT_INITIAL_MAX_STREAMS_BIDI as configured");
     check(peer.initial_max_streams_uni.value_or(0) == 3, "WT_INITIAL_MAX_STREAMS_UNI as configured");
@@ -871,7 +872,8 @@ auto t_settings_disabled([[maybe_unused]] event_loop& loop, env& e) -> task<void
     const auto& peer = e.client.peer_settings();
     check(peer.received, "server SETTINGS received");
     check(!peer.wt_enabled && !peer.initial_max_data && !peer.initial_max_streams_bidi &&
-          !peer.initial_max_streams_uni, "no WebTransport settings when disabled");
+          !peer.initial_max_streams_uni && !peer.max_sessions_draft07,
+          "no WebTransport settings when disabled");
     check(!peer.h3_datagram, "H3_DATAGRAM absent when WebTransport is disabled");
     co_return;
 }
@@ -919,14 +921,76 @@ auto t_disabled_501([[maybe_unused]] event_loop& loop, env& e) -> task<void>
 
 // ---- Requirements (H3_MESSAGE_ERROR on the CONNECT stream) -----------------
 
-auto expect_malformed([[maybe_unused]] event_loop& loop, env& e) -> task<void>
+auto expect_malformed([[maybe_unused]] event_loop& loop, env& e,
+                        std::string_view protocol = "webtransport-h3") -> task<void>
 {
-    auto stream = flatten_result(co_await e.client.async_send_request(request_options {}));
+    request_options request;
+    request.protocol = protocol;
+    auto stream = flatten_result(co_await e.client.async_send_request(request));
     check(stream.has_value(), "send CONNECT");
     auto head = flatten_result(co_await e.client.async_read_response(*stream));
     check(!head.has_value(), "malformed CONNECT gets no response");
     check(e.client.connection().stream_reset_code(stream->id()) == h3_message_error,
           "CONNECT stream reset with H3_MESSAGE_ERROR");
+}
+
+auto t_draft07_malformed(event_loop& loop, env& e) -> task<void>
+{
+    co_await expect_malformed(loop, e, "webtransport");
+}
+
+auto t_draft07_one_session(event_loop& loop, env& e) -> task<void>
+{
+    request_options request;
+    request.protocol = "webtransport";
+    auto first = flatten_result(co_await open_request(loop, e, request));
+    check(first && first->head.status == 200, "draft-07 accepted without RESET_STREAM_AT");
+    auto bidi = flatten_result(co_await open_bidi(loop, e, first->stream.id()));
+    check(bidi.has_value(), "open draft-07 bidi stream");
+    check(flatten_result(co_await e.client.async_write_all(*bidi, to_bytes("bidi"), true)).has_value(),
+          "write draft-07 bidi with FIN");
+    auto reply = flatten_result(co_await read_text(loop, e, *bidi, 4));
+    check(reply && *reply == "bidi", "draft-07 bidi echo");
+    auto fin = flatten_result(co_await at_fin(loop, e, *bidi));
+    check(fin && *fin, "draft-07 bidi echo has FIN");
+    auto uni = flatten_result(co_await e.client.async_open_stream(first->stream.id(), false));
+    check(uni.has_value(), "open draft-07 uni stream");
+    check(flatten_result(co_await e.client.async_write_all(*uni, to_bytes("uni"), true)).has_value(),
+          "write draft-07 uni with FIN");
+    auto peer = flatten_result(co_await e.client.async_accept_peer_stream());
+    check(peer && peer->session_id == first->stream.id() &&
+          peer->type == wt::webtransport_uni_stream_type, "draft-07 server uni stream");
+    reply = flatten_result(co_await read_text(loop, e, peer->id, 3));
+    check(reply && *reply == "uni", "draft-07 uni echo");
+    fin = flatten_result(co_await at_fin(loop, e, peer->id));
+    check(fin && *fin, "draft-07 uni echo has FIN");
+    check(flatten_result(co_await e.client.async_send_datagram(first->stream.id(), to_bytes("ping"))).has_value(),
+          "send draft-07 datagram");
+    auto datagram = flatten_result(co_await e.client.async_receive_datagram());
+    check(datagram && datagram->session_id == first->stream.id() && to_text(datagram->payload) == "ping",
+          "draft-07 datagram echo");
+    auto second = flatten_result(co_await e.client.async_send_request(request));
+    check(second.has_value(), "second draft-07 CONNECT sent");
+    check(!flatten_result(co_await e.client.async_read_response(*second)), "second draft-07 session refused");
+    check(e.client.connection().stream_reset_code(second->id()) == h3_request_rejected,
+          "draft-07 has one session even if peer sends WT_INITIAL settings");
+}
+
+auto t_draft07_reset(event_loop& loop, env& e) -> task<void>
+{
+    request_options request;
+    request.protocol = "webtransport";
+    request.path = "/bye";
+    auto session = flatten_result(co_await open_request(loop, e, request));
+    check(session && session->head.status == 200, "draft-07 close route accepted");
+    auto stream = flatten_result(co_await e.client.async_open_stream(session->stream.id(), true));
+    check(stream.has_value(), "open draft-07 bidi stream");
+    check(flatten_result(co_await e.client.async_write_all(*stream, to_bytes("hello"))).has_value(),
+          "write draft-07 stream");
+    auto error = co_await read_until_error(loop, e, *stream);
+    check(error && *error == make_error_code(quic_errc::stream_reset), "ordinary RESET_STREAM delivered");
+    check(e.client.connection().stream_reset_code(*stream) == wt_session_gone,
+          "draft-07 session close resets its stream with WT_SESSION_GONE");
 }
 
 auto t_requires_h3_datagram(event_loop& loop, env& e) -> task<void>
@@ -1077,8 +1141,8 @@ auto t_oversize_send([[maybe_unused]] event_loop& loop, env& e) -> task<void>
     check(session.has_value() && session->head.status == 200, "session accepted");
     auto maximum = flatten_result(co_await e.client.async_receive_datagram());
     check(maximum && e.obs.write_done, "maximum-sized datagram sent");
-    auto small = flatten_result(co_await e.client.async_receive_datagram());
-    check(small.has_value() && to_text(small->payload) == "ok", "small datagram after the failed send");
+    auto small_reply = flatten_result(co_await e.client.async_receive_datagram());
+    check(small_reply.has_value() && to_text(small_reply->payload) == "ok", "small datagram after the failed send");
     check(e.obs.datagram_error == make_error_code(webtransport_errc::datagram_size),
           "oversize datagram fails with datagram_size");
 }
@@ -1890,6 +1954,27 @@ auto main() -> int
     run_case("requires WT_ENABLED", make_wt({}), make_client({.wt_enabled = false}), t_requires_wt_enabled);
     run_case("requires reset_stream_at", make_wt({}), make_client({.reset_stream_at = false}), t_requires_reset_stream_at);
     run_case("requires max_datagram_frame_size", make_wt({}), make_client({.max_datagram = 0}), t_requires_max_datagram);
+    auto draft07 = make_client({.wt_enabled = false, .reset_stream_at = false});
+    draft07.settings.max_sessions_draft07 = 1;
+    run_case("draft-07 single session without RESET_STREAM_AT", make_wt({}), draft07, t_draft07_one_session);
+    run_case("draft-07 ordinary stream reset", make_wt({}), draft07, t_draft07_reset);
+    run_case("draft-16 token rejects draft-07 settings", make_wt({}), draft07, t_requires_wt_enabled);
+    auto missing_draft07 = draft07;
+    missing_draft07.settings.max_sessions_draft07 = 0;
+    run_case("draft-07 requires MAX_SESSIONS", make_wt({}), missing_draft07, t_draft07_malformed);
+    auto missing_datagrams = draft07;
+    missing_datagrams.settings.h3_datagram = false;
+    run_case("draft-07 requires H3_DATAGRAM", make_wt({}), missing_datagrams, t_draft07_malformed);
+    missing_datagrams = draft07;
+    missing_datagrams.limits.max_datagram_frame_size = 0;
+    run_case("draft-07 requires QUIC DATAGRAM", make_wt({}), missing_datagrams, t_requires_max_datagram);
+    auto both_versions = draft07;
+    both_versions.settings.wt_enabled = true;
+    both_versions.limits.reset_stream_at = true;
+    run_case("mutual draft-16 selected", make_wt({}), both_versions, t_accept);
+    run_case("mutual draft-16 rejects draft-07 token", make_wt({}), both_versions, t_draft07_malformed);
+    both_versions.limits.reset_stream_at = false;
+    run_case("draft-07 does not bypass draft-16 RESET_STREAM_AT", make_wt({}), both_versions, t_requires_reset_stream_at);
     // Protocols
     run_case("protocol negotiated", make_wt({}), default_client(), t_protocol_negotiated);
     run_case("protocol list malformed", make_wt({}), default_client(), t_protocol_malformed);

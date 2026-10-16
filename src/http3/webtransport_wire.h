@@ -27,6 +27,11 @@ namespace eventloop::http3::detail {
 inline constexpr std::uint64_t webtransport_uni_stream_type = 0x54;
 inline constexpr std::uint64_t webtransport_bidi_signal = 0x41;
 
+[[nodiscard]] constexpr auto is_webtransport_protocol(std::string_view protocol) noexcept -> bool
+{
+    return protocol == "webtransport-h3" || protocol == "webtransport";
+}
+
 // The SETTINGS identifiers (SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM,
 // and the WT_ENABLED and WT_INITIAL_* settings) are defined by peer_streams.h,
 // which this header includes.

@@ -441,6 +441,10 @@ public:
         entry.write_finished = true;
         entry.reset_sent = true;
         if (connection_ == nullptr) return;
+        if (!connection_->peer_reset_stream_at()) {
+            (void)connection_->reset_stream(entry.id, code);
+            return;
+        }
         const auto reliable = entry.local ? entry.header_length : 0;
         auto result = connection_->reset_stream_at(entry.id, code, reliable);
         if (!result && reliable != 0) (void)connection_->reset_stream(entry.id, code);
@@ -943,7 +947,8 @@ struct webtransport_access {
             if (record.phase_ == state::phase::admitting) record.settings_wakeup->notify();
     }
 
-    static auto admit(event_loop& loop, state& s, std::uint64_t connect_id, std::uint32_t& slot)
+    static auto admit(event_loop& loop, state& s, std::uint64_t connect_id, std::uint32_t& slot,
+                       bool draft07)
         -> task<admission>
     {
         (void)loop;
@@ -967,9 +972,11 @@ struct webtransport_access {
             }
         }
         const auto& critical = *s.critical_;
-        const bool requirements = critical.h3_datagram && critical.wt_enabled &&
-                                  s.connection_->peer_max_datagram_frame_size() > 0 &&
-                                  s.connection_->peer_reset_stream_at();
+        const bool version = draft07
+            ? !critical.wt_enabled && critical.wt_max_sessions_draft07 > 0
+            : critical.wt_enabled && s.connection_->peer_reset_stream_at();
+        const bool requirements = critical.h3_datagram && version &&
+                                  s.connection_->peer_max_datagram_frame_size() > 0;
         if (!requirements) {
             record.phase_ = state::phase::free;
             co_return admission::malformed;
@@ -980,7 +987,7 @@ struct webtransport_access {
         const bool peer_flow = critical.wt_initial_max_data != 0 ||
                                critical.wt_initial_max_streams_bidi != 0 ||
                                critical.wt_initial_max_streams_uni != 0;
-        s.flow_enabled_ = local_flow && peer_flow;
+        s.flow_enabled_ = !draft07 && local_flow && peer_flow;
         if (!s.flow_enabled_) {
             for (std::uint32_t i = 0; i < s.sessions_.size(); ++i) {
                 if (i == *index) continue;
@@ -1507,9 +1514,10 @@ auto webtransport_connection::shutdown() -> task<void>
     return webtransport_access::shutdown(state_->loop_, *state_);
 }
 
-auto webtransport_connection::admit(std::uint64_t connect_id, std::uint32_t& slot) -> task<admission>
+auto webtransport_connection::admit(std::uint64_t connect_id, std::uint32_t& slot, bool draft07)
+    -> task<admission>
 {
-    return webtransport_access::admit(state_->loop_, *state_, connect_id, slot);
+    return webtransport_access::admit(state_->loop_, *state_, connect_id, slot, draft07);
 }
 
 auto webtransport_connection::establish(std::uint32_t slot, const http3::detail::request_frames& frames,

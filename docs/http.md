@@ -72,6 +72,11 @@ HTTP/2/3 CONNECT handlers can inspect `connect_protocol()` and call
 operations; see [routed WebSockets](websocket.md#routed-http2-and-http3-websockets).
 Authentication/Origin policy belongs to the handler.
 
+HTTP/3 CONNECT routes can also call `async_accept_webtransport()` for negotiated
+draft-16 (`webtransport-h3`) or browser draft-07 (`webtransport`) sessions when
+`server_options::webtransport.enabled` is set. See [WebTransport](webtransport.md)
+for admission, ownership, capacity, and flow-control differences.
+
 ## Responses
 
 - `async_start` sends status/fields, `async_write` body bytes, and

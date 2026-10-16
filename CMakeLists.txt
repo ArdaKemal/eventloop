@@ -545,6 +545,27 @@ if(WIN32)
         target_link_libraries(http3_request_stream_test PRIVATE eventloop::eventloop)
         add_test(NAME http3_request_stream COMMAND http3_request_stream_test)
 
+        foreach(suffix wire engine client)
+            add_executable(http3_webtransport_${suffix}_test tests/http3_webtransport_${suffix}.cc)
+            target_include_directories(http3_webtransport_${suffix}_test PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(http3_webtransport_${suffix}_test PRIVATE
+                eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+            add_test(NAME http3_webtransport_${suffix} COMMAND http3_webtransport_${suffix}_test)
+            set_tests_properties(http3_webtransport_${suffix} PROPERTIES TIMEOUT 120)
+        endforeach()
+        target_sources(http3_webtransport_client_test PRIVATE
+            tests/fixtures/webtransport_client.cc src/http3/qpack.cc)
+
+        add_executable(http3_webtransport_test tests/http3_webtransport.cc
+            tests/fixtures/webtransport_client.cc src/http3/qpack.cc)
+        target_include_directories(http3_webtransport_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(http3_webtransport_test PRIVATE
+            eventloop::eventloop OpenSSL::SSL OpenSSL::Crypto)
+        add_test(NAME http3_webtransport COMMAND http3_webtransport_test)
+        set_tests_properties(http3_webtransport PROPERTIES TIMEOUT 120)
+
         add_executable(quic_udp_endpoint_test tests/quic_udp_endpoint.cc)
         target_include_directories(quic_udp_endpoint_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)

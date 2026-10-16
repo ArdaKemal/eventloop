@@ -2,11 +2,22 @@
 
 WebTransport over HTTP/3, server role, implementing
 [draft-ietf-webtrans-http3-16](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-16)
-(the latest revision; draft-version codepoint `SETTINGS_WT_ENABLED = 0x2c7cf000`)
+(draft-version codepoint `SETTINGS_WT_ENABLED = 0x2c7cf000`)
 with [RESET_STREAM_AT](https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-11)
 from QUIC. Shared async rules: [coroutines](coroutines.md); HTTP/3 server:
 [HTTP/3](http3.md); QUIC streams/resets: [QUIC](quic.md). Include
 `eventloop/http/webtransport.h`; names are relative to `eventloop::http`.
+Browser clients also negotiate
+[draft-ietf-webtrans-http3-07](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-07)
+using `SETTINGS_WEBTRANSPORT_MAX_SESSIONS = 0x2b603742` and
+`:protocol webtransport`. The server advertises one draft-07 session per
+connection; it uses QUIC flow control and ordinary RESET_STREAM when the peer
+does not support RESET_STREAM_AT. Draft-16 retains its mandatory settings,
+`webtransport-h3` token, RESET_STREAM_AT requirement, and session flow control.
+When the peer advertises both versions, draft-16 is selected. Both versions
+share the same loop-affine session/stream handles, borrowed-buffer lifetimes,
+bounded queues, cancellation, and close behavior below on all platforms.
+
 The library has no WebTransport client; tests use a raw test-only client
 (`tests/fixtures/webtransport_client.h`).
 
@@ -26,9 +37,9 @@ auto session_handler(event_loop&, http::request& request, http::response& respon
         co_return;
     }
     const std::array<std::string_view, 1> protocols {"chat/1"};
-    auto session = co_await request.async_accept_webtransport(protocols);
+    auto session = flatten_result(co_await request.async_accept_webtransport(protocols));
     if (!session) co_return;
-    while (auto stream = co_await session->async_accept_stream()) { /* ... */ }
+    while (auto stream = flatten_result(co_await session->async_accept_stream())) { /* ... */ }
 }
 ```
 
@@ -44,9 +55,10 @@ auto session_handler(event_loop&, http::request& request, http::response& respon
   `WT-Protocol`; the handler can close the session itself.
 - To reject, respond without accepting (403, 404, 429, ...). A matched path
   without a CONNECT route answers 405 with Allow; an unknown path 404; with
-  WebTransport disabled `:protocol webtransport-h3` answers 501.
+  WebTransport disabled either WebTransport `:protocol` token answers 501.
 - HTTP/1.1 and HTTP/2 return `operation_not_supported`; a request that is not
-  `CONNECT` with `:protocol webtransport-h3`, or already started or read,
+  `CONNECT` with the negotiated `:protocol` (`webtransport-h3` for draft-16,
+  `webtransport` for draft-07), or already started or read,
   returns `invalid_argument`.
 - Origin, authentication, and rate policy belong to the handler.
 
@@ -63,24 +75,30 @@ programming error.
 With WebTransport enabled the server's SETTINGS carry
 `ENABLE_CONNECT_PROTOCOL=1`, `H3_DATAGRAM=1`, `WT_ENABLED=1`, and
 `WT_INITIAL_MAX_STREAMS_BIDI/UNI` and `WT_INITIAL_MAX_DATA` from the options;
-the QUIC transport parameters carry `max_datagram_frame_size=1232` and an empty
+they also advertise `SETTINGS_WEBTRANSPORT_MAX_SESSIONS=1` for draft-07.
+The QUIC transport parameters carry `max_datagram_frame_size=1232` and an empty
 `reset_stream_at`. Without WebTransport none of these are sent.
 
-A `webtransport-h3` CONNECT reserves a session slot and waits for the client's
-SETTINGS before the handler runs (draft-16 3.1 and 8.1 for draft versions).
-Then:
+A WebTransport CONNECT reserves a session slot and waits for the client's
+SETTINGS before the handler runs (draft-16 3.1/7.1, draft-07 3.1).
+Admission follows the negotiated version:
 
 | Condition | Result |
 | --- | --- |
-| Client SETTINGS lack `H3_DATAGRAM=1` or `WT_ENABLED=1`, or its transport parameters lack `max_datagram_frame_size>0` or `reset_stream_at` | Malformed: CONNECT stream reset with `H3_MESSAGE_ERROR` |
+| Draft-16: client SETTINGS lack `H3_DATAGRAM=1` or `WT_ENABLED=1`, or its transport parameters lack `max_datagram_frame_size>0` or `reset_stream_at` | Malformed: CONNECT stream reset with `H3_MESSAGE_ERROR` |
+| Draft-07: client SETTINGS lack `H3_DATAGRAM=1` or positive `WEBTRANSPORT_MAX_SESSIONS`, or its transport parameters lack `max_datagram_frame_size>0` | Malformed: CONNECT stream reset with `H3_MESSAGE_ERROR` |
+| CONNECT token does not match the highest mutually supported draft | Malformed: CONNECT stream reset with `H3_MESSAGE_ERROR` |
 | Client `H3_DATAGRAM=1` without QUIC DATAGRAM | Connection error `H3_SETTINGS_ERROR` (RFC 9297 2.1.1) |
 | `max_sessions` reserved or open sessions on the connection | `H3_REQUEST_REJECTED` |
-| Session flow control disabled and another session exists | `H3_REQUEST_REJECTED` (draft-16 5.1) |
+| Session flow control disabled, including draft-07, and another session exists | `H3_REQUEST_REJECTED` |
 | Scheme other than `https` | `H3_MESSAGE_ERROR` |
 
-Session flow control is enabled when both endpoints send a nonzero
-`WT_INITIAL_*` setting. `WT_ENABLED` values other than 1 from a client mean
-"not supported" (the `H3_SETTINGS_ERROR` rule binds clients only).
+Draft-16 session flow control is enabled when both endpoints send a nonzero
+`WT_INITIAL_*` setting. Draft-07 never enables session flow control, even if the
+peer sends `WT_INITIAL_*`; it admits one session and uses QUIC flow control.
+Advertising draft-07 does not waive draft-16's RESET_STREAM_AT requirement when
+the peer also advertises draft-16. `WT_ENABLED` values other than 1 from a client
+mean "not supported" (the `H3_SETTINGS_ERROR` rule binds clients only).
 
 ## Streams
 
@@ -93,9 +111,10 @@ application reads. `0x41` anywhere but the first bytes of a request stream is
 a connection `H3_ID_ERROR`.
 
 `async_accept_stream()` returns peer streams in arrival order;
-`async_open_stream(direction)` opens one and writes its header, waiting while
-the peer's `WT_MAX_STREAMS` is reached (`WT_STREAMS_BLOCKED` is sent once per
-limit); a QUIC stream-limit refusal returns `capacity_exceeded` at once.
+`async_open_stream(direction)` opens one and writes its header. With session
+flow control enabled, it waits while the peer's `WT_MAX_STREAMS` is reached
+(`WT_STREAMS_BLOCKED` is sent once per limit); a QUIC stream-limit refusal
+returns `capacity_exceeded` at once in either draft.
 `webtransport_stream` I/O follows `quic_connection`: `async_read` returns 0 at
 FIN, `async_write` may accept fewer bytes than supplied, one read and one write
 may be pending. Errors:
@@ -107,11 +126,14 @@ may be pending. Errors:
 - Peer STOP_SENDING on a write: `stream_reset` with `error_code()` likewise.
 - After a local `reset()`/`stop_sending()`: `stream_closed`.
 
-`reset(code)` sends RESET_STREAM_AT with the mapped code and the stream header
-as reliable size, so the peer can still associate the stream with its session;
+For draft-16, `reset(code)` sends RESET_STREAM_AT with the mapped code and the
+stream header as reliable size, so the peer can still associate the stream with
+its session;
 on a peer-initiated bidirectional stream nothing of ours precedes the body, so
 the reliable size is 0. Destroying an unfinished stream handle resets and stops
 it with application code 0.
+Draft-07 uses ordinary RESET_STREAM when the peer lacks RESET_STREAM_AT;
+reset error delivery before a stream header arrives is best effort in that draft.
 
 ## Datagrams
 
@@ -156,7 +178,8 @@ ignored (draft-16 5.1).
 
 A session ends when either side sends `WT_CLOSE_SESSION`, the CONNECT stream
 ends or is reset, the handler returns, or the connection closes. Then every
-stream of the session is reset (RESET_STREAM_AT, header reliable) and stopped
+stream of the session is reset (RESET_STREAM_AT with a reliable header, or
+ordinary RESET_STREAM for draft-07 peers without the extension) and stopped
 with `WT_SESSION_GONE`, queued streams and datagrams are dropped, no streams
 or datagrams are sent, and pending operations complete with `session_closed`.
 `close_info()` reports the code, reason, and whether the peer ended it.
@@ -181,7 +204,7 @@ Per connection, reserved when the server is constructed:
 
 | Resource | Bound |
 | --- | --- |
-| `max_sessions` | 4 by default; 1..16 |
+| `max_sessions` | 4 by default; 1..16 reserved slots; draft-07 admits only one session |
 | Session buffers | about 6 KiB each (CONNECT read buffer, capsule send buffer, datagram scratch, close reason, protocol) |
 | Received datagrams | `datagram_queue` (8; 1..64) x 1200 bytes per session |
 | Stream table | 216 entries (QUIC's 100 + 8 streams per initiator), at most 16 unread body bytes each |
@@ -232,12 +255,15 @@ directions; see [QUIC](quic.md#reset-and-stop-sending).
   reads them. A peer that exceeds `WT_MAX_DATA` is detected when the excess
   is read and still exceeds the credit advertised by then; QUIC's own
   connection and stream windows bound buffered data regardless.
-- Only draft-16 is negotiated; clients speaking earlier drafts (different
-  `WT_ENABLED` codepoints) see no WebTransport support. Interop was verified
+- Draft-16 interop was verified
   with pywebtransport 0.20.1 (draft-16 settings) for session setup, protocol
   negotiation, bidirectional and unidirectional echo, datagrams, flow-control
   settings and close, using a local build that waived the `reset_stream_at`
   requirement, because its QUIC stack (quinn 0.11) does not advertise
   RESET_STREAM_AT. Unmodified, this server rejects such clients as draft-16
-  requires. Browsers were not tested: none available here speaks draft-16.
+  requires. Browser draft-07 interop was verified on Windows IOCP with Chromium
+  155.0.0.0 on 2026-10-15: `echo/1` negotiation, 32- and 1000-byte datagrams,
+  64 KiB bidirectional and unidirectional echoes including FIN, and clean
+  session close with code and reason. Browser draft-16, Firefox, and Safari
+  were not tested.
 - 0-RTT is not supported by the server, so the 0-RTT settings rules do not apply.

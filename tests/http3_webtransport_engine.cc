@@ -19,7 +19,11 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1418,7 +1422,13 @@ auto reset_client(event_loop& loop, client_side& cs, scenario& s) -> task<void>
 auto main() -> int
 {
     const auto directory = std::filesystem::temp_directory_path() /
-                           ("eventloop-webtransport-engine-" + std::to_string(::getpid()));
+                           ("eventloop-webtransport-engine-" + std::to_string(
+#ifdef _WIN32
+                               ::_getpid()
+#else
+                               ::getpid()
+#endif
+                           ));
     std::filesystem::create_directories(directory);
     if (!make_certificate(directory)) {
         std::fprintf(stderr, "WebTransport engine: certificate generation failed\n");

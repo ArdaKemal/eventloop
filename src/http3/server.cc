@@ -14,6 +14,7 @@
 #include "request_stream.h"
 #include "qpack.h"
 #include "webtransport_session.h"
+#include "webtransport_wire.h"
 
 #include <algorithm>
 #include <array>
@@ -766,13 +767,14 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
         fail(connection, id, h3::h3_error::excessive_load);
         co_return;
     }
-    // A webtransport-h3 CONNECT is admitted before the handler runs: the engine
+    // A WebTransport CONNECT is admitted before the handler runs: the engine
     // waits for the client's SETTINGS and reserves a session slot.
     detail::webtransport_connection* engine =
-        head.connect_protocol == "webtransport-h3" ? s.webtransport : nullptr;
+        h3::is_webtransport_protocol(head.connect_protocol) ? s.webtransport : nullptr;
     std::uint32_t engine_slot = 0;
     if (engine != nullptr) {
-        const auto admitted = co_await engine->admit(id, engine_slot);
+        const auto admitted = co_await engine->admit(id, engine_slot,
+                                                    head.connect_protocol == "webtransport");
         if (!admitted) co_return;
         using admission = detail::webtransport_connection::admission;
         if (*admitted == admission::rejected) {
@@ -846,7 +848,7 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         detail::method_from_name(head.method), head.path.substr(0, head.path.find('?')));
     const bool extended = !head.connect_protocol.empty();
     const bool webtransport = s.webtransport != nullptr &&
-        head.connect_protocol == "webtransport-h3";
+        h3::is_webtransport_protocol(head.connect_protocol);
     const bool unsupported = extended && head.connect_protocol != "websocket" && !webtransport;
     if (match.allowed == 0 && !extended) co_return false;
     // The body limit does not apply to a WebTransport CONNECT: its stream
@@ -947,7 +949,7 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     const auto path = s.head.path;
     const bool https = h3::ascii_equal(s.head.scheme, "https");
     const bool webtransport = s.webtransport != nullptr &&
-        s.head.connect_protocol == "webtransport-h3";
+        h3::is_webtransport_protocol(s.head.connect_protocol);
     if ((s.head.connect_protocol == "websocket" || webtransport) && !https) {
         fail(connection, id, h3::h3_error::message_error);
         co_return;
@@ -1150,7 +1152,7 @@ auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t 
 auto encode_control_stream(bool extended, const webtransport_options* webtransport,
                            std::span<std::byte> output) noexcept -> std::size_t
 {
-    std::array<h3::setting, 8> settings {};
+    std::array<h3::setting, 9> settings {};
     std::size_t count = 0;
     settings[count++] = {h3::qpack_max_table_capacity, 0};
     settings[count++] = {h3::qpack_blocked_streams, 0};
@@ -1158,13 +1160,14 @@ auto encode_control_stream(bool extended, const webtransport_options* webtranspo
     if (webtransport != nullptr) {
         settings[count++] = {h3::h3_datagram_setting, 1};
         settings[count++] = {h3::wt_enabled_setting, 1};
+        settings[count++] = {h3::wt_max_sessions_draft07_setting, 1};
         settings[count++] = {h3::wt_initial_max_streams_uni_setting,
                              webtransport->initial_max_streams_uni};
         settings[count++] = {h3::wt_initial_max_streams_bidi_setting,
                              webtransport->initial_max_streams_bidi};
         settings[count++] = {h3::wt_initial_max_data_setting, webtransport->initial_max_data};
     }
-    // The worst case is 43 bytes: five settings with eight-byte values.
+    // At most 48 bytes, including eight-byte values for the three WT limits.
     std::array<std::byte, 64> payload {};
     const auto payload_size = h3::encode_settings(
         std::span<const h3::setting>(settings).first(count), payload, settings.size());

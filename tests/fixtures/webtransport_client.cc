@@ -167,6 +167,8 @@ auto apply_setting(server_settings& out, const h3::setting& item) -> void
     if (item.identifier == connect_protocol_setting) out.connect_protocol = item.value;
     else if (item.identifier == h3_datagram_setting) out.h3_datagram = item.value;
     else if (item.identifier == wire::wt_enabled_setting) out.wt_enabled = item.value;
+    else if (item.identifier == wire::wt_max_sessions_draft07_setting)
+        out.max_sessions_draft07 = item.value;
     else if (item.identifier == wire::wt_initial_max_data_setting) out.initial_max_data = item.value;
     else if (item.identifier == wire::wt_initial_max_streams_bidi_setting)
         out.initial_max_streams_bidi = item.value;
@@ -577,6 +579,8 @@ auto encode_settings_frame(const client_settings& settings, std::span<std::byte>
     if (settings.connect_protocol) add(connect_protocol_setting, 1);
     if (settings.h3_datagram) add(h3_datagram_setting, 1);
     if (settings.wt_enabled) add(wire::wt_enabled_setting, 1);
+    if (settings.max_sessions_draft07)
+        add(wire::wt_max_sessions_draft07_setting, *settings.max_sessions_draft07);
     if (settings.initial_max_data) add(wire::wt_initial_max_data_setting, *settings.initial_max_data);
     if (settings.initial_max_streams_bidi)
         add(wire::wt_initial_max_streams_bidi_setting, *settings.initial_max_streams_bidi);

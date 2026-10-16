@@ -32,6 +32,7 @@ struct client_settings {
     std::optional<std::uint64_t> initial_max_data {1024 * 1024};
     std::optional<std::uint64_t> initial_max_streams_bidi {16};
     std::optional<std::uint64_t> initial_max_streams_uni {16};
+    std::optional<std::uint64_t> max_sessions_draft07;
 };
 
 struct client_options {
@@ -51,6 +52,7 @@ struct server_settings {
     std::optional<std::uint64_t> initial_max_data;
     std::optional<std::uint64_t> initial_max_streams_bidi;
     std::optional<std::uint64_t> initial_max_streams_uni;
+    std::optional<std::uint64_t> max_sessions_draft07;
 };
 
 // Fields of an Extended CONNECT (or ordinary) request. Empty views are omitted

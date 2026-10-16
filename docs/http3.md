@@ -86,11 +86,15 @@ and unknown extension frames; trailing HEADERS is a connection
 H3_FRAME_UNEXPECTED.
 
 With `server_options::webtransport` enabled (routes required), `webtransport-h3`
-CONNECTs are routed rather than answered 501. The control stream's SETTINGS
+(draft-16) and `webtransport` (draft-07) CONNECTs are routed rather than answered
+501. The control stream's SETTINGS
 additionally carry SETTINGS_H3_DATAGRAM = 1 (0x33), SETTINGS_WT_ENABLED = 1
 (0x2c7cf000), and SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, _UNI, and _MAX_DATA
-(0x2b65, 0x2b64, 0x2b61) from the options. The QUIC transport parameters add
-max_datagram_frame_size 1232 and reset_stream_at. With WebTransport disabled
+(0x2b65, 0x2b64, 0x2b61) from the options, plus draft-07
+SETTINGS_WEBTRANSPORT_MAX_SESSIONS = 1 (0x2b603742). Browser draft-07
+CONNECTs use the same session API. Draft-16 takes precedence when both versions
+are advertised. The QUIC transport parameters add max_datagram_frame_size 1232
+and reset_stream_at. With WebTransport disabled
 the SETTINGS bytes are unchanged. Session behavior is in
 [WebTransport](webtransport.md).
 
@@ -115,7 +119,9 @@ and rejects duplicate or HTTP/2-only identifiers, and
 (`H3_SETTINGS_ERROR`). The parser also records the WebTransport settings in
 `peer_critical_streams`: `SETTINGS_WT_ENABLED` (draft-16 0x2c7cf000) is enabled
 only for value 1, and a larger value means not enabled rather than an error, so
-the server never rejects it there. The initial `WT_MAX_STREAMS` and `WT_MAX_DATA`
+the server never rejects it there. `SETTINGS_WEBTRANSPORT_MAX_SESSIONS`
+(draft-07 0x2b603742) is stored as an integer; zero means unsupported.
+The initial `WT_MAX_STREAMS` and `WT_MAX_DATA`
 limits are stored as parsed. These fields and `settings_received` change only
 when the whole SETTINGS frame has been parsed. The `on_settings` hook then runs
 once.

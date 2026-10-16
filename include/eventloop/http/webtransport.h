@@ -13,10 +13,11 @@
 
 namespace eventloop::http {
 
-// WebTransport over HTTP/3 (draft-ietf-webtrans-http3-16), server role.
+// WebTransport over HTTP/3 (draft-16 and browser draft-07), server role.
 // Enable it with server_options::webtransport on an http3_server with routes;
 // a route handler accepts an Extended CONNECT request whose :protocol is
-// webtransport-h3 with request::async_accept_webtransport(). See
+// webtransport-h3 (draft-16) or webtransport (draft-07) with
+// request::async_accept_webtransport(). See
 // docs/webtransport.md.
 //
 // Zero is reserved for success, as std::error_code requires.
@@ -56,6 +57,7 @@ struct webtransport_options {
     // Concurrent sessions per HTTP/3 connection, 1..16. A CONNECT beyond it
     // is refused with H3_REQUEST_REJECTED. When the client does not enable
     // session flow control the limit is one session (draft-16 5.1).
+    // Browser draft-07 always advertises and admits one session per connection.
     std::size_t max_sessions {4};
     // Initial session limits advertised in SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI,
     // _UNI and _MAX_DATA. Credit is renewed as the application consumes data
@@ -102,7 +104,7 @@ public:
     webtransport_stream(const webtransport_stream&) = delete;
     auto operator=(const webtransport_stream&) -> webtransport_stream& = delete;
     // Abandons any direction still open: RESET_STREAM_AT and STOP_SENDING
-    // with application code 0.
+    // with application code 0; draft-07 peers without RESET_STREAM_AT use RESET_STREAM.
     ~webtransport_stream();
 
     [[nodiscard]] auto valid() const noexcept -> bool;
@@ -123,7 +125,8 @@ public:
     [[nodiscard]] auto async_write(std::span<const std::byte> buffer, bool fin = false)
         -> task<std::expected<std::size_t, std::error_code>>;
     // Abandons sending with RESET_STREAM_AT, keeping the stream header
-    // reliable (draft-16 4.4). A finished send side is unchanged.
+    // reliable (draft-16 4.4). Draft-07 uses RESET_STREAM if the peer lacks
+    // RESET_STREAM_AT. A finished send side is unchanged.
     auto reset(std::uint32_t code) noexcept -> std::expected<void, std::error_code>;
     // Asks the peer to stop sending with STOP_SENDING.
     auto stop_sending(std::uint32_t code) noexcept -> std::expected<void, std::error_code>;

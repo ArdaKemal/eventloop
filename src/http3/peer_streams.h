@@ -17,6 +17,7 @@ namespace eventloop::http3::detail {
 inline constexpr std::uint64_t enable_connect_protocol_setting = 0x08;
 inline constexpr std::uint64_t h3_datagram_setting = 0x33;
 inline constexpr std::uint64_t wt_enabled_setting = 0x2c7cf000; // draft-16 codepoint
+inline constexpr std::uint64_t wt_max_sessions_draft07_setting = 0x2b603742;
 inline constexpr std::uint64_t wt_initial_max_streams_uni_setting = 0x2b64;
 inline constexpr std::uint64_t wt_initial_max_streams_bidi_setting = 0x2b65;
 inline constexpr std::uint64_t wt_initial_max_data_setting = 0x2b61;
@@ -48,6 +49,7 @@ struct peer_critical_streams {
     bool h3_datagram {false};      // SETTINGS_H3_DATAGRAM == 1 (RFC 9297 2.1.1)
     bool connect_protocol {false}; // SETTINGS_ENABLE_CONNECT_PROTOCOL == 1
     bool wt_enabled {false};       // SETTINGS_WT_ENABLED == 1 (draft-16)
+    std::uint64_t wt_max_sessions_draft07 {0};
     std::uint64_t wt_initial_max_streams_bidi {0};
     std::uint64_t wt_initial_max_streams_uni {0};
     std::uint64_t wt_initial_max_data {0};
@@ -123,6 +125,7 @@ private:
         bool h3_datagram {false};
         bool connect_protocol {false};
         bool wt_enabled {false};
+        std::uint64_t wt_max_sessions_draft07 {0};
         std::uint64_t wt_initial_max_streams_bidi {0};
         std::uint64_t wt_initial_max_streams_uni {0};
         std::uint64_t wt_initial_max_data {0};
@@ -253,6 +256,8 @@ private:
                     return std::unexpected(h3_error::settings_error);
                 if (identifier == max_field_section_size) critical.max_field_section_size = *value;
                 if (identifier == wt_enabled_setting) pending_.wt_enabled = *value == 1;
+                else if (identifier == wt_max_sessions_draft07_setting)
+                    pending_.wt_max_sessions_draft07 = *value;
                 else if (identifier == wt_initial_max_streams_bidi_setting)
                     pending_.wt_initial_max_streams_bidi = *value;
                 else if (identifier == wt_initial_max_streams_uni_setting)
@@ -301,6 +306,7 @@ private:
         critical.h3_datagram = pending_.h3_datagram;
         critical.connect_protocol = pending_.connect_protocol;
         critical.wt_enabled = pending_.wt_enabled;
+        critical.wt_max_sessions_draft07 = pending_.wt_max_sessions_draft07;
         critical.wt_initial_max_streams_bidi = pending_.wt_initial_max_streams_bidi;
         critical.wt_initial_max_streams_uni = pending_.wt_initial_max_streams_uni;
         critical.wt_initial_max_data = pending_.wt_initial_max_data;

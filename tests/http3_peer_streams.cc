@@ -231,6 +231,18 @@ auto settings_recording() -> void
               probe.calls == 1 && !critical.wt_enabled, "empty SETTINGS completes");
     }
     {
+        peer_critical_streams critical;
+        peer_uni_stream stream;
+        const auto frame = settings_stream({{wt_max_sessions_draft07_setting, 1}});
+        for (std::size_t i = 0; i < frame.size(); ++i) {
+            check(stream.receive(std::span(frame).subspan(i, 1), critical).has_value(),
+                  "fragmented draft-07 SETTINGS accepted");
+            check(critical.wt_max_sessions_draft07 == (i + 1 == frame.size() ? 1u : 0u),
+                  "draft-07 setting committed only when complete");
+        }
+        check(!critical.wt_enabled, "draft-07 does not enable draft-16");
+    }
+    {
         // Values of SETTINGS_WT_ENABLED other than 1 mean not enabled. A server
         // does not reject them here.
         for (const std::uint64_t value : {0ull, 2ull, 3ull}) {

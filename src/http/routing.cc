@@ -87,7 +87,7 @@ auto accept_webtransport_task(event_loop& loop, exchange& owner, const request& 
     if (incoming.protocol() == http::protocol::http1_1)
         co_return std::unexpected(failure(std::errc::operation_not_supported));
     if (owner.websocket_accepted || owner.body_read || incoming.method() != method_type::connect ||
-        incoming.connect_protocol() != "webtransport-h3")
+        !wire::is_webtransport_protocol(incoming.connect_protocol()))
         co_return std::unexpected(failure(std::errc::invalid_argument));
     std::array<std::string_view, 16> offered {};
     std::optional<std::size_t> count;
