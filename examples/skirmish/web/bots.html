@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skirmish bots</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="bots">
+<header>
+  <h1>Skirmish bots</h1>
+  <span id="summary"></span>
+  <button id="stop" type="button">Stop</button>
+</header>
+<table id="table">
+  <thead>
+    <tr>
+      <th>Bot</th><th>State</th><th>RTT ms</th><th>Snap/s</th><th>Loss %</th>
+      <th>Kills / deaths</th><th>Killcams recv / aborted</th><th>Close reason</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+  <tfoot></tfoot>
+</table>
+<script type="module" src="bots.js"></script>
+</body>
+</html>

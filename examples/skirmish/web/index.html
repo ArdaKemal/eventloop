@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skirmish</title>
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<canvas id="view"></canvas>
+<canvas id="minimap" width="200" height="200"></canvas>
+<div id="crosshair"></div>
+
+<div id="hud">
+  <div id="health">HP 100</div>
+  <div id="rocket"><div id="rocket-bar"></div><span>ROCKET</span></div>
+  <div id="respawn" hidden></div>
+  <div id="dead" hidden>YOU DIED</div>
+  <div id="killcam" hidden><b>KILLCAM</b> <span id="killcam-text"></span> <i>Space to skip</i></div>
+  <div id="feed"></div>
+  <div id="chatlog"></div>
+  <form id="chatbox" hidden>
+    <input id="chatinput" maxlength="200" autocomplete="off" placeholder="say something - Enter sends, Esc cancels">
+  </form>
+  <div id="hint">WASD move - mouse look - LMB rifle - RMB rocket - T chat - Tab scores - F3 net stats - M minimap</div>
+  <table id="scoreboard" hidden>
+    <thead><tr><th>Player</th><th>Kills</th><th>Deaths</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <pre id="stats" hidden></pre>
+</div>
+
+<div id="overlay">
+  <form id="join">
+    <h1>SKIRMISH</h1>
+    <input id="name" maxlength="16" placeholder="your name" autocomplete="off" required>
+    <button id="connect" type="submit">Connect</button>
+    <p id="joinmsg"></p>
+  </form>
+</div>
+
+<script type="module" src="game.js"></script>
+</body>
+</html>
