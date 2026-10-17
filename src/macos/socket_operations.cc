@@ -133,6 +133,11 @@ auto socket_operations::configure_client(native_socket socket,
     -> std::error_code
 {
     if (set_ipv6_only(socket, endpoint) == -1) return code(errno);
+    // As for accepted sockets: Nagle would hold a small write until the
+    // previous one is acknowledged, often a delayed-ACK interval.
+    const int enabled = 1;
+    if (::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &enabled,
+                     sizeof(enabled)) == -1) return code(errno);
     return {};
 }
 

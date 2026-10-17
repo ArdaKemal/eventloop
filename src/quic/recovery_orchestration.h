@@ -272,11 +272,11 @@ public:
             (!last_persistent_endpoint_ ||
              *endpoint > *last_persistent_endpoint_);
         if (persistent) controller.on_persistent_congestion();
-        auto histories = histories_;
-        histories[*index] = history;
-        prune_events(events, event_count, histories);
-        bound_events(events, event_count);
+        // All failure checks precede this commit; pruning needs only the
+        // updated history, not another copy of all packet-number spaces.
         histories_[*index] = history;
+        prune_events(events, event_count, histories_);
+        bound_events(events, event_count);
         congestion_ = controller;
         rtt_ = estimator;
         first_sample_highest_sent_ = first_sample;

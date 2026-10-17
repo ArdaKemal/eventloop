@@ -77,6 +77,8 @@ Standalone applications build from their own example directories:
   playback, and concurrent disconnect stress tests.
 
 Root test fixtures are in `tests/fixtures/`; benchmarks are in `benchmark/`.
+[Latency optimization](docs/latency-optimization.md) covers TCP/TLS and HTTP/2/3
+experiments, measurement rules, and further optimization.
 [API conventions](docs/api-conventions.md) guide API changes;
 [the contract index](docs/api-contract.md) links shared rules and topic details.
 

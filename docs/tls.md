@@ -15,6 +15,9 @@ Setup/inherited operations: [TCP](tcp.md). Names below are in `eventloop`.
   verification hostname (also SNI); `application_protocols` sets ALPN.
   Await inherited connect before handshake; unconnected handshake is `ENOTCONN`.
   Raw TCP send-file is hidden because it bypasses TLS framing.
+- On Linux a server handshake starts when the ClientHello is readable, not
+  inline after accept, so its CPU-heavy first flight queues behind sockets
+  that were already ready.
 - A `tls_context` is immutable once created (session cache and tickets are
   off), so streams on different loops and threads may share one.
 - Contexts require TLS 1.2 or later. TLS 1.2 offers only ECDHE/DHE suites

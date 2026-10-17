@@ -134,6 +134,8 @@ request/sink arguments, limits, and errors as `async_request`, on client
 streams 1, 3, 5, and so on; `async_close()` sends GOAWAY and closes.
 Connection state (HPACK decoder table, peer SETTINGS, connection send window)
 persists across requests; the connection preface is sent with the first.
+Consumed DATA returns connection credit even when it ends a stream, so later
+requests can use the full connection window.
 An empty `:authority` uses the connection hostname.
 
 `can_reuse_for(hostname, endpoint)` is true while the connection is open, has

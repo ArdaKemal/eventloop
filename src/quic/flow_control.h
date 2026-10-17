@@ -8,6 +8,7 @@
 #include <expected>
 #include <optional>
 #include <type_traits>
+#include <utility>
 
 namespace eventloop::quic::detail {
 
@@ -233,19 +234,28 @@ public:
 
     // The application has consumed newly delivered contiguous bytes. Gaps and
     // duplicate delivery are the caller's responsibility. Consumption does not
-    // itself advertise credit; replenish_* returns the current advertised
-    // absolute limit after adding the requested window to consumed bytes.
+    // itself advertise credit unless windows are supplied. Validate both
+    // windows before changing any counters; return their absolute limits.
     [[nodiscard]] constexpr auto consume(std::uint64_t id,
-                                          std::uint64_t bytes) noexcept
-        -> std::expected<void, flow_control_error>
+        std::uint64_t bytes, std::uint64_t window = 0,
+        std::uint64_t stream_window = 0) noexcept
+        -> std::expected<std::pair<std::uint64_t, std::uint64_t>, flow_control_error>
     {
         auto* stream = find(id);
         if (!stream) return std::unexpected(flow_control_error::unknown_stream);
         if (bytes > stream->received - stream->consumed)
             return std::unexpected(flow_control_error::over_consumed);
+        const auto total = consumed_ + bytes;
+        const auto consumed = stream->consumed + bytes;
+        if (window > max_varint_value - total ||
+            stream_window > max_varint_value - consumed)
+            return std::unexpected(flow_control_error::invalid_value);
         stream->consumed += bytes;
         consumed_ += bytes; // consumed_ <= received_total_ <= max_varint_value
-        return {};
+        if (total + window > receive_limit_) receive_limit_ = total + window;
+        if (consumed + stream_window > stream->receive_limit)
+            stream->receive_limit = consumed + stream_window;
+        return std::pair {receive_limit_, stream->receive_limit};
     }
 
     [[nodiscard]] constexpr auto replenish_receive_max_data(

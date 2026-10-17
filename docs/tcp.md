@@ -16,6 +16,9 @@ Names below are in `eventloop`.
   `EALREADY`. Immediate connect failure leaves the stream registered for
   inspection/close; pending connect failure or cancellation removes it.
   Check results or saved descriptors before retaining a pointer after failure.
+- Accepted and outbound TCP streams set `TCP_NODELAY`. On POSIX, `close()`
+  immediately issues a bidirectional shutdown; descriptor release may wait for
+  the current dispatch to finish.
 - `async_send_file(header, file, offset, size)` takes file ownership and sends
   the borrowed header followed by the range without moving the file position.
   Keep the header valid through completion. It returns

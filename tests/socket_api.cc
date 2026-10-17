@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #endif
 
@@ -77,6 +78,21 @@ auto finish(event_loop& loop, int& completed, bool passed) -> void
     if (++completed == 2) loop.stop();
 }
 
+[[nodiscard]] auto no_delay(native_socket descriptor) -> bool
+{
+#ifdef _WIN32
+    BOOL enabled = FALSE;
+    int length = sizeof(enabled);
+    return ::getsockopt(static_cast<SOCKET>(descriptor), IPPROTO_TCP, TCP_NODELAY,
+                        reinterpret_cast<char*>(&enabled), &length) == 0 && enabled;
+#else
+    int enabled = 0;
+    socklen_t length = sizeof(enabled);
+    return ::getsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY,
+                        &enabled, &length) == 0 && enabled != 0;
+#endif
+}
+
 auto tcp_server(event_loop& loop, tcp_acceptor& listener, int& completed,
                 bool& passed) -> task<void>
 {
@@ -86,12 +102,10 @@ auto tcp_server(event_loop& loop, tcp_acceptor& listener, int& completed,
         co_return;
     }
     listener.close();
-    bool no_delay = true;
-#ifndef _WIN32
-    int enabled = 0;
-    socklen_t length = sizeof(enabled);
-    no_delay = ::getsockopt(accepted->get(), IPPROTO_TCP, TCP_NODELAY,
-                            &enabled, &length) == 0 && enabled != 0;
+#ifdef _WIN32
+    const bool accepted_no_delay = true;
+#else
+    const bool accepted_no_delay = no_delay(accepted->get());
 #endif
     auto stream = std::make_unique<tcp_stream>(loop, std::move(*accepted));
     auto* peer = stream.get();
@@ -100,7 +114,7 @@ auto tcp_server(event_loop& loop, tcp_acceptor& listener, int& completed,
     const auto read = co_await peer->async_read_some(input);
     constexpr std::array<std::byte, 1> reply {std::byte {'b'}};
     const auto write = co_await peer->async_write_some(reply);
-    passed = no_delay && read && *read == 1 && input[0] == std::byte {'a'} &&
+    passed = accepted_no_delay && read && *read == 1 && input[0] == std::byte {'a'} &&
              write && *write == 1;
     peer->close();
     finish(loop, completed, passed);
@@ -119,7 +133,7 @@ auto tcp_client(event_loop& loop, tcp_stream& peer, int& completed,
     const auto write = co_await peer.async_write_some(request);
     std::array<std::byte, 1> reply {};
     const auto read = co_await peer.async_read_some(reply);
-    passed = write && *write == 1 && read && *read == 1 &&
+    passed = no_delay(peer.descriptor()) && write && *write == 1 && read && *read == 1 &&
              reply[0] == std::byte {'b'};
     peer.close();
     finish(loop, completed, passed);
@@ -152,6 +166,62 @@ auto tcp_client(event_loop& loop, tcp_stream& peer, int& completed,
     return !timed_out && completed == 2 && server_ok && client_ok &&
            loop.coroutine_statistics().live == 0;
 }
+
+#ifndef _WIN32
+// Closes from a read completion, inside the loop's dispatch of that socket,
+// and checks that the peer sees end of stream before the dispatch returns.
+auto fin_server(event_loop& loop, tcp_acceptor& listener, native_socket client,
+                bool& fin_seen) -> task<void>
+{
+    auto accepted = co_await listener.async_accept();
+    listener.close();
+    if (!accepted) {
+        loop.shutdown(0ms);
+        co_return;
+    }
+    auto stream = std::make_unique<tcp_stream>(loop, std::move(*accepted));
+    auto* peer = stream.get();
+    loop.add(std::move(stream));
+    std::array<std::byte, 1> input {};
+    const auto read = co_await peer->async_read_some(input);
+    peer->close();
+    pollfd ready {.fd = client, .events = POLLIN, .revents = 0};
+    std::byte peeked {};
+    fin_seen = read && *read == 1 && ::poll(&ready, 1, 1000) == 1 &&
+               ::recv(client, &peeked, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+    loop.shutdown(0ms);
+}
+
+auto fin_client(event_loop& loop, tcp_stream& peer) -> task<void>
+{
+    if (!co_await peer.async_connect()) co_return;
+    // Lets the server's read suspend, so it completes from the poller.
+    (void)co_await sleep_for(loop, 20ms);
+    constexpr std::array<std::byte, 1> request {std::byte {'a'}};
+    (void)co_await peer.async_write_some(request);
+}
+
+[[nodiscard]] auto test_close_sends_fin() -> bool
+{
+    event_loop loop;
+    auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4());
+    auto* accepting = listener.get();
+    auto client = std::make_unique<tcp_stream>(loop, listener_endpoint(*accepting));
+    auto* connecting = client.get();
+    loop.add(std::move(listener));
+    loop.add(std::move(client));
+    bool fin_seen = false;
+    bool timed_out = false;
+    check(loop.spawn(fin_server(loop, *accepting, connecting->descriptor(), fin_seen)) ==
+              task_spawn_result::accepted, "spawn FIN server");
+    check(loop.spawn(fin_client(loop, *connecting)) ==
+              task_spawn_result::accepted, "spawn FIN client");
+    check(loop.spawn(watchdog(loop, timed_out)) ==
+              task_spawn_result::accepted, "spawn FIN watchdog");
+    return loop.run() == event_loop_result::stopped && !timed_out && fin_seen &&
+           loop.coroutine_statistics().live == 0;
+}
+#endif
 
 auto cancelled_read(event_loop& loop, tcp_stream& stream, bool& started,
                     bool& cancelled) -> task<void>
@@ -449,6 +519,9 @@ auto main() -> int
         check(test_concurrent_tcp_cancel(),
               "concurrent TCP cancellation failed");
         check(test_pending_accept_cancel(), "pending accept cancellation failed");
+#ifndef _WIN32
+        check(test_close_sends_fin(), "TCP close did not send FIN promptly");
+#endif
         check(test_udp(), "UDP public API roundtrip failed");
 #ifdef EVENTLOOP_TEST_TLS
         check(test_tls(), "TLS public API roundtrip failed");

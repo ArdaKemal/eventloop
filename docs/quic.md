@@ -114,6 +114,8 @@ A server endpoint keeps one slot free: when a connection enters retention and
 no slot is free, the oldest retained connection's period ends early, and a
 late packet for it is dropped (the endpoint sends no stateless resets). Live
 connections are never reclaimed, so capacity exhaustion by them is unchanged.
+If an Initial arrives before pending retirement completes, admission retries
+that buffered datagram once after queued loop work, before dropping it.
 
 Endpoint close keeps UDP open until running connections send close and retire,
 then closes it; it may shorten retention (RFC 9000 10.2). UDP failure/loop

@@ -672,6 +672,17 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
     if (auto activated = self.activate_async_tls(); !activated) co_return std::unexpected(activated.error());
     guard.close_on_exit = true;
     auto& state = *self.implementation_;
+#ifdef __linux__
+    // A server's first flight costs hundreds of microseconds of CPU. Starting
+    // it from readiness, not inline after accept, queues it behind peers that
+    // were already ready instead of ahead of them.
+    if (SSL_is_server(state.ssl_.get()) && SSL_in_before(state.ssl_.get())) {
+        auto ready = co_await self.await_readable();
+        if (!ready) co_return std::unexpected(ready.error());
+        if (self.transport_closed()) co_return std::unexpected(system_code(ECANCELED));
+        if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
+    }
+#endif
     for (;;) {
         ERR_clear_error();
 #ifdef __linux__

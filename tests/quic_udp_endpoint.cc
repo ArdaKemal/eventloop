@@ -28,10 +28,10 @@ auto receive(event_loop&, udp_endpoint& server, bool& cancelled) -> task<void>
     cancelled = error && error->value() == ECANCELED;
 }
 auto transmit(event_loop& loop, udp_endpoint& client, endpoint_connection handle,
-              int& packets, bool& sent) -> task<void>
+              int& packets, bool& sent, std::span<const std::byte> datagram = payload) -> task<void>
 {
-    const auto result = co_await client.async_send(handle, payload);
-    sent = result && *result && **result == payload.size();
+    const auto result = co_await client.async_send(handle, datagram);
+    sent = result && *result && **result == datagram.size();
     for (unsigned i = 0; i != 100 && packets == 0; ++i)
         if (co_await sleep_for(loop, 1ms) != timer_wait_result::expired) co_return;
     loop.shutdown(event_loop::clock::duration::zero());
@@ -62,6 +62,41 @@ auto roundtrip() -> void
     // Destructors run after shutdown has removed both loop-owned sockets.
     server.close();
     client.close();
+}
+
+// Retry the same buffered Initial without waiting for peer loss recovery;
+// permanent refusal remains bounded and shutdown retires the receiver.
+auto initial_retry(bool accept) -> void
+{
+    struct state { int attempts = 0, packets = 0; bool accept; } record {0, 0, accept};
+    event_loop loop;
+    udp_endpoint server(loop, ip_endpoint::loopback_v4(), path_endpoint_role::server, 2,
+        {&record, [](void* argument, endpoint_router& router, const packet_header& header,
+                    ip_endpoint source) noexcept -> bool {
+            auto& value = *static_cast<state*>(argument);
+            if (++value.attempts == 1 || !value.accept) return false;
+            return router.add(header.destination_cid, source,
+                {&value.packets, [](void* count, std::span<const std::byte> bytes,
+                                    const packet_header& packet, ip_endpoint) noexcept {
+                    check(bytes.size() == 1200 && packet.kind == packet_kind::initial);
+                    ++*static_cast<int*>(count);
+                    return true;
+                }}).has_value();
+        }});
+    udp_endpoint client(loop, ip_endpoint::loopback_v4(), path_endpoint_role::client, 2);
+    constexpr std::array<std::byte, 1200> initial {std::byte {0xc0}, std::byte {0},
+        std::byte {0}, std::byte {0}, std::byte {1}, std::byte {2}, std::byte {1},
+        std::byte {2}, std::byte {1}, std::byte {3}, std::byte {0}, std::byte {2}};
+    constexpr std::array cid {std::byte {1}, std::byte {2}};
+    const auto handle = client.router().add(cid, server.local_endpoint(), {&record.packets, packet});
+    check(handle.has_value());
+    bool cancelled = false, sent = false;
+    check(loop.spawn(receive(loop, server, cancelled)) == task_spawn_result::accepted);
+    check(loop.spawn(transmit(loop, client, *handle, record.packets, sent, initial)) == task_spawn_result::accepted);
+    check(loop.spawn(watchdog(loop)) == task_spawn_result::accepted);
+    (void)loop.run();
+    check(cancelled && sent && record.attempts == 2 && record.packets == (accept ? 1 : 0));
+    check(loop.coroutine_statistics().live == 0);
 }
 
 // Worker group forwarding: short-header packets for a connection owned by
@@ -185,6 +220,8 @@ int main()
     check(transient_send_error(std::error_code(ENOBUFS, std::system_category())));
 #endif
     roundtrip();
+    initial_retry(true);
+    initial_retry(false);
     forwarding();
     forwarding_backlog();
     large_batches();

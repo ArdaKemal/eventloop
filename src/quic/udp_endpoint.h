@@ -16,6 +16,7 @@ struct endpoint_accept_callback {
     void* argument {};
     // Register caller-owned connection state with router before returning true.
     // The callback may add the original Initial DCID as a routing alias.
+    // A refusal may be retried once after pending loop work retires.
     bool (*initial)(void*, endpoint_router&, const packet_header&,
                     ip_endpoint) noexcept {};
 };

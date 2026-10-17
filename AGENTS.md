@@ -10,6 +10,8 @@ read [conventions](docs/api-conventions.md). For HTTP, read
 [shared HTTP](docs/http.md) plus only the affected protocol:
 [1.1](docs/http1.1.md), [2](docs/http2.md), or [3](docs/http3.md).
 Load additional contracts only when crossing their boundaries.
+For latency work, read the compact [optimization guide](docs/latency-optimization.md)
+for prior trials, measurement pitfalls, and evidence limits; rebaseline current code.
 
 ## Design priorities
 

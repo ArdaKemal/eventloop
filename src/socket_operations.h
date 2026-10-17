@@ -13,6 +13,9 @@
 #include <span>
 #include <string_view>
 #include <system_error>
+#ifndef _WIN32
+#include <sys/socket.h>
+#endif
 
 namespace eventloop { class tcp_stream; class tcp_acceptor; class udp_socket; }
 
@@ -244,7 +247,13 @@ inline auto socket_operations::stream_cancel(tcp_stream&,
                                       socket_operation&) noexcept -> bool
 { return false; }
 inline auto socket_operations::stream_close(tcp_stream& stream) -> void
-{ stream.loop_.remove(stream.descriptor_.get()); }
+{
+    // The descriptor closes when the loop retires the handler, after the
+    // current dispatch batch. Send the FIN now so the peer does not wait for
+    // the rest of that batch.
+    (void)::shutdown(stream.descriptor_.get(), SHUT_RDWR);
+    stream.loop_.remove(stream.descriptor_.get());
+}
 inline auto socket_operations::stream_send_file(tcp_stream& stream,
                                          unique_fd& file, std::uint64_t offset,
                                          std::size_t size,

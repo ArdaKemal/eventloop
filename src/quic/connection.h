@@ -275,23 +275,22 @@ public:
             s->state.receiving() == stream_receive_state::reset_received ||
             s->state.receiving() == stream_receive_state::reset_read)
             return std::unexpected(connection_error::invalid_state);
-        auto next_flow = flow_;
-        if (!next_flow.consume(id, size))
+        const auto previous_limit = flow_.receive_max_data();
+        const auto credit = flow_.consume(id, size, local_.data, s->receive_window);
+        if (!credit)
             return std::unexpected(connection_error::invalid_state);
-        const auto data_limit = next_flow.replenish_receive_max_data(local_.data);
-        const auto stream_limit = next_flow.replenish_receive_stream_limit(id, s->receive_window);
-        if (!data_limit || !stream_limit || !s->receive->consume(size) ||
-            !s->receive->extend_flow_limit(*stream_limit))
+        const auto [data_limit, stream_limit] = *credit;
+        // The readable-size check and monotonic limits make these infallible.
+        if (!s->receive->consume(size) || !s->receive->extend_flow_limit(stream_limit))
             return std::unexpected(connection_error::invalid_state);
-        data_credit_pending_ |= *data_limit > flow_.receive_max_data();
+        data_credit_pending_ |= data_limit > previous_limit;
         // Stream credit matters only before the final size is known (RFC 9000
         // 3.2); peers count later MAX_STREAM_DATA as misbehavior.
-        s->credit_pending |= *stream_limit > s->receive_limit &&
+        s->credit_pending |= stream_limit > s->receive_limit &&
             s->state.receiving() == stream_receive_state::receive;
         if (s->credit_pending) stream_control_pending_ = true;
-        s->receive_limit = *stream_limit;
+        s->receive_limit = stream_limit;
         s->consumed += size;
-        flow_ = next_flow;
         if (!s->state.receive_contiguous(s->receive->next_offset() + s->receive->readable().size()))
             return std::unexpected(connection_error::invalid_state);
         if (s->receive->complete() && !s->state.read_all_data())

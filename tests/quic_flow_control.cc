@@ -94,6 +94,17 @@ auto consumption_and_replenishment() -> void
           flow.replenish_receive_max_data(5) == 13 &&
           flow.receive_range(4, 0, 1).has_value(),
           "consumption restores connection window");
+    check(flow.consume(4, 1, max_varint_value, 0).error() ==
+              flow_control_error::invalid_value &&
+          flow.consume(4, 1, 0, max_varint_value).error() ==
+              flow_control_error::invalid_value &&
+          flow.consumed_total() == 8 && flow.receive_max_data() == 13 &&
+          flow.replenish_receive_stream_limit(4, 0) == 5,
+          "combined credit overflow leaves consumption and both limits unchanged");
+    const auto credit = flow.consume(4, 1, 10, 10);
+    check(credit && credit->first == 19 && credit->second == 11 &&
+          flow.consumed_total() == 9,
+          "one consumption replenishes both windows after failed attempts");
 }
 
 auto final_size_contract() -> void

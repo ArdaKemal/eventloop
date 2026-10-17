@@ -211,6 +211,14 @@ auto responses(const certificate_files& files) -> void
     const auto accepted = exchange(files, get(), ok);
     check(accepted && accepted->status == 200 && accepted->body == bytes("abcde"),
           "DATA matching Content-Length");
+    std::string final_credit;
+    append_frame(final_credit, 8, 0, 0, std::string_view("\0\0\0\3", 4));
+    check(server_received.find(final_credit) != std::string::npos,
+          "final DATA returns connection credit for reused connections");
+    final_credit.clear();
+    append_frame(final_credit, 8, 0, 1, std::string_view("\0\0\0\3", 4));
+    check(server_received.find(final_credit) == std::string::npos,
+          "final DATA does not return closed-stream credit");
 
     // Each sink exclusively owns its state across suspension and task moves.
     std::string streamed;

@@ -277,6 +277,17 @@ auto udp_endpoint::receive_loop(event_loop& loop, udp_endpoint& endpoint) -> tas
                         endpoint.accept_.initial) {
                         handled = !endpoint.accept_.initial(endpoint.accept_.argument,
                             endpoint.router_, *header, received->source);
+                        if (handled) {
+                            // Progress can enqueue a retained driver's retirement.
+                            // Retry once after both wakeup generations retire.
+                            (void)co_await yield(loop);
+                            co_await queue_behind_wakeups {loop};
+                            co_await queue_behind_wakeups {loop};
+                            if (!endpoint.socket_)
+                                co_return std::error_code(ECANCELED, std::generic_category());
+                            handled = !endpoint.accept_.initial(endpoint.accept_.argument,
+                                endpoint.router_, *header, received->source);
+                        }
                     } else if (endpoint.inbox_) {
                         // Parse as the router does: a peer that negotiated
                         // greasing clears the QUIC bit (RFC 9287).

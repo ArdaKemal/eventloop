@@ -673,14 +673,15 @@ auto client_connection::state::exchange(event_loop& loop, state& self,
             } else {
                 response.body.insert(response.body.end(), chunk.begin(), chunk.end());
             }
-            // Return consumed connection and stream windows before the next DATA.
-            if (length != 0 && !(flags & 1u)) {
+            // Connection credit survives END_STREAM and is needed by later requests.
+            if (length != 0) {
                 std::array<std::byte, 26> updates{};
                 frame_header(updates.data(), 4, 8, 0, 0);
                 put_u32(updates.data() + 9, static_cast<std::uint32_t>(length));
                 frame_header(updates.data() + 13, 4, 8, 0, stream_id);
                 put_u32(updates.data() + 22, static_cast<std::uint32_t>(length));
-                written = unwrap(co_await write_all(loop, *stream, updates));
+                written = unwrap(co_await write_all(loop, *stream,
+                    std::span(updates).first((flags & 1u) ? 13 : 26)));
                 if (!written) { error = written.error(); break; }
             }
             if (flags & 1u) finished = true;

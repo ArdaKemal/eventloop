@@ -42,7 +42,7 @@ tcp_stream::tcp_stream(event_loop& loop, ip_endpoint remote)
     detail::socket_operations::stream_register(*this);
     if (auto error = detail::socket_operations::configure_client(
             descriptor_.get(), remote); error)
-        throw std::system_error(error, "IPV6_V6ONLY");
+        throw std::system_error(error, "configure TCP client socket");
 }
 
 #ifndef _WIN32

@@ -531,7 +531,16 @@ struct generated_fields {
     {
         if (emit_length) fields[count++] = {"content-length", length_digits.view()};
         if (add_date) {
-            const auto size = http::detail::format_http_time(std::time(nullptr), date);
+            // Date changes once per second; the fields still borrow this response.
+            static thread_local std::array<char, 64> cached_date {};
+            static thread_local std::time_t cached_second {};
+            static thread_local std::size_t size {0};
+            const auto now = std::time(nullptr);
+            if (now != cached_second || size == 0) {
+                size = http::detail::format_http_time(now, cached_date);
+                cached_second = now;
+            }
+            date = cached_date;
             fields[count++] = {"date", {date.data(), size}};
         }
     }
