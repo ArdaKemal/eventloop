@@ -20,6 +20,7 @@ enum class task_result {
     success,
     frame_allocation_failure,
     cancelled,
+    unhandled_exception,
 };
 
 namespace detail {
@@ -27,9 +28,14 @@ namespace detail {
 [[nodiscard]] inline auto task_error_code(task_result state) noexcept
     -> std::error_code
 {
-    return std::make_error_code(
-        state == task_result::frame_allocation_failure
-            ? std::errc::not_enough_memory : std::errc::operation_canceled);
+    switch (state) {
+    case task_result::frame_allocation_failure:
+        return std::make_error_code(std::errc::not_enough_memory);
+    case task_result::unhandled_exception:
+        return std::make_error_code(std::errc::state_not_recoverable);
+    default:
+        return std::make_error_code(std::errc::operation_canceled);
+    }
 }
 
 } // namespace detail
@@ -127,10 +133,9 @@ struct task_promise_base {
         return {};
     }
 
-    [[noreturn]] static auto unhandled_exception() noexcept -> void
-    {
-        std::terminate();
-    }
+    // An escaping exception fails only this task: the frame completes, and
+    // its awaiter or observer receives task_result::unhandled_exception.
+    auto unhandled_exception() noexcept -> void { failed_ = true; }
 
     [[nodiscard]] auto owner_loop() const noexcept -> event_loop* { return loop_; }
     [[nodiscard]] auto cancellation_state() const noexcept
@@ -147,6 +152,7 @@ struct task_promise_base {
     void* completion_context_ {nullptr};
     std::coroutine_handle<> (*completion_)(void*) noexcept {nullptr};
     bool started_ {false};
+    bool failed_ {false};
 };
 
 template<typename Handle>
@@ -251,6 +257,8 @@ public:
         if (handle_ != nullptr && !handle_.done()) {
             throw std::logic_error("coroutine task has not completed");
         }
+        if (handle_ != nullptr && handle_.promise().failed_)
+            return task_result::unhandled_exception;
         return task_result::success;
     }
 
@@ -291,11 +299,14 @@ public:
         auto await_resume() noexcept -> task_result
         {
             if (allocation_failed_) return task_result::frame_allocation_failure;
+            auto result = task_result::success;
             if (handle_ != nullptr) {
+                if (handle_.promise().failed_)
+                    result = task_result::unhandled_exception;
                 handle_.destroy();
                 handle_ = {};
             }
-            return task_result::success;
+            return result;
         }
 
     private:
@@ -404,6 +415,8 @@ public:
             return std::unexpected(task_result::frame_allocation_failure);
         }
         if (!handle_.done()) throw std::logic_error("coroutine task has not completed");
+        if (handle_.promise().failed_)
+            return std::unexpected(task_result::unhandled_exception);
         auto& value = handle_.promise().value_;
         if (!value) throw std::logic_error("coroutine task result was already taken");
         result_type result(std::move(*value));
@@ -438,7 +451,10 @@ public:
             if (allocation_failed_ || handle_ == nullptr) {
                 return std::unexpected(task_result::frame_allocation_failure);
             }
-            auto value = std::move(*handle_.promise().value_);
+            auto& promise = handle_.promise();
+            result_type value = promise.failed_
+                ? result_type(std::unexpected(task_result::unhandled_exception))
+                : result_type(std::move(*promise.value_));
             handle_.destroy();
             handle_ = {};
             return value;
@@ -611,11 +627,14 @@ private:
         -> std::coroutine_handle<>
     {
         auto& self = *static_cast<task_handle*>(context);
+        auto handle = task<T>::handle_type::from_address(
+            self.root_->handle.address());
         if constexpr (std::is_void_v<T>) {
-            self.result_.emplace(task_result::success);
+            self.result_.emplace(handle.promise().failed_
+                ? task_result::unhandled_exception : task_result::success);
+        } else if (handle.promise().failed_) {
+            self.result_.emplace(std::unexpected(task_result::unhandled_exception));
         } else {
-            auto handle = task<T>::handle_type::from_address(
-                self.root_->handle.address());
             self.result_.emplace(std::move(*handle.promise().value_));
         }
         self.root_ = nullptr;

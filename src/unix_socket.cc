@@ -17,7 +17,7 @@ namespace {
 auto validate_path(std::string_view path) -> void
 {
     if (path.empty() || path.size() >= sizeof(sockaddr_un::sun_path) ||
-        path.find('\0') != std::string_view::npos)
+        path.contains('\0'))
         throw std::invalid_argument("invalid Unix socket path");
 }
 

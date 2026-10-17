@@ -164,6 +164,7 @@ private:
     auto on_shutdown() -> void override;
     auto update_interest() -> void;
     auto refresh_interest() noexcept -> void;
+    auto fail_and_close(int result) -> void;
     auto complete_receive(int result, ip_endpoint source = {},
                           std::size_t segment = 0) noexcept -> void;
     auto complete_send(int result) noexcept -> void;

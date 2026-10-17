@@ -65,7 +65,7 @@ B baseline already includes A's Date/credit/ACK fixes, without extra headroom.
 B's candidate included a later-dropped TLS guard unused by QUIC.
 
 Caveats: A's HTTP/2 static controls varied +2.7%/+2.8%; HTTP/3 routed p99 +1.9%.
-No additional HTTP/2 cold-setup/pre-handler gain was established. B's cold median
+No additional HTTP/2 cold-setup/pre-handler gain was established in A/B. B's cold median
 total rose 1216→4342 us and post-handshake dispatch p95 2016→2864 us. Removing
 stalled connections keeps more fixed-concurrency work active; lower tails need
 not improve every phase or percentile. Closed-loop results do not establish
@@ -113,6 +113,24 @@ claims below were not independently reproduced; do not combine with A/B.
 | TLS tickets/resumption | Reported improvement, not adopted: changes immutable/shared-context contract and requires key-lifecycle design. |
 | Timers, handoff, batching, file I/O | Profiled; no changes justified. Loaded completions wait a dispatch batch; workers can inherit loop CPU affinity. Cold-file evidence did not justify a new I/O layer. Timer slack helped idle timers, not request tails. |
 
+Independent macOS HTTP/2 follow-up (C): fixed server, identical native-client
+source linked before/after the TCP/TLS changes; otherwise A/B's environment,
+body, warmup and percentile method. Three AB/BA/AB pairs per workload, 10,000
+measured warm requests/connection. IPv6: four processes, 64 warm connections;
+lower-load IPv4: one process, 16. Cells below are **p95 / p99, microseconds**.
+
+| Established path | Before | After |
+| --- | ---: | ---: |
+| IPv6 request→first response read | 1189 / 1633 | 875 / 1237 |
+| IPv6 request→handler entry | 1165 / 1599 | 826 / 1207 |
+| IPv4, 16 connections, request→first read | 307 / 340 | 329 / 352 |
+| IPv4, 16 connections, request→handler entry | 281 / 310 | 26 / 41 |
+
+IPv6 warm tails improved in every pair. This does not establish a universal
+TTFB win: 64-connection IPv4 first-read tails were mixed, and four-connection
+cold IPv4 total p95/p99 increased 1793/1987→1985/2052 us. Improving dispatch can
+shift waiting elsewhere; measure end-to-end latency as well as individual phases.
+
 ## Guidance for further work
 
 Follow [agent guidance](../AGENTS.md) and affected [HTTP](http.md),
@@ -131,3 +149,8 @@ setup/handshake. Useful regressions: [HTTP/2 client](../tests/http2_client_valid
 100,000 operations; admission regression failed before and passed after.
 The [routing benchmark](../benchmark/routing_benchmark_server.cc) is a starting
 point for new instrumentation; no archived binaries or temporary files are needed.
+
+A TCP cancellation test exposed a setup race: after raw send-queue saturation,
+both async writes completed before close in 22/100 diagnostic runs. Filling
+through bounded async writes instead keeps the first awaiter registered before
+the duplicate check; 500/500 runs passed with all original assertions intact.

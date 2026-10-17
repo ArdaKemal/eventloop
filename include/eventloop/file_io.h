@@ -75,7 +75,7 @@ public:
         operation_.mode = mode;
         if (path.empty() || path.size() >= path_.size()) {
             result_ = -ENAMETOOLONG;
-        } else if (path.find('\0') != std::string_view::npos) {
+        } else if (path.contains('\0')) {
             result_ = -EINVAL;
         } else {
             std::memcpy(path_.data(), path.data(), path.size());

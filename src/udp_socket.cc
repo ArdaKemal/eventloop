@@ -101,6 +101,11 @@ auto udp_socket::prepare_quic(bool ipv6) noexcept -> bool
 
 auto udp_socket::close() -> void
 {
+    fail_and_close(-ECANCELED);
+}
+
+auto udp_socket::fail_and_close(int result) -> void
+{
     event_loop::handler_call_scope scope(loop_);
     if (closing_) return;
     closing_ = true;
@@ -108,10 +113,10 @@ auto udp_socket::close() -> void
         detail::socket_operations::datagram_cancel(*this, receive_->operation_);
     const bool send_kernel = send_ != nullptr &&
         detail::socket_operations::datagram_cancel(*this, send_->operation_);
-    if (!receive_kernel && !send_kernel) complete_pending(-ECANCELED);
+    if (!receive_kernel && !send_kernel) complete_pending(result);
     else {
-        if (!receive_kernel) complete_receive(-ECANCELED);
-        if (!send_kernel) complete_send(-ECANCELED);
+        if (!receive_kernel) complete_receive(result);
+        if (!send_kernel) complete_send(result);
     }
     detail::socket_operations::datagram_close(*this);
 }
@@ -328,8 +333,8 @@ auto udp_socket::refresh_interest() noexcept -> void
     if (closing_) return;
     try {
         update_interest();
-    } catch (...) {
-        std::terminate();
+    } catch (const std::system_error& error) {
+        fail_and_close(-error.code().value());
     }
 }
 

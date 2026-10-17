@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace eventloop::http3::detail {
 
@@ -72,7 +73,7 @@ enum class h3_error : std::uint64_t {
 }
 
 [[nodiscard]] inline auto make_error_code(h3_error value) noexcept -> std::error_code
-{ return {static_cast<int>(value), h3_category()}; }
+{ return {static_cast<int>(std::to_underlying(value)), h3_category()}; }
 
 } // namespace eventloop::http3::detail
 

@@ -108,7 +108,7 @@ auto error_category() noexcept -> const std::error_category&
 
 auto make_error_code(errc error) noexcept -> std::error_code
 {
-    return {static_cast<int>(error), error_category()};
+    return {std::to_underlying(error), error_category()};
 }
 
 namespace detail {
@@ -332,7 +332,7 @@ auto web_socket_core::enqueue(opcode type, std::span<const std::byte> payload)
     }
     output_.resize(needed);
     auto* frame = output_.data() + frame_offset;
-    frame[0] = static_cast<std::byte>(0x80u | static_cast<std::uint8_t>(type));
+    frame[0] = static_cast<std::byte>(0x80u | std::to_underlying(type));
     if (header_size == 2) {
         frame[1] = static_cast<std::byte>(size);
     } else if (header_size == 4) {

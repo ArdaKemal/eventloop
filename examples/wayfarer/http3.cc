@@ -535,7 +535,7 @@ auto safe_field(std::string_view value, bool name) -> bool
 {
     return std::all_of(value.begin(), value.end(), [name](unsigned char c) {
         return name ? (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-            std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) != std::string_view::npos
+            std::string_view("!#$%&'*+-.^_`|~").contains(static_cast<char>(c))
             : (c >= 0x20 && c != 0x7f) || c == '\t';
     });
 }

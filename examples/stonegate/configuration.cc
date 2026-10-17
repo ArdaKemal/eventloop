@@ -161,7 +161,7 @@ auto require_type(const toml_value& value, toml_type type,
 auto text(const toml_value& value) -> std::string_view
 {
     require_type(value, toml_type::string);
-    if (value.string.find('\0') != std::string_view::npos)
+    if (value.string.contains('\0'))
         throw std::invalid_argument("string contains NUL");
     return value.string;
 }
@@ -187,9 +187,9 @@ auto read_server(server_config& settings, const toml_value& table,
                     throw std::invalid_argument("invalid server name");
                 continue;
             }
-            const auto entry = std::find_if(std::begin(schema), std::end(schema),
+            const auto entry = std::ranges::find_if(schema,
                 [&](const auto& item) { return item.section == section && item.key == value.key; });
-            if (entry == std::end(schema)) throw std::invalid_argument("unknown setting");
+            if (entry == std::ranges::end(schema)) throw std::invalid_argument("unknown setting");
             require_type(value, entry->type);
             if (value.type == toml_type::string) apply(settings, entry->cli, text(value), &directory);
             else if (value.type == toml_type::boolean)
@@ -420,7 +420,7 @@ auto parse_configuration(int argc, char** argv) -> configuration
     }
     auto* target = &output.servers.front();
     if (!selected_server.empty()) {
-        const auto selected = std::find_if(output.servers.begin(), output.servers.end(),
+        const auto selected = std::ranges::find_if(output.servers,
             [&](const auto& server) { return server.name == selected_server; });
         if (selected == output.servers.end()) throw std::invalid_argument("unknown --server name");
         target = &*selected;

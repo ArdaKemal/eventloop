@@ -100,8 +100,8 @@ auto tcp_acceptor::complete_accept(unique_fd descriptor,
             // the listener armed in that case and avoid a disable/re-enable
             // pair on every accepted connection.
             set_read_interest(waiter_ != nullptr);
-        } catch (...) {
-            std::terminate();
+        } catch (const std::system_error& error) {
+            fail_and_close(error.code());
         }
     }
 }

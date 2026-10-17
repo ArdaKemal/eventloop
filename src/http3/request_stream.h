@@ -251,7 +251,7 @@ private:
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') ||
-           std::string_view("-._~!$&'()*+,;=").find(static_cast<char>(c)) != std::string_view::npos;
+           std::string_view("-._~!$&'()*+,;=").contains(static_cast<char>(c));
 }
 
 [[nodiscard]] constexpr auto valid_ipv4_tail(std::string_view address) noexcept -> bool
@@ -297,7 +297,7 @@ private:
         const auto colon = address.find(':');
         const auto group = address.substr(0, colon);
         if (group.empty()) return false;
-        if (group.find('.') != std::string_view::npos) {
+        if (group.contains('.')) {
             if (colon != std::string_view::npos || !valid_ipv4_tail(group)) return false;
             groups += 2;
             break;

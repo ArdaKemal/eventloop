@@ -69,7 +69,7 @@ auto write_u32(std::byte* output, std::uint32_t value) noexcept -> void
         (value >= 'a' && value <= 'z') ||
         (value >= 'A' && value <= 'Z')) return true;
     constexpr std::string_view punctuation = "!#$%&'*+-.^_`|~";
-    return punctuation.find(static_cast<char>(value)) != std::string_view::npos;
+    return punctuation.contains(static_cast<char>(value));
 }
 
 [[nodiscard]] auto valid_header_name(std::string_view name) noexcept -> bool
@@ -145,7 +145,7 @@ auto write_u32(std::byte* output, std::uint32_t value) noexcept -> void
             return {};
         while (at < text.size() &&
                ((text[at] >= 'a' && text[at] <= 'z') || (text[at] >= '0' && text[at] <= '9') ||
-                std::string_view("_-.*").find(text[at]) != std::string_view::npos)) ++at;
+                std::string_view("_-.*").contains(text[at]))) ++at;
         return text.substr(start, at - start);
     };
     // Skips one bare item or inner list and returns its text.
@@ -1257,10 +1257,10 @@ auto session::validate_initial_headers(stream& value,
             if (!alpha(byte) && !(byte >= '0' && byte <= '9') &&
                 byte != '+' && byte != '-' && byte != '.') return false;
         }
-        if (target.find('#') != std::string_view::npos) return false;
+        if (target.contains('#')) return false;
         if (!valid_request_target(target)) return false;
         if ((ascii_equal(scheme, "http") || ascii_equal(scheme, "https")) &&
-            authority_seen && authority.find('@') != std::string_view::npos) {
+            authority_seen && authority.contains('@')) {
             return false;
         }
     }

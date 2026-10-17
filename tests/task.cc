@@ -569,6 +569,81 @@ auto root_task_test() -> bool
            statistics.live == 0 && allocations == before;
 }
 
+auto throwing(event_loop& loop, bool suspend) -> task<void>
+{
+    if (suspend) (void)co_await yield(loop);
+    throw std::runtime_error("handler failure");
+}
+
+auto throwing_value(event_loop& loop) -> task<int>
+{
+    (void)co_await yield(loop);
+    throw std::runtime_error("handler failure");
+}
+
+auto await_throwing(event_loop& loop, task_result& first, task_result& second,
+                    task_result& value, int& after) -> task<void>
+{
+    first = co_await throwing(loop, false);
+    second = co_await throwing(loop, true);
+    const auto result = co_await throwing_value(loop);
+    value = result ? task_result::success : result.error();
+    ++after;
+}
+
+// Yields past every failing task above before stopping the loop.
+auto healthy_root(event_loop& loop, int& count) -> task<void>
+{
+    while (count < 4) {
+        if (!co_await yield(loop)) co_return;
+        ++count;
+    }
+    loop.stop();
+}
+
+// An exception escaping a task fails that task only; its parent, observers
+// and unrelated roots keep running on the same loop.
+auto unhandled_exception_test() -> bool
+{
+    event_loop loop;
+    auto direct = throwing(loop, false);
+    if (direct.start() != task_state::completed ||
+        direct.result() != task_result::unhandled_exception) return false;
+    auto direct_value = throwing_value(loop);
+    (void)direct_value.start();
+
+    auto first = task_result::success;
+    auto second = task_result::success;
+    auto value = task_result::success;
+    int after = 0;
+    task_handle<void> observed;
+    task_handle<int> observed_value;
+    int healthy = 0;
+    if (loop.spawn(throwing(loop, true)) != task_spawn_result::accepted ||
+        loop.spawn(throwing(loop, true), observed) != task_spawn_result::accepted ||
+        loop.spawn(throwing_value(loop), observed_value) !=
+            task_spawn_result::accepted ||
+        loop.spawn(await_throwing(loop, first, second, value, after)) !=
+            task_spawn_result::accepted) return false;
+    if (loop.spawn(healthy_root(loop, healthy)) != task_spawn_result::accepted ||
+        loop.run() != event_loop_result::stopped) return false;
+    const auto value_result = direct_value.result();
+    const auto observed_result = observed_value.take_result();
+    return first == task_result::unhandled_exception &&
+           second == task_result::unhandled_exception &&
+           value == task_result::unhandled_exception && after == 1 &&
+           observed.done() &&
+           observed.take_result() == task_result::unhandled_exception &&
+           !observed_result &&
+           observed_result.error() == task_result::unhandled_exception &&
+           !value_result && value_result.error() == task_result::unhandled_exception &&
+           healthy == 4 && loop.coroutine_statistics().active_roots == 0 &&
+           flatten_result(std::expected<std::expected<int, std::error_code>,
+                                        task_result>(std::unexpected(
+                              task_result::unhandled_exception))).error() ==
+               std::errc::state_not_recoverable;
+}
+
 auto root_shutdown_test() -> bool
 {
     event_loop loop;
@@ -953,6 +1028,10 @@ auto main(int argc, char** argv) -> int
     }
     if (!root_task_test()) {
         std::cerr << "event-loop root task test failed\n";
+        return 1;
+    }
+    if (!unhandled_exception_test()) {
+        std::cerr << "task unhandled exception test failed\n";
         return 1;
     }
     if (!root_shutdown_test()) {

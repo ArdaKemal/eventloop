@@ -40,19 +40,12 @@ constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     return std::make_error_code(code);
 }
 
-[[nodiscard]] auto task_failure(task_result result) -> std::error_code
-{
-    return failure(result == task_result::frame_allocation_failure
-        ? std::errc::not_enough_memory : std::errc::operation_canceled);
-}
-
 template<class T>
 [[nodiscard]] auto unwrap(std::expected<std::expected<T, std::error_code>,
                                         task_result> result)
     -> std::expected<T, std::error_code>
 {
-    if (!result) return std::unexpected(task_failure(result.error()));
-    return std::move(*result);
+    return flatten_result(std::move(result));
 }
 
 [[nodiscard]] auto write_all(event_loop& loop, tls_stream& stream,
@@ -115,7 +108,7 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
     if (name.empty() || name.front() == ':') return false;
     for (unsigned char c : name) {
         if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-            std::string_view("!#$%&'*+-.^_`|~").find(char(c)) != std::string_view::npos)
+            std::string_view("!#$%&'*+-.^_`|~").contains(char(c)))
             continue;
         return false;
     }
@@ -128,7 +121,7 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
     for (unsigned char c : method) {
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') ||
-            std::string_view("!#$%&'*+-.^_`|~").find(char(c)) != std::string_view::npos)
+            std::string_view("!#$%&'*+-.^_`|~").contains(char(c)))
             continue;
         return false;
     }
@@ -147,7 +140,7 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
 
 [[nodiscard]] auto valid_target(std::string_view value) -> bool
 {
-    if (value.empty() || value.front() != '/' || value.find('#') != std::string_view::npos)
+    if (value.empty() || value.front() != '/' || value.contains('#'))
         return false;
     for (unsigned char c : value) if (c <= 0x20 || c == 0x7f) return false;
     return true;

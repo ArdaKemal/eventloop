@@ -10,6 +10,7 @@
 #include <span>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 namespace eventloop::http::detail {
 
@@ -67,7 +68,7 @@ using method_set = std::uint16_t;
 
 [[nodiscard]] constexpr auto method_bit(method_type method) noexcept -> method_set
 {
-    return static_cast<method_set>(1u << static_cast<unsigned>(method));
+    return static_cast<method_set>(1u << std::to_underlying(method));
 }
 
 struct route_match {

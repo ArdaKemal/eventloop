@@ -85,7 +85,7 @@ auto open_decoded(native_socket root, std::span<const char> path) noexcept
 {
 #if defined(SYS_openat2) && defined(RESOLVE_NO_SYMLINKS)
     std::string_view relative(path.data(), path.size());
-    if (relative.find('\0') != std::string_view::npos) return {};
+    if (relative.contains('\0')) return {};
     while (relative.starts_with('/')) relative.remove_prefix(1);
     if (relative.empty()) relative = ".";
     if (relative.size() < 4096) {

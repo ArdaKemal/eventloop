@@ -87,7 +87,7 @@ namespace {
 auto open_root(std::string_view root) -> unique_fd
 {
     if (root.empty() || root.size() >= 4096 ||
-        root.find('\0') != std::string_view::npos)
+        root.contains('\0'))
         throw std::invalid_argument("HTTP root path is invalid or too long");
     auto path = utf16(root);
     if (path.empty()) throw std::invalid_argument("HTTP root path is invalid UTF-8");

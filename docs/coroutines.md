@@ -48,12 +48,16 @@ under `eventloop/`. Platform readiness is private.
 
 An inner expected remains distinct from the task result. `flatten_result`
 maps `expected<expected<T, error_code>, task_result>` to the inner expected:
-frame exhaustion becomes `not_enough_memory`, cancellation `operation_canceled`.
+frame exhaustion becomes `not_enough_memory`, cancellation `operation_canceled`,
+an unhandled exception `state_not_recoverable`.
 It supports `void` and move-only values without allocating. Pending cancelled
 I/O reports generic-category `ECANCELED`; this differs from
 `task_result::cancelled`. `task::result()` and `task_handle::take_result()`
-consume values once. Unhandled task exceptions terminate; return anticipated
-application errors as values.
+consume values once. An exception escaping a task fails only that task: its
+frame completes and the awaiter, observer, or composition receives
+`task_result::unhandled_exception`; the exception object is discarded. Other
+tasks and the loop keep running. Return anticipated application errors as
+values.
 
 `event_loop_options` controls frame/queue limits; full pools/queues report
 failure rather than allocating replacements. Frame payload classes are

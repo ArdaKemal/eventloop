@@ -92,7 +92,9 @@ in fixed stream slots on the owner loop; retransmit until acknowledged.
   internally, allowing retirement without reads; later reads return `invalid_state`.
 - Finished directions stay unchanged. Unknown stream/missing unidirectional
   direction returns `invalid_argument`; closing connection returns
-  `not_connected`; writing a retired stream returns `invalid_argument`.
+  `not_connected`, as do operations through a handle whose slot was released
+  or reused; writing a retired stream returns `invalid_argument`. A handle
+  without an endpoint (default or moved-from) throws `std::logic_error`.
   These errors are `quic_errc`.
 
 ## Connection and endpoint close

@@ -51,7 +51,7 @@ tcp_stream::tcp_stream(event_loop& loop, std::string_view unix_path)
       connected_(false), transport_activated_(true)
 {
     if (unix_path.empty() || unix_path.size() >= sizeof(sockaddr_un::sun_path) ||
-        unix_path.find('\0') != std::string_view::npos)
+        unix_path.contains('\0'))
         throw std::invalid_argument("invalid Unix socket path");
     descriptor_.reset(detail::socket_operations::create(AF_UNIX, SOCK_STREAM, 0));
     detail::socket_operations::stream_register(*this);
@@ -205,8 +205,10 @@ auto tcp_stream::update_async_interest() noexcept -> void
                     || write_waiter_ != nullptr || second_write_waiter_ != nullptr
 #endif
                 );
-        } catch (...) {
-            std::terminate();
+        } catch (const std::system_error& error) {
+            // Re-arming can fail at runtime (ENOMEM, or kqueue EPIPE for a
+            // peer-closed socket). Fail the stream instead of the process.
+            fail_and_close(error.code());
         }
     }
 }

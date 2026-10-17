@@ -32,12 +32,7 @@ template<typename T>
 [[nodiscard]] auto io_value(std::expected<std::expected<T, std::error_code>, task_result> result)
     noexcept -> std::expected<T, std::error_code>
 {
-    if (!result) {
-        return std::unexpected(std::make_error_code(
-            result.error() == task_result::frame_allocation_failure
-                ? std::errc::not_enough_memory : std::errc::operation_canceled));
-    }
-    return std::move(*result);
+    return flatten_result(std::move(result));
 }
 
 [[nodiscard]] constexpr auto reason_phrase(unsigned status) noexcept -> std::string_view

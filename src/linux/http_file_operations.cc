@@ -20,7 +20,7 @@ namespace eventloop::http::detail {
 auto open_root(std::string_view root) -> unique_fd
 {
     if (root.empty() || root.size() >= 4096 ||
-        root.find('\0') != std::string_view::npos)
+        root.contains('\0'))
         throw std::invalid_argument("HTTP root path is invalid or too long");
     std::string path(root);
     unique_fd descriptor(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -32,8 +32,8 @@ auto open_root(std::string_view root) -> unique_fd
 auto open_child(native_socket parent, std::string_view name,
                 bool directory_required) noexcept -> unique_fd
 {
-    if (name.empty() || name.find('/') != std::string_view::npos ||
-        name.find('\0') != std::string_view::npos || name.size() >= 4096)
+    if (name.empty() || name.contains('/') ||
+        name.contains('\0') || name.size() >= 4096)
         return {};
     char path[4096] {};
     std::memcpy(path, name.data(), name.size());

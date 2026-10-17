@@ -27,6 +27,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -530,6 +531,81 @@ auto cancel_scenario(const std::filesystem::path& certificate) -> bool
     (void)loop.run();
     return result.cancelled && result.elapsed < std::chrono::milliseconds(500) &&
            result.datagram_unsupported;
+}
+
+// A handle whose slot was reused by a later connection reports not_connected
+// instead of failing the process; a handle with no endpoint throws into its
+// task. With one slot, the second connection ends the first one's closing
+// period and takes its slot (docs/quic.md).
+struct stale_outcome {
+    bool released {false};
+    bool not_connected {false};
+    bool default_rejected {false};
+    bool done {false};
+};
+
+auto stale_server(event_loop& loop, quic_endpoint& server, stale_outcome& result)
+    -> task<void>
+{
+    auto first = flatten_result(co_await server.async_accept());
+    if (!first) { result.done = true; co_return; }
+    auto stale = std::move(*first);
+    stale.close();
+    auto second = flatten_result(co_await server.async_accept());
+    result.released = second && !stale.valid();
+    std::array<std::byte, 8> buffer {};
+    result.not_connected = result.released &&
+        (co_await fails_with(loop, stale.async_read(0, buffer),
+                             quic_errc::not_connected)).value_or(false) &&
+        (co_await fails_with(loop, stale.async_open_stream(
+                                 quic_stream_direction::bidirectional),
+                             quic_errc::not_connected)).value_or(false);
+    quic_connection empty;
+    try {
+        (void)co_await empty.async_accept_stream();
+    } catch (const std::logic_error&) {
+        result.default_rejected = true;
+    }
+    result.done = true;
+}
+
+auto stale_client(event_loop& loop, quic_endpoint& server, quic_endpoint& first,
+                  quic_endpoint& second, stale_outcome& result) -> task<void>
+{
+    auto a = flatten_result(co_await first.async_connect(server.local_endpoint(), "localhost"));
+    auto b = flatten_result(co_await second.async_connect(server.local_endpoint(), "localhost"));
+    for (int i = 0; a && b && i < 500 && !result.done; ++i)
+        (void)co_await sleep_for(loop, 10ms);
+    co_await server.async_close();
+    co_await first.async_close();
+    co_await second.async_close();
+    loop.shutdown(event_loop::clock::duration::zero());
+}
+
+auto stale_scenario(const std::filesystem::path& certificate) -> bool
+{
+    event_loop loop;
+    quic_server_options server_options;
+    server_options.certificate_chain = certificate / "cert.pem";
+    server_options.private_key = certificate / "key.pem";
+    server_options.alpn = protocol;
+    server_options.connection_capacity = 1;
+    const auto client_options = [&] {
+        quic_client_options options;
+        options.alpn = protocol;
+        options.trusted_ca = certificate / "cert.pem";
+        return options;
+    };
+    quic_endpoint server(loop, ip_endpoint::loopback_v4(0), std::move(server_options));
+    quic_endpoint first(loop, ip_endpoint::loopback_v4(0), client_options());
+    quic_endpoint second(loop, ip_endpoint::loopback_v4(0), client_options());
+    stale_outcome result;
+    check(loop.spawn(stale_server(loop, server, result)) == task_spawn_result::accepted,
+          "spawn stale server");
+    check(loop.spawn(stale_client(loop, server, first, second, result)) ==
+              task_spawn_result::accepted, "spawn stale client");
+    (void)loop.run();
+    return result.released && result.not_connected && result.default_rejected;
 }
 
 // Closing the server endpoint sends CONNECTION_CLOSE (NO_ERROR) on every
@@ -1186,6 +1262,7 @@ auto main() -> int
     const bool small_v2 = scenario(quic_version::v2, directory, true);
     const bool control = control_scenario(directory);
     const bool cancel = cancel_scenario(directory);
+    const bool stale = stale_scenario(directory);
     const bool shutdown = shutdown_scenario(directory);
     const bool indexed = worker_index_scenario(directory);
     const bool http3_indexed = http3_worker_index_scenario(directory);
@@ -1210,6 +1287,7 @@ auto main() -> int
     check(small_v2, "QUIC v2 small receive windows");
     check(control, "QUIC stream control and application close");
     check(cancel, "QUIC cancelled read on an idle connection resumes promptly");
+    check(stale, "QUIC operations on a released connection handle");
     check(shutdown, "QUIC endpoint close notifies peers");
     check(indexed, "QUIC worker index in connection IDs");
     check(http3_indexed, "HTTP/3 worker index in connection IDs");

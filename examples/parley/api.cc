@@ -537,7 +537,7 @@ auto classify(std::string_view content_type) -> media_type
     const bool token = !mime.empty() && mime.size() <= 100 &&
         std::ranges::all_of(mime, [](char c) {
             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                std::string_view("/.+-_").find(c) != std::string_view::npos;
+                std::string_view("/.+-_").contains(c);
         });
     return {token ? mime : "application/octet-stream", "file"};
 }
@@ -608,7 +608,7 @@ auto parse_range(std::string_view value, std::uint64_t size, bool& unsatisfiable
     -> std::optional<byte_range>
 {
     unsatisfiable = false;
-    if (!value.starts_with("bytes=") || value.find(',') != std::string_view::npos) return std::nullopt;
+    if (!value.starts_with("bytes=") || value.contains(',')) return std::nullopt;
     value.remove_prefix(6);
     const auto dash = value.find('-');
     if (dash == std::string_view::npos) return std::nullopt;

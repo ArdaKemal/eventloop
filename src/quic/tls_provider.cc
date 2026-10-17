@@ -25,7 +25,7 @@ auto tls_provider::initialize(SSL_CTX* context, const tls_options& options)
         options.transport_parameters.size() > local_parameters_.size() ||
         (!options.server && (options.server_name.empty() ||
                             options.server_name.size() > 253 ||
-                            options.server_name.find('\0') != std::string_view::npos)))
+                            options.server_name.contains('\0'))))
         return std::unexpected(tls_error::invalid_configuration);
     for (auto* buffer : input_)
         if (!buffer || !buffer->valid())

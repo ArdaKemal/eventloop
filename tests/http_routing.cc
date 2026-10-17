@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -109,6 +110,12 @@ auto stream(event_loop&, http::request&, http::response& response) -> task<void>
 
 auto silent(event_loop&, http::request&, http::response&) -> task<void>
 {
+    co_return;
+}
+
+auto throws(event_loop&, http::request&, http::response&) -> task<void>
+{
+    throw std::runtime_error("handler failure");
     co_return;
 }
 
@@ -411,6 +418,7 @@ auto main() -> int
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
           routes->add(http::method_type::get, "/short", short_body, &truncated).has_value() &&
           routes->add(http::method_type::get, "/misuse", misuse).has_value() &&
+          routes->add(http::method_type::get, "/throws", throws).has_value() &&
           routes->add(http::method_type::get, "/file", file,
                       const_cast<std::string*>(&file_path)).has_value(),
           "register routes");
@@ -457,6 +465,9 @@ auto main() -> int
                 "Content-Length: 3\r\nConnection: close\r\n\r\n0\r\n\r\n",
             chunked_request("POST /index.html HTTP/1.1\r\n", "abc", 3),
             chunked_request("POST /hello HTTP/1.1\r\n", "abc", 3),
+            // A throwing handler fails its request; the server keeps serving.
+            request("GET /throws HTTP/1.1\r\n"),
+            request("GET /hello HTTP/1.1\r\n"),
         });
 
     const std::string hello_head =
@@ -503,6 +514,9 @@ auto main() -> int
     check(responses[23].starts_with("HTTP/1.1 405 ") &&
           responses[23].find("Connection: close") != std::string::npos,
           "chunked body on a path without a handler for the method");
+    check(responses[24] == responses[8], "throwing handler answers 500");
+    check(responses[25] == hello_head + "connection: close\r\n\r\nhello",
+          "server survives a throwing handler");
 
     const auto cached = serve({.document_root = directory.path()},
         {

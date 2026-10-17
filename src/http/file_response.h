@@ -109,10 +109,10 @@ struct file_response {
         return result;
     }
     auto range = trim_http(conditions.range);
-    if (!range.starts_with("bytes=") || range.find(',') != std::string_view::npos) return result;
+    if (!range.starts_with("bytes=") || range.contains(',')) return result;
     range.remove_prefix(6);
     const auto hyphen = range.find('-');
-    if (hyphen == std::string_view::npos || range.find('-', hyphen + 1) != std::string_view::npos)
+    if (hyphen == std::string_view::npos || range.substr(hyphen + 1).contains('-'))
         return result;
     const auto left = range.substr(0, hyphen), right = range.substr(hyphen + 1);
     std::uint64_t first = 0, last = 0;

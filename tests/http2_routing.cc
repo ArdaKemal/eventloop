@@ -23,6 +23,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -147,6 +148,12 @@ auto big(event_loop&, http::request&, http::response& response) -> task<void>
 
 auto silent(event_loop&, http::request&, http::response&) -> task<void>
 {
+    co_return;
+}
+
+auto throws(event_loop&, http::request&, http::response&) -> task<void>
+{
+    throw std::runtime_error("handler failure");
     co_return;
 }
 
@@ -548,6 +555,7 @@ auto main() -> int
           routes->add(http::method_type::get, "/stream", stream).has_value() &&
           routes->add(http::method_type::get, "/big", big).has_value() &&
           routes->add(http::method_type::get, "/silent", silent).has_value() &&
+          routes->add(http::method_type::get, "/throws", throws).has_value() &&
           routes->add(http::method_type::get, "/short", short_body).has_value() &&
           routes->add(http::method_type::get, "/slow", slow).has_value() &&
           routes->add(http::method_type::get, "/cookies", cookies).has_value() &&
@@ -617,6 +625,9 @@ auto main() -> int
     auto one_cookie = request("GET", "/cookies");
     one_cookie.headers = {{"cookie", "single=1"}, {"x-test", "seen"}};
     requests.push_back(std::move(one_cookie));
+    // A throwing handler fails only its stream.
+    requests.push_back(request("GET", "/throws"));
+    requests.push_back(request("GET", "/hello"));
 
     const auto results = serve(files,
         {.routes = routes, .document_root = directory.path() / "www",
@@ -657,6 +668,8 @@ auto main() -> int
     check(ok(results[16]).body == bytes("partial"), "unread body stopped");
     check(ok(results[17]).body == bytes("a=1; b=2; c=3; d=4"), "split Cookie lines join");
     check(ok(results[18]).body == bytes("single=1"), "single Cookie line");
+    check(ok(results[19]).status == 500, "throwing handler answers 500");
+    check(ok(results[20]).body == bytes("hello"), "connection survives a throwing handler");
 
     // Handlers on one connection run concurrently: /hello on stream 3 is
     // answered while /slow on stream 1 sleeps.

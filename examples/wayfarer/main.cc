@@ -119,7 +119,7 @@ auto remote_output_name(std::string_view target) -> std::filesystem::path
         "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
     if (name.find_first_of("<>:\"|?*") != std::string::npos ||
-        std::find(reserved.begin(), reserved.end(), upper) != reserved.end() ||
+        std::ranges::find(reserved, upper) != reserved.end() ||
         name.ends_with('.') || name.ends_with(' '))
         throw std::invalid_argument("cannot derive a safe output name from the URL");
 #endif
@@ -149,7 +149,7 @@ auto parse_options(int argc, char** argv) -> request_options
             std::string val = header.substr(pos + 1);
             if (!val.empty() && val.front() == ' ') val.erase(0, 1);
             if (!safe_header(val) || !std::all_of(name.begin(), name.end(), [](unsigned char c) {
-                    return std::isalnum(c) || std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) != std::string_view::npos;
+                    return std::isalnum(c) || std::string_view("!#$%&'*+-.^_`|~").contains(static_cast<char>(c));
                 })) throw std::invalid_argument("invalid header");
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (name == "host" || name == "connection" || name == "content-length" || name == "transfer-encoding")
@@ -198,7 +198,7 @@ auto parse_options(int argc, char** argv) -> request_options
         options.show_headers = true;
     }
     if (options.method.empty() || !std::all_of(options.method.begin(), options.method.end(), [](unsigned char c) {
-            return std::isupper(c) || std::isdigit(c) || std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) != std::string_view::npos;
+            return std::isupper(c) || std::isdigit(c) || std::string_view("!#$%&'*+-.^_`|~").contains(static_cast<char>(c));
         })) throw std::invalid_argument("invalid request method");
     if (options.body_supplied && options.method == "GET") options.method = "POST";
     if (options.head_request && options.body_supplied)

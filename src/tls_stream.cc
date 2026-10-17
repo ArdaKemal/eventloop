@@ -27,12 +27,6 @@ constexpr std::size_t max_record_plaintext = 16 * 1024;
 {
     return {value, std::generic_category()};
 }
-#ifndef __linux__
-[[nodiscard]] auto task_code(task_result result) noexcept -> std::error_code
-{
-    return system_code(result == task_result::frame_allocation_failure ? ENOMEM : ECANCELED);
-}
-#endif
 // Marks one TLS operation active and pins the stream for its duration. Once
 // armed, an unsuccessful exit closes the stream; closing removes a loop-owned
 // stream, which then lives until its last operation releases the pin.
@@ -259,7 +253,7 @@ auto tls_error_category() noexcept -> const std::error_category&
 }
 auto make_error_code(tls_errc error) noexcept -> std::error_code
 {
-    return {static_cast<int>(error), tls_error_category()};
+    return {std::to_underlying(error), tls_error_category()};
 }
 
 class tls_stream::implementation : public tls_callbacks {
@@ -277,7 +271,7 @@ public:
         : context_(std::move(context)), ssl_(nullptr, SSL_free)
     {
         initialize(context_role::client);
-        if (options.hostname.empty() || options.hostname.size() > 255 || options.hostname.find('\0') != std::string::npos)
+        if (options.hostname.empty() || options.hostname.size() > 255 || options.hostname.contains('\0'))
             throw std::invalid_argument("TLS client hostname is invalid");
         auto* param = SSL_get0_param(ssl_.get());
         X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
@@ -454,7 +448,7 @@ auto tls_stream::application_protocol() const -> std::string
 auto tls_stream::certificate_matches(std::string_view hostname) const -> bool
 {
     if (!implementation_ || !implementation_->active() || hostname.empty() ||
-        hostname.size() > 255 || hostname.find('\0') != std::string_view::npos)
+        hostname.size() > 255 || hostname.contains('\0'))
         return false;
     auto* ssl = implementation_->ssl_.get();
     auto* certificate = SSL_get0_peer_certificate(ssl);
@@ -701,7 +695,7 @@ auto tls_stream::handshake_task(event_loop& loop, tls_stream& self)
         if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
 #else
         auto flushed = co_await flush_task(loop, self);
-        if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+        if (!flushed) co_return std::unexpected(detail::task_error_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
         if (result == 1) { guard.close_on_exit = false; co_return std::expected<void, std::error_code> {}; }
         if (error == SSL_ERROR_WANT_WRITE || state.input_size_ != 0) continue;
@@ -754,7 +748,7 @@ auto tls_stream::read_task(event_loop& loop, tls_stream& self, std::span<std::by
         if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
 #else
         auto flushed = co_await flush_task(loop, self);
-        if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+        if (!flushed) co_return std::unexpected(detail::task_error_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
         if (result == 1) { guard.close_on_exit = false; co_return size; }
         if (error == SSL_ERROR_WANT_WRITE || state.input_size_ != 0) continue;
@@ -788,7 +782,7 @@ auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const 
 #ifndef __linux__
     // Flush before writing, so this record always has bounded output space.
     auto flushed = co_await flush_task(loop, self);
-    if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+    if (!flushed) co_return std::unexpected(detail::task_error_code(flushed.error()));
     if (!*flushed) co_return std::unexpected(flushed->error());
 #endif
     for (;;) {
@@ -816,7 +810,7 @@ auto tls_stream::write_task(event_loop& loop, tls_stream& self, std::span<const 
         if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
 #else
         auto sent = co_await flush_task(loop, self);
-        if (!sent) co_return std::unexpected(task_code(sent.error()));
+        if (!sent) co_return std::unexpected(detail::task_error_code(sent.error()));
         if (!*sent) co_return std::unexpected(sent->error());
         if (result == 1) { guard.close_on_exit = false; co_return written; }
 #endif
@@ -859,7 +853,7 @@ auto tls_stream::close_task(event_loop& loop, tls_stream& self)
         if (co_await cancellation_requested()) co_return std::unexpected(system_code(ECANCELED));
 #else
         auto flushed = co_await flush_task(loop, self);
-        if (!flushed) co_return std::unexpected(task_code(flushed.error()));
+        if (!flushed) co_return std::unexpected(detail::task_error_code(flushed.error()));
         if (!*flushed) co_return std::unexpected(flushed->error());
         // API sends close_notify without waiting for the peer's reply.
         if (SSL_get_shutdown(state.ssl_.get()) & SSL_SENT_SHUTDOWN) {

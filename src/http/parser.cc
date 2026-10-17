@@ -161,7 +161,7 @@ auto parse_request_head(std::string_view input, parsed_request& output) noexcept
         ? std::string_view::npos
         : first_line.find(' ', first_space + 1);
     if (first_space == std::string_view::npos || second_space == std::string_view::npos ||
-        first_line.find(' ', second_space + 1) != std::string_view::npos) {
+        first_line.substr(second_space + 1).contains(' ')) {
         return {parse_status::bad_request};
     }
 

@@ -350,11 +350,15 @@ auto read_result(event_loop&, tcp_stream& socket, int& error) -> task<void>
     error = result ? 0 : result.error().value();
 }
 
-auto write_result(event_loop&, tcp_stream& socket, int& error) -> task<void>
+auto write_result(event_loop&, tcp_stream& socket, int& error,
+                  bool fill_queue = false) -> task<void>
 {
-    constexpr std::array<std::byte, 1> buffer {std::byte {'x'}};
-    const auto result = co_await socket.async_write_some(buffer);
-    error = result ? 0 : result.error().value();
+    static constexpr std::array<std::byte, 4096> buffer {};
+    for (int attempt = 0; attempt < (fill_queue ? 1024 : 1); ++attempt) {
+        const auto result = co_await socket.async_write_some(buffer);
+        error = result ? 0 : result.error().value();
+        if (!result) co_return;
+    }
 }
 
 auto connect_result(event_loop& loop, tcp_stream& socket,
@@ -427,37 +431,6 @@ auto bounded_backlog_accept() -> bool
     return first_run < backlog_connections && accepted == backlog_connections;
 }
 
-auto fill_send_queue(native_socket descriptor) -> bool
-{
-    std::array<std::byte, 4096> buffer {};
-#ifdef _WIN32
-    u_long nonblocking = 1;
-    if (::ioctlsocket(static_cast<SOCKET>(descriptor), FIONBIO, &nonblocking) != 0)
-        return false;
-#endif
-#ifdef __APPLE__
-    const int flags = ::fcntl(descriptor, F_GETFL);
-    if (flags == -1 ||
-        ::fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == -1) return false;
-#endif
-    for (int attempts = 0; attempts < 1024; ++attempts) {
-#ifdef _WIN32
-        const auto written = ::send(static_cast<SOCKET>(descriptor),
-                                    reinterpret_cast<const char*>(buffer.data()),
-                                    static_cast<int>(buffer.size()), 0);
-        if (written >= 0) continue;
-        return ::WSAGetLastError() == WSAEWOULDBLOCK;
-#else
-        const auto written = ::send(descriptor, buffer.data(), buffer.size(),
-                                    MSG_DONTWAIT | test_socket::no_signal);
-        if (written >= 0) continue;
-        if (errno == EINTR) continue;
-        return errno == EAGAIN || errno == EWOULDBLOCK;
-#endif
-    }
-    return false;
-}
-
 auto duplicate_io_and_close() -> bool
 {
     auto pair = connected_pair();
@@ -467,15 +440,15 @@ auto duplicate_io_and_close() -> bool
         loop, std::move(pair.client));
     auto* owner = socket.get();
     const native_socket descriptor = owner->descriptor();
-    if (!fill_send_queue(descriptor)) return false;
     loop.add(std::move(socket));
     int pending_read = -1;
     int duplicate_read = -1;
     int pending_write = -1;
     int duplicate_write = -1;
+    // Fill through the awaiter: a raw EAGAIN can clear before this starts.
     if (loop.spawn(read_result(loop, *owner, pending_read)) != task_spawn_result::accepted ||
         loop.spawn(read_result(loop, *owner, duplicate_read)) != task_spawn_result::accepted ||
-        loop.spawn(write_result(loop, *owner, pending_write)) != task_spawn_result::accepted ||
+        loop.spawn(write_result(loop, *owner, pending_write, true)) != task_spawn_result::accepted ||
         loop.spawn(write_result(loop, *owner, duplicate_write)) != task_spawn_result::accepted) {
         owner->close();
         return false;
@@ -602,6 +575,47 @@ auto shutdown_pending() -> bool
            loop.coroutine_statistics().live == 0;
 }
 
+#ifndef _WIN32
+auto read_before_interest_failure(event_loop& loop, tcp_stream& socket,
+                                  native_socket replacement, int& error)
+    -> task<void>
+{
+    std::array<std::byte, 1> buffer {};
+    const auto read = co_await socket.async_read_some(buffer);
+    error = read ? 0 : read.error().value();
+    // Replacing the descriptor drops its poller registration, so disabling
+    // read interest after this continuation suspends fails with ENOENT. The
+    // stream then closes and the loop retires it; do not touch it again.
+    if (::dup2(replacement, socket.descriptor()) == -1) error = errno;
+    (void)co_await sleep_for(loop, 10ms);
+    loop.stop();
+}
+
+// A failed interest update after a completion closes the stream instead of
+// terminating the process.
+auto interest_failure_closes_stream() -> bool
+{
+    auto pair = connected_pair();
+    unique_fd replacement(raw_socket(AF_INET));
+    if (!pair.client || !pair.server || !replacement) return false;
+    event_loop loop;
+    auto socket = std::make_unique<tcp_stream>(loop, std::move(pair.client));
+    auto* reading = socket.get();
+    const native_socket descriptor = reading->descriptor();
+    loop.add(std::move(socket));
+    int error = -1;
+    if (loop.spawn(read_before_interest_failure(loop, *reading,
+                                                replacement.get(), error)) !=
+        task_spawn_result::accepted) return false;
+    constexpr std::byte byte {'x'};
+    if (::send(pair.server.get(), &byte, 1, test_socket::no_signal) != 1)
+        return false;
+    return loop.run() == event_loop_result::stopped && error == 0 &&
+           closed_descriptor(descriptor) &&
+           loop.coroutine_statistics().live == 0;
+}
+#endif
+
 auto send_opened_file(event_loop& loop, tcp_stream& socket,
                       std::string_view path, int& completed, bool& passed)
     -> task<void>
@@ -710,4 +724,8 @@ int main()
         !check(refused_connect(), "refused connect") ||
         !check(opened_file_send(), "async_openat send file") ||
         !check(shutdown_pending(), "shutdown pending")) return 1;
+#ifndef _WIN32
+    if (!check(interest_failure_closes_stream(), "interest failure closes stream"))
+        return 1;
+#endif
 }

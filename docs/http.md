@@ -83,8 +83,9 @@ Authentication/Origin policy belongs to the handler.
 - Declared content-length is enforced: overrun returns `invalid_argument`;
   short finish does too and abandons the response. Status 204/304 has no body.
   Framing/trailers follow the protocol contract.
-- Returning before start answers 500; returning after start without finish
-  abandons the response (connection close or stream reset per protocol).
+- Returning or throwing before start answers 500; doing so after start
+  without finish abandons the response (connection close or stream reset per
+  protocol). A throwing handler affects only its own request.
 
 ## Static resources
 

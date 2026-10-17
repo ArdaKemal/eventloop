@@ -128,8 +128,8 @@ enum class version_negotiation_error {
     if (prior_packet_processed)
         return std::unexpected(version_negotiation_error::prior_packet_processed);
     if (offered_version == 0 || !valid_version_list(client_preference) ||
-        std::find(client_preference.begin(), client_preference.end(),
-                  offered_version) == client_preference.end())
+        std::ranges::find(client_preference, offered_version) ==
+            client_preference.end())
         return std::unexpected(version_negotiation_error::invalid_version_list);
     const auto parsed = parse_packet_header(packet);
     if (!parsed || parsed->kind != packet_kind::version_negotiation ||
@@ -186,17 +186,15 @@ enum class version_negotiation_error {
         return std::unexpected(version_negotiation_error::invalid_version_list);
     if (server_available_versions.empty())
         return std::unexpected(version_negotiation_error::downgrade_detected);
-    if (std::find(client_advertised_versions.begin(),
-                  client_advertised_versions.end(), attempted_version) ==
+    if (std::ranges::find(client_advertised_versions, attempted_version) ==
             client_advertised_versions.end() ||
-        std::find(client_preference.begin(), client_preference.end(),
-                  attempted_version) == client_preference.end() ||
+        std::ranges::find(client_preference, attempted_version) ==
+            client_preference.end() ||
         is_reserved_version_number(attempted_version) ||
         is_reserved_version_number(negotiated_version))
         return std::unexpected(version_negotiation_error::downgrade_detected);
     if (server_chosen_version != negotiated_version ||
-        std::find(client_advertised_versions.begin(),
-                  client_advertised_versions.end(), server_chosen_version) ==
+        std::ranges::find(client_advertised_versions, server_chosen_version) ==
             client_advertised_versions.end())
         return std::unexpected(version_negotiation_error::downgrade_detected);
     // Original Version is only a special case for unauthenticated VN packets.
@@ -205,8 +203,7 @@ enum class version_negotiation_error {
     for (const auto version : client_preference) {
         if (is_reserved_version_number(version)) continue;
         if (version == negotiated_version ||
-            std::find(server_available_versions.begin(),
-                      server_available_versions.end(), version) !=
+            std::ranges::find(server_available_versions, version) !=
                 server_available_versions.end())
             return version == attempted_version
                        ? std::expected<void, version_negotiation_error> {}

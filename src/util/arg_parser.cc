@@ -53,7 +53,7 @@ auto arg_parser::parse(int argc, char *argv[]) -> void
     }
 
     for (std::size_t i = 0; i < args.size(); i++) {
-        const auto it = std::find_if(options_.begin(), options_.end(),
+        const auto it = std::ranges::find_if(options_,
             std::bind_front(valid_argumnet, args[i]));
 
         if (it == options_.end()) {

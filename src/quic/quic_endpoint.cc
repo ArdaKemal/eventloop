@@ -102,7 +102,7 @@ auto to_internal_version(quic_version version) noexcept -> std::uint32_t
 
 auto make_error_code(quic_errc value) noexcept -> std::error_code
 {
-    return {static_cast<int>(value), quic_category()};
+    return {std::to_underlying(value), quic_category()};
 }
 
 class quic_endpoint::implementation {
@@ -1144,7 +1144,10 @@ auto quic_connection::remote_endpoint() const noexcept -> ip_endpoint
 auto quic_connection::async_open_stream(quic_stream_direction direction)
     -> task<std::expected<std::uint64_t, std::error_code>>
 {
-    if (!valid()) std::terminate();
+    // A released or reused slot reaches the operation, which reports
+    // not_connected; only a handle without an endpoint has no loop to use.
+    if (endpoint_ == nullptr || !endpoint_->implementation_) [[unlikely]]
+        throw std::logic_error("quic_connection has no endpoint");
     auto& impl = *endpoint_->implementation_;
     return open_stream_task(impl.loop_, impl, slot_, generation_, direction);
 }
@@ -1152,7 +1155,10 @@ auto quic_connection::async_open_stream(quic_stream_direction direction)
 auto quic_connection::async_accept_stream()
     -> task<std::expected<std::uint64_t, std::error_code>>
 {
-    if (!valid()) std::terminate();
+    // A released or reused slot reaches the operation, which reports
+    // not_connected; only a handle without an endpoint has no loop to use.
+    if (endpoint_ == nullptr || !endpoint_->implementation_) [[unlikely]]
+        throw std::logic_error("quic_connection has no endpoint");
     auto& impl = *endpoint_->implementation_;
     return accept_stream(impl.loop_, impl, slot_, generation_);
 }
@@ -1161,7 +1167,10 @@ auto quic_connection::async_read(std::uint64_t stream_id,
                                  std::span<std::byte> buffer)
     -> task<std::expected<std::size_t, std::error_code>>
 {
-    if (!valid()) std::terminate();
+    // A released or reused slot reaches the operation, which reports
+    // not_connected; only a handle without an endpoint has no loop to use.
+    if (endpoint_ == nullptr || !endpoint_->implementation_) [[unlikely]]
+        throw std::logic_error("quic_connection has no endpoint");
     auto& impl = *endpoint_->implementation_;
     return read_stream(impl.loop_, impl, slot_, generation_, stream_id, buffer);
 }
@@ -1170,7 +1179,10 @@ auto quic_connection::async_write(std::uint64_t stream_id,
                                   std::span<const std::byte> buffer, bool fin)
     -> task<std::expected<std::size_t, std::error_code>>
 {
-    if (!valid()) std::terminate();
+    // A released or reused slot reaches the operation, which reports
+    // not_connected; only a handle without an endpoint has no loop to use.
+    if (endpoint_ == nullptr || !endpoint_->implementation_) [[unlikely]]
+        throw std::logic_error("quic_connection has no endpoint");
     auto& impl = *endpoint_->implementation_;
     return write_stream(impl.loop_, impl, slot_, generation_, stream_id, buffer, fin);
 }
@@ -1178,7 +1190,10 @@ auto quic_connection::async_write(std::uint64_t stream_id,
 auto quic_connection::async_send_datagram(std::span<const std::byte> payload)
     -> task<std::expected<void, std::error_code>>
 {
-    if (!valid()) std::terminate();
+    // A released or reused slot reaches the operation, which reports
+    // not_connected; only a handle without an endpoint has no loop to use.
+    if (endpoint_ == nullptr || !endpoint_->implementation_) [[unlikely]]
+        throw std::logic_error("quic_connection has no endpoint");
     auto& impl = *endpoint_->implementation_;
     return send_datagram_task(impl.loop_, impl, slot_, generation_, payload);
 }
@@ -1186,7 +1201,10 @@ auto quic_connection::async_send_datagram(std::span<const std::byte> payload)
 auto quic_connection::async_receive_datagram(std::span<std::byte> buffer)
     -> task<std::expected<std::size_t, std::error_code>>
 {
-    if (!valid()) std::terminate();
+    // A released or reused slot reaches the operation, which reports
+    // not_connected; only a handle without an endpoint has no loop to use.
+    if (endpoint_ == nullptr || !endpoint_->implementation_) [[unlikely]]
+        throw std::logic_error("quic_connection has no endpoint");
     auto& impl = *endpoint_->implementation_;
     return receive_datagram_task(impl.loop_, impl, slot_, generation_, buffer);
 }

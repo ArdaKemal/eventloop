@@ -67,14 +67,14 @@ struct ip_endpoint {
         -> ip_endpoint
     {
         if (text.empty() || text.size() >= INET6_ADDRSTRLEN + 11 ||
-            text.find('\0') != std::string_view::npos) {
+            text.contains('\0')) {
             throw std::invalid_argument("invalid IP address");
         }
         std::uint32_t scope = 0;
         const auto percent = text.find('%');
         if (percent != std::string_view::npos) {
             const auto suffix = text.substr(percent + 1);
-            if (suffix.empty() || suffix.find('%') != std::string_view::npos) {
+            if (suffix.empty() || suffix.contains('%')) {
                 throw std::invalid_argument("invalid IPv6 scope ID");
             }
             const auto [end, error] = std::from_chars(

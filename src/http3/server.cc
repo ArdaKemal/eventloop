@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace eventloop::http {
@@ -153,7 +154,7 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
 // connection error sent in CONNECTION_CLOSE.
 auto fail(quic_connection& connection, std::uint64_t id, h3::h3_error error) noexcept -> void
 {
-    const auto code = static_cast<std::uint64_t>(error);
+    const auto code = std::to_underlying(error);
     if (!h3::stream_scoped(error)) {
         connection.close_application(code);
         return;
@@ -222,7 +223,7 @@ auto finish_request(event_loop& loop, quic_connection& connection, std::uint64_t
             continue;
         }
         case read_outcome::body_limit:
-            (void)connection.stop_sending(id, static_cast<std::uint64_t>(h3::h3_error::no_error));
+            (void)connection.stop_sending(id, std::to_underlying(h3::h3_error::no_error));
             co_return;
         case read_outcome::failure: fail(connection, id, error); co_return;
         case read_outcome::end:
@@ -737,7 +738,7 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
     }
     // RFC 9114 4.1: the rest of the body is not needed.
     if (!exchange.body_ended_)
-        (void)connection.stop_sending(id, static_cast<std::uint64_t>(h3::h3_error::no_error));
+        (void)connection.stop_sending(id, std::to_underlying(h3::h3_error::no_error));
 }
 
 // The server-wide request settings, shared by every connection.
@@ -779,7 +780,7 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         co_return true;
     }
     if (too_large || !head.connect_protocol.empty())
-        (void)connection.stop_sending(id, static_cast<std::uint64_t>(h3::h3_error::no_error));
+        (void)connection.stop_sending(id, std::to_underlying(h3::h3_error::no_error));
     else
         (void)co_await finish_request(loop, connection, id, s, frames, pending);
     co_return true;
@@ -999,7 +1000,7 @@ auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t 
         // Every error on a critical stream closes the connection, including
         // EXCESSIVE_LOAD from too many SETTINGS (RFC 9114 6.2.1).
         if (!checked) {
-            connection.close_application(static_cast<std::uint64_t>(checked.error()));
+            connection.close_application(std::to_underlying(checked.error()));
             co_return;
         }
         if (ended) co_return;
@@ -1007,7 +1008,7 @@ auto read_peer_uni(event_loop& loop, quic_connection& connection, std::uint64_t 
         // (RFC 9114 6.2); the transport discards anything still arriving.
         if (stream.stream_kind() == h3::peer_uni_stream::kind::unknown) {
             (void)connection.stop_sending(id,
-                static_cast<std::uint64_t>(h3::h3_error::stream_creation_error));
+                std::to_underlying(h3::h3_error::stream_creation_error));
             co_return;
         }
     }
@@ -1021,7 +1022,7 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
     h3::peer_critical_streams critical;
     auto control = flatten_result(co_await connection.async_open_stream(quic_stream_direction::unidirectional));
     // RFC 9114 6.2 requires room for the three server critical streams.
-    const auto general = static_cast<std::uint64_t>(h3::h3_error::general_protocol_error);
+    const auto general = std::to_underlying(h3::h3_error::general_protocol_error);
     if (!control) { connection.close_application(general); co_return; }
     // Server control stream: stream type 0, SETTINGS with zero QPACK dynamic table.
     const bool extended = settings.routes != nullptr;
@@ -1055,7 +1056,7 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
         }
         // Handler slots cover every stream QUIC admits (100 bidirectional and
         // 8 unidirectional), so exhaustion here is a capacity bug.
-        auto slot = std::find_if(handlers.begin(), handlers.end(),
+        auto slot = std::ranges::find_if(handlers,
             [](const auto& handler) { return !handler || handler->done(); });
         stream_storage* storage = request ? pool.acquire() : nullptr;
         auto spawned = task_spawn_result::invalid_task;
@@ -1082,11 +1083,11 @@ auto serve_connection(event_loop& loop, quic_connection& connection,
         // unidirectional stream may be critical, so the connection ends.
         if (request) fail(connection, id, h3::h3_error::request_rejected);
         else {
-            connection.close_application(static_cast<std::uint64_t>(h3::h3_error::internal_error));
+            connection.close_application(std::to_underlying(h3::h3_error::internal_error));
             break;
         }
     }
-    connection.close_application(static_cast<std::uint64_t>(h3::h3_error::no_error));
+    connection.close_application(std::to_underlying(h3::h3_error::no_error));
     for (auto& handler : handlers) {
         if (!handler) continue;
         (void)handler->cancel();
@@ -1172,7 +1173,7 @@ auto http3_server::run_loop(event_loop& loop, http3_server& server) -> task<void
             if (accepted.error() == std::make_error_code(std::errc::operation_canceled)) break;
             continue;
         }
-        auto slot = std::find_if(impl.connections_.begin(), impl.connections_.end(),
+        auto slot = std::ranges::find_if(impl.connections_,
             [](const auto& entry) { return !entry.handle || entry.handle->done(); });
         if (slot == impl.connections_.end()) { accepted->close(); continue; }
         slot->handle.emplace();

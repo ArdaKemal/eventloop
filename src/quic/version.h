@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 
 namespace eventloop::quic::detail {
 
@@ -23,7 +24,7 @@ enum class long_packet_type : std::uint8_t {
 [[nodiscard]] constexpr auto long_header_type_bits(
     std::uint32_t version, long_packet_type type) noexcept -> std::uint8_t
 {
-    const auto index = static_cast<std::uint8_t>(type);
+    const auto index = std::to_underlying(type);
     return version == version_2 ? static_cast<std::uint8_t>((index + 1) & 3)
                                 : index;
 }

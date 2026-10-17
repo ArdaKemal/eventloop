@@ -45,7 +45,7 @@ auto parse_url(std::string_view url) -> url_parts
     auto remainder = authority_end == std::string_view::npos
                          ? std::string_view {}
                          : url.substr(authority_end);
-    if (authority.empty() || authority.find('@') != std::string_view::npos) {
+    if (authority.empty() || authority.contains('@')) {
         throw std::invalid_argument("URL needs a host without user information");
     }
 

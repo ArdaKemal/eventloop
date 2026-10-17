@@ -282,8 +282,8 @@ auto list_videos(event_loop& loop, http::request& request, http::response& respo
     std::vector<const video*> found;
     for (const auto& [id, item] : application.library.videos()) {
         if (!channel.empty() && item.channel != channel) continue;
-        if (!search.empty() && lower(item.title).find(search) == std::string::npos &&
-            lower(item.channel).find(search) == std::string::npos)
+        if (!search.empty() && !lower(item.title).contains(search) &&
+            !lower(item.channel).contains(search))
             continue;
         found.push_back(&item);
     }
@@ -501,7 +501,7 @@ auto parse_range(std::string_view value, std::uint64_t size, bool& unsatisfiable
     -> std::optional<byte_range>
 {
     unsatisfiable = false;
-    if (!value.starts_with("bytes=") || value.find(',') != std::string_view::npos) return std::nullopt;
+    if (!value.starts_with("bytes=") || value.contains(',')) return std::nullopt;
     value.remove_prefix(6);
     const auto dash = value.find('-');
     if (dash == std::string_view::npos) return std::nullopt;
