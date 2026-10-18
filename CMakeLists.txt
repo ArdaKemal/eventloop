@@ -323,6 +323,8 @@ if(BUILD_TESTING)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             eventloop_test(interest_churn tests/interest_churn.cc LINK OpenSSL::Crypto TIMEOUT 10)
             eventloop_test(http2_file_send tests/http2_file_send.cc PRIVATE)
+            eventloop_test(http_file_batching tests/http_file_batching.cc PRIVATE
+                LINK OpenSSL::SSL OpenSSL::Crypto TIMEOUT 60)
             eventloop_test(http_open_file_cache tests/http_open_file_cache.cc PRIVATE)
             add_test(NAME http_open_file_cache_openat2_unavailable
                 COMMAND http_open_file_cache_test ENOSYS)

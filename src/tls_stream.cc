@@ -983,6 +983,12 @@ auto tls_stream::send_file_task(event_loop& loop, tls_stream& self,
     // Keep the H2 DATA header and file payload under one write guard and task.
     // The prefix is borrowed from the caller's bounded queue; it is never copied
     // into frame storage, and SSL retries keep the same pointer and length.
+    // Transmit kTLS encrypts plain socket writes: sent with MSG_MORE, the
+    // prefix stays in the kernel's open record and leaves with the file's
+    // first bytes instead of as a record and segment of its own. What the
+    // socket does not take now goes through SSL below.
+    if (size != 0)
+        prefix = prefix.subspan(detail::socket_operations::send_more_now(self.descriptor(), prefix));
     while (!prefix.empty()) {
         const auto amount = std::min<std::size_t>(prefix.size(), 16 * 1024);
         std::size_t written = 0;

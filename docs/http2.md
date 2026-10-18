@@ -33,7 +33,11 @@ do not block others. Defaults are urgency 3/non-incremental; malformed values
 keep defaults, updates for unopened streams are ignored.
 Across connections, a writer yields to the loop after 64 KiB of writes
 that did not suspend, so one connection with queued responses on a fast
-socket cannot starve others. SETTINGS_NO_RFC7540_PRIORITIES is advertised; RFC 7540 PRIORITY frames receive
+socket cannot starve others. On Linux with transmit kTLS, each DATA header
+joins its payload's TLS record (`MSG_MORE`), and the socket is corked
+(`TCP_CORK`) from the first file DATA until the writer runs out of output or
+credit, or the connection ends, so frames fill whole segments. A failed cork
+only loses the batching. SETTINGS_NO_RFC7540_PRIORITIES is advertised; RFC 7540 PRIORITY frames receive
 validity checks but do not affect scheduling. A PRIORITY of the wrong length
 is a stream FRAME_SIZE_ERROR.
 

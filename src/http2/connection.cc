@@ -5,6 +5,7 @@
 #include "../http/resource.h"
 #include "../http/file_operations.h"
 #include "../http/file_response.h"
+#include "../socket_operations.h"
 #include "session.h"
 
 #include <algorithm>
@@ -241,6 +242,38 @@ constexpr std::uint32_t cancel_error = 8;
 
 using void_result = http::detail::void_result;
 using size_result = http::detail::size_result;
+
+// Corks the socket across a run of kTLS file sends, so the kernel fills
+// segments across DATA frames instead of pushing each frame's tail alone.
+// Kept across write turns, which resume on the loop's next pass; released
+// before the writer waits for output or credit and on exit, since a corked
+// tail is held up to 200 ms. A failed cork only loses the batching.
+class send_cork {
+public:
+    explicit send_cork(native_socket socket) noexcept : socket_(socket) {}
+    ~send_cork() { release(); }
+    send_cork(const send_cork&) = delete;
+    auto operator=(const send_cork&) -> send_cork& = delete;
+    auto hold() noexcept -> void
+    {
+#ifdef __linux__
+        if (!held_) held_ = eventloop::detail::socket_operations::set_cork(socket_, true);
+#else
+        (void)socket_;
+#endif
+    }
+    auto release() noexcept -> void
+    {
+#ifdef __linux__
+        if (held_) (void)eventloop::detail::socket_operations::set_cork(socket_, false);
+#endif
+        held_ = false;
+    }
+
+private:
+    native_socket socket_;
+    bool held_ {false};
+};
 
 [[nodiscard]] auto failure(std::errc code) -> std::error_code
 {
@@ -899,12 +932,14 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
         co_return false;
     bool clean = false;
     std::size_t turn = 0;
+    send_cork cork {peer.descriptor()};
     for (;;) {
         if (turn >= write_turn_bytes) {
             turn = 0;
             (void)co_await yield(loop);
         }
         if (auto file = state->take_file_send(true)) {
+            cork.hold();
             auto sent = operation_result(co_await peer.async_send_file(
                 file->file.get(), file->offset, file->size, file->prefix));
             if (!sent) break;
@@ -923,6 +958,7 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
             continue;
         }
         turn = 0;
+        cork.release();
         if (state->closed()) {
             clean = true;
             break;
@@ -935,6 +971,7 @@ auto serve_routed(event_loop& loop, tls_stream& peer, native_socket root,
                            connection->broken || state->has_output() || state->closed()))
             break;
     }
+    cork.release();
     // Wake every parked task with the connection marked broken, then wait for
     // the reader and handlers before releasing the shared state they borrow.
     connection->broken = true;
@@ -976,6 +1013,7 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
         idle_deadline idle {deadline, idle_timeout};
         request incoming;
         std::size_t turn = 0;
+        send_cork cork {peer.descriptor()};
         for (;;) {
             while (state->pop_request(incoming)) {
                 serve_request(*state, incoming, document_root->descriptor.get(),
@@ -989,6 +1027,7 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
                     (void)co_await yield(loop);
                 }
                 if (auto file = state->take_file_send(true)) {
+                    cork.hold();
                     auto sent = operation_result(co_await peer.async_send_file(
                         file->file.get(), file->offset, file->size, file->prefix));
                     if (!sent) co_return false;
@@ -1005,6 +1044,7 @@ auto serve([[maybe_unused]] event_loop& loop, tls_stream& peer,
                 state->consume_output(*written);
                 if (state->closed()) co_return true;
             }
+            cork.release();
             if (state->closed()) co_return true;
 
             idle.update(*state);
