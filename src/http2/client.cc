@@ -2,6 +2,7 @@
 
 #include "eventloop/tls_stream.h"
 #include "hpack.h"
+#include "http/client_fields.h"
 
 #include <algorithm>
 #include <array>
@@ -30,9 +31,9 @@ public:
 } // namespace detail
 namespace {
 
-constexpr std::size_t max_body = 4 * 1024 * 1024;
+constexpr std::size_t max_body = http::detail::client_max_body;
 constexpr std::size_t max_frame = 16 * 1024;
-constexpr std::uint64_t max_streamed_body = std::uint64_t{1} << 40;
+constexpr std::uint64_t max_streamed_body = http::detail::client_max_streamed_body;
 constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 [[nodiscard]] auto failure(std::errc code) -> std::error_code
@@ -103,74 +104,6 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
     put_u32(p + 5, stream_id);
 }
 
-[[nodiscard]] auto valid_name(std::string_view name) -> bool
-{
-    if (name.empty() || name.front() == ':') return false;
-    for (unsigned char c : name) {
-        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-            std::string_view("!#$%&'*+-.^_`|~").contains(char(c)))
-            continue;
-        return false;
-    }
-    return true;
-}
-
-[[nodiscard]] auto valid_method(std::string_view method) -> bool
-{
-    if (method.empty()) return false;
-    for (unsigned char c : method) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') ||
-            std::string_view("!#$%&'*+-.^_`|~").contains(char(c)))
-            continue;
-        return false;
-    }
-    return true;
-}
-
-[[nodiscard]] auto valid_value(std::string_view value) -> bool
-{
-    if (!value.empty() && (value.front() == ' ' || value.front() == '\t' ||
-                           value.back() == ' ' || value.back() == '\t'))
-        return false;
-    for (unsigned char c : value)
-        if (c == 0x7f || (c < 0x20 && c != '\t')) return false;
-    return true;
-}
-
-[[nodiscard]] auto valid_target(std::string_view value) -> bool
-{
-    if (value.empty() || value.front() != '/' || value.contains('#'))
-        return false;
-    for (unsigned char c : value) if (c <= 0x20 || c == 0x7f) return false;
-    return true;
-}
-
-// RFC 9113 section 8.2.2. TE is allowed only in requests, as "trailers".
-[[nodiscard]] auto connection_specific(const std::string_view name) -> bool
-{
-    return name == "connection" || name == "upgrade" || name == "keep-alive" ||
-           name == "proxy-connection" || name == "transfer-encoding";
-}
-
-// Every content-length field must hold the same decimal value. Absent returns
-// an empty optional; a malformed or conflicting value returns an error.
-[[nodiscard]] auto content_length(std::span<const header> headers)
-    -> std::expected<std::optional<std::uint64_t>, std::error_code>
-{
-    std::optional<std::uint64_t> length;
-    for (const auto& item : headers) {
-        if (item.name != "content-length") continue;
-        std::uint64_t value = 0;
-        const auto* end = item.value.data() + item.value.size();
-        const auto parsed = std::from_chars(item.value.data(), end, value);
-        if (parsed.ec != std::errc{} || parsed.ptr != end || (length && *length != value))
-            return std::unexpected(failure(std::errc::protocol_error));
-        length = value;
-    }
-    return length;
-}
-
 [[nodiscard]] auto parse_headers(std::span<const std::byte> block,
                                  detail::hpack_decoder& decoder,
                                  client_response& response, bool initial)
@@ -199,8 +132,9 @@ auto frame_header(std::byte* p, std::size_t length, unsigned type,
             status_seen = true;
         } else if (!field.name.empty() && field.name.front() == ':') {
             return failure(std::errc::protocol_error);
-        } else if (!valid_name(field.name) || !valid_value(field.value) ||
-                   connection_specific(field.name) || field.name == "te") {
+        } else if (!http::detail::valid_field_name(field.name) ||
+                   !http::detail::valid_field_value(field.value) ||
+                   http::detail::connection_specific(field.name) || field.name == "te") {
             return failure(std::errc::protocol_error);
         } else {
             regular_seen = true;
@@ -221,40 +155,21 @@ struct prepared_request {
 [[nodiscard]] auto prepare(client_request& request, std::string_view hostname)
     -> std::expected<prepared_request, std::error_code>
 {
-    if (!valid_target(request.target) ||
-        (!request.authority.empty() && !valid_value(request.authority)) ||
-        !valid_method(request.method) ||
-        (request.body_source && !request.body.empty()))
-        return std::unexpected(failure(std::errc::invalid_argument));
-    // A CONNECT tunnel (RFC 9113 section 8.5) does not fit one buffered exchange.
-    if (request.method == "CONNECT")
-        return std::unexpected(failure(std::errc::operation_not_supported));
-    if (request.body.size() > max_body ||
-        request.headers.size() > detail::hpack_max_fields - 4)
-        return std::unexpected(failure(std::errc::message_size));
+    std::string authority = request.authority.empty() ? std::string(hostname)
+                                                      : request.authority;
+    const auto length = http::detail::validate_client_request(
+        request, authority, detail::hpack_max_fields - 4);
+    if (!length) return std::unexpected(length.error());
     std::vector<detail::field> fields;
     fields.reserve(request.headers.size() + 4);
     fields.push_back({":method", request.method});
     fields.push_back({":scheme", "https"});
-    fields.push_back({":authority", request.authority.empty() ? std::string(hostname)
-                                                               : request.authority});
+    fields.push_back({":authority", std::move(authority)});
     fields.push_back({":path", request.target});
-    for (auto& item : request.headers) {
-        // A Host field must repeat :authority (RFC 9113 8.3.1).
-        if (!valid_name(item.name) || !valid_value(item.value) ||
-            connection_specific(item.name) || (item.name == "te" && item.value != "trailers") ||
-            (item.name == "host" && item.value != fields[2].value))
-            return std::unexpected(failure(std::errc::invalid_argument));
-    }
-    // A declared request length must match the owned body, or the source total.
-    const auto request_length = content_length(request.headers);
-    if (!request_length ||
-        (*request_length && !request.body_source && **request_length != request.body.size()))
-        return std::unexpected(failure(std::errc::invalid_argument));
     for (auto& item : request.headers)
         fields.push_back({std::move(item.name), std::move(item.value)});
     request.headers.clear();
-    prepared_request prepared {.block = {}, .length = *request_length};
+    prepared_request prepared {.block = {}, .length = *length};
     const auto encoded = detail::hpack_encode(fields, prepared.block);
     if (encoded != detail::hpack_error::none)
         return std::unexpected(failure(encoded == detail::hpack_error::limit_exceeded
@@ -607,7 +522,7 @@ auto client_connection::state::exchange(event_loop& loop, state& self,
                 if (!initial_headers && response.status >= 200) {
                     bodyless = request.method == "HEAD" || response.status == 204 ||
                                response.status == 304;
-                    const auto length = content_length(response.headers);
+                    const auto length = http::detail::content_length(response.headers);
                     if (!length) { error = length.error(); break; }
                     if (!bodyless) response_length = *length;
                 }

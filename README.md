@@ -60,6 +60,7 @@ Public headers are under `include/eventloop/`; readiness APIs remain private.
 | QUIC v1/v2 streams and DATAGRAMs | `quic.h` | [QUIC](docs/quic.md), [echo](examples/quic_echo_server.cc) |
 | HTTP servers and routing | `http/server.h`, `http/http3_server.h`, `http/router.h` | [Shared HTTP](docs/http.md), [routing server](examples/routing_server.cc) |
 | HTTPS HTTP/2 client | `http2/client.h` | [Client contract](docs/http2.md#outbound-client), Wayfarer below |
+| HTTP/3 client | `http3/client.h` | [Client contract](docs/http3.md#outbound-client), Wayfarer below |
 | WebSocket | `ws/web_socket.h` | [WebSocket](docs/websocket.md), [client guide](examples/README-websocket-client.md) |
 | File I/O | `file_io.h` | [File I/O](docs/file-io.md) |
 | Synchronous TOML configuration | `util/toml.h` | [TOML](docs/toml.md) |
@@ -109,9 +110,10 @@ buffered fallback. See [shared HTTP](docs/http.md) and
 
 The HTTP/2 client performs HTTPS requests with ALPN `h2`, bounded owned bodies
 or streamed uploads/responses, one-shot or as sequential requests on a
-connection reused across origins its certificate covers (RFC 9113 9.1.1). QUIC exposes v1/v2
-endpoints, streams, and DATAGRAMs; Wayfarer's HTTP/3 codec has narrower limits
-than the server. WebSocket framing is bounded; HTTP/2 and HTTP/3 CONNECT routes
+connection reused across origins its certificate covers (RFC 9113 9.1.1). The
+HTTP/3 client takes the same request and response types and carries sequential
+requests on one QUIC connection. QUIC exposes v1/v2 endpoints, streams, and
+DATAGRAMs. WebSocket framing is bounded; HTTP/2 and HTTP/3 CONNECT routes
 can accept RFC 8441/9220 WebSockets. The
 [routed echo example](examples/websocket_routing_server.cc) exercises both.
 Keep interoperability and performance claims scoped to the tested paths;

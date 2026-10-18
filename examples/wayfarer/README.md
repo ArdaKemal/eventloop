@@ -1,6 +1,6 @@
 # Wayfarer
 
-A curl-style CLI using public eventloop TCP/TLS, HTTP/2, and QUIC APIs.
+A curl-style CLI using public eventloop TCP/TLS, HTTP/2, and HTTP/3 client APIs.
 One request per invocation, with optional redirect hops; unsupported options
 return errors. No private headers/codecs are linked.
 
@@ -24,9 +24,9 @@ adds it as a subdirectory and links `eventloop::eventloop`.
 | Option | Behavior |
 | --- | --- |
 | `--http1.1`, `--http2`, `--http3`, `--http3-v2` | Select protocol; HTTP/3 uses QUIC v1/v2 |
-| `-X METHOD`, repeated `-H FIELD` | Method/headers; HTTP/3 accepts only GET/HEAD and no custom headers |
-| `-d TEXT`, `--data-binary @FILE` | Literal/file body; unsupported on HTTP/3 |
-| `-i` | Headers before DATA, HTTP/2 trailers after body |
+| `-X METHOD`, repeated `-H FIELD` | Method/headers |
+| `-d TEXT`, `--data-binary @FILE` | Literal/file body |
+| `-i` | Headers before DATA, HTTP/2 and HTTP/3 trailers after body |
 | `-I`, `--head` | HEAD plus `-i`; conflicts with body/non-HEAD `-X` |
 | `-L` | Up to ten redirects |
 | `-o FILE` | Commit completed output to FILE |
@@ -38,7 +38,8 @@ adds it as a subdirectory and links `eventloop::eventloop`.
 URLs support http/https, numeric ports, paths/queries, and bracketed IPv6.
 TLS verifies hostnames. Status/metadata go to stderr; stdout carries response
 bytes and may be partial on failure. Request storage remains owned until
-writes retire. Deadline closes TCP/QUIC or cancels the HTTP/2 task to wake I/O.
+writes retire. Deadline closes TCP or the HTTP/3 connection, or cancels the
+HTTP/2 task, to wake I/O.
 
 ## Output files
 
@@ -62,9 +63,10 @@ certificate covers it (RFC 9113 9.1.1); a 421 on a reused connection, or a
 failure before any output, retries on a new connection. POST changes to GET on 301/302; 303 changes all
 but HEAD to GET; 307/308 preserve method/body. Cross-origin redirects drop
 Authorization, Cookie, and Proxy-Authorization. HTTP/1.1 replays its buffered
-file body; HTTP/2 reopens files per attempt/hop. Intermediate bodies are
-discarded, while `-i` includes their headers. Loops/ten-hop overflow fail.
-Missing Location fails on HTTP/1.1/3; HTTP/2 treats it as a final response.
+file body; HTTP/2 and HTTP/3 reopen files per attempt/hop. Intermediate bodies
+are discarded, while `-i` includes their headers. Loops/ten-hop overflow fail.
+Missing Location fails on HTTP/1.1; HTTP/2 and HTTP/3 treat it as a final
+response.
 HTTP/2/3 require HTTPS targets throughout; HTTP/1.1 can upgrade HTTP to HTTPS.
 
 ## Protocol limits
@@ -78,12 +80,9 @@ HTTP/2/3 require HTTPS targets throughout; HTTP/1.1 can upgrade HTTP to HTTPS.
   and sink output <=1 TiB. Uploads obey flow control; output streams as received.
   Headers <=64 KiB/128 fields, frames <=16 KiB. No h2c or push.
   Ownership/errors follow the [client contract](../../docs/http2.md#outbound-client).
-- HTTP/3: HTTPS GET/HEAD, request HEADERS <=4 KiB. Response QPACK supports
-  static indices, static-name literals, literal names/values, and Huffman;
-  no dynamic table/trailers/push. Field sections <=64 KiB/128 fields, complete
-  frames <=64 KiB, total DATA <=16 MiB. Content-Length mismatches on body
-  responses fail. Client opens control/encoder/decoder streams. This narrow
-  codec exercises public QUIC; root tests use a broader private-codec fixture.
+- HTTP/3: HTTPS, the HTTP/2 request and body options, and the limits and
+  errors of the [client contract](../../docs/http3.md#outbound-client): field
+  sections <=64 KiB/128 fields, no QPACK dynamic table or push.
 
 ## Automated checks
 

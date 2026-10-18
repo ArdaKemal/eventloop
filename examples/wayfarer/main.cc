@@ -1,4 +1,3 @@
-#include "http3.h"
 #include "options.h"
 #include "http_client_resolve.h"
 #include "http_client_url.h"
@@ -9,6 +8,7 @@
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
 #include "eventloop/http2/client.h"
+#include "eventloop/http3/client.h"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -205,10 +206,6 @@ auto parse_options(int argc, char** argv) -> request_options
         throw std::invalid_argument("-I/--head cannot send a request body");
     if (options.body.size() > 4 * 1024 * 1024)
         throw std::invalid_argument("request body exceeds 4 MiB");
-    if (options.protocol == 3 && (options.method != "GET" && options.method != "HEAD"))
-        throw std::invalid_argument("HTTP/3 supports GET and HEAD only");
-    if (options.protocol == 3 && (options.body_supplied || !options.headers.empty()))
-        throw std::invalid_argument("HTTP/3 request bodies and custom headers are unsupported");
     if (options.remote_name && !options.output.empty())
         throw std::invalid_argument("-O/--remote-name and -o/--output are mutually exclusive");
     if (options.protocol == 1 && !options.body_file.empty()) {
@@ -519,16 +516,37 @@ auto same_origin(const url_parts& left, const url_parts& right) -> bool
         [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
 }
 
-auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& options,
-                 std::FILE* output, request_state& state, bool& success, unsigned& final_status) -> task<void>
+template<int Version>
+using client_connection =
+    std::conditional_t<Version == 2, http2::client_connection, http3::client_connection>;
+
+template<class Connection>
+auto close_connection(event_loop& loop, std::optional<Connection>& connection,
+                      request_state& state) -> task<void>
 {
-    auto tls = options.ca_file.empty() ? tls_context::make_system_client() : tls_context::make_client(options.ca_file);
+    (void)loop;
+    if (!connection) co_return;
+    (void)co_await connection->async_close();
+    state.http3 = nullptr;
+    connection.reset();
+}
+
+// HTTP/2 and HTTP/3 share request construction, sinks, and redirects. Only
+// HTTP/2 reuses its connection across hops; HTTP/3 connects once per hop.
+template<int Version>
+auto follow_redirects(event_loop& loop, const url_parts& url, const request_options& options,
+                      std::FILE* output, request_state& state, bool& success, unsigned& final_status,
+                      std::optional<client_connection<Version>>& connection) -> task<void>
+{
+    const std::string label = "HTTP/" + std::to_string(Version);
+    std::shared_ptr<tls_context> tls;
+    if constexpr (Version == 2)
+        tls = options.ca_file.empty() ? tls_context::make_system_client() : tls_context::make_client(options.ca_file);
     url_parts current = url;
     std::string method = options.method;
     std::string body = options.body;
     std::filesystem::path body_file = options.body_file;
     auto custom_headers = options.headers;
-    std::optional<http2::client_connection> connection;
     for (unsigned hop = 0; hop <= 10 && !state.expired; ++hop) {
         auto addresses = co_await run_blocking(loop, [host = current.hostname, port = current.port]() noexcept {
             return http_client_example::resolve_addresses(host, port);
@@ -537,22 +555,30 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
         // RFC 9113 9.1.1: a redirect to a host the open connection is
         // authoritative for, at one of the host's addresses, reuses it.
         const auto endpoints = std::span(addresses->endpoints).first(addresses->count);
-        const bool reused = connection && std::any_of(endpoints.begin(), endpoints.end(),
-            [&](const ip_endpoint& endpoint) { return connection->can_reuse_for(current.hostname, endpoint); });
-        if (connection && !reused) { (void)co_await connection->async_close(); connection.reset(); }
+        bool reused = false;
+        if constexpr (Version == 2)
+            reused = connection && std::any_of(endpoints.begin(), endpoints.end(),
+                [&](const ip_endpoint& endpoint) { return connection->can_reuse_for(current.hostname, endpoint); });
+        if (!reused) co_await close_connection(loop, connection, state);
         bool redirected = false;
         // Attempt 0 uses the reused connection; attempt i connects to address i - 1.
         for (std::size_t attempt = reused ? 0 : 1; attempt <= addresses->count && !state.expired; ++attempt) {
             if (attempt != 0) {
-                connection.reset();
-                connection.emplace(loop, endpoints[attempt - 1], tls, current.hostname);
+                co_await close_connection(loop, connection, state);
+                if constexpr (Version == 2) {
+                    connection.emplace(loop, endpoints[attempt - 1], tls, current.hostname);
+                } else {
+                    connection.emplace(loop, endpoints[attempt - 1], current.hostname,
+                        http3::client_options {options.ca_file, options.quic_version});
+                    state.http3 = &*connection;
+                }
                 auto connected = io_result(co_await connection->async_connect());
                 if (!connected) {
-                    if (!state.expired) fail("HTTP/2 request failed: " + connected.error().message());
+                    if (!state.expired) fail(label + " request failed: " + connected.error().message());
                     continue;
                 }
             }
-            http2::client_request request;
+            http::client_request request;
             request.method = method;
             request.target = current.target;
             request.authority = current.host_header;
@@ -575,15 +601,15 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
             // this host there, so retry on a new connection (RFC 9110 15.5.20).
             bool wrote_output = false, redirect_response = false, misdirected = false;
             std::string location;
-            http2::response_sink sink = [&](std::span<const std::byte> chunk) -> std::error_code {
+            http::response_sink sink = [&](std::span<const std::byte> chunk) -> std::error_code {
                 if (chunk.empty() || redirect_response || misdirected) return {};
                 wrote_output = true;
                 if (std::fwrite(chunk.data(), 1, chunk.size(), output) != chunk.size())
                     return std::make_error_code(std::errc::io_error);
                 return {};
             };
-            http2::response_header_sink headers_sink = [&](unsigned status,
-                std::span<const http2::header> fields) -> std::error_code {
+            http::response_header_sink headers_sink = [&](unsigned status,
+                std::span<const http::client_header> fields) -> std::error_code {
                 if (status == 421 && attempt == 0) misdirected = true;
                 if (misdirected) return {};
                 if (options.follow_redirects && redirect_status(status)) {
@@ -594,7 +620,7 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
                 if (!options.show_headers) return {};
                 wrote_output = true;
                 if (status != 0) {
-                    const auto line = "HTTP/2 " + std::to_string(status) + "\r\n";
+                    const auto line = label + " " + std::to_string(status) + "\r\n";
                     if (std::fwrite(line.data(), 1, line.size(), output) != line.size())
                         return std::make_error_code(std::errc::io_error);
                 }
@@ -611,24 +637,23 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
                 std::move(request), std::move(sink), std::move(headers_sink)));
             if (!response) {
                 if (!state.expired && (attempt != 0 || wrote_output))
-                    fail("HTTP/2 request failed: " + response.error().message());
+                    fail(label + " request failed: " + response.error().message());
                 if (wrote_output) co_return;
                 continue;
             }
             if (misdirected) continue;
-            std::cerr << "HTTP/2 " << response->status << '\n';
+            std::cerr << label << " " << response->status << '\n';
             if (!redirect_response) {
                 if (std::fflush(output) != 0) { fail("output flush failed"); co_return; }
                 final_status = response->status;
                 success = true;
-                (void)co_await connection->async_close();
                 co_return;
             }
             if (hop == 10) { fail("redirect limit of 10 reached"); co_return; }
             url_parts next;
             try { next = redirect_url(current, location); }
             catch (const std::exception& error) { fail(error.what()); co_return; }
-            if (!next.secure) { fail("HTTP/2 redirect to non-HTTPS URL is unsupported"); co_return; }
+            if (!next.secure) { fail(label + " redirect to non-HTTPS URL is unsupported"); co_return; }
             if (!same_origin(current, next)) {
                 std::erase_if(custom_headers, [](const auto& field) {
                     return field.first == "authorization" || field.first == "cookie" || field.first == "proxy-authorization";
@@ -645,8 +670,19 @@ auto fetch_http2(event_loop& loop, const url_parts& url, const request_options& 
             redirected = true;
             break;
         }
-        if (!redirected) { if (!state.expired) fail("all HTTP/2 connection attempts failed"); co_return; }
+        if (!redirected) { if (!state.expired) fail("all " + label + " connection attempts failed"); co_return; }
     }
+}
+
+template<int Version>
+auto fetch_multiplexed(event_loop& loop, const url_parts& url, const request_options& options,
+                       std::FILE* output, request_state& state, bool& success,
+                       unsigned& final_status) -> task<void>
+{
+    std::optional<client_connection<Version>> connection;
+    (void)co_await follow_redirects<Version>(loop, url, options, output, state, success,
+                                             final_status, connection);
+    co_await close_connection(loop, connection, state);
 }
 
 auto deadline(event_loop& loop, request_state& state, std::chrono::milliseconds duration) -> task<void>
@@ -655,8 +691,8 @@ auto deadline(event_loop& loop, request_state& state, std::chrono::milliseconds 
         state.expired = true;
         fail("overall timeout");
         if (state.socket) state.socket->close();
-        if (state.endpoint) state.endpoint->close();
-        if (!state.socket && !state.endpoint && state.operation)
+        if (state.http3) state.http3->close();
+        if (!state.socket && !state.http3 && state.operation)
             (void)state.operation->cancel();
     }
 }
@@ -669,8 +705,8 @@ auto run_request(event_loop& loop, url_parts url, const request_options& options
     state.operation = &operation;
     const bool timer_started = loop.spawn(deadline(loop, state, options.timeout), timer) == task_spawn_result::accepted;
     const bool operation_started = timer_started && loop.spawn(
-        options.protocol == 3 ? fetch_http3(loop, url, options, output, state, success, final_status)
-        : options.protocol == 2 ? fetch_http2(loop, url, options, output, state, success, final_status)
+        options.protocol == 3 ? fetch_multiplexed<3>(loop, url, options, output, state, success, final_status)
+        : options.protocol == 2 ? fetch_multiplexed<2>(loop, url, options, output, state, success, final_status)
                                 : fetch_http1(loop, url, options, output, state, success, final_status), operation) == task_spawn_result::accepted;
     if (operation_started) (void)co_await operation;
     if (timer_started) { (void)timer.cancel(); (void)co_await timer; }

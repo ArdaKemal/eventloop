@@ -155,6 +155,63 @@ Content-Length is not checked past that point. Routed bodies follow handler
 rules above. Shared bounded listings preserve GET length on HEAD without DATA. Static/automatic responses include Date.
 HTTP/3 server push and WebTransport are not supported.
 
+## Outbound client
+
+Include `eventloop/http3/client.h`. `http3::client_connection(loop, endpoint,
+hostname, options = {})` carries sequential requests on one QUIC connection
+with ALPN h3. It owns a client `quic_endpoint` bound to the unspecified address
+of `endpoint`'s family; `client_options` selects `trusted_ca` (empty uses the
+system store) and the QUIC version. Numeric endpoint resolution belongs to the
+caller; hostname supplies verification, SNI, and default `:authority`.
+`async_connect()` handshakes and opens the control stream (SETTINGS) and the
+QPACK encoder and decoder streams. `async_request()` takes the request, sink,
+and header-sink arguments of the [HTTP/2 client](http2.md#outbound-client)
+(`http::client_*` types), with the same ownership, callback, Content-Length,
+and malformed-response rules. General token methods work; CONNECT returns
+`operation_not_supported`.
+
+| Situation | Result |
+| --- | --- |
+| Second operation while one is pending | `device_or_resource_busy` |
+| Request before connect, after `close()`/failure/GOAWAY | `not_connected` |
+| Second `async_connect()` | `already_connected` |
+| GOAWAY at or below the request's stream ID, or request stream reset | `connection_reset` |
+| Request failure after validation, including cancellation | Closes the QUIC connection |
+
+Once `async_connect()` has been called, `async_close()` must complete before
+destruction (destroying earlier terminates), even after a failed connect.
+`async_close()` sends CONNECTION_CLOSE with H3_NO_ERROR, retires the peer-stream
+readers, and awaits endpoint retirement. `close()` closes the connection and
+endpoint without waiting so a pending operation fails promptly, for deadlines;
+it does not replace `async_close()`. A request failure closes with
+H3_GENERAL_PROTOCOL_ERROR for `protocol_error`, otherwise H3_REQUEST_CANCELLED.
+
+| Storage / data | Limit / behavior |
+| --- | --- |
+| Request / response field section | 64 KiB, 128 fields; SETTINGS_MAX_FIELD_SECTION_SIZE 64 KiB |
+| Owned request / buffered response body | 4 MiB each |
+| Streamed source / sink total | 1 TiB each |
+| Source chunk / sink chunk | 16 KiB |
+| Connection buffers | About 230 KiB, allocated by `async_connect()`, shared by sequential requests |
+
+A request larger than the server's SETTINGS_MAX_FIELD_SECTION_SIZE, once known,
+is `message_size` before a stream opens. A body is sent by a separate task while
+the response is read, so a server may answer before the upload ends: a complete
+response then resets the request stream with H3_REQUEST_CANCELLED and succeeds,
+and a peer STOP_SENDING ends the upload quietly. Spawning that task can fail
+with `not_enough_memory` under frame exhaustion.
+
+Unknown frames are skipped by length between HEADERS, DATA, and one trailing
+HEADERS; trailers append to `response.headers` and reach the header sink with
+status 0. Control or reserved frames on a request stream, and QPACK sections
+that reference the dynamic table, are `protocol_error`. The client advertises
+a zero-capacity dynamic table and sends no MAX_PUSH_ID, so a push stream is
+H3_ID_ERROR. Peer control and encoder streams follow the server rules above
+(SETTINGS first and once, critical streams never close, encoder capacity 0
+only); the decoder stream accepts only Stream Cancellation, and unknown stream
+types get STOP_SENDING H3_STREAM_CREATION_ERROR. A violation closes the
+connection; the pending or next request fails.
+
 ## Allocation measurements
 
 [http3_routing_allocations](../tests/http3_routing_allocations.cc) checks zero

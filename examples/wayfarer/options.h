@@ -1,6 +1,6 @@
 #pragma once
 
-#include "eventloop/quic.h"
+#include "eventloop/http3/client.h"
 #include "eventloop/tcp_stream.h"
 #include "eventloop/task.h"
 
@@ -31,7 +31,7 @@ struct request_options {
 
 struct request_state {
     eventloop::tcp_stream* socket {};
-    eventloop::quic_endpoint* endpoint {};
+    eventloop::http3::client_connection* http3 {};
     eventloop::task_handle<void>* operation {};
     bool expired {};
 };

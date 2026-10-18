@@ -50,6 +50,7 @@ if(WIN32)
         src/quic/retry_token.cc
         src/quic/tls_provider.cc
         src/quic/quic_endpoint.cc
+        src/http3/client.cc
         src/http3/server.cc
         src/http3/qpack.cc
         src/windows/file_operation.cc
@@ -760,7 +761,9 @@ add_library(eventloop
     include/eventloop/http/response.h
     include/eventloop/http/router.h
     include/eventloop/http/server_options.h
+    include/eventloop/http/client.h
     include/eventloop/http2/client.h
+    include/eventloop/http3/client.h
     include/eventloop/http/server.h
     include/eventloop/http/http3_server.h
     include/eventloop/ip_endpoint.h
@@ -789,6 +792,7 @@ add_library(eventloop
     src/quic/retry_token.cc
     src/quic/tls_provider.cc
     src/quic/quic_endpoint.cc
+    src/http3/client.cc
     src/http3/server.cc
     src/http3/qpack.cc
     src/executor/single_thread_executor.cc
@@ -1485,6 +1489,12 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME http3_routing COMMAND http3_routing_test)
     set_tests_properties(http3_routing PROPERTIES TIMEOUT 20)
+
+    add_executable(http3_client_test tests/http3_client.cc)
+    target_link_libraries(http3_client_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
+    target_compile_options(http3_client_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME http3_client COMMAND http3_client_test)
+    set_tests_properties(http3_client PROPERTIES TIMEOUT 30)
 
     add_executable(http_websocket_test tests/http_websocket.cc src/http3/qpack.cc)
     target_include_directories(http_websocket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

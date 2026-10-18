@@ -121,7 +121,10 @@ allocates on each new connection.
 
 ## Outbound client
 
-Include `eventloop/http2/client.h`. `http2::async_request(loop, endpoint,
+Include `eventloop/http2/client.h`. Request, response, and callback types are
+the `http::client_*` types of `eventloop/http/client.h`, shared with the
+[HTTP/3 client](http3.md#outbound-client); `http2::header` and the other
+`http2::` names alias them. `http2::async_request(loop, endpoint,
 context, hostname, request, sink = {}, header_sink = {})` performs one HTTPS
 request on one owned TLS connection. Numeric endpoint resolution belongs to
 the caller; hostname supplies verification, SNI, and default `:authority`.

@@ -21,4 +21,4 @@ changes. Contracts describe behavior; current test runs establish status.
 | [Shared HTTP](http.md) | Options, routing, request/response ownership, static files, listings/cache |
 | [HTTP/1.1](http1.1.md) | Plain/TLS servers, chunked bodies, trailers, reuse, allocations |
 | [HTTP/2](http2.md) | ALPN, streams, flow control, priority, cancellation, closure history, client, allocations |
-| [HTTP/3](http3.md) | Server lifetime/capacity, framing, QPACK, errors, allocations |
+| [HTTP/3](http3.md) | Server lifetime/capacity, framing, QPACK, errors, client, allocations |

@@ -5,7 +5,7 @@ set(EVENTLOOP_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." CACHE PATH
     "eventloop source checkout used by the standalone wayfarer build")
 add_subdirectory("${EVENTLOOP_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/eventloop-root")
 
-add_executable(wayfarer main.cc http3.cc
+add_executable(wayfarer main.cc
     ../common/http_client_url.cc ../common/http_client_resolve.cc)
 target_include_directories(wayfarer PRIVATE ../common)
 target_compile_features(wayfarer PRIVATE cxx_std_23)
