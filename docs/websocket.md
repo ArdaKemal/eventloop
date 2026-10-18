@@ -9,7 +9,7 @@ One receive and send may coexist. Payload views expire at next receive/socket
 destruction; send buffers borrow through completion. Message/output limits
 bound framing plus control overhead. Failures retire framing state and close
 transport. Best-effort fan-out drops only the current message for a full
-recipient and counts drops. [Client guide](../examples/README-websocket-client.md).
+recipient and counts drops. [Client guide](../examples/basics/README.md).
 
 ## Routed HTTP/2 and HTTP/3 WebSockets
 
@@ -47,7 +47,7 @@ read. `connect_protocol()` exposes :protocol (empty on ordinary requests).
 Portable across TLS HTTP/2/QUIC HTTP/3 platforms; cleartext HTTP/2 and HTTP/1.1
 route upgrades are unsupported. Session/framing setup may allocate.
 
-[websocket_routing_server](../examples/websocket_routing_server.cc) echoes
+[websocket_routing_server](../examples/basics/websocket_routing_server.cc) echoes
 `/chat` and serves ordinary HTTP at `/hello`; peers need Extended CONNECT:
 
 ```sh

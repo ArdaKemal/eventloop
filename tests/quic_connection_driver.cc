@@ -67,8 +67,6 @@ static bool valid_parameters(void*, std::span<const std::uint8_t> value) noexcep
         std::ranges::equal(value.first(parameters.size()), parameters) &&
         std::ranges::equal(value.subspan(parameters.size()), grease);
 }
-static bool on_frame(void* argument, tls_level, const decoded_frame&) noexcept
-{ ++*static_cast<int*>(argument); return true; }
 struct buffers {
     std::array<std::uint8_t, 2048> encoded {}, frame {}, build_scratch {},
         packet_scratch {}, plaintext {}, auth_scratch {};
@@ -93,7 +91,7 @@ struct send_progress {
         self.previous=highest;
     }
 };
-static auto wait_for_notification(event_loop& loop,connection_driver& driver,
+static auto wait_for_notification(event_loop&,connection_driver& driver,
     bool& finished,bool& completed) -> task<void>
 {
     // A distant deadline makes this a signal/cancellation test rather than a
@@ -483,7 +481,7 @@ static auto receive_burst(event_loop& loop,connection_driver& driver,bounded_con
     for (int copy=0;copy<40;++copy)
         check((co_await peer.async_send_to(std::as_bytes(std::span(storage.encoded).first(*size)),
                                           endpoint.local_endpoint())).has_value());
-    co_await sleep_for(loop,100ms);
+    (void)co_await sleep_for(loop,100ms);
     check(driver.dropped_packets()==0);
     loop.shutdown(event_loop::clock::duration::zero());
 }
@@ -554,7 +552,7 @@ static auto amplification(event_loop& loop,bounded_connection& server,bounded_co
     check(!server.core().keys_available(tls_level::application,tls_direction::read));
     // Blocked, the server arms no PTO (RFC 9002 6.2.2.1): nothing is sent or
     // counted past the first 999 ms PTO.
-    co_await sleep_for(loop,700ms);
+    (void)co_await sleep_for(loop,700ms);
     check(server.recovery().pto_count()==0 && !server.recovery().next_alarm());
     check(co_await receive_raw(loop,peer,input)==0);
     // A client datagram restores credit and the server resumes at once.
@@ -642,7 +640,7 @@ int main()
         check(server->initialize(context.server.get(),{true,{},protocol,parameters},version,dcid).has_value());
         auto client_driver=std::make_unique<connection_driver>(loop,client_endpoint,*client,dcid,dcid,server_endpoint.local_endpoint(),true);
         auto server_driver=std::make_unique<connection_driver>(loop,server_endpoint,*server,dcid,dcid,client_endpoint.local_endpoint());
-        send_progress progress {*client};
+        send_progress progress {*client, {}};
         client_driver->set_progress(&progress,send_progress::observe);
         bool delivered=false,client_clean=false,server_clean=false;
         check(loop.spawn(receiver(loop,client_endpoint))==task_spawn_result::accepted);
@@ -651,7 +649,8 @@ int main()
         check(loop.spawn(drive(loop,*server_driver,server_clean))==task_spawn_result::accepted);
         check(loop.spawn(observe(loop,*client,*server,*client_driver,*server_driver,client_endpoint,server_endpoint.local_endpoint(),delivered,progress))==task_spawn_result::accepted);
         (void)loop.run();
-        if (!delivered) std::fprintf(stderr,"delivery failure state %d/%d dropped %zu/%zu\n",static_cast<int>(client->core().state()),static_cast<int>(server->core().state()),client_driver->dropped_packets(),server_driver->dropped_packets()); check(delivered && client_clean && server_clean);
+        if (!delivered) std::fprintf(stderr,"delivery failure state %d/%d dropped %zu/%zu\n",static_cast<int>(client->core().state()),static_cast<int>(server->core().state()),client_driver->dropped_packets(),server_driver->dropped_packets());
+        check(delivered && client_clean && server_clean);
         check(loop.coroutine_statistics().live==0);
         // Each side issues a spare connection ID up to the peer's default
         // active_connection_id_limit of 2 (RFC 9000 5.1.1), routes it, and

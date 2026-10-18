@@ -4,7 +4,7 @@
 #include <string>
 #include <string_view>
 
-namespace http_client_example {
+namespace client_support {
 
 struct url_parts {
     bool secure {false};
@@ -16,4 +16,4 @@ struct url_parts {
 
 [[nodiscard]] auto parse_url(std::string_view url) -> url_parts;
 
-} // namespace http_client_example
+} // namespace client_support

@@ -13,12 +13,11 @@
 #include "eventloop/http/server.h"
 #include "eventloop/ip_endpoint.h"
 #include "eventloop/util/arg_parser.h"
+#include "port.h"
 
 #include <array>
-#include <charconv>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -101,16 +100,15 @@ auto serve(event_loop& loop, http::server& server) -> task<void>
 auto main(int argc, char** argv) -> int
 {
     try {
-        int port_number = 8080;
+        std::uint16_t port = 8080;
         std::string document_root;
         const std::array positionals {
-            arg_parser::positional {"PORT", &port_number, false},
+            arg_parser::positional {"PORT", basics::port_argument(port), false},
             arg_parser::positional {"DOCUMENT-ROOT", &document_root, false},
         };
         arg_parser arguments({}, positionals);
         arguments.set_usage("usage: routing_server [port] [document-root]  (default port 8080)\n");
         arguments.parse(argc, argv);
-        const auto port = static_cast<std::uint16_t>(port_number);
         auto routes = std::make_shared<http::router>();
         if (!routes->add(http::method_type::get, "/hello", hello) ||
             !routes->add_prefix(http::method_type::get, "/api/", api) ||

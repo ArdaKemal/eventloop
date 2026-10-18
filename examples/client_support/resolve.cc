@@ -1,4 +1,4 @@
-#include "http_client_resolve.h"
+#include "client_support/resolve.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -14,7 +14,7 @@
 #include <charconv>
 #include <cstring>
 
-namespace http_client_example {
+namespace client_support {
 
 auto resolve_addresses(const std::string& host,
                                      std::uint16_t port) noexcept
@@ -67,4 +67,4 @@ auto resolve_addresses(const std::string& host,
     return result;
 }
 
-} // namespace http_client_example
+} // namespace client_support

@@ -1,5 +1,5 @@
-#include "http_client_resolve.h"
-#include "http_client_url.h"
+#include "client_support/resolve.h"
+#include "client_support/url.h"
 
 #include "eventloop/event_loop.h"
 #include "eventloop/task.h"
@@ -34,9 +34,9 @@
 #endif
 
 namespace {
-using http_client_example::parse_url;
-using http_client_example::resolve_addresses;
-using http_client_example::url_parts;
+using client_support::parse_url;
+using client_support::resolve_addresses;
+using client_support::url_parts;
 
 [[nodiscard]] auto io(std::expected<std::size_t, std::error_code> result)
     -> std::expected<std::size_t, std::error_code> { return result; }

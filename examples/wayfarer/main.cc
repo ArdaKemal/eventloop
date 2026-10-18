@@ -1,6 +1,6 @@
 #include "options.h"
-#include "http_client_resolve.h"
-#include "http_client_url.h"
+#include "client_support/resolve.h"
+#include "client_support/url.h"
 
 #include "eventloop/event_loop.h"
 #include "eventloop/task.h"
@@ -44,7 +44,7 @@
 
 namespace {
 using namespace eventloop;
-using http_client_example::url_parts;
+using client_support::url_parts;
 
 auto fail(std::string_view message) -> void { std::cerr << "wayfarer: " << message << '\n'; }
 
@@ -406,7 +406,7 @@ auto fetch_http1(event_loop& loop, const url_parts& url, const request_options& 
             ':' + std::to_string(current.port) + current.target + '\n' + request.method;
         if (!visited.insert(identity).second) { fail("redirect loop detected"); co_return; }
         auto addresses = co_await run_blocking(loop, [host = current.hostname, port = current.port]() noexcept {
-            return http_client_example::resolve_addresses(host, port);
+            return client_support::resolve_addresses(host, port);
         });
         if (!addresses || addresses->error || addresses->count == 0) { fail("DNS lookup failed"); co_return; }
         std::shared_ptr<tls_context> tls;
@@ -480,17 +480,17 @@ auto redirect_url(const url_parts& current, std::string_view location) -> url_pa
         std::string absolute(location);
         std::transform(absolute.begin(), absolute.begin() + separator, absolute.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return http_client_example::parse_url(absolute);
+        return client_support::parse_url(absolute);
     }
     if (location.starts_with("//"))
-        return http_client_example::parse_url(scheme + std::string(location));
+        return client_support::parse_url(scheme + std::string(location));
     if (location.starts_with('/'))
-        return http_client_example::parse_url(origin + std::string(location));
+        return client_support::parse_url(origin + std::string(location));
     if (location.starts_with('#'))
-        return http_client_example::parse_url(origin + current.target + std::string(location));
+        return client_support::parse_url(origin + current.target + std::string(location));
     if (location.starts_with('?')) {
         const auto question = current.target.find('?');
-        return http_client_example::parse_url(origin + current.target.substr(0, question) + std::string(location));
+        return client_support::parse_url(origin + current.target.substr(0, question) + std::string(location));
     }
     const auto question = current.target.find('?');
     const auto path = current.target.substr(0, question);
@@ -518,7 +518,7 @@ auto redirect_url(const url_parts& current, std::string_view location) -> url_pa
         if (!normalized.ends_with('/')) normalized += '/';
     }
     if (suffix != std::string::npos) normalized += combined.substr(suffix);
-    return http_client_example::parse_url(origin + normalized);
+    return client_support::parse_url(origin + normalized);
 }
 
 auto same_origin(const url_parts& left, const url_parts& right) -> bool
@@ -562,7 +562,7 @@ auto follow_redirects(event_loop& loop, const url_parts& url, const request_opti
     auto custom_headers = options.headers;
     for (unsigned hop = 0; hop <= 10 && !state.expired; ++hop) {
         auto addresses = co_await run_blocking(loop, [host = current.hostname, port = current.port]() noexcept {
-            return http_client_example::resolve_addresses(host, port);
+            return client_support::resolve_addresses(host, port);
         });
         if (!addresses || addresses->error || addresses->count == 0) { fail("DNS lookup failed"); co_return; }
         // RFC 9113 9.1.1: a redirect to a host the open connection is
@@ -781,7 +781,7 @@ auto main(int argc, char** argv) -> int
 {
     try {
         auto options = parse_options(argc, argv);
-        const auto url = http_client_example::parse_url(options.url);
+        const auto url = client_support::parse_url(options.url);
         if (options.remote_name) options.output = remote_output_name(url.target);
         if (options.protocol == 3 && !url.secure) throw std::invalid_argument("HTTP/3 requires https://");
         if (options.protocol == 2 && !url.secure) throw std::invalid_argument("HTTP/2 requires https://");

@@ -3,9 +3,9 @@
 #include "eventloop/tcp_acceptor.h"
 #include "eventloop/tcp_stream.h"
 #include "eventloop/util/arg_parser.h"
+#include "port.h"
 
 #include <array>
-#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -55,25 +55,14 @@ namespace {
     }
 }
 
-[[nodiscard]] auto parse_port(std::string_view text) -> std::uint16_t
-{
-    unsigned int port = 0;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), port);
-    if (error != std::errc {} || end != text.data() + text.size() || port == 0 ||
-        port > 65535) {
-        throw std::invalid_argument("port must be between 1 and 65535");
-    }
-    return static_cast<std::uint16_t>(port);
-}
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
 {
     try {
         std::uint16_t port = 7000;
-        const std::array positionals {arg_parser::positional {"PORT",
-            arg_parser::value_handler([&port](std::string_view value) { port = parse_port(value); }),
-            false}};
+        const std::array positionals {
+            arg_parser::positional {"PORT", basics::port_argument(port), false}};
         arg_parser arguments({}, positionals);
         arguments.set_usage("usage: tcp_echo [port]  (default 7000)\n");
         arguments.parse(argc, argv);

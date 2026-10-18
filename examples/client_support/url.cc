@@ -1,10 +1,10 @@
-#include "http_client_url.h"
+#include "client_support/url.h"
 
 #include <algorithm>
 #include <charconv>
 #include <stdexcept>
 
-namespace http_client_example {
+namespace client_support {
 namespace {
 [[nodiscard]] auto parse_port(std::string_view text) -> std::uint16_t
 {
@@ -102,4 +102,4 @@ auto parse_url(std::string_view url) -> url_parts
     return parsed;
 }
 
-} // namespace http_client_example
+} // namespace client_support

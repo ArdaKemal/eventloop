@@ -6,8 +6,8 @@
 #include "eventloop/http/server.h"
 #include "eventloop/ws/web_socket.h"
 #include "eventloop/util/arg_parser.h"
+#include "port.h"
 
-#include <charconv>
 #include <array>
 #include <chrono>
 #include <iostream>
@@ -50,19 +50,17 @@ auto hello(event_loop&, http::request&, http::response& response) -> task<void>
 
 auto main(int argc, char** argv) -> int
 {
-    std::string certificate, private_key, port_text = "8443";
-    const std::array positionals {
-        arg_parser::positional {"CERTIFICATE", &certificate, true},
-        arg_parser::positional {"PRIVATE-KEY", &private_key, true},
-        arg_parser::positional {"PORT", &port_text, false},
-    };
-    arg_parser arguments({}, positionals);
-    arguments.set_usage("usage: websocket_routing_server certificate.pem private-key.pem [port]\n");
-    arguments.parse(argc, argv);
-    std::uint16_t port = 0;
-    const auto parsed = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
-    if (parsed.ec != std::errc{} || parsed.ptr != port_text.data() + port_text.size() || port == 0) return 1;
     try {
+        std::uint16_t port = 8443;
+        std::string certificate, private_key;
+        const std::array positionals {
+            arg_parser::positional {"CERTIFICATE", &certificate, true},
+            arg_parser::positional {"PRIVATE-KEY", &private_key, true},
+            arg_parser::positional {"PORT", basics::port_argument(port), false},
+        };
+        arg_parser arguments({}, positionals);
+        arguments.set_usage("usage: websocket_routing_server certificate.pem private-key.pem [port]\n");
+        arguments.parse(argc, argv);
         auto routes = std::make_shared<http::router>();
         if (!routes->add(http::method_type::connect, "/chat", chat) ||
             !routes->add(http::method_type::get, "/hello", hello)) return 1;

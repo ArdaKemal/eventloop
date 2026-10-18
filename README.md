@@ -22,10 +22,10 @@ ctest --test-dir build --output-on-failure
 ./build/tcp_echo 7000
 ```
 
-[TCP echo](examples/tcp_echo.cc) is a complete public-header server: it accepts
+[TCP echo](examples/basics/tcp_echo.cc) is a complete public-header server: it accepts
 an owning `unique_fd`, transfers the stream to the loop, handles partial I/O
 with a frame-local buffer, and closes sessions on completion or failure.
-[Unix echo](examples/unix_echo.cc) uses filesystem-path sockets on FreeBSD,
+[Unix echo](examples/basics/unix_echo.cc) uses filesystem-path sockets on FreeBSD,
 Linux, and macOS.
 On Windows, use a Visual Studio CMake generator and run executables from the
 build configuration directory. `EVENTLOOP_WINDOWS_TLS` defaults to `ON`;
@@ -53,19 +53,21 @@ Public headers are under `include/eventloop/`; readiness APIs remain private.
 | Tasks, timers, composition, workers | `event_loop.h`, `task.h`, `task_composition.h`, `wakeup.h` | [Coroutines](docs/coroutines.md) |
 | Bounded coroutine channel | `channel.h` | [Channel](docs/channel.md) |
 | Scoped concurrency permits | `semaphore.h` | [Semaphore](docs/semaphore.md) |
-| TCP | `tcp_acceptor.h`, `tcp_stream.h`, `ip_endpoint.h` | [TCP](docs/tcp.md), [echo](examples/tcp_echo.cc) |
-| TLS | `tls_stream.h`, `tls_context.h` | [TLS](docs/tls.md), [echo](examples/tls_echo.cc) |
-| Unix streams (FreeBSD/Linux/macOS) | `unix_socket.h` | [Unix sockets](docs/unix-sockets.md), [echo](examples/unix_echo.cc) |
+| TCP | `tcp_acceptor.h`, `tcp_stream.h`, `ip_endpoint.h` | [TCP](docs/tcp.md), [echo](examples/basics/tcp_echo.cc) |
+| TLS | `tls_stream.h`, `tls_context.h` | [TLS](docs/tls.md), [echo](examples/basics/tls_echo.cc) |
+| Unix streams (FreeBSD/Linux/macOS) | `unix_socket.h` | [Unix sockets](docs/unix-sockets.md), [echo](examples/basics/unix_echo.cc) |
 | UDP | `udp_socket.h` | [UDP](docs/udp.md) |
-| QUIC v1/v2 streams and DATAGRAMs | `quic.h` | [QUIC](docs/quic.md), [echo](examples/quic_echo_server.cc) |
-| HTTP servers and routing | `http/server.h`, `http/http3_server.h`, `http/router.h` | [Shared HTTP](docs/http.md), [routing server](examples/routing_server.cc) |
+| QUIC v1/v2 streams and DATAGRAMs | `quic.h` | [QUIC](docs/quic.md), [echo](examples/basics/quic_echo_server.cc) |
+| HTTP servers and routing | `http/server.h`, `http/http3_server.h`, `http/router.h` | [Shared HTTP](docs/http.md), [routing server](examples/basics/routing_server.cc) |
 | HTTPS HTTP/2 client | `http2/client.h` | [Client contract](docs/http2.md#outbound-client), Wayfarer below |
 | HTTP/3 client | `http3/client.h` | [Client contract](docs/http3.md#outbound-client), Wayfarer below |
-| WebSocket | `ws/web_socket.h` | [WebSocket](docs/websocket.md), [client guide](examples/README-websocket-client.md) |
+| WebSocket | `ws/web_socket.h` | [WebSocket](docs/websocket.md), [client guide](examples/basics/README.md) |
 | File I/O | `file_io.h` | [File I/O](docs/file-io.md) |
 | Synchronous TOML configuration | `util/toml.h` | [TOML](docs/toml.md) |
 
-Standalone applications build from their own example directories:
+The root build also produces the single-file programs in
+[examples/basics](examples/basics/README.md). Standalone applications build
+from their own example directories:
 
 - [Wayfarer](examples/wayfarer/README.md): HTTP/1.1, HTTP/2, and HTTP/3 CLI
   client; redirects and file downloads.
@@ -74,10 +76,10 @@ Standalone applications build from their own example directories:
   and a `/healthz` route.
 - [Parley](examples/parley/README.md): browser chat, uploads, routed APIs,
   HTTP/2 WebSockets, and event-stream fallback.
-- [Lantern](examples/lantern/README.md): resumable video uploads, ranged
-  playback, and concurrent disconnect stress tests.
 
-Root test fixtures are in `tests/fixtures/`; benchmarks are in `benchmark/`.
+Shared URL and DNS helpers for the client examples are in
+`examples/client_support/`. Root test fixtures are in `tests/fixtures/`;
+benchmarks are in `benchmark/`.
 [Latency optimization](docs/latency-optimization.md) covers TCP/TLS and HTTP/2/3
 experiments, measurement rules, and further optimization.
 [API conventions](docs/api-conventions.md) guide API changes;
@@ -115,7 +117,7 @@ HTTP/3 client takes the same request and response types and carries sequential
 requests on one QUIC connection. QUIC exposes v1/v2 endpoints, streams, and
 DATAGRAMs. WebSocket framing is bounded; HTTP/2 and HTTP/3 CONNECT routes
 can accept RFC 8441/9220 WebSockets. The
-[routed echo example](examples/websocket_routing_server.cc) exercises both.
+[routed echo example](examples/basics/websocket_routing_server.cc) exercises both.
 Keep interoperability and performance claims scoped to the tested paths;
 local benchmark workloads are not throughput guarantees.
 

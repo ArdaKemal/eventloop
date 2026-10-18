@@ -102,10 +102,13 @@ auto generate_certificate(const fs::path& certificate, const fs::path& private_k
     X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600);
     X509_gmtime_adj(X509_getm_notAfter(cert.get()), 365L * 24 * 3600);
     X509_set_pubkey(cert.get(), key.get());
-    auto* name = X509_get_subject_name(cert.get());
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
-    X509_set_issuer_name(cert.get(), name);
+    // A fresh name works with OpenSSL 4, whose X509_get_subject_name is const.
+    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name(X509_NAME_new(), X509_NAME_free);
+    if (!name || !X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) ||
+        !X509_set_subject_name(cert.get(), name.get()) ||
+        !X509_set_issuer_name(cert.get(), name.get()))
+        throw std::runtime_error("cannot build the certificate");
     X509V3_CTX context;
     X509V3_set_ctx_nodb(&context);
     X509V3_set_ctx(&context, cert.get(), cert.get(), nullptr, nullptr, 0);

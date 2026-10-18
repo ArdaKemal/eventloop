@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <string>
 
-namespace http_client_example {
+namespace client_support {
 
 struct resolved_addresses {
     std::array<eventloop::ip_endpoint, 16> endpoints {};
@@ -20,4 +20,4 @@ struct resolved_addresses {
                                      std::uint16_t port) noexcept
     -> resolved_addresses;
 
-} // namespace http_client_example
+} // namespace client_support

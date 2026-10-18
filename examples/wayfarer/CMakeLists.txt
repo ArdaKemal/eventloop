@@ -6,8 +6,8 @@ set(EVENTLOOP_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." CACHE PATH
 add_subdirectory("${EVENTLOOP_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/eventloop-root")
 
 add_executable(wayfarer main.cc
-    ../common/http_client_url.cc ../common/http_client_resolve.cc)
-target_include_directories(wayfarer PRIVATE ../common)
+    ../client_support/url.cc ../client_support/resolve.cc)
+target_include_directories(wayfarer PRIVATE ..)
 target_compile_features(wayfarer PRIVATE cxx_std_23)
 target_link_libraries(wayfarer PRIVATE eventloop::eventloop)
 if(MSVC)

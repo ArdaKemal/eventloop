@@ -5,13 +5,11 @@
 #include "eventloop/quic.h"
 #include "eventloop/event_loop.h"
 #include "eventloop/util/arg_parser.h"
+#include "port.h"
 
 #include <array>
-#include <charconv>
 #include <cstddef>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <span>
 #include <string_view>
 
@@ -19,14 +17,6 @@ namespace {
 
 using namespace eventloop;
 
-auto parse_port(const char* text) -> std::uint16_t
-{
-    unsigned value = 0;
-    const auto* end = text + std::strlen(text);
-    const auto result = std::from_chars(text, end, value);
-    if (result.ec != std::errc {} || value == 0 || value > 65535) return 0;
-    return static_cast<std::uint16_t>(value);
-}
 
 auto serve(event_loop& loop, quic_endpoint& endpoint,
            std::span<std::byte> buffer) -> task<void>
@@ -65,18 +55,22 @@ auto serve(event_loop& loop, quic_endpoint& endpoint,
 
 auto main(int argc, char** argv) -> int
 {
-    std::string port_text, certificate, private_key, alpn;
+    std::uint16_t port = 0;
+    std::string certificate, private_key, alpn;
     const std::array positionals {
-        arg_parser::positional {"PORT", &port_text, true},
+        arg_parser::positional {"PORT", basics::port_argument(port), true},
         arg_parser::positional {"CERTIFICATE", &certificate, true},
         arg_parser::positional {"PRIVATE-KEY", &private_key, true},
         arg_parser::positional {"ALPN", &alpn, true},
     };
     arg_parser arguments({}, positionals);
     arguments.set_usage("usage: quic_echo_server <port> <cert.pem> <key.pem> <alpn>\n");
-    arguments.parse(argc, argv);
-    const auto port = parse_port(port_text.c_str());
-    if (port == 0) return 2;
+    try {
+        arguments.parse(argc, argv);
+    } catch (const std::invalid_argument& error) {
+        std::fprintf(stderr, "quic_echo_server: %s\n", error.what());
+        return 2;
+    }
 
     event_loop loop;
     quic_server_options options;
