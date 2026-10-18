@@ -150,6 +150,17 @@ public:
                                               std::size_t size,
                                               socket_operation& operation) noexcept
         -> socket_result;
+#ifdef __linux__
+    // Sends what the socket takes now with MSG_MORE, so the kernel holds a
+    // partial segment (or open kTLS record) for the data that follows. Returns
+    // the bytes sent; on would-block or error the caller writes the rest.
+    [[nodiscard]] static auto send_more_now(native_socket socket,
+                                            std::span<const std::byte> buffer) noexcept
+        -> std::size_t;
+    // Sets TCP_CORK, or clears it, which also pushes data held by MSG_MORE.
+    // Returns false if the option could not be changed.
+    static auto set_cork(native_socket socket, bool enabled) noexcept -> bool;
+#endif
     [[nodiscard]] static auto start_receive_from(
         native_socket socket, void* buffer, std::size_t size,
         socket_operation& operation) noexcept -> socket_result;

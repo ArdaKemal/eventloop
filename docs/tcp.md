@@ -26,6 +26,9 @@ Names below are in `eventloop`.
   the borrowed header followed by the range without moving the file position.
   Keep the header valid through completion. It returns
   `task<expected<void, error_code>>`, requiring a frame and both result layers.
+  On Linux, a header the socket takes at once is sent with `MSG_MORE`, so it
+  shares the file's first segment; if the file send then fails, the header is
+  pushed rather than held.
 
 See [TLS](tls.md) for encrypted operations and [Unix sockets](unix-sockets.md)
 for TCP-compatible local streams. HTTP document-root security belongs to

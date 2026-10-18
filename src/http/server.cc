@@ -269,7 +269,12 @@ template<typename Stream>
             if (!state->has_response()) continue;
 
             auto response = std::as_bytes(state->response());
-            while (!response.empty()) {
+            const auto file_size = state->file_size();
+            const auto file_offset = state->file_offset();
+            auto file = state->take_file();
+            // Plain TCP sends the head with the file in one operation.
+            constexpr bool plain = std::is_same_v<Stream, tcp_stream>;
+            while (!(plain && file) && !response.empty()) {
                 auto written = operation_result(
                     co_await peer->async_write_some(response));
                 if (!written || *written == 0) {
@@ -279,14 +284,11 @@ template<typename Stream>
                 response = response.subspan(*written);
             }
 
-            const auto file_size = state->file_size();
-            const auto file_offset = state->file_offset();
-            auto file = state->take_file();
             if (file) {
                 bool sent = false;
-                if constexpr (std::is_same_v<Stream, tcp_stream>)
+                if constexpr (plain)
                     sent = operation_succeeded(co_await peer->async_send_file(
-                        {}, std::move(file), file_offset, file_size));
+                        response, std::move(file), file_offset, file_size));
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
                 if constexpr (std::is_same_v<Stream, tls_stream>) {
                     const auto copied = co_await send_file_over_tls(

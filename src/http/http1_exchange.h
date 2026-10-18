@@ -532,19 +532,23 @@ private:
         auto started = co_await start_task(loop, self, status, headers, size);
         if (!started) co_return std::unexpected(failure(std::errc::operation_canceled));
         if (!*started) co_return std::unexpected(started->error());
-        // start() keeps the headers buffered for a declared body; the file
-        // goes out separately and reuses the buffer, so send them first.
-        if (self.output_size_ != 0) {
+        // start() keeps the headers buffered for a declared body. Plain TCP
+        // sends them with the file in one operation; otherwise the file goes
+        // out separately and reuses the buffer, so send them first.
+        constexpr bool plain = std::is_same_v<Stream, tcp_stream>;
+        const bool body = !self.bodyless_ && !self.head_only_ && size != 0;
+        if (self.output_size_ != 0 && !(plain && body)) {
             busy writing(self.writing_);
             auto flushed = unwrap(co_await flush(loop, self));
             if (!flushed) co_return std::unexpected(flushed.error());
         }
-        if (!self.bodyless_ && !self.head_only_ && size != 0) {
+        if (body) {
             busy writing(self.writing_);
             bool sent = false;
-            if constexpr (std::is_same_v<Stream, tcp_stream>) {
+            if constexpr (plain) {
+                const auto head = std::span(self.buffer_).first(std::exchange(self.output_size_, 0));
                 auto result = io_value(co_await self.peer_.async_send_file(
-                    {}, std::move(file), offset, static_cast<std::size_t>(size)));
+                    head, std::move(file), offset, static_cast<std::size_t>(size)));
                 if (!result) {
                     self.broken_ = true;
                     co_return std::unexpected(result.error());

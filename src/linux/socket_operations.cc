@@ -291,6 +291,27 @@ auto socket_operations::start_send_file(native_socket socket,
     }
 }
 
+auto socket_operations::send_more_now(native_socket socket,
+                                      std::span<const std::byte> buffer) noexcept
+    -> std::size_t
+{
+    std::size_t sent = 0;
+    while (sent < buffer.size()) {
+        const auto result = ::send(socket, buffer.data() + sent, buffer.size() - sent,
+                                   MSG_NOSIGNAL | MSG_MORE);
+        if (result > 0) sent += static_cast<std::size_t>(result);
+        else if (result == -1 && errno == EINTR) continue;
+        else break;
+    }
+    return sent;
+}
+
+auto socket_operations::set_cork(native_socket socket, bool enabled) noexcept -> bool
+{
+    const int value = enabled ? 1 : 0;
+    return ::setsockopt(socket, IPPROTO_TCP, TCP_CORK, &value, sizeof(value)) == 0;
+}
+
 auto socket_operations::start_receive_from(native_socket socket, void* buffer,
                                            std::size_t size,
                                            socket_operation&) noexcept

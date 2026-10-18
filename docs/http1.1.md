@@ -29,7 +29,9 @@ gathered write with the buffered head (and chunk framing), not after it.
 - Responses without content-length use chunked framing; send trailers only
   when chunked and the request includes `TE: trailers`. Returning after start
   without finish closes the connection.
-- Large plain files use sendfile; HTTPS file sending follows [TLS](tls.md).
+- Large plain files use sendfile, with the response head sent ahead of the
+  body by the same operation (see [TCP](tcp.md)); HTTPS file sending follows
+  [TLS](tls.md).
 
 ## Allocation measurements
 

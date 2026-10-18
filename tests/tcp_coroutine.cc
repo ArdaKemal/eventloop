@@ -27,6 +27,7 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -618,6 +619,55 @@ auto interest_failure_closes_stream() -> bool
 }
 #endif
 
+#ifndef _WIN32
+auto send_past_end(event_loop& loop, tcp_stream& socket, native_socket file,
+                   bool& failed) -> task<void>
+{
+    constexpr std::array<std::byte, 4> header {
+        std::byte {'h'}, std::byte {'e'}, std::byte {'a'}, std::byte {'d'}};
+    // The range starts past the end of the file, so no file byte follows.
+    const auto sent = co_await socket.async_send_file(
+        header, unique_fd(::dup(file)), 64, 16);
+    failed = sent && !*sent;
+    loop.stop();
+}
+
+// A header must not stay held for file data that never follows (Linux sends
+// it with MSG_MORE). The stream stays open, so no FIN pushes it out either.
+auto failed_file_send_delivers_header() -> bool
+{
+    std::array<char, 40> name {};
+    constexpr std::string_view pattern = "/tmp/eventloop-tcp-short-XXXXXX";
+    std::ranges::copy(pattern, name.begin());
+    const unique_fd file(::mkstemp(name.data()));
+    if (!file || ::unlink(name.data()) != 0 || ::write(file.get(), "payload!", 8) != 8)
+        return false;
+    auto pair = connected_pair();
+    if (!pair.client || !pair.server) return false;
+    event_loop loop;
+    auto sender = std::make_unique<tcp_stream>(loop, std::move(pair.client));
+    auto* sending = sender.get();
+    loop.add(std::move(sender));
+    bool failed = false;
+    if (loop.spawn(send_past_end(loop, *sending, file.get(), failed)) !=
+        task_spawn_result::accepted) return false;
+    task_handle<void> watchdog;
+    if (loop.spawn(stop_after(loop, 2s), watchdog) != task_spawn_result::accepted)
+        return false;
+    (void)loop.run();
+    pollfd ready {.fd = pair.server.get(), .events = POLLIN, .revents = 0};
+    std::array<char, 8> received {};
+    const bool delivered = ::poll(&ready, 1, 100) == 1 &&
+        ::recv(pair.server.get(), received.data(), received.size(), MSG_DONTWAIT) == 4 &&
+        std::string_view(received.data(), 4) == "head";
+    sending->close();
+    if (!watchdog.done()) (void)watchdog.cancel();
+    loop.shutdown(0s);
+    (void)loop.run();
+    return failed && delivered;
+}
+#endif
+
 auto send_opened_file(event_loop& loop, tcp_stream& socket,
                       std::string_view path, int& completed, bool& passed)
     -> task<void>
@@ -815,7 +865,8 @@ int main()
         !check(gathered_write(), "gathered write") ||
         !check(shutdown_pending(), "shutdown pending")) return 1;
 #ifndef _WIN32
-    if (!check(interest_failure_closes_stream(), "interest failure closes stream"))
+    if (!check(interest_failure_closes_stream(), "interest failure closes stream") ||
+        !check(failed_file_send_delivers_header(), "failed file send delivers header"))
         return 1;
 #endif
 }

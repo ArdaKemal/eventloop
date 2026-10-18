@@ -627,13 +627,32 @@ auto tcp_stream::send_file_task(event_loop& loop, tcp_stream& socket,
     -> task<std::expected<void, std::error_code>>
 {
     (void)loop;
+#ifdef __linux__
+    // Under TCP_NODELAY a header written alone goes out as a segment of its
+    // own. Sent with MSG_MORE it joins the file's first segment instead. Only
+    // what the socket takes now goes this way; the rest is written below.
+    bool held = false;
+    if (!header.empty() && size != 0 && !socket.closed_ && socket.writer_ == nullptr &&
+        socket.file_writer_ == nullptr && socket.write_waiter_ == nullptr &&
+        socket.second_write_waiter_ == nullptr && socket.activate_async_transport()) {
+        header = header.subspan(detail::socket_operations::send_more_now(
+            socket.descriptor_.get(), header));
+        held = header.empty();
+    }
+#endif
     while (!header.empty()) {
         auto sent = co_await socket.async_write_some(header);
         if (!sent) co_return std::unexpected(sent.error());
         if (*sent == 0) co_return std::unexpected(code(EIO));
         header = header.subspan(*sent);
     }
-    co_return co_await tcp_stream::file_awaiter(socket, std::move(file), offset, size);
+    auto result = co_await tcp_stream::file_awaiter(socket, std::move(file), offset, size);
+#ifdef __linux__
+    // Without the file data the held header would wait; push it.
+    if (!result && held)
+        (void)detail::socket_operations::set_cork(socket.descriptor_.get(), false);
+#endif
+    co_return result;
 }
 auto tcp_stream::async_send_file(std::span<const std::byte> header,
                                   unique_fd file, std::uint64_t offset, std::size_t size)
