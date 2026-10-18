@@ -1,6 +1,7 @@
 #include "eventloop/event_loop.h"
 #include "eventloop/task.h"
 #include "eventloop/unix_socket.h"
+#include "eventloop/util/arg_parser.h"
 
 #include <array>
 #include <chrono>
@@ -56,7 +57,11 @@ namespace {
 auto main(int argc, char* argv[]) -> int
 {
     try {
-        const std::string_view path = argc > 1 ? argv[1] : "/tmp/eventloop-echo.sock";
+        std::string path = "/tmp/eventloop-echo.sock";
+        const std::array positionals {arg_parser::positional {"PATH", &path, false}};
+        arg_parser arguments({}, positionals);
+        arguments.set_usage("usage: unix_echo [socket-path]  (default /tmp/eventloop-echo.sock)\n");
+        arguments.parse(argc, argv);
         event_loop loop;
         auto listener = std::make_unique<unix_acceptor>(loop, path);
         auto* accepting = listener.get();

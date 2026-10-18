@@ -1,6 +1,7 @@
 #include "configuration.h"
 
 #include "eventloop/ip_endpoint.h"
+#include "eventloop/util/arg_parser.h"
 #include "eventloop/util/toml.h"
 
 #include <algorithm>
@@ -8,50 +9,47 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <iterator>
 #include <memory>
 #include <set>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace stonegate {
 namespace {
 
-auto usage() -> void
-{
-    std::cout <<
-        "Stonegate: bounded static HTTP server\n"
-        "usage: stonegate --root DIR [options] | --config FILE [options]\n"
-        "  --config FILE           load TOML settings before CLI options\n"
-        "  --server NAME           select server for CLI overrides\n"
-        "  --check                 validate config and credentials, then exit\n"
-        "  --bind ADDRESS          numeric IPv4/IPv6 bind address (default 127.0.0.1)\n"
-        "  --http-port PORT        plain HTTP port (default 8080)\n"
-        "  --http-mode MODE        serve, redirect, or off (default serve)\n"
-        "  --https-port PORT       TLS port (default 8443; 0 disables)\n"
-        "  --http3-port PORT       UDP HTTP/3 port (0 disables; default off)\n"
-        "  --http3-connections N  concurrent HTTP/3 connections (1..256; default 8)\n"
-        "  --http3-requests N     concurrent HTTP/3 requests (0..8192; 0 selects 10 per connection)\n"
-        "  --http3-max-datagram N max application UDP payload 1200..8192 (default 8192)\n"
-        "  --certificate FILE      PEM certificate chain\n"
-        "  --private-key FILE      PEM private key\n"
-        "  --key-password TEXT     password for encrypted private key\n"
-        "  --redirect-host HOST    host in HTTP to HTTPS redirect (default localhost)\n"
-        "  --http2 on|off         TLS HTTP/2 ALPN (default on)\n"
-        "  --directory-listing     list directories without index files\n"
-        "  --no-directory-listing  disable directory listing\n"
-        "  --reuse-port            allow multiple listeners to reuse a port\n"
-        "  --no-reuse-port         disable port reuse\n"
-        "  --shutdown-seconds N    shutdown deadline (default 5)\n"
-        "  --workers N             event-loop threads serving every listener (1..256; default 1)\n"
-        "  --worker-mode MODE      auto, reuse_port, or handoff (default auto)\n"
-        "  --open-file-cache-capacity N  cached file descriptors (0..65536)\n"
-        "  --header-timeout-ms N    first head/TLS timeout (0..3600000)\n"
-        "  --idle-timeout-ms N      next head timeout (0..3600000)\n"
-        "  --help                  show this message\n";
-}
+constexpr std::string_view usage =
+    "Stonegate: bounded static HTTP server\n"
+    "usage: stonegate --root DIR [options] | --config FILE [options]\n"
+    "  --config FILE           load TOML settings before CLI options\n"
+    "  --server NAME           select server for CLI overrides\n"
+    "  --check                 validate config and credentials, then exit\n"
+    "  --bind ADDRESS          numeric IPv4/IPv6 bind address (default 127.0.0.1)\n"
+    "  --http-port PORT        plain HTTP port (default 8080)\n"
+    "  --http-mode MODE        serve, redirect, or off (default serve)\n"
+    "  --https-port PORT       TLS port (default 8443; 0 disables)\n"
+    "  --http3-port PORT       UDP HTTP/3 port (0 disables; default off)\n"
+    "  --http3-connections N  concurrent HTTP/3 connections (1..256; default 8)\n"
+    "  --http3-requests N     concurrent HTTP/3 requests (0..8192; 0 selects 10 per connection)\n"
+    "  --http3-max-datagram N max application UDP payload 1200..8192 (default 8192)\n"
+    "  --certificate FILE      PEM certificate chain\n"
+    "  --private-key FILE      PEM private key\n"
+    "  --key-password TEXT     password for encrypted private key\n"
+    "  --redirect-host HOST    host in HTTP to HTTPS redirect (default localhost)\n"
+    "  --http2 on|off         TLS HTTP/2 ALPN (default on)\n"
+    "  --directory-listing     list directories without index files\n"
+    "  --no-directory-listing  disable directory listing\n"
+    "  --reuse-port            allow multiple listeners to reuse a port\n"
+    "  --no-reuse-port         disable port reuse\n"
+    "  --shutdown-seconds N    shutdown deadline (default 5)\n"
+    "  --workers N             event-loop threads serving every listener (1..256; default 1)\n"
+    "  --worker-mode MODE      auto, reuse_port, or handoff (default auto)\n"
+    "  --open-file-cache-capacity N  cached file descriptors (0..65536)\n"
+    "  --header-timeout-ms N    first head/TLS timeout (0..3600000)\n"
+    "  --idle-timeout-ms N      next head timeout (0..3600000)\n"
+    "  --help                  show this message\n";
 
 auto parse_worker_mode(std::string_view value) -> worker_mode
 {
@@ -375,38 +373,47 @@ auto validate_endpoints(const std::vector<server_config>& servers) -> void
 
 auto parse_configuration(int argc, char** argv) -> configuration
 {
-    struct option { std::string_view key, value; };
-    std::vector<option> overrides;
+    struct override_entry { std::string_view key, value; };
+    std::vector<override_entry> overrides;
     std::string_view config_path, selected_server;
     configuration output;
-    for (int index = 1; index < argc; ++index) {
-        const std::string_view argument = argv[index];
-        if (argument == "--help") { usage(); std::exit(0); }
-        if (argument == "--check") { output.check = true; continue; }
-        if (argument == "--directory-listing" || argument == "--no-directory-listing") {
-            overrides.push_back({"directory-listing", argument == "--directory-listing" ? "on" : "off"});
-            continue;
-        }
-        if (argument == "--reuse-port" || argument == "--no-reuse-port") {
-            overrides.push_back({"reuse-port", argument == "--reuse-port" ? "on" : "off"});
-            continue;
-        }
-        if (!argument.starts_with("--")) throw std::invalid_argument("unknown option");
-        const auto key = argument.substr(2);
-        if (key != "config" && key != "server" && key != "shutdown-seconds" && key != "workers" &&
-            key != "worker-mode" &&
-            std::none_of(std::begin(schema), std::end(schema), [&](const auto& entry) { return entry.cli == key; }))
-            throw std::invalid_argument("unknown option");
-        if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
-            throw std::invalid_argument("missing value for " + std::string(argument));
-        const std::string_view value = argv[++index];
-        if (key == "config" || key == "server") {
-            auto& destination = key == "config" ? config_path : selected_server;
-            if (!destination.empty()) throw std::invalid_argument("duplicate " + std::string(argument));
-            if (value.empty()) throw std::invalid_argument("empty value for " + std::string(argument));
+    const auto override_flag = [&overrides](std::string_view key, std::string_view value) {
+        return eventloop::arg_parser::flag_handler([&overrides, key, value] {
+            overrides.push_back({key, value});
+        });
+    };
+    const auto override_value = [&overrides](std::string_view key) {
+        return eventloop::arg_parser::value_handler([&overrides, key](std::string_view value) {
+            overrides.push_back({key, value});
+        });
+    };
+    const auto single = [](std::string_view& destination, std::string_view name) {
+        return eventloop::arg_parser::value_handler([&destination, name](std::string_view value) {
+            if (!destination.empty()) throw std::invalid_argument("duplicate --" + std::string(name));
+            if (value.empty()) throw std::invalid_argument("empty value for --" + std::string(name));
             destination = value;
-        } else overrides.push_back({key, value});
-    }
+        });
+    };
+    using option = eventloop::arg_parser::option;
+    std::vector<option> options {
+        option {'\0', "check", &output.check, false},
+        option {'\0', "config", single(config_path, "config"), false},
+        option {'\0', "server", single(selected_server, "server"), false},
+        option {'\0', "directory-listing", override_flag("directory-listing", "on"), false},
+        option {'\0', "no-directory-listing", override_flag("directory-listing", "off"), false},
+        option {'\0', "reuse-port", override_flag("reuse-port", "on"), false},
+        option {'\0', "no-reuse-port", override_flag("reuse-port", "off"), false},
+    };
+    for (const auto key : {std::string_view("shutdown-seconds"), std::string_view("workers"),
+                           std::string_view("worker-mode")})
+        options.push_back({'\0', key, override_value(key), false});
+    // Boolean settings are the flags above; every other setting takes a value.
+    for (const auto& entry : schema)
+        if (entry.cli != "directory-listing" && entry.cli != "reuse-port")
+            options.push_back({'\0', entry.cli, override_value(entry.cli), false});
+    eventloop::arg_parser parser(options);
+    parser.set_usage(usage);
+    parser.parse(argc, argv);
     if (!config_path.empty()) {
         config_loader loader(output);
         loader.load(std::filesystem::path(config_path));

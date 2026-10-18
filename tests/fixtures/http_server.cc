@@ -90,7 +90,7 @@ auto main(int argc, char* argv[]) -> int
             arg_parser::option {'o', "http-only", &http_only, false},
             arg_parser::option {'t', "shutdown-timeout", &shutdown_timeout, false},
         };
-        arg_parser arguments(options.data(), options.size());
+        arg_parser arguments(options);
         arguments.set_usage(
             "usage: http_server --root <directory> [TLS options] [options]\n"
             "  -r, --root <directory>       document root (required)\n"

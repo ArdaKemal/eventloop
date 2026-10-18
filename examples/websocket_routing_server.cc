@@ -5,6 +5,7 @@
 #include "eventloop/http/router.h"
 #include "eventloop/http/server.h"
 #include "eventloop/ws/web_socket.h"
+#include "eventloop/util/arg_parser.h"
 
 #include <charconv>
 #include <array>
@@ -49,16 +50,18 @@ auto hello(event_loop&, http::request&, http::response& response) -> task<void>
 
 auto main(int argc, char** argv) -> int
 {
-    if (argc < 3 || argc > 4) {
-        std::cerr << "usage: websocket_routing_server certificate.pem private-key.pem [port]\n";
-        return 1;
-    }
-    std::uint16_t port = 8443;
-    if (argc == 4) {
-        const std::string_view input = argv[3];
-        const auto parsed = std::from_chars(input.data(), input.data() + input.size(), port);
-        if (parsed.ec != std::errc{} || parsed.ptr != input.data() + input.size() || port == 0) return 1;
-    }
+    std::string certificate, private_key, port_text = "8443";
+    const std::array positionals {
+        arg_parser::positional {"CERTIFICATE", &certificate, true},
+        arg_parser::positional {"PRIVATE-KEY", &private_key, true},
+        arg_parser::positional {"PORT", &port_text, false},
+    };
+    arg_parser arguments({}, positionals);
+    arguments.set_usage("usage: websocket_routing_server certificate.pem private-key.pem [port]\n");
+    arguments.parse(argc, argv);
+    std::uint16_t port = 0;
+    const auto parsed = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
+    if (parsed.ec != std::errc{} || parsed.ptr != port_text.data() + port_text.size() || port == 0) return 1;
     try {
         auto routes = std::make_shared<http::router>();
         if (!routes->add(http::method_type::connect, "/chat", chat) ||
@@ -69,10 +72,10 @@ auto main(int argc, char** argv) -> int
         loop_options.coroutine_frame_capacities[4] = 64;
         event_loop loop(loop_options);
         auto tls = std::make_unique<http::https_server>(loop, ip_endpoint::loopback_v4(port),
-            tls_context::make_server(argv[1], argv[2]), http::server_options {.routes = routes});
+            tls_context::make_server(certificate, private_key), http::server_options {.routes = routes});
         auto* listener = tls.get();
         loop.add(std::move(tls));
-        http::http3_server quic(loop, ip_endpoint::loopback_v4(port), argv[1], argv[2],
+        http::http3_server quic(loop, ip_endpoint::loopback_v4(port), certificate, private_key,
                                {.routes = routes});
         task_handle<void> serving;
         if (loop.spawn(listener->run()) != task_spawn_result::accepted ||

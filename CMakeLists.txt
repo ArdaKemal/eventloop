@@ -1490,6 +1490,11 @@ if(BUILD_TESTING)
     add_test(NAME http3_routing COMMAND http3_routing_test)
     set_tests_properties(http3_routing PROPERTIES TIMEOUT 20)
 
+    add_executable(arg_parser_test tests/arg_parser.cc)
+    target_link_libraries(arg_parser_test PRIVATE eventloop::eventloop)
+    target_compile_options(arg_parser_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME arg_parser COMMAND arg_parser_test)
+
     add_executable(http3_client_test tests/http3_client.cc)
     target_link_libraries(http3_client_test PRIVATE eventloop::eventloop OpenSSL::Crypto)
     target_compile_options(http3_client_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion)

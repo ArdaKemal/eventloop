@@ -12,6 +12,7 @@
 #include "eventloop/http/server.h"
 #include "eventloop/task.h"
 #include "eventloop/tls_context.h"
+#include "eventloop/util/arg_parser.h"
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -21,6 +22,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <charconv>
 #include <span>
 #include <chrono>
@@ -47,42 +49,40 @@ struct options {
     bool http3 = false;
 };
 
-auto usage() -> void
-{
-    std::cout <<
-        "Parley: WhatsApp-style chat over HTTP/2, HTTP/3, and WebSockets\n"
-        "usage: parley [options]\n"
-        "  --bind ADDRESS       numeric IPv4/IPv6 address (default 127.0.0.1)\n"
-        "  --port PORT          HTTPS port, also UDP for HTTP/3 (default 8443)\n"
-        "  --data DIR           journal, media, and generated certificate (default parley-data)\n"
-        "  --web DIR            browser client files (default: the source tree's web/)\n"
-        "  --certificate FILE   PEM certificate chain (default: generated self-signed)\n"
-        "  --private-key FILE   PEM private key\n"
-        "  --http3              also serve HTTP/3 on the UDP port and advertise it\n";
-}
+constexpr std::string_view usage =
+    "Parley: WhatsApp-style chat over HTTP/2, HTTP/3, and WebSockets\n"
+    "usage: parley [options]\n"
+    "  --bind ADDRESS       numeric IPv4/IPv6 address (default 127.0.0.1)\n"
+    "  --port PORT          HTTPS port, also UDP for HTTP/3 (default 8443)\n"
+    "  --data DIR           journal, media, and generated certificate (default parley-data)\n"
+    "  --web DIR            browser client files (default: the source tree's web/)\n"
+    "  --certificate FILE   PEM certificate chain (default: generated self-signed)\n"
+    "  --private-key FILE   PEM private key\n"
+    "  --http3              also serve HTTP/3 on the UDP port and advertise it\n";
 
 auto parse(int argc, char** argv) -> options
 {
     options result;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view option = argv[i];
-        if (option == "--help") { usage(); std::exit(0); }
-        if (option == "--http3") { result.http3 = true; continue; }
-        if (i + 1 >= argc) throw std::invalid_argument("missing value for " + std::string(option));
-        const std::string_view value = argv[++i];
-        if (option == "--bind") result.bind = value;
-        else if (option == "--data") result.data = value;
-        else if (option == "--web") result.web = value;
-        else if (option == "--certificate") result.certificate = value;
-        else if (option == "--private-key") result.private_key = value;
-        else if (option == "--port") {
-            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result.port);
-            if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size() || result.port == 0)
-                throw std::invalid_argument("invalid --port");
-        } else {
-            throw std::invalid_argument("unknown option " + std::string(option));
-        }
-    }
+    const auto path = [](fs::path& target) {
+        return arg_parser::value_handler([&target](std::string_view value) { target = value; });
+    };
+    const auto port = [&result](std::string_view value) {
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result.port);
+        if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size() || result.port == 0)
+            throw std::invalid_argument("invalid --port");
+    };
+    const std::array arguments {
+        arg_parser::option {'\0', "bind", &result.bind, false},
+        arg_parser::option {'\0', "port", arg_parser::value_handler(port), false},
+        arg_parser::option {'\0', "data", path(result.data), false},
+        arg_parser::option {'\0', "web", path(result.web), false},
+        arg_parser::option {'\0', "certificate", path(result.certificate), false},
+        arg_parser::option {'\0', "private-key", path(result.private_key), false},
+        arg_parser::option {'\0', "http3", &result.http3, false},
+    };
+    arg_parser parser(arguments);
+    parser.set_usage(usage);
+    parser.parse(argc, argv);
     if (result.certificate.empty() != result.private_key.empty())
         throw std::invalid_argument("--certificate and --private-key go together");
     return result;

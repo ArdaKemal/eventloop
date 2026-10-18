@@ -6,6 +6,7 @@
 #include "eventloop/tcp_stream.h"
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
+#include "eventloop/util/arg_parser.h"
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -315,12 +316,15 @@ auto run(eventloop::event_loop& loop, url_parts url, std::string message,
 
 auto main(int argc, char* argv[]) -> int
 {
-    if (argc < 2 || argc > 3) {
-        std::cerr << "usage: websocket_client <ws:// or wss:// URL> [message]\n";
-        return 2;
-    }
+    std::string address, message = "eventloop echo";
+    const std::array positionals {
+        eventloop::arg_parser::positional {"URL", &address, true},
+        eventloop::arg_parser::positional {"MESSAGE", &message, false},
+    };
+    eventloop::arg_parser arguments({}, positionals);
+    arguments.set_usage("usage: websocket_client <ws:// or wss:// URL> [message]\n");
+    arguments.parse(argc, argv);
     try {
-        std::string address = argv[1];
         if (address.starts_with("wss://")) address.replace(0, 6, "https://");
         else if (address.starts_with("ws://")) address.replace(0, 5, "http://");
         else throw std::invalid_argument("URL must start with ws:// or wss://");
@@ -329,7 +333,7 @@ auto main(int argc, char* argv[]) -> int
         options.worker_count = 1;
         eventloop::event_loop loop(options);
         bool success = false;
-        if (loop.spawn(run(loop, std::move(url), argc == 3 ? argv[2] : "eventloop echo", success)) !=
+        if (loop.spawn(run(loop, std::move(url), message, success)) !=
             eventloop::task_spawn_result::accepted)
             throw std::runtime_error("cannot start WebSocket client task");
         if (loop.run() == eventloop::event_loop_result::interrupted) {

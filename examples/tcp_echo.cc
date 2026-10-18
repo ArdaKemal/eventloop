@@ -2,6 +2,7 @@
 #include "eventloop/task.h"
 #include "eventloop/tcp_acceptor.h"
 #include "eventloop/tcp_stream.h"
+#include "eventloop/util/arg_parser.h"
 
 #include <array>
 #include <charconv>
@@ -69,7 +70,13 @@ namespace {
 auto main(int argc, char* argv[]) -> int
 {
     try {
-        const auto port = argc > 1 ? parse_port(argv[1]) : std::uint16_t {7000};
+        std::uint16_t port = 7000;
+        const std::array positionals {arg_parser::positional {"PORT",
+            arg_parser::value_handler([&port](std::string_view value) { port = parse_port(value); }),
+            false}};
+        arg_parser arguments({}, positionals);
+        arguments.set_usage("usage: tcp_echo [port]  (default 7000)\n");
+        arguments.parse(argc, argv);
         event_loop loop;
         auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4(port));
         auto* accepting = listener.get();

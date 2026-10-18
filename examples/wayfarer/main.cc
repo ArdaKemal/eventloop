@@ -7,6 +7,7 @@
 #include "eventloop/tcp_stream.h"
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
+#include "eventloop/util/arg_parser.h"
 #include "eventloop/http2/client.h"
 #include "eventloop/http3/client.h"
 
@@ -127,27 +128,39 @@ auto remote_output_name(std::string_view target) -> std::filesystem::path
     return std::filesystem::path(name);
 }
 
+constexpr std::string_view usage =
+    "usage: wayfarer [--http1.1|--http2|--http3|--http3-v2] "
+    "[-X METHOD] [-H 'Name: value']... [-d BODY|--data-binary @FILE] "
+    "[-o FILE|-O|--remote-name] [-I|--head] [-i] [-L] [--fail] "
+    "[--ca-file PEM] [--timeout-ms N] URL\n";
+
 auto parse_options(int argc, char** argv) -> request_options
 {
     request_options options;
     bool explicit_method = false;
-    for (int i = 1; i < argc; ++i) {
-        std::string_view arg(argv[i]);
-        auto value = [&]() -> std::string {
-            if (++i == argc) throw std::invalid_argument("missing value for " + std::string(arg));
-            return argv[i];
-        };
-        if (arg == "--http1.1") options.protocol = 1;
-        else if (arg == "--http2") options.protocol = 2;
-        else if (arg == "--http3") options.protocol = 3;
-        else if (arg == "--http3-v2") { options.protocol = 3; options.quic_version = quic_version::v2; }
-        else if (arg == "-X" || arg == "--request") { options.method = value(); explicit_method = true; }
-        else if (arg == "-H" || arg == "--header") {
-            const auto header = value();
+    using option = arg_parser::option;
+    using flag = arg_parser::flag_handler;
+    using value = arg_parser::value_handler;
+    const auto protocol = [&options](int number, quic_version version) {
+        return flag([&options, number, version] {
+            options.protocol = number;
+            options.quic_version = version;
+        });
+    };
+    const std::array parsers {
+        option {'\0', "http1.1", protocol(1, quic_version::v1), false},
+        option {'\0', "http2", protocol(2, quic_version::v1), false},
+        option {'\0', "http3", protocol(3, quic_version::v1), false},
+        option {'\0', "http3-v2", protocol(3, quic_version::v2), false},
+        option {'X', "request", value([&](std::string_view method) {
+            options.method = method;
+            explicit_method = true;
+        }), false},
+        option {'H', "header", value([&options](std::string_view header) {
             const auto pos = header.find(':');
-            if (pos == std::string::npos || pos == 0) throw std::invalid_argument("header needs Name: value");
-            std::string name = header.substr(0, pos);
-            std::string val = header.substr(pos + 1);
+            if (pos == std::string_view::npos || pos == 0) throw std::invalid_argument("header needs Name: value");
+            std::string name(header.substr(0, pos));
+            std::string val(header.substr(pos + 1));
             if (!val.empty() && val.front() == ' ') val.erase(0, 1);
             if (!safe_header(val) || !std::all_of(name.begin(), name.end(), [](unsigned char c) {
                     return std::isalnum(c) || std::string_view("!#$%&'*+-.^_`|~").contains(static_cast<char>(c));
@@ -156,13 +169,13 @@ auto parse_options(int argc, char** argv) -> request_options
             if (name == "host" || name == "connection" || name == "content-length" || name == "transfer-encoding")
                 throw std::invalid_argument("Host, Connection, Content-Length and Transfer-Encoding are managed by wayfarer");
             options.headers.emplace_back(std::move(name), std::move(val));
-        } else if (arg == "-d" || arg == "--data") {
-            options.body = value();
+        }), false},
+        option {'d', "data", value([&options](std::string_view data) {
+            options.body = data;
             options.body_file.clear();
             options.body_supplied = true;
-        }
-        else if (arg == "--data-binary") {
-            const auto data = value();
+        }), false},
+        option {'\0', "data-binary", value([&options](std::string_view data) {
             if (data.starts_with('@')) {
                 if (data.size() == 1) throw std::invalid_argument("--data-binary @ requires a file path");
                 options.body_file = data.substr(1);
@@ -172,26 +185,26 @@ auto parse_options(int argc, char** argv) -> request_options
                 options.body_file.clear();
             }
             options.body_supplied = true;
-        }
-        else if (arg == "-o" || arg == "--output") options.output = value();
-        else if (arg == "-O" || arg == "--remote-name") options.remote_name = true;
-        else if (arg == "-I" || arg == "--head") options.head_request = true;
-        else if (arg == "-i" || arg == "--include") options.show_headers = true;
-        else if (arg == "-L" || arg == "--location") options.follow_redirects = true;
-        else if (arg == "--fail") options.fail_http_errors = true;
-        else if (arg == "--ca-file") options.ca_file = value();
-        else if (arg == "--timeout-ms") {
-            const auto input = value();
+        }), false},
+        option {'o', "output", value([&options](std::string_view path) { options.output = path; }), false},
+        option {'O', "remote-name", &options.remote_name, false},
+        option {'I', "head", &options.head_request, false},
+        option {'i', "include", &options.show_headers, false},
+        option {'L', "location", &options.follow_redirects, false},
+        option {'\0', "fail", &options.fail_http_errors, false},
+        option {'\0', "ca-file", value([&options](std::string_view path) { options.ca_file = path; }), false},
+        option {'\0', "timeout-ms", value([&options](std::string_view input) {
             unsigned duration {};
             const auto result = std::from_chars(input.data(), input.data() + input.size(), duration);
             if (result.ec != std::errc{} || result.ptr != input.data() + input.size() ||
                 duration == 0 || duration > 3600000) throw std::invalid_argument("timeout must be 1..3600000 ms");
             options.timeout = std::chrono::milliseconds(duration);
-        } else if (arg.starts_with('-')) throw std::invalid_argument("unknown option " + std::string(arg));
-        else if (!options.url.empty()) throw std::invalid_argument("only one URL is supported per invocation");
-        else options.url = arg;
-    }
-    if (options.url.empty()) throw std::invalid_argument("URL required");
+        }), false},
+    };
+    const std::array positionals {arg_parser::positional {"URL", &options.url, true}};
+    arg_parser arguments(parsers, positionals);
+    arguments.set_usage(usage);
+    arguments.parse(argc, argv);
     if (options.head_request) {
         if (explicit_method && options.method != "HEAD")
             throw std::invalid_argument("-I/--head conflicts with -X " + options.method);
@@ -767,13 +780,6 @@ struct temporary_output {
 auto main(int argc, char** argv) -> int
 {
     try {
-        if (argc == 2 && std::string_view(argv[1]) == "--help") {
-            std::cout << "usage: wayfarer [--http1.1|--http2|--http3|--http3-v2] "
-                         "[-X METHOD] [-H 'Name: value']... [-d BODY|--data-binary @FILE] "
-                         "[-o FILE|-O|--remote-name] [-I|--head] [-i] [-L] [--fail] "
-                         "[--ca-file PEM] [--timeout-ms N] URL\n";
-            return 0;
-        }
         auto options = parse_options(argc, argv);
         const auto url = http_client_example::parse_url(options.url);
         if (options.remote_name) options.output = remote_output_name(url.target);

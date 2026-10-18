@@ -4,6 +4,7 @@
 // Usage: quic_echo_server <port> <certificate.pem> <key.pem> <alpn>
 #include "eventloop/quic.h"
 #include "eventloop/event_loop.h"
+#include "eventloop/util/arg_parser.h"
 
 #include <array>
 #include <charconv>
@@ -64,19 +65,23 @@ auto serve(event_loop& loop, quic_endpoint& endpoint,
 
 auto main(int argc, char** argv) -> int
 {
-    if (argc != 5) {
-        std::fprintf(stderr, "usage: %s <port> <cert.pem> <key.pem> <alpn>\n",
-                     argv[0]);
-        return 2;
-    }
-    const auto port = parse_port(argv[1]);
+    std::string port_text, certificate, private_key, alpn;
+    const std::array positionals {
+        arg_parser::positional {"PORT", &port_text, true},
+        arg_parser::positional {"CERTIFICATE", &certificate, true},
+        arg_parser::positional {"PRIVATE-KEY", &private_key, true},
+        arg_parser::positional {"ALPN", &alpn, true},
+    };
+    arg_parser arguments({}, positionals);
+    arguments.set_usage("usage: quic_echo_server <port> <cert.pem> <key.pem> <alpn>\n");
+    arguments.parse(argc, argv);
+    const auto port = parse_port(port_text.c_str());
     if (port == 0) return 2;
-    const std::string_view alpn = argv[4];
 
     event_loop loop;
     quic_server_options options;
-    options.certificate_chain = argv[2];
-    options.private_key = argv[3];
+    options.certificate_chain = certificate;
+    options.private_key = private_key;
     options.alpn = std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(alpn.data()), alpn.size());
     options.limits.max_datagram_frame_size = 1200;

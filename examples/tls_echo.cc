@@ -3,6 +3,7 @@
 #include "eventloop/tcp_acceptor.h"
 #include "eventloop/tls_context.h"
 #include "eventloop/tls_stream.h"
+#include "eventloop/util/arg_parser.h"
 
 #include <array>
 #include <charconv>
@@ -85,14 +86,19 @@ namespace {
 
 auto main(int argc, char* argv[]) -> int
 {
-    if (argc < 3 || argc > 4) {
-        std::cerr << "usage: tls_echo <certificate-chain.pem> <private-key.pem> [port]\n";
-        return 1;
-    }
-
     try {
-        const auto port = argc == 4 ? parse_port(argv[3]) : std::uint16_t {7443};
-        auto context = tls_context::make_server(argv[1], argv[2]);
+        std::string certificate, private_key;
+        std::uint16_t port = 7443;
+        const std::array positionals {
+            arg_parser::positional {"CERTIFICATE", &certificate, true},
+            arg_parser::positional {"PRIVATE-KEY", &private_key, true},
+            arg_parser::positional {"PORT", arg_parser::value_handler(
+                [&port](std::string_view value) { port = parse_port(value); }), false},
+        };
+        arg_parser arguments({}, positionals);
+        arguments.set_usage("usage: tls_echo <certificate-chain.pem> <private-key.pem> [port]\n");
+        arguments.parse(argc, argv);
+        auto context = tls_context::make_server(certificate, private_key);
         event_loop loop;
         auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4(port));
         auto* accepting = listener.get();

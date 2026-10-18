@@ -3,6 +3,7 @@
 #include "eventloop/tcp_acceptor.h"
 #include "eventloop/tcp_stream.h"
 #include "eventloop/ws/web_socket.h"
+#include "eventloop/util/arg_parser.h"
 
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -171,8 +172,13 @@ constexpr std::size_t maximum_request_size = 8192;
 auto main(int argc, char* argv[]) -> int
 {
     try {
-        if (argc > 2) throw std::invalid_argument("usage: websocket_echo_server [port]");
-        const auto port = argc == 2 ? parse_port(argv[1]) : std::uint16_t {7001};
+        std::uint16_t port = 7001;
+        const std::array positionals {arg_parser::positional {"PORT",
+            arg_parser::value_handler([&port](std::string_view value) { port = parse_port(value); }),
+            false}};
+        arg_parser arguments({}, positionals);
+        arguments.set_usage("usage: websocket_echo_server [port]  (default 7001)\n");
+        arguments.parse(argc, argv);
         event_loop loop;
         auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4(port));
         auto* accepting = listener.get();
