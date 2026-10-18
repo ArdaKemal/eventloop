@@ -23,11 +23,18 @@ Setup/inherited operations: [TCP](tcp.md). Names below are in `eventloop`.
 - Contexts require TLS 1.2 or later. TLS 1.2 offers only ECDHE/DHE suites
   with AES-GCM or ChaCha20-Poly1305, so no suite RFC 9113 prohibits for
   HTTP/2 is negotiated.
+- A write covers at most three 16 KiB records (48 KiB), also through the
+  gathered `async_write_some(span<const span<const byte>>)`, and completes
+  once all of them are sent. Smaller buffers each still become a record.
 - OpenSSL allocates a read or write record buffer (about 16.5 KiB each) while
   a record is in flight and frees it once drained, so an idle stream holds
   none. A failed allocation fails the operation with `ENOMEM` and closes the
-  stream. Other OpenSSL processing may allocate. On Linux the stream keeps no
-  buffers of its own; OpenSSL reads and writes the socket directly.
+  stream. Other OpenSSL processing may allocate. Reads use read-ahead: one
+  transport read takes as many application records as the record buffer holds.
+- On Linux the stream keeps no buffers of its own; OpenSSL reads the socket
+  directly. After a handshake without transmit kTLS, records are sent by the
+  stream with `MSG_MORE` on all but the last of a write, so the kernel pushes
+  them together.
 
 ## kTLS file sending
 

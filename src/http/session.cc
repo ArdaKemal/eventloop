@@ -307,7 +307,6 @@ auto session::serve_file(const parsed_request& parsed, static_file descriptor, c
         return;
     }
 
-    std::array<char, 64> date {};
     std::string joined_none_match;
     const auto selection = detail::choose_file_response(info, {
         parsed.joined_header_value("If-None-Match", joined_none_match),
@@ -315,7 +314,7 @@ auto session::serve_file(const parsed_request& parsed, static_file descriptor, c
         parsed.header_occurrences("Range") > 1
             ? std::string_view {}
             : parsed.header_value("Range").value_or(std::string_view {})});
-    const auto date_size = detail::format_http_time(std::time(nullptr), date);
+    const auto date = detail::current_http_date();
     const auto mime = mime_type_from_path(mime_path);
     std::array<char, 1024> header {};
     const auto status_text = selection.status == 304 ? "304 Not Modified" :
@@ -328,7 +327,7 @@ auto session::serve_file(const parsed_request& parsed, static_file descriptor, c
         "Content-Length: %llu\r\nContent-Type: %.*s\r\n%s%.*s%s%s%.*s%s"
         "Connection: %s\r\n\r\n",
         status_text,
-        static_cast<int>(date_size), date.data(),
+        static_cast<int>(date.size()), date.data(),
         static_cast<int>(selection.modified_size), selection.modified.data(),
         static_cast<int>(selection.etag_size), selection.etag.data(),
         static_cast<unsigned long long>(selection.length),

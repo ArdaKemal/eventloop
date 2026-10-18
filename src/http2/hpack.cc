@@ -499,7 +499,7 @@ auto hpack_decoder::resolve(std::size_t index, field& result) const -> bool
     if (index >= entry_count_) return false;
     const auto& entry = entries_[(newest_ + max_entries - index) % max_entries];
     load(entry.offset, entry.name_size, result.name);
-    load((entry.offset + entry.name_size) % hpack_max_table_size, entry.value_size,
+    load((entry.offset + entry.name_size) % ring_size_, entry.value_size,
          result.value);
     return true;
 }
@@ -507,17 +507,39 @@ auto hpack_decoder::resolve(std::size_t index, field& result) const -> bool
 auto hpack_decoder::load(std::size_t offset, std::size_t size, std::string& output) const
     -> void
 {
-    const auto first = std::min(size, hpack_max_table_size - offset);
+    const auto first = std::min(size, ring_size_ - offset);
     output.assign(table_octets_.get() + offset, first);
     output.append(table_octets_.get(), size - first);
 }
 
 auto hpack_decoder::store(std::string_view octets) noexcept -> void
 {
-    const auto first = std::min(octets.size(), hpack_max_table_size - write_offset_);
+    const auto first = std::min(octets.size(), ring_size_ - write_offset_);
     std::memcpy(table_octets_.get() + write_offset_, octets.data(), first);
     std::memcpy(table_octets_.get(), octets.data() + first, octets.size() - first);
-    write_offset_ = (write_offset_ + octets.size()) % hpack_max_table_size;
+    write_offset_ = (write_offset_ + octets.size()) % ring_size_;
+}
+
+// Copies the live entries, oldest first, to the start of a larger ring.
+auto hpack_decoder::grow_ring(std::size_t needed) -> void
+{
+    auto size = std::max<std::size_t>(ring_size_, 256);
+    while (size < needed) size *= 2;
+    size = std::min(size, hpack_max_table_size);
+    auto grown = std::make_unique_for_overwrite<char[]>(size);
+    std::size_t used = 0;
+    for (std::size_t age = entry_count_; age-- > 0;) {
+        auto& entry = entries_[(newest_ + max_entries - age) % max_entries];
+        const std::size_t octets = std::size_t {entry.name_size} + entry.value_size;
+        const auto first = std::min(octets, ring_size_ - entry.offset);
+        std::memcpy(grown.get() + used, table_octets_.get() + entry.offset, first);
+        std::memcpy(grown.get() + used + first, table_octets_.get(), octets - first);
+        entry.offset = static_cast<std::uint16_t>(used);
+        used += octets;
+    }
+    table_octets_ = std::move(grown);
+    ring_size_ = size;
+    write_offset_ = used % size;
 }
 
 auto hpack_decoder::evict_oldest() noexcept -> void
@@ -542,10 +564,10 @@ auto hpack_decoder::insert(const field& entry) -> void
         return;
     }
     while (table_bytes_ + size > table_size_) evict_oldest();
-    if (!table_octets_)
-        table_octets_ = std::make_unique_for_overwrite<char[]>(hpack_max_table_size);
-    // Live octets are contiguous before write_offset_ and, with this entry,
-    // stay below table_size_ - 32 * entries, so the ring never overwrites them.
+    // Live octets are contiguous before write_offset_; with this entry they
+    // must fit the ring, so it never overwrites them.
+    const auto live = table_bytes_ - 32 * entry_count_ + size - 32;
+    if (live > ring_size_) grow_ring(live);
     const auto offset = write_offset_;
     store(entry.name);
     store(entry.value);

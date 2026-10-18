@@ -109,7 +109,7 @@ claims below were not independently reproduced; do not combine with A/B.
 | POSIX immediate shutdown before deferred descriptor release | Reported HTTP churn c=16 p99 7.03→1.02 ms. macOS FIN regression failed before and passed 25/25 after. POSIX-only: Windows with no pending I/O still defers release to batch end; scope any immediate-shutdown contract accordingly. |
 | Linux server handshake starts from ClientHello readiness | Reported HTTPS churn p99 6.78→4.59 ms; concurrent keep-alive/churn 6.06→4.46 ms. Static review only; Linux needs already-readable input, cancellation-before-ClientHello and shutdown-while-waiting tests. |
 | Outbound TCP_NODELAY | Implemented for Linux/macOS/FreeBSD/Windows; reported write-write-read p99 45.9→0.111 ms. macOS option regression failed before and passed 25/25 after; other backends not executed independently. |
-| TLS read-ahead; disable SSL_MODE_RELEASE_BUFFERS | No demonstrated tail benefit; dropped. Preserve idle-buffer resource behavior. |
+| TLS read-ahead; disable SSL_MODE_RELEASE_BUFFERS | No demonstrated tail benefit; dropped. Preserve idle-buffer resource behavior. Read-ahead was later adopted for throughput (below). |
 | TLS tickets/resumption | Reported improvement, not adopted: changes immutable/shared-context contract and requires key-lifecycle design. |
 | Timers, handoff, batching, file I/O | Profiled; no changes justified. Loaded completions wait a dispatch batch; workers can inherit loop CPU affinity. Cold-file evidence did not justify a new I/O layer. Timer slack helped idle timers, not request tails. |
 
@@ -130,6 +130,34 @@ IPv6 warm tails improved in every pair. This does not establish a universal
 TTFB win: 64-connection IPv4 first-read tails were mixed, and four-connection
 cold IPv4 total p95/p99 increased 1793/1987→1985/2052 us. Improving dispatch can
 shift waiting elsewhere; measure end-to-end latency as well as individual phases.
+
+## Syscalls per response against tokio (Linux, 2026-10-18)
+
+Same 4-vCPU VM, one server thread against hyper 1 / tokio-rustls 0.26; harness
+and report in the project's `beat-tokio` folder. strace counted two sends per
+16 KiB HTTP/1.1 response (head, then body), two reads per TLS record (header,
+then body), and one send per TLS record where hyper uses one `writev`.
+
+| Change | Requests/s before → after (hyper) |
+| --- | --- |
+| HTTP/1.1 head and body in one gathered `sendmsg` | 16 KiB: 51.6k → 71.4k (60.3k) |
+| TLS: records of one write sent with `MSG_MORE` but the last; read-ahead | HTTPS 16 KiB: 26.0k → 39.1k (41.1k); h2 16 KiB: 51.1k → 73.3k (60.7k) |
+| All of the above, plus a per-thread HTTP/1.1 Date cache and a status line without `snprintf` | HTTPS 13 B: 51.4k → 59.3k (61.7k) |
+
+Medians of three alternating 8 s runs; the VM varies about 10-20%. The
+remaining HTTPS gap is user-space TLS cost per record, not syscalls.
+
+Allocation scratch buffers (dropped): a full TLS handshake makes about 700
+heap allocations, 98% inside OpenSSL and mostly for state that outlives the
+call (keys, record layers, session); eventloop's own nine are
+connection-lifetime objects. Keep-alive HTTPS makes about 7 per request,
+from `SSL_MODE_RELEASE_BUFFERS`. As an upper bound on any thread-local
+scratch or caching scheme, preloading jemalloc or raising glibc's tcache
+(`GLIBC_TUNABLES=glibc.malloc.tcache_count=1000:glibc.malloc.tcache_max=4096`)
+moved keep-alive HTTPS by 0% and handshakes by 2-10%, within VM noise. Only a
+process-wide `CRYPTO_set_mem_functions` could reach OpenSSL's allocations,
+which a library should not impose; deployments can use those allocator
+settings instead.
 
 ## Guidance for further work
 

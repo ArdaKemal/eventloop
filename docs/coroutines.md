@@ -11,7 +11,9 @@ under `eventloop/`. Platform readiness is private.
 - Tasks are move-only and start once, by awaiting or spawning. Destroying an
   unfinished started task is a programming error. Frames use bounded per-loop
   size classes: warm reserves, hard slot limits, on-demand backing slabs,
-  and reclamation of empty growth slabs. Individual frames have no heap fallback.
+  and reclamation of empty growth slabs. One empty growth slab per class stays
+  as a spare while the class's other slabs are more than half used, so load at
+  a slab boundary does not churn it. Individual frames have no heap fallback.
 - `add()` takes owning pointers to acceptors, TCP/TLS streams, and UDP sockets,
   including Unix acceptors/streams on POSIX; application readiness handlers
   are not accepted. `close()` cancels pending I/O and deregisters the object.
@@ -64,8 +66,9 @@ failure rather than allocating replacements. Frame payload classes are
 128/256/512/1024/2048/4096 bytes, and 16 times larger on Windows
 (2048 through 65536 bytes) because MSVC frames are about ten times larger
 for the same coroutines. Default hard slots are
-64/32/10240/10240/4/2, enough for 10k idle HTTPS connections per loop (a
-1024-byte connection frame plus a 512-byte pending TLS read); warm slots
+64/32/10240/40960/4/2, enough for 10k idle HTTPS connections per loop (a
+1024-byte connection frame plus a 512-byte pending TLS read) or 10k HTTP/2
+connections (four 1024-byte frames each); warm slots
 64/32/16/160/4/2. Zero disables a class;
 warm counts clamp to hard limits. Frame state must not exceed `max_align_t`
 alignment. `post_capacity` defaults to 1024, `coroutine_completion_capacity`

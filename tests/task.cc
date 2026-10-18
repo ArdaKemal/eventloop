@@ -477,6 +477,31 @@ auto frame_class_lifecycle_test() -> bool
     return true;
 }
 
+// A frame that repeatedly crosses a slab boundary while the class is busy
+// reuses the emptied growth slab instead of freeing and recreating it.
+auto spare_slab_test() -> bool
+{
+    event_loop_options options;
+    options.coroutine_frame_capacities.fill(0);
+    options.coroutine_frame_initial_capacities.fill(0);
+    options.coroutine_frame_capacities[0] = 4;
+    options.coroutine_frame_initial_capacities[0] = 1;
+    event_loop loop(options);
+    const auto size = coroutine_frame_sizes[0];
+    auto* held = detail::coroutine_frame_access::allocate(loop, size);
+    if (held == nullptr) return false;
+    for (int round = 0; round < 3; ++round) {
+        auto* crossing = detail::coroutine_frame_access::allocate(loop, size);
+        if (crossing == nullptr || loop.coroutine_statistics().backed_capacity != 2) {
+            return false;
+        }
+        detail::coroutine_frame_access::deallocate(crossing, size);
+        if (loop.coroutine_statistics().backed_capacity != 2) return false;
+    }
+    detail::coroutine_frame_access::deallocate(held, size);
+    return loop.coroutine_statistics().backed_capacity == 1;
+}
+
 auto alignment_and_oversize_test() -> bool
 {
     event_loop loop;
@@ -1008,6 +1033,10 @@ auto main(int argc, char** argv) -> int
     }
     if (!frame_class_lifecycle_test()) {
         std::cerr << "task frame-pool class lifecycle test failed\n";
+        return 1;
+    }
+    if (!spare_slab_test()) {
+        std::cerr << "task frame-pool spare slab test failed\n";
         return 1;
     }
     if (!alignment_and_oversize_test()) {

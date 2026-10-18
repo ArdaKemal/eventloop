@@ -9,7 +9,8 @@ resources, listings/cache: [shared HTTP](http.md). Names are relative to `eventl
 selects http/1.1 and also advertises h2 by default. Disable h2 with
 `http::server_options::enable_http2 = false`. One handler runs per connection.
 Routed connections allocate routing state, request view, and 4 KiB response
-buffer once.
+buffer once. A body write that does not fit the buffer goes out in one
+gathered write with the buffered head (and chunk framing), not after it.
 
 ## Bodies and reuse
 

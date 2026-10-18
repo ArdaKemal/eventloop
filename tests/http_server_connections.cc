@@ -456,7 +456,7 @@ auto fetch_file(event_loop& loop, std::uint16_t port, std::shared_ptr<tls_contex
 }
 
 // An HTTPS connection holds its connection frame for its lifetime, so the
-// frame must fit the 1 KiB class, whose default 10,240 slots size a loop for
+// frame must fit the 1 KiB class, whose default 40,960 slots size a loop for
 // 10k connections; larger classes have only a few. This server loop has none
 // above 1 KiB. A client on its own loop fetches a static file twice over one
 // connection, which also exercises the userspace TLS file path.

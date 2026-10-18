@@ -111,9 +111,12 @@ are in flight and frees when the connection is idle. Userspace TLS, the only
 transport on Windows, macOS, and FreeBSD, also makes about 8 small OpenSSL
 allocations per request in record writes; the test bounds that path separately.
 Request fields reuse existing strings;
-HPACK's dynamic table uses a 4 KiB ring allocated with its first entry;
-response fields encode from views into reused storage. Longer-than-warmed
-header values may allocate. TLS handshake key exchange/transcript/key schedule
+HPACK's dynamic table ring starts at 256 bytes with its first entry and
+doubles to the peer's working set, up to 4 KiB; the header-block buffer and
+output queue (1 KiB at first) likewise grow to the traffic and keep that
+capacity, so an idle connection holds only what its peer used. Response
+fields encode from views into reused storage. Longer-than-warmed header
+values may allocate. TLS handshake key exchange/transcript/key schedule
 allocates on each new connection.
 
 ## Outbound client

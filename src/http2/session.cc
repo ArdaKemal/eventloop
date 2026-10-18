@@ -280,8 +280,9 @@ session::session(bool file_sendfile, const http::router* routes,
 {
     requests_.reserve(8);
     if (routes_ != nullptr) routed_.reserve(route_body_slots);
-    header_block_.reserve(4096);
-    output_.resize(4096);
+    // Header blocks and the output queue grow to what the peer's traffic
+    // needs and keep that capacity; idle connections stay small.
+    output_.resize(1024);
     decoded_fields_.reserve(16);
 
     std::array<std::byte, 42> settings {};

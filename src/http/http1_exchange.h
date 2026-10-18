@@ -18,6 +18,7 @@
 #include <optional>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 namespace eventloop::http::detail {
 
@@ -230,6 +231,32 @@ private:
         co_return void_result {};
     }
 
+    // Sends the pieces in order through gathered writes.
+    static auto write_gathered(event_loop& loop, http1_exchange& self,
+                               std::array<std::span<const std::byte>, 3> pieces)
+        -> task<void_result>
+    {
+        (void)loop;
+        std::size_t first = 0;
+        for (;;) {
+            while (first < pieces.size() && pieces[first].empty()) ++first;
+            if (first == pieces.size()) co_return void_result {};
+            const auto written = io_value(co_await self.peer_.async_write_some(
+                std::span<const std::span<const std::byte>>(pieces).subspan(first)));
+            if (!written || *written == 0) {
+                self.broken_ = true;
+                co_return std::unexpected(written ? failure(std::errc::broken_pipe)
+                                                  : written.error());
+            }
+            for (auto left = *written; left != 0; ++first) {
+                const auto count = std::min(left, pieces[first].size());
+                pieces[first] = pieces[first].subspan(count);
+                left -= count;
+                if (!pieces[first].empty()) break;
+            }
+        }
+    }
+
     static auto flush(event_loop& loop, http1_exchange& self) -> task<void_result>
     {
         const auto size = self.output_size_;
@@ -360,10 +387,16 @@ private:
         self.declared_ = checked->declared;
         self.chunked_ = !checked->bodyless && !checked->declared;
 
+        // "HTTP/1.1 " + three status digits + " " + reason phrase + CRLF.
         std::array<char, 64> status_line {};
         const auto reason = reason_phrase(status);
-        const int status_size = std::snprintf(status_line.data(), status_line.size(),
-            "HTTP/1.1 %u %.*s\r\n", status, static_cast<int>(reason.size()), reason.data());
+        auto* cursor = std::to_chars(status_line.data() + 9, status_line.data() + 12, status).ptr;
+        std::memcpy(status_line.data(), "HTTP/1.1 ", 9);
+        *cursor++ = ' ';
+        cursor = std::copy(reason.begin(), reason.end(), cursor);
+        *cursor++ = '\r';
+        *cursor++ = '\n';
+        const auto status_size = cursor - status_line.data();
         std::array<char, 192> trailer_lines {};
         std::size_t extra = 0;
         const auto add = [&](std::string_view text) {
@@ -371,9 +404,8 @@ private:
             extra += text.size();
         };
         if (!checked->has_date) {
-            std::array<char, 64> date {};
             add("date: ");
-            add({date.data(), format_http_time(std::time(nullptr), date)});
+            add(current_http_date());
             add("\r\n");
         }
         if (checked->emit_length) {
@@ -438,16 +470,18 @@ private:
             if (self.chunked_) (void)self.append("\r\n");
             co_return unwrap(co_await flush(loop, self));
         }
-        auto flushed = unwrap(co_await flush(loop, self));
-        if (!flushed) co_return std::unexpected(flushed.error());
-        auto written = co_await write_all(loop, self, data);
-        if (!written) co_return std::unexpected(failure(std::errc::operation_canceled));
-        if (!*written) co_return std::unexpected(written->error());
-        if (self.chunked_) {
-            (void)self.append("\r\n");
-            co_return unwrap(co_await flush(loop, self));
+        // Buffered headers or chunk size, the data, and its chunk end go out
+        // together.
+        constexpr std::string_view chunk_end = "\r\n";
+        const auto buffered = std::exchange(self.output_size_, 0);
+        auto written = co_await write_gathered(loop, self, {
+            std::span<const std::byte>(self.buffer_).first(buffered), data,
+            self.chunked_ ? std::as_bytes(std::span(chunk_end)) : std::span<const std::byte> {}});
+        if (!written) {
+            self.broken_ = true;
+            co_return std::unexpected(failure(std::errc::operation_canceled));
         }
-        co_return void_result {};
+        co_return *written;
     }
 
     static auto finish_task(event_loop& loop, http1_exchange& self, std::span<const header> trailers)

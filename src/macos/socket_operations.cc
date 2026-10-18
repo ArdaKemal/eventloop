@@ -4,6 +4,7 @@
 #include "eventloop/udp_socket.h"
 #include "ip_endpoint_native.h"
 
+#include <array>
 #include <cerrno>
 #include <fcntl.h>
 #include <limits>
@@ -281,6 +282,37 @@ auto socket_operations::start_write(native_socket socket, const void* buffer,
                                    0); // SO_NOSIGPIPE is set by activate().
 #else
                                    MSG_NOSIGNAL);
+#endif
+        if (result >= 0) return {.transferred = static_cast<std::size_t>(result)};
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return {.pending = true};
+        return {.error = code(errno)};
+    }
+}
+
+auto socket_operations::start_write_gather(native_socket socket,
+    std::span<const std::span<const std::byte>> buffers,
+    socket_operation&) noexcept -> socket_result
+{
+    std::array<iovec, tcp_stream::max_write_buffers> vectors {};
+    msghdr message {};
+    message.msg_iov = vectors.data();
+    std::size_t total = 0;
+    for (const auto buffer : buffers) {
+        if (buffer.empty()) continue;
+        if (buffer.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()) - total)
+            break;
+        vectors[static_cast<std::size_t>(message.msg_iovlen++)] =
+            {const_cast<std::byte*>(buffer.data()), buffer.size()};
+        total += buffer.size();
+    }
+    if (total == 0) return {};
+    for (;;) {
+        const auto result = ::sendmsg(socket, &message,
+#if defined(__APPLE__) || defined(__FreeBSD__)
+                                      0); // SO_NOSIGPIPE is set by activate().
+#else
+                                      MSG_NOSIGNAL);
 #endif
         if (result >= 0) return {.transferred = static_cast<std::size_t>(result)};
         if (errno == EINTR) continue;

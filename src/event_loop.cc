@@ -174,6 +174,8 @@ public:
             if (slab == nullptr || slab->free == nullptr || slab->free_count == 0) {
                 std::terminate();
             }
+            if (slab == current.spare) current.spare = nullptr;
+            ++current.live;
             auto* block = slab->free;
             slab->free = block->next;
             --slab->free_count;
@@ -270,6 +272,10 @@ private:
 
         slab_header* slabs {nullptr};
         slab_header* available {nullptr};
+        // One empty growth slab kept while the class stays busy, so a load
+        // hovering at a slab boundary does not create and free it per frame.
+        slab_header* spare {nullptr};
+        std::size_t live {0};
         std::size_t payload_size {0};
         std::size_t stride {0};
         std::size_t maximum_capacity {0};
@@ -379,22 +385,43 @@ private:
         slab.free = &block;
         ++slab.free_count;
         --slab.live;
+        --current.live;
         --live_;
         if (was_full) add_available(current, slab);
 
         if (slab.live == 0 && !slab.retained) {
-            remove_available(current, slab);
-            auto** link = &current.slabs;
-            while (*link != &slab) {
-                if (*link == nullptr) std::terminate();
-                link = &(*link)->all_next;
+            if (current.spare == nullptr && keeps_spare(current, slab)) {
+                current.spare = &slab;
+            } else {
+                free_slab(current, slab);
             }
-            *link = slab.all_next;
-            current.backed_capacity -= slab.capacity;
-            backed_capacity_ -= slab.capacity;
-            ::operator delete(&slab,
-                              std::align_val_t {coroutine_frame_alignment});
         }
+        if (current.spare != nullptr && !keeps_spare(current, *current.spare)) {
+            free_slab(current, *current.spare);
+            current.spare = nullptr;
+        }
+    }
+
+    // Keep an empty slab while the class's other slabs are more than half
+    // used; below that, the load has receded and the slab is released.
+    [[nodiscard]] static auto keeps_spare(const size_class& current,
+                                          const slab_header& slab) noexcept -> bool
+    {
+        return current.live * 2 > current.backed_capacity - slab.capacity;
+    }
+
+    auto free_slab(size_class& current, slab_header& slab) noexcept -> void
+    {
+        remove_available(current, slab);
+        auto** link = &current.slabs;
+        while (*link != &slab) {
+            if (*link == nullptr) std::terminate();
+            link = &(*link)->all_next;
+        }
+        *link = slab.all_next;
+        current.backed_capacity -= slab.capacity;
+        backed_capacity_ -= slab.capacity;
+        ::operator delete(&slab, std::align_val_t {coroutine_frame_alignment});
     }
 
     std::array<size_class, coroutine_frame_sizes.size()> classes_;

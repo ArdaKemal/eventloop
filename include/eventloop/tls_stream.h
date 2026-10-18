@@ -64,6 +64,12 @@ public:
         -> task<std::expected<std::size_t, std::error_code>>;
     [[nodiscard]] auto async_write_some(std::span<const std::byte> buffer)
         -> task<std::expected<std::size_t, std::error_code>>;
+    // Writes the buffers in order, as for tcp_stream; the array and the
+    // buffers stay caller-owned until completion. One call writes at most
+    // three full records (48 KiB) and makes one transport push for them.
+    [[nodiscard]] auto async_write_some(
+        std::span<const std::span<const std::byte>> buffers)
+        -> task<std::expected<std::size_t, std::error_code>>;
     // Available after handshake when OpenSSL enabled Linux transmit kTLS.
     // The file remains owned through completion or cancellation.
     [[nodiscard]] auto kernel_sendfile_available() const noexcept -> bool;
@@ -96,8 +102,10 @@ private:
     [[nodiscard]] static auto read_task(event_loop& loop, tls_stream& self,
                                         std::span<std::byte> buffer)
         -> task<std::expected<std::size_t, std::error_code>>;
+    // Writes buffer when buffers is empty.
     [[nodiscard]] static auto write_task(event_loop& loop, tls_stream& self,
-                                         std::span<const std::byte> buffer)
+        std::span<const std::byte> buffer,
+        std::span<const std::span<const std::byte>> buffers)
         -> task<std::expected<std::size_t, std::error_code>>;
     [[nodiscard]] static auto flush_task(event_loop& loop, tls_stream& self)
         -> task<std::expected<void, std::error_code>>;

@@ -531,17 +531,10 @@ struct generated_fields {
     {
         if (emit_length) fields[count++] = {"content-length", length_digits.view()};
         if (add_date) {
-            // Date changes once per second; the fields still borrow this response.
-            static thread_local std::array<char, 64> cached_date {};
-            static thread_local std::time_t cached_second {};
-            static thread_local std::size_t size {0};
-            const auto now = std::time(nullptr);
-            if (now != cached_second || size == 0) {
-                size = http::detail::format_http_time(now, cached_date);
-                cached_second = now;
-            }
-            date = cached_date;
-            fields[count++] = {"date", {date.data(), size}};
+            // The fields borrow this response, not the per-thread cache.
+            const auto now = http::detail::current_http_date();
+            std::copy(now.begin(), now.end(), date.begin());
+            fields[count++] = {"date", {date.data(), now.size()}};
         }
     }
     generated_fields(const generated_fields&) = delete;
@@ -818,7 +811,6 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
         entry.name.clear();
     }
     std::string_view method, target, authority, host, connect_protocol;
-    exchange.headers.reserve(hpack_max_fields);
     for (const auto& entry : exchange.routed.fields) {
         if (entry.name == ":method") method = entry.value;
         else if (entry.name == ":path") target = entry.value;

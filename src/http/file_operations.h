@@ -4,8 +4,10 @@
 #include "eventloop/unique_fd.h"
 #include "directory_listing.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <expected>
 #include <optional>
 #include <span>
@@ -47,6 +49,21 @@ struct directory_entry {
     -> std::optional<std::vector<directory_entry>>;
 [[nodiscard]] auto format_http_time(std::int64_t unix_seconds,
                                     std::span<char> output) noexcept -> std::size_t;
+// The current time for a Date field, formatted at most once per second per
+// thread (again after a clock change or a formatting failure). The view is
+// valid on this thread until the next call; copy it before suspending.
+[[nodiscard]] inline auto current_http_date() noexcept -> std::string_view
+{
+    static thread_local std::array<char, 64> text {};
+    static thread_local std::time_t second {};
+    static thread_local std::size_t size {0};
+    const auto now = std::time(nullptr);
+    if (now != second || size == 0) {
+        size = format_http_time(now, text);
+        second = now;
+    }
+    return {text.data(), size};
+}
 
 // Shared directory HTML renderer, with ownership of the directory handle.
 // Applies the directory_listing_max_* bounds and stable byte-wise name order.

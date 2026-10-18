@@ -42,10 +42,11 @@ private:
         std::uint16_t name_size = 0;
         std::uint16_t value_size = 0;
     };
-    // The dynamic table keeps entry octets in one ring, allocated on the
-    // first insertion; live octets stay below hpack_max_table_size, so
-    // insertion and eviction do not allocate.
+    // The dynamic table keeps entry octets in one ring that grows by
+    // doubling to fit the live octets, up to hpack_max_table_size; once the
+    // peer's working set fits, insertion and eviction do not allocate.
     std::unique_ptr<char[]> table_octets_;
+    std::size_t ring_size_ = 0;
     std::array<table_entry, max_entries> entries_ {};
     std::size_t newest_ = 0;
     std::size_t entry_count_ = 0;
@@ -59,6 +60,7 @@ private:
     [[nodiscard]] auto resolve(std::size_t index, field& result) const -> bool;
     auto insert(const field& entry) -> void;
     auto evict_oldest() noexcept -> void;
+    auto grow_ring(std::size_t needed) -> void;
     auto resize_table(std::size_t size) -> void;
     auto store(std::string_view octets) noexcept -> void;
     auto load(std::size_t offset, std::size_t size, std::string& output) const -> void;

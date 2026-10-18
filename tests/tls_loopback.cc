@@ -20,6 +20,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <openssl/ssl.h>
 
@@ -305,6 +306,62 @@ struct stream_pair {
     result.finish();
 }
 
+// One gathered write covers at most 48 KiB in order across its buffers, also
+// when a small send buffer makes records wait for writability.
+[[nodiscard]] auto gathered_byte(std::size_t index) -> std::byte
+{
+    return static_cast<std::byte>(index * 131 % 251);
+}
+
+[[nodiscard]] auto gather_server(event_loop& loop, tls_stream& stream,
+                                 result_state& result) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    if (handshake && *handshake) {
+        std::vector<std::byte> buffer(16384);
+        std::size_t total = 0;
+        bool ordered = true;
+        for (;;) {
+            auto received = co_await stream.async_read_some(buffer);
+            if (!received || !*received || **received == 0) break;
+            for (std::size_t i = 0; i < **received; ++i)
+                ordered = ordered && buffer[i] == gathered_byte(total + i);
+            total += **received;
+        }
+        result.server_ok = ordered && total == 3 + 40960 + 20480;
+    }
+    stream.close();
+    result.finish();
+}
+
+[[nodiscard]] auto gather_client(event_loop& loop, tls_stream& stream,
+                                 result_state& result) -> task<void>
+{
+    (void)loop;
+    auto handshake = co_await stream.async_handshake();
+    if (handshake && *handshake) {
+        std::vector<std::byte> bytes(3 + 40960 + 20480);
+        for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = gathered_byte(i);
+        const std::span<const std::byte> all(bytes);
+        std::array<std::span<const std::byte>, 4> parts {
+            all.first(3), std::span<const std::byte> {}, all.subspan(3, 40960),
+            all.subspan(3 + 40960)};
+        auto first = co_await stream.async_write_some(parts);
+        bool passed = first && *first && **first == 48 * 1024;
+        std::size_t sent = passed ? **first : 0;
+        while (passed && sent < bytes.size()) {
+            auto written = co_await stream.async_write_some(all.subspan(sent));
+            passed = written && *written && **written != 0;
+            if (passed) sent += **written;
+        }
+        auto closed = co_await stream.async_close();
+        result.client_ok = passed && closed && *closed;
+    }
+    stream.close();
+    result.finish();
+}
+
 [[nodiscard]] auto run_case(const std::filesystem::path& certificate,
                             const std::filesystem::path& key,
                             const std::filesystem::path& trusted_ca,
@@ -314,7 +371,7 @@ struct stream_pair {
     result_state result {loop};
     auto streams = add_streams(loop, certificate, key, trusted_ca,
                                which == 1 ? "wrong.example" : "localhost",
-                               which == 3, which == 6);
+                               which == 3 || which == 7, which == 6);
     task<void> server;
     task<void> client;
     switch (which) {
@@ -332,6 +389,10 @@ struct stream_pair {
         server = blocked_write_server(loop, *streams.server, *streams.client,
                                       result);
         client = blocked_write_client(loop, *streams.client, result);
+        break;
+    case 7:
+        server = gather_server(loop, *streams.server, result);
+        client = gather_client(loop, *streams.client, result);
         break;
     case 4:
         server = busy_server(loop, *streams.server, result);
@@ -548,6 +609,7 @@ auto main(int argc, char* argv[]) -> int
                             run_case(certificate, key, trusted_ca, 3) &&
                             run_case(certificate, key, trusted_ca, 4) &&
                             run_case(certificate, key, trusted_ca, 6) &&
+                            run_case(certificate, key, trusted_ca, 7) &&
                             run_plaintext_peer_case(trusted_ca) &&
                             // RFC 9113 9.2.2: suites prohibited for HTTP/2
                             // are refused; a forward-secret AEAD suite works.

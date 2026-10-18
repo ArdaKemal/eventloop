@@ -70,7 +70,8 @@ public:
     template<bool Read>
     class io_awaiter {
     public:
-        io_awaiter(tcp_stream& owner, void* data, std::size_t size) noexcept;
+        io_awaiter(tcp_stream& owner, void* data, std::size_t size,
+                   bool gather = false) noexcept;
         ~io_awaiter();
         io_awaiter(const io_awaiter&) = delete;
         auto operator=(const io_awaiter&) -> io_awaiter& = delete;
@@ -92,9 +93,11 @@ public:
         auto suspend(std::coroutine_handle<> handle,
                      detail::coroutine_cancellation_state& state) -> bool;
         auto finish(std::size_t size, std::error_code error) noexcept -> void;
+        auto start() noexcept -> detail::socket_result;
         tcp_stream& owner_;
         void* data_;
         std::size_t size_;
+        bool gather_;
         detail::coroutine_cancellation_node cancellation_ {};
         std::coroutine_handle<> continuation_ {};
         std::size_t transferred_ {0};
@@ -116,6 +119,17 @@ public:
         -> io_awaiter<false>
     {
         return {*this, const_cast<std::byte*>(buffer.data()), buffer.size()};
+    }
+    // Gathers the buffers, in order, into one send; the byte count may end
+    // inside any of them. At most max_write_buffers are used per call. The
+    // array and the buffers stay caller-owned until completion.
+    static constexpr std::size_t max_write_buffers = 16;
+    [[nodiscard]] auto async_write_some(
+        std::span<const std::span<const std::byte>> buffers) noexcept
+        -> io_awaiter<false>
+    {
+        return {*this, const_cast<std::span<const std::byte>*>(buffers.data()),
+                buffers.size(), true};
     }
 private:
     class file_awaiter {

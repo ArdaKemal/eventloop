@@ -139,8 +139,7 @@ auto tcp_stream::on_write() -> void
     }
 #endif
     if (writer_ == nullptr || closed_) return;
-    auto result = detail::socket_operations::start_write(
-        descriptor_.get(), writer_->data_, writer_->size_, writer_->operation_);
+    auto result = writer_->start();
     if (result.pending) return;
     complete_write(result.transferred, result.error);
 }
@@ -365,8 +364,8 @@ auto tcp_stream::connect_awaiter::await_resume() const noexcept
 
 template<bool Read>
 tcp_stream::io_awaiter<Read>::io_awaiter(
-    tcp_stream& owner, void* data, std::size_t size) noexcept
-    : owner_(owner), data_(data), size_(size)
+    tcp_stream& owner, void* data, std::size_t size, bool gather) noexcept
+    : owner_(owner), data_(data), size_(size), gather_(gather)
 {
     cancellation_.operation = this;
     cancellation_.cancel = &cancel;
@@ -433,14 +432,7 @@ auto tcp_stream::io_awaiter<Read>::suspend(
     }
     if constexpr (Read) owner_.reader_ = this;
     else owner_.writer_ = this;
-    const auto result = [&] {
-        if constexpr (Read)
-            return detail::socket_operations::start_read(
-                owner_.descriptor_.get(), data_, size_, operation_);
-        else
-            return detail::socket_operations::start_write(
-                owner_.descriptor_.get(), data_, size_, operation_);
-    }();
+    const auto result = start();
     if (!result.pending) {
         if constexpr (Read) owner_.reader_ = nullptr;
         else owner_.writer_ = nullptr;
@@ -466,6 +458,21 @@ auto tcp_stream::io_awaiter<Read>::suspend(
         return false;
     }
     return true;
+}
+
+template<bool Read>
+auto tcp_stream::io_awaiter<Read>::start() noexcept -> detail::socket_result
+{
+    const auto socket = owner_.descriptor_.get();
+    if constexpr (Read) {
+        return detail::socket_operations::start_read(socket, data_, size_, operation_);
+    } else {
+        if (!gather_)
+            return detail::socket_operations::start_write(socket, data_, size_, operation_);
+        return detail::socket_operations::start_write_gather(socket,
+            {static_cast<const std::span<const std::byte>*>(data_),
+             std::min(size_, max_write_buffers)}, operation_);
+    }
 }
 
 template<bool Read>

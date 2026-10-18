@@ -11,6 +11,9 @@ Names below are in `eventloop`.
   `tcp_stream::async_connect`, `async_read_some`, and `async_write_some`
   return expected results. Reads/writes may be partial; zero read means EOF.
   Borrowed buffers stay valid through completion, including cancellation.
+  `async_write_some(span<const span<const byte>>)` gathers up to
+  `max_write_buffers` (16) buffers into one send; the borrowed array stays
+  valid through completion too.
 - One read and one connect may be pending; writes and file sends share the
   write direction. Duplicate pending I/O returns `EBUSY`; a second pending connect returns
   `EALREADY`. Immediate connect failure leaves the stream registered for

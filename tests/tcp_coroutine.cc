@@ -5,6 +5,7 @@
 #include "eventloop/task.h"
 #include "eventloop/file_io.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -18,6 +19,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 #include <fcntl.h>
 #ifdef _WIN32
 #include <winsock2.h>
@@ -703,6 +705,93 @@ auto opened_file_send() -> bool
            sent && received && loop.coroutine_statistics().live == 0;
 }
 
+// Gathered writes keep order across buffers, skip empty ones, use at most
+// max_write_buffers, and resume a partial send from the readiness path.
+auto send_gathered(event_loop& loop, tcp_stream& socket, std::span<const std::byte> large,
+                   int& completed, bool& passed) -> task<void>
+{
+    constexpr std::array<std::byte, 1> letter {std::byte {'a'}};
+    std::array<std::span<const std::byte>, tcp_stream::max_write_buffers + 1> many {};
+    many.fill(letter);
+    const auto counted = co_await socket.async_write_some(many);
+    passed = counted && *counted == tcp_stream::max_write_buffers;
+    // A large gather fills the socket buffer, so it completes after waiting.
+    std::array<std::span<const std::byte>, 3> parts {
+        large.first(large.size() / 2), std::span<const std::byte> {},
+        large.subspan(large.size() / 2)};
+    std::size_t sent = 0;
+    while (passed && sent < large.size()) {
+        std::size_t skip = sent;
+        std::array<std::span<const std::byte>, 3> rest {};
+        std::size_t count = 0;
+        for (const auto part : parts) {
+            const auto drop = std::min(skip, part.size());
+            skip -= drop;
+            if (part.size() > drop) rest[count++] = part.subspan(drop);
+        }
+        const auto written = co_await socket.async_write_some(std::span(rest).first(count));
+        passed = written && *written != 0;
+        if (passed) sent += *written;
+    }
+    socket.close();
+    stop_after_two(loop, completed);
+}
+
+auto receive_gathered(event_loop& loop, tcp_stream& socket, std::span<const std::byte> large,
+                      int& completed, bool& passed) -> task<void>
+{
+    std::vector<std::byte> received;
+    std::vector<std::byte> buffer(65536);
+    for (;;) {
+        const auto result = co_await socket.async_read_some(buffer);
+        if (!result || *result == 0) break;
+        received.insert(received.end(), buffer.begin(),
+                        buffer.begin() + static_cast<std::ptrdiff_t>(*result));
+    }
+    passed = received.size() == tcp_stream::max_write_buffers + large.size() &&
+        std::all_of(received.begin(), received.begin() + tcp_stream::max_write_buffers,
+                    [](std::byte value) { return value == std::byte {'a'}; }) &&
+        std::equal(large.begin(), large.end(),
+                   received.begin() + tcp_stream::max_write_buffers);
+    socket.close();
+    stop_after_two(loop, completed);
+}
+
+auto gathered_write() -> bool
+{
+    auto pair = connected_pair();
+    if (!pair.client || !pair.server) return false;
+    std::vector<std::byte> large(8 << 20);
+    for (std::size_t i = 0; i < large.size(); ++i)
+        large[i] = static_cast<std::byte>(i * 131 % 251);
+    event_loop loop;
+    auto sender = std::make_unique<tcp_stream>(loop, std::move(pair.client));
+    auto receiver = std::make_unique<tcp_stream>(loop, std::move(pair.server));
+    auto* sending = sender.get();
+    auto* receiving = receiver.get();
+    loop.add(std::move(sender));
+    loop.add(std::move(receiver));
+    int completed = 0;
+    bool sent = false;
+    bool received = false;
+    task_handle<void> watchdog;
+    if (loop.spawn(send_gathered(loop, *sending, large, completed, sent)) !=
+            task_spawn_result::accepted ||
+        loop.spawn(receive_gathered(loop, *receiving, large, completed, received)) !=
+            task_spawn_result::accepted ||
+        loop.spawn(stop_after(loop, 5s), watchdog) != task_spawn_result::accepted) {
+        loop.shutdown(0s);
+        (void)loop.run();
+        return false;
+    }
+    const auto result = loop.run();
+    if (!watchdog.done()) (void)watchdog.cancel();
+    loop.shutdown(0s);
+    (void)loop.run();
+    return result == event_loop_result::stopped && completed == 2 && sent && received &&
+           loop.coroutine_statistics().live == 0;
+}
+
 } // namespace
 
 int main()
@@ -723,6 +812,7 @@ int main()
         !check(immediate_error_cases(), "immediate errors") ||
         !check(refused_connect(), "refused connect") ||
         !check(opened_file_send(), "async_openat send file") ||
+        !check(gathered_write(), "gathered write") ||
         !check(shutdown_pending(), "shutdown pending")) return 1;
 #ifndef _WIN32
     if (!check(interest_failure_closes_stream(), "interest failure closes stream"))

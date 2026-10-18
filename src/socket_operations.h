@@ -139,6 +139,10 @@ public:
                                           std::size_t size,
                                           socket_operation& operation) noexcept
         -> socket_result;
+    // At most tcp_stream::max_write_buffers buffers.
+    [[nodiscard]] static auto start_write_gather(native_socket socket,
+        std::span<const std::span<const std::byte>> buffers,
+        socket_operation& operation) noexcept -> socket_result;
     // Reads at offset; the file position does not move.
     [[nodiscard]] static auto start_send_file(native_socket socket,
                                               native_socket file,

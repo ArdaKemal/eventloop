@@ -6,6 +6,7 @@
 
 #include <mswsock.h>
 #include <mstcpip.h>
+#include <array>
 #include <cerrno>
 #include <io.h>
 #include <limits>
@@ -590,6 +591,27 @@ auto socket_operations::start_write(native_socket socket, const void* buffer,
                         const_cast<char*>(static_cast<const char*>(buffer))};
     return submission_result(::WSASend(static_cast<SOCKET>(socket),
                                        &operation.buffer, 1, nullptr, 0,
+                                       &operation.overlapped, nullptr), operation);
+}
+
+auto socket_operations::start_write_gather(native_socket socket,
+    std::span<const std::span<const std::byte>> buffers,
+    socket_operation& operation) noexcept -> socket_result
+{
+    // WSASend captures the WSABUF array before it returns.
+    std::array<WSABUF, tcp_stream::max_write_buffers> vectors {};
+    DWORD count = 0;
+    std::size_t total = 0;
+    for (const auto buffer : buffers) {
+        if (buffer.empty()) continue;
+        if (buffer.size() > std::numeric_limits<ULONG>::max() - total) break;
+        vectors[count++] = {static_cast<ULONG>(buffer.size()),
+            const_cast<char*>(reinterpret_cast<const char*>(buffer.data()))};
+        total += buffer.size();
+    }
+    if (total == 0) return {};
+    return submission_result(::WSASend(static_cast<SOCKET>(socket),
+                                       vectors.data(), count, nullptr, 0,
                                        &operation.overlapped, nullptr), operation);
 }
 

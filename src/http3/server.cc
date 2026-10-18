@@ -137,9 +137,9 @@ auto send_headers(event_loop& loop, quic_connection& connection, std::uint64_t i
         if (selected->content_range_size != 0)
             fields[field_count++] = {"content-range", {selected->content_range.data(), selected->content_range_size}};
     }
-    const auto date_size = detail::format_http_time(std::time(nullptr),
-                                                     {date_text, date_buffer.size()});
-    fields[field_count++] = {"date", {date_text, date_size}};
+    const auto now = detail::current_http_date();
+    std::copy(now.begin(), now.end(), date_text);
+    fields[field_count++] = {"date", {date_text, now.size()}};
     auto encoded = h3::qpack_encode(std::span(fields).first(field_count),
                                     buffer.subspan(16, buffer.size() - 80));
     if (!encoded) co_return false;
@@ -358,8 +358,9 @@ public:
             fields[count++] = {"content-length", {length_text.data(), end}};
         }
         if (!checked->has_date) {
-            const auto size = detail::format_http_time(std::time(nullptr), date);
-            fields[count++] = {"date", {date.data(), size}};
+            const auto now = detail::current_http_date();
+            std::copy(now.begin(), now.end(), date.begin());
+            fields[count++] = {"date", {date.data(), now.size()}};
         }
         if (!self.fits_peer(fields.first(count)))
             co_return std::unexpected(failure(std::errc::message_size));
