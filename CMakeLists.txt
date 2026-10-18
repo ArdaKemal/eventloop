@@ -53,7 +53,6 @@ add_library(eventloop
     src/tcp_stream.cc
     src/udp_socket.cc
     src/util/arg_parser.cc
-    src/util/toml.cc
 )
 if(EVENTLOOP_TLS)
     target_sources(eventloop PRIVATE

@@ -63,7 +63,6 @@ Public headers are under `include/eventloop/`; readiness APIs remain private.
 | HTTP/3 client | `http3/client.h` | [Client contract](docs/http3.md#outbound-client), Wayfarer below |
 | WebSocket | `ws/web_socket.h` | [WebSocket](docs/websocket.md), [client guide](examples/basics/README.md) |
 | File I/O | `file_io.h` | [File I/O](docs/file-io.md) |
-| Synchronous TOML configuration | `util/toml.h` | [TOML](docs/toml.md) |
 
 The root build also produces the single-file programs in
 [examples/basics](examples/basics/README.md). Standalone applications build
@@ -71,9 +70,6 @@ from their own example directories:
 
 - [Wayfarer](examples/wayfarer/README.md): HTTP/1.1, HTTP/2, and HTTP/3 CLI
   client; redirects and file downloads.
-- [Stonegate](examples/stonegate/README.md): file server with TOML defaults, includes, and
-  named servers across all three protocols; TLS, redirects, directory listings,
-  and a `/healthz` route.
 - [Parley](examples/parley/README.md): browser chat, uploads, routed APIs,
   HTTP/2 WebSockets, and event-stream fallback.
 
