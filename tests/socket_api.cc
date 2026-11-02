@@ -221,6 +221,58 @@ auto fin_client(event_loop& loop, tcp_stream& peer) -> task<void>
     return loop.run() == event_loop_result::stopped && !timed_out && fin_seen &&
            loop.coroutine_statistics().live == 0;
 }
+
+// Resets the accepted connection; the client has no operation pending.
+auto reset_server(event_loop& loop, tcp_acceptor& listener) -> task<void>
+{
+    (void)loop;
+    auto accepted = co_await listener.async_accept();
+    listener.close();
+    if (!accepted) co_return;
+    const linger abort {.l_onoff = 1, .l_linger = 0};
+    (void)::setsockopt(accepted->get(), SOL_SOCKET, SO_LINGER, &abort, sizeof(abort));
+}
+
+// The loop removes the idle client when the reset arrives; the hold keeps the
+// stream usable, so the next read fails instead of touching freed memory.
+auto held_client(event_loop& loop, tcp_stream& peer, bool& passed) -> task<void>
+{
+    const tcp_stream_hold hold(peer);
+    if (co_await peer.async_connect()) {
+        (void)co_await sleep_for(loop, 100ms);
+        std::array<std::byte, 1> input {};
+        const auto read = co_await peer.async_read_some(input);
+        passed = hold.get() == &peer && !read;
+    }
+    peer.close();
+    peer.close();
+    loop.stop();
+}
+
+[[nodiscard]] auto test_held_stream_survives_reset() -> bool
+{
+    event_loop loop;
+    auto listener = std::make_unique<tcp_acceptor>(loop, ip_endpoint::loopback_v4());
+    auto* accepting = listener.get();
+    auto client = std::make_unique<tcp_stream>(loop, listener_endpoint(*accepting));
+    auto* connecting = client.get();
+    loop.add(std::move(listener));
+    loop.add(std::move(client));
+    bool passed = false;
+    bool timed_out = false;
+    task_handle<void> timer;
+    check(loop.spawn(reset_server(loop, *accepting)) == task_spawn_result::accepted,
+          "spawn reset server");
+    check(loop.spawn(held_client(loop, *connecting, passed)) == task_spawn_result::accepted,
+          "spawn held client");
+    check(loop.spawn(watchdog(loop, timed_out), timer) == task_spawn_result::accepted,
+          "spawn reset watchdog");
+    (void)loop.run();
+    if (!timer.done()) (void)timer.cancel();
+    loop.shutdown(0ms);
+    (void)loop.run();
+    return !timed_out && passed && loop.coroutine_statistics().live == 0;
+}
 #endif
 
 auto cancelled_read(event_loop& loop, tcp_stream& stream, bool& started,
@@ -521,6 +573,7 @@ auto main() -> int
         check(test_pending_accept_cancel(), "pending accept cancellation failed");
 #ifndef _WIN32
         check(test_close_sends_fin(), "TCP close did not send FIN promptly");
+        check(test_held_stream_survives_reset(), "held TCP stream did not survive a reset");
 #endif
         check(test_udp(), "UDP public API roundtrip failed");
 #ifdef EVENTLOOP_TEST_TLS
