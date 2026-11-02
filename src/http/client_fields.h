@@ -83,6 +83,18 @@ inline constexpr std::uint64_t client_max_streamed_body = std::uint64_t {1} << 4
     return length;
 }
 
+// A final response's declared Content-Length. A 204 declaring content is
+// malformed (RFC 9110 section 8.6); a zero length is tolerated.
+[[nodiscard]] inline auto response_content_length(std::span<const client_header> headers,
+                                                  unsigned status)
+    -> std::expected<std::optional<std::uint64_t>, std::error_code>
+{
+    auto length = content_length(headers);
+    if (length && status == 204 && length->value_or(0) != 0)
+        return std::unexpected(std::make_error_code(std::errc::protocol_error));
+    return length;
+}
+
 // Validates a request before any I/O and returns its declared Content-Length.
 // authority is the value :authority will carry; max_fields excludes the four
 // request pseudo-header fields.

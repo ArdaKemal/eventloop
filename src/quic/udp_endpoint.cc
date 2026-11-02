@@ -1,4 +1,5 @@
 #include "quic/udp_endpoint.h"
+#include "queue_behind_wakeups.h"
 
 #include <cerrno>
 #include <memory>
@@ -192,21 +193,7 @@ auto udp_endpoint::flush_send() -> std::error_code
     return {};
 }
 
-namespace {
-
-struct queue_behind_wakeups {
-    event_loop& loop;
-    eventloop::detail::wakeup_node node {};
-    [[nodiscard]] static auto await_ready() noexcept -> bool { return false; }
-    auto await_suspend(std::coroutine_handle<> handle) noexcept -> void
-    {
-        node.handle = handle;
-        eventloop::detail::coroutine_frame_access::schedule_wakeup(loop, node);
-    }
-    static auto await_resume() noexcept -> void {}
-};
-
-} // namespace
+using eventloop::detail::queue_behind_wakeups;
 
 auto udp_endpoint::receive_loop(event_loop& loop, udp_endpoint& endpoint) -> task<std::error_code>
 {
