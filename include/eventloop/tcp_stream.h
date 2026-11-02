@@ -276,4 +276,25 @@ private:
     [[no_unique_address]] detail::socket_stream_state socket_state_ {};
 };
 
+// Keeps a loop-owned stream allocated while its owner still refers to it. A
+// peer reset or error reported while no operation is pending, a failed
+// operation, close(), and loop shutdown each remove the stream from its loop,
+// which otherwise destroys it. A removed stream that is held stays valid and
+// closed: its operations fail and close() does nothing. Releasing the last
+// hold on a removed stream destroys it. Holds are created, moved, and
+// released on the owning loop's thread, before the loop is destroyed.
+class tcp_stream_hold {
+public:
+    tcp_stream_hold() noexcept = default;
+    explicit tcp_stream_hold(tcp_stream& stream) noexcept;
+    tcp_stream_hold(tcp_stream_hold&& other) noexcept;
+    auto operator=(tcp_stream_hold&& other) noexcept -> tcp_stream_hold&;
+    ~tcp_stream_hold();
+
+    [[nodiscard]] auto get() const noexcept -> tcp_stream* { return stream_; }
+
+private:
+    tcp_stream* stream_ {nullptr};
+};
+
 } // namespace eventloop

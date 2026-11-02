@@ -72,6 +72,30 @@ tcp_stream::~tcp_stream()
     }
 }
 
+tcp_stream_hold::tcp_stream_hold(tcp_stream& stream) noexcept : stream_(&stream)
+{
+    detail::socket_operations::stream_pin(stream);
+}
+
+tcp_stream_hold::tcp_stream_hold(tcp_stream_hold&& other) noexcept
+    : stream_(std::exchange(other.stream_, nullptr))
+{
+}
+
+auto tcp_stream_hold::operator=(tcp_stream_hold&& other) noexcept -> tcp_stream_hold&
+{
+    if (this != &other) {
+        if (stream_ != nullptr) detail::socket_operations::stream_unpin(*stream_);
+        stream_ = std::exchange(other.stream_, nullptr);
+    }
+    return *this;
+}
+
+tcp_stream_hold::~tcp_stream_hold()
+{
+    if (stream_ != nullptr) detail::socket_operations::stream_unpin(*stream_);
+}
+
 auto tcp_stream::descriptor() const noexcept -> native_socket
 {
     return descriptor_.get();

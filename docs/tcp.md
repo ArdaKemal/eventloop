@@ -19,6 +19,12 @@ Names below are in `eventloop`.
   `EALREADY`. Immediate connect failure leaves the stream registered for
   inspection/close; pending connect failure or cancellation removes it.
   Check results or saved descriptors before retaining a pointer after failure.
+- A peer reset or error reported while no operation is pending also removes
+  the stream, so an owner that awaits other work between operations holds it
+  with `tcp_stream_hold`. A removed, held stream stays allocated and closed:
+  its operations fail and `close()` does nothing. The last hold released on a
+  removed stream destroys it. Holds stay on the owning loop's thread and are
+  released before the loop is destroyed.
 - Accepted and outbound TCP streams set `TCP_NODELAY`. On POSIX, `close()`
   immediately issues a bidirectional shutdown; descriptor release may wait for
   the current dispatch to finish.
