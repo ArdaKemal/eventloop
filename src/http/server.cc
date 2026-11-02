@@ -324,6 +324,42 @@ struct redirect_state {
     std::size_t input_size {0};
 };
 
+// The response for the buffered request head: a redirect, a 400, or empty
+// while the head is incomplete. The parsed request holds over 1 KiB of
+// fields, so it stays out of serve_redirect's frame.
+[[nodiscard]] auto redirect_response(redirect_state& state, const std::string& hostname,
+                                     std::uint16_t https_port) -> std::span<const std::byte>
+{
+    static constexpr std::string_view bad =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+    detail::parsed_request request;
+    const auto parsed = parse_request(
+        std::string_view {state.input.data(), state.input_size}, request);
+    if (parsed.status == parse_status::complete) {
+        const int size = https_port == 443
+            ? std::snprintf(state.response.data(), state.response.size(),
+                  "HTTP/1.1 308 Permanent Redirect\r\n"
+                  "Location: https://%.*s%.*s\r\n"
+                  "Content-Length: 0\r\nConnection: close\r\n\r\n",
+                  static_cast<int>(hostname.size()), hostname.data(),
+                  static_cast<int>(request.target.size()), request.target.data())
+            : std::snprintf(state.response.data(), state.response.size(),
+                  "HTTP/1.1 308 Permanent Redirect\r\n"
+                  "Location: https://%.*s:%u%.*s\r\n"
+                  "Content-Length: 0\r\nConnection: close\r\n\r\n",
+                  static_cast<int>(hostname.size()), hostname.data(),
+                  static_cast<unsigned int>(https_port),
+                  static_cast<int>(request.target.size()), request.target.data());
+        if (size >= 0 && static_cast<std::size_t>(size) < state.response.size())
+            return std::as_bytes(std::span {state.response}.first(static_cast<std::size_t>(size)));
+        return std::as_bytes(std::span {bad.data(), bad.size()});
+    }
+    if (parsed.status != parse_status::incomplete || state.input_size == state.input.size())
+        return std::as_bytes(std::span {bad.data(), bad.size()});
+    return {};
+}
+
 [[nodiscard]] auto serve_redirect(event_loop& loop, unique_fd descriptor,
                                   std::shared_ptr<const std::string> hostname,
                                   std::uint16_t https_port,
@@ -344,47 +380,10 @@ struct redirect_state {
         registered = true;
         pin.hold(*peer);
         auto state = std::make_unique<redirect_state>();
-        constexpr std::string_view bad =
-            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
-            "Connection: close\r\n\r\n";
         std::span<const std::byte> response;
         for (;;) {
-            {
-                detail::parsed_request request;
-                const auto parsed = parse_request(
-                    std::string_view {state->input.data(), state->input_size}, request);
-                if (parsed.status == parse_status::complete) {
-                    const int size = https_port == 443
-                        ? std::snprintf(state->response.data(), state->response.size(),
-                              "HTTP/1.1 308 Permanent Redirect\r\n"
-                              "Location: https://%.*s%.*s\r\n"
-                              "Content-Length: 0\r\nConnection: close\r\n\r\n",
-                              static_cast<int>(hostname->size()), hostname->data(),
-                              static_cast<int>(request.target.size()),
-                              request.target.data())
-                        : std::snprintf(state->response.data(), state->response.size(),
-                              "HTTP/1.1 308 Permanent Redirect\r\n"
-                              "Location: https://%.*s:%u%.*s\r\n"
-                              "Content-Length: 0\r\nConnection: close\r\n\r\n",
-                              static_cast<int>(hostname->size()), hostname->data(),
-                              static_cast<unsigned int>(https_port),
-                              static_cast<int>(request.target.size()),
-                              request.target.data());
-                    if (size >= 0 && static_cast<std::size_t>(size) <
-                                         state->response.size()) {
-                        response = std::as_bytes(std::span {state->response}.first(
-                            static_cast<std::size_t>(size)));
-                    } else {
-                        response = std::as_bytes(std::span {bad.data(), bad.size()});
-                    }
-                    break;
-                }
-                if (parsed.status != parse_status::incomplete ||
-                    state->input_size == state->input.size()) {
-                    response = std::as_bytes(std::span {bad.data(), bad.size()});
-                    break;
-                }
-            }
+            response = redirect_response(*state, *hostname, https_port);
+            if (!response.empty()) break;
             auto space = std::as_writable_bytes(std::span {state->input})
                 .subspan(state->input_size);
             auto received = co_await peer->async_read_some(space);
