@@ -104,7 +104,9 @@ auto child_exits_77(const wchar_t* argument) -> bool
 }
 #endif
 
-auto increment(event_loop&, int& value) -> task<void>
+// Tests that count pool frames keep these out of line: once a coroutine is
+// inlined, Clang may elide its allocation and place the frame in the caller.
+[[gnu::noinline]] auto increment(event_loop&, int& value) -> task<void>
 {
     ++value;
     co_return;
@@ -171,7 +173,7 @@ auto value_result_test() -> bool
     return false;
 }
 
-auto nested(event_loop& loop, int& value, task_result& child_result)
+[[gnu::noinline]] auto nested(event_loop& loop, int& value, task_result& child_result)
     -> task<void>
 {
     child_result = co_await increment(loop, value);
@@ -182,7 +184,7 @@ struct naturally_aligned {
     long double value;
 };
 
-auto aligned_frame(event_loop& loop, std::uintptr_t& address) -> task<void>
+[[gnu::noinline]] auto aligned_frame(event_loop& loop, std::uintptr_t& address) -> task<void>
 {
     naturally_aligned storage {1.0L};
     const auto result = co_await noop(loop);
@@ -191,7 +193,7 @@ auto aligned_frame(event_loop& loop, std::uintptr_t& address) -> task<void>
     }
 }
 
-auto oversized_frame(event_loop& loop, int& value) -> task<void>
+[[gnu::noinline]] auto oversized_frame(event_loop& loop, int& value) -> task<void>
 {
     volatile std::byte storage[coroutine_frame_sizes.back() + 1] {};
     storage[0] = std::byte {1};

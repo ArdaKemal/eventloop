@@ -600,7 +600,8 @@ auto tls_stream::receive_encrypted(std::span<const std::byte> data) noexcept
 {
     auto& state = *implementation_;
     if (state.input_size_ != 0 || data.size() > state.input_.size()) return system_code(ENOBUFS);
-    if (data.data() != state.input_.data()) std::memcpy(state.input_.data(), data.data(), data.size());
+    if (!data.empty() && data.data() != state.input_.data())
+        std::ranges::copy(data, state.input_.begin());
     state.input_offset_ = 0;
     state.input_size_ = data.size();
     return {};
