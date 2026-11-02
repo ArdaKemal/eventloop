@@ -55,6 +55,26 @@ auto hello(event_loop&, http::request&, http::response& response) -> task<void>
     (void)co_await response.async_send(200, fields, text("hello"));
 }
 
+// Accepts an HTTP/1.1 WebSocket upgrade, choosing "chat" when protocols are
+// offered, and echoes the first bytes it reads. A refused handshake answers
+// 400.
+auto upgrade(event_loop&, http::request& request, http::response& response) -> task<void>
+{
+    const bool offered = request.header_value("sec-websocket-protocol").has_value();
+    auto accepted = co_await request.async_accept_websocket(offered ? "chat" : "");
+    if (!accepted || !*accepted) {
+        check(accepted && accepted->error() == std::errc::invalid_argument,
+              "invalid upgrade is invalid_argument");
+        (void)co_await response.async_send(400, {}, text("refused"));
+        co_return;
+    }
+    auto& stream = **accepted;
+    std::array<std::byte, 64> buffer {};
+    const auto read = co_await stream.async_read_some(buffer);
+    if (read && *read && **read != 0)
+        (void)co_await stream.async_write_some(std::span(buffer).first(**read));
+}
+
 // Echoes what the handler saw about the request.
 auto info(event_loop&, http::request& request, http::response& response) -> task<void>
 {
@@ -423,6 +443,7 @@ auto main() -> int
           routes->add(http::method_type::get, "/short", short_body, &truncated).has_value() &&
           routes->add(http::method_type::get, "/misuse", misuse).has_value() &&
           routes->add(http::method_type::get, "/throws", throws).has_value() &&
+          routes->add(http::method_type::get, "/ws", upgrade).has_value() &&
           routes->add(http::method_type::get, "/file", file,
                       const_cast<std::string*>(&file_path)).has_value(),
           "register routes");
@@ -472,6 +493,16 @@ auto main() -> int
             // A throwing handler fails its request; the server keeps serving.
             request("GET /throws HTTP/1.1\r\n"),
             request("GET /hello HTTP/1.1\r\n"),
+            // RFC 6455 upgrades; frame bytes may follow the head at once.
+            "GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: WebSocket\r\n"
+                "Connection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                "Sec-WebSocket-Protocol: other, chat\r\n\r\nping",
+            "GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\n"
+                "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ\r\n"
+                "\r\n",
+            request("GET /ws HTTP/1.1\r\nSec-WebSocket-Version: 13\r\n"
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"),
         });
 
     const std::string hello_head =
@@ -518,6 +549,14 @@ auto main() -> int
     check(responses[23].starts_with("HTTP/1.1 405 ") &&
           responses[23].find("Connection: close") != std::string::npos,
           "chunked body on a path without a handler for the method");
+    const auto upgrades = std::span(responses).last(3);
+    check(upgrades[0] == "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n"
+          "connection: upgrade\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+          "sec-websocket-protocol: chat\r\n\r\nping", "HTTP/1.1 WebSocket upgrade");
+    check(upgrades[1].starts_with("HTTP/1.1 400 ") && upgrades[1].ends_with("refused"),
+          "upgrade with an invalid key");
+    check(upgrades[2].starts_with("HTTP/1.1 400 ") && upgrades[2].ends_with("refused"),
+          "upgrade without Upgrade fields");
     check(responses[24] == responses[8], "throwing handler answers 500");
     check(responses[25] == hello_head + "connection: close\r\n\r\nhello",
           "server survives a throwing handler");

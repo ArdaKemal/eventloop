@@ -11,21 +11,32 @@ bound framing plus control overhead. Failures retire framing state and close
 transport. Best-effort fan-out drops only the current message for a full
 recipient and counts drops. [Client guide](../examples/basics/README.md).
 
-## Routed HTTP/2 and HTTP/3 WebSockets
+## Routed WebSockets
 
-Servers with routes support Extended CONNECT:
-[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) /
-[RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html). Register CONNECT and
-call `request::async_accept_websocket(subprotocol)` before response start/body
-read. `connect_protocol()` exposes :protocol (empty on ordinary requests).
+Servers with routes accept WebSockets on every protocol: HTTP/1.1 Upgrade
+([RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html)) on GET routes, and
+Extended CONNECT ([RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) /
+[RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html)) on CONNECT routes for
+HTTP/2 and HTTP/3. Call `request::async_accept_websocket(subprotocol)` before
+response start/body read. `connect_protocol()` exposes :protocol (empty on
+ordinary requests).
 
-- Acceptance requires websocket, version 13, no Content-Length, and any
-  selected subprotocol offered by the peer. Borrow subprotocol through
-  acceptance. Invalid handshake returns `invalid_argument` without responding;
-  the handler can reject (include Sec-WebSocket-Version: 13 for unsupported
-  version). HTTP/1.1 returns `operation_not_supported`. Handler owns
+- Acceptance requires version 13 and any selected subprotocol offered by the
+  peer. HTTP/1.1 also requires GET without a body, `Upgrade: websocket`,
+  `Connection: upgrade`, and one `Sec-WebSocket-Key` encoding 16 bytes;
+  HTTP/2 and HTTP/3 require CONNECT with :protocol websocket and no
+  Content-Length. Borrow subprotocol through acceptance. Invalid handshake
+  returns `invalid_argument` without responding; the handler can reject
+  (include Sec-WebSocket-Version: 13 for unsupported version). Handler owns
   authentication/Origin policy; extensions are not negotiated.
-- Success sends 200 without Content-Length or END_STREAM/FIN, returning
+- HTTP/1.1 success sends 101 Switching Protocols with
+  `Sec-WebSocket-Accept`; the stream then carries the connection's raw bytes,
+  starting with any the client sent after the request head. A read of zero is
+  the client closing the connection. `async_close()` sends nothing (there is
+  no half-close) and waits for that. The connection closes when the handler
+  returns and never carries another request; the server's header and idle
+  timeouts do not apply while the handler runs.
+- HTTP/2 and HTTP/3 success sends 200 without Content-Length or END_STREAM/FIN, returning
   move-only `http::websocket_stream` for `ws::web_socket`. It borrows the
   server-owned exchange and must not escape the handler. Ordinary request/
   response operations become invalid. No descriptor transfers to the handler;
@@ -44,8 +55,9 @@ read. `connect_protocol()` exposes :protocol (empty on ordinary requests).
   vectors may allocate within bounds. Size HTTP/3's 2048-byte frame class
   for simultaneous requests.
 
-Portable across TLS HTTP/2/QUIC HTTP/3 platforms; cleartext HTTP/2 and HTTP/1.1
-route upgrades are unsupported. Session/framing setup may allocate.
+Portable across HTTP/1.1 (plain or TLS), TLS HTTP/2, and QUIC HTTP/3
+platforms; cleartext HTTP/2 is unsupported. Session/framing setup may
+allocate.
 
 [websocket_routing_server](../examples/basics/websocket_routing_server.cc) echoes
 `/chat` and serves ordinary HTTP at `/hello`; peers need Extended CONNECT:

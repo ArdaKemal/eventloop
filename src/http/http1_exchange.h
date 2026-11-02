@@ -107,6 +107,8 @@ public:
             loop, self.request_, self.response_);
         const bool rejected = handled == task_result::frame_allocation_failure;
         if (handled == task_result::cancelled) co_return false;
+        // An upgraded connection carried WebSocket bytes; it cannot be reused.
+        if (self.upgraded_) co_return false;
         if (!self.started_ && !self.broken_) {
             const unsigned status = self.malformed_ ? 400 : self.too_large_ ? 413
                 : rejected ? 503 : 500;
@@ -149,6 +151,7 @@ public:
 
     auto read_body(std::span<std::byte> buffer) -> task<size_result> override
     {
+        if (upgraded_) return tunnel_read_task(loop_, *this, buffer);
         return routing_.request.chunked ? read_chunked_task(loop_, *this, buffer)
                                         : read_task(loop_, *this, buffer);
     }
@@ -159,12 +162,23 @@ public:
     }
     auto write(std::span<const std::byte> data) -> task<void_result> override
     {
+        if (upgraded_) return tunnel_write_task(loop_, *this, data);
         return write_task(loop_, *this, data);
     }
+    // After an upgrade there is nothing to end: TCP has no half-close here,
+    // so a WebSocket close waits for the client to close the connection.
     auto finish(std::span<const header> trailers) -> task<void_result> override
     {
+        if (upgraded_) return tunnel_finish_task(loop_, *this);
         return finish_task(loop_, *this, trailers);
     }
+    // RFC 6455: 101 Switching Protocols, then the connection carries
+    // WebSocket frames in both directions until the handler returns.
+    auto accept_websocket(std::span<const header> headers) -> task<void_result> override
+    {
+        return accept_task(loop_, *this, headers);
+    }
+    auto abort_websocket() noexcept -> void override { broken_ = true; }
     auto send_file(unsigned status, std::span<const header> headers, unique_fd file,
                    std::uint64_t offset, std::uint64_t size) -> task<void_result> override
     {
@@ -208,7 +222,8 @@ private:
         decoder_ = chunked_decoder {};
         staging_begin_ = staging_end_ = 0;
         malformed_ = too_large_ = false;
-        chunked_ = bodyless_ = false;
+        chunked_ = bodyless_ = upgraded_ = false;
+        websocket_accepted = websocket_aborted = body_read = false;
     }
 
     // Copies as much of text as fits into the output buffer and returns the rest.
@@ -304,6 +319,79 @@ private:
         }
         self.body_read_ += *received;
         co_return *received;
+    }
+
+    static auto accept_task(event_loop& loop, http1_exchange& self, std::span<const header> headers)
+        -> task<void_result>
+    {
+        if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.broken_) co_return std::unexpected(failure(std::errc::connection_reset));
+        if (self.started_) co_return std::unexpected(failure(std::errc::invalid_argument));
+        busy writing(self.writing_);
+        self.started_ = self.finished_ = true;
+        constexpr std::string_view status =
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\n";
+        for (std::size_t index = 0; index < 2 + headers.size() * 4; ++index) {
+            std::string_view piece = index == 0 ? status : "\r\n";
+            if (index != 0 && index != 1 + headers.size() * 4) {
+                const auto& field = headers[(index - 1) / 4];
+                const std::array<std::string_view, 4> parts {field.name, ": ", field.value, "\r\n"};
+                piece = parts[(index - 1) % 4];
+            }
+            while (!piece.empty()) {
+                piece = self.append(piece);
+                if (self.output_size_ == self.buffer_.size()) {
+                    auto flushed = unwrap(co_await flush(loop, self));
+                    if (!flushed) co_return std::unexpected(flushed.error());
+                }
+            }
+        }
+        auto flushed = unwrap(co_await flush(loop, self));
+        if (!flushed) co_return std::unexpected(flushed.error());
+        self.upgraded_ = true;
+        self.websocket_accepted = true;
+        co_return void_result {};
+    }
+
+    // Upgraded reads: input buffered behind the request head first. Zero is
+    // the client closing the connection.
+    static auto tunnel_read_task(event_loop& loop, http1_exchange& self, std::span<std::byte> buffer)
+        -> task<size_result>
+    {
+        (void)loop;
+        if (self.reading_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.broken_) co_return std::unexpected(failure(std::errc::operation_canceled));
+        if (buffer.empty()) co_return std::unexpected(failure(std::errc::invalid_argument));
+        busy reading(self.reading_);
+        const auto buffered = self.session_.upgraded_input();
+        if (!buffered.empty()) {
+            const auto count = std::min(buffer.size(), buffered.size());
+            std::memcpy(buffer.data(), buffered.data(), count);
+            self.session_.consume_upgraded_input(count);
+            co_return count;
+        }
+        const auto received = io_value(co_await self.peer_.async_read_some(buffer));
+        if (!received) {
+            self.broken_ = true;
+            co_return std::unexpected(received.error());
+        }
+        co_return *received;
+    }
+
+    static auto tunnel_write_task(event_loop& loop, http1_exchange& self,
+                                  std::span<const std::byte> data) -> task<void_result>
+    {
+        if (self.writing_) co_return std::unexpected(failure(std::errc::operation_in_progress));
+        if (self.broken_) co_return std::unexpected(failure(std::errc::operation_canceled));
+        busy writing(self.writing_);
+        co_return unwrap(co_await write_all(loop, self, data));
+    }
+
+    static auto tunnel_finish_task(event_loop& loop, http1_exchange& self) -> task<void_result>
+    {
+        (void)loop;
+        if (self.broken_) co_return std::unexpected(failure(std::errc::operation_canceled));
+        co_return void_result {};
     }
 
     // RFC 9110 section 10.1.1: ask for the body only once it is read.
@@ -610,6 +698,7 @@ private:
     bool chunked_ {false};
     bool bodyless_ {false};
     bool continued_ {false};
+    bool upgraded_ {false};
     // Chunked request bodies.
     chunked_decoder decoder_;
     std::array<std::byte, 1024> staging_ {};

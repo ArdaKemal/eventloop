@@ -231,6 +231,19 @@ auto session::consume_buffered_body(std::size_t size) noexcept -> void
     if (routed_) routing_->buffered_consumed += std::min(size, buffered_body().size());
 }
 
+auto session::upgraded_input() noexcept -> std::span<const std::byte>
+{
+    if (!routed_) return {};
+    const auto start = routing_->head_size + routing_->buffered_consumed;
+    if (start >= input_size_) return {};
+    return std::as_bytes(std::span {input_data() + start, input_size_ - start});
+}
+
+auto session::consume_upgraded_input(std::size_t size) noexcept -> void
+{
+    if (routed_) routing_->buffered_consumed += std::min(size, upgraded_input().size());
+}
+
 auto session::finish_routed(bool keep_alive) -> void
 {
     if (!routed_) return;

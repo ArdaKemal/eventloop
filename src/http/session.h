@@ -61,6 +61,10 @@ public:
     // chunked request, all input after the head, including framing.
     [[nodiscard]] auto buffered_body() noexcept -> std::span<const std::byte>;
     auto consume_buffered_body(std::size_t size) noexcept -> void;
+    // After an HTTP/1.1 upgrade: every byte received after the request head
+    // and not yet consumed.
+    [[nodiscard]] auto upgraded_input() noexcept -> std::span<const std::byte>;
+    auto consume_upgraded_input(std::size_t size) noexcept -> void;
     // Releases the routed request. Without keep_alive the session closes.
     auto finish_routed(bool keep_alive) -> void;
 

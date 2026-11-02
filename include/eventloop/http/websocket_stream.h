@@ -10,7 +10,8 @@
 namespace eventloop::http {
 namespace detail { class exchange; struct request_access; }
 
-// One accepted Extended CONNECT stream, borrowed from its route handler's
+// One accepted WebSocket: the raw bytes of an upgraded HTTP/1.1 connection,
+// or an HTTP/2 or HTTP/3 Extended CONNECT stream, borrowed from its route handler's
 // exchange. Keep it and pending operations inside that handler. It owns no
 // socket. Destruction aborts this stream unless async_close() completed.
 // One read and one write may run concurrently; spans are borrowed through
@@ -28,7 +29,9 @@ public:
         -> task<std::expected<std::size_t, std::error_code>>;
     [[nodiscard]] auto async_write_some(std::span<const std::byte> buffer)
         -> task<std::expected<std::size_t, std::error_code>>;
-    // Ends sending, then waits for peer END_STREAM/FIN. Cancellation aborts.
+    // Ends sending, then waits for peer END_STREAM/FIN. HTTP/1.1 cannot end
+    // sending alone, so it only waits for the client to close. Cancellation
+    // aborts.
     [[nodiscard]] auto async_close() -> task<std::expected<void, std::error_code>>;
     // Abort only this stream; pending operations must still retire.
     auto close() noexcept -> void;

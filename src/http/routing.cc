@@ -1,10 +1,13 @@
 #include "exchange.h"
 #include "parser.h"
 
+#include <openssl/evp.h>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstring>
+#include <string>
 
 namespace eventloop::http {
 namespace detail {
@@ -33,25 +36,101 @@ auto rejected(event_loop& loop, std::errc code) -> task<std::expected<T, std::er
     return true;
 }
 
+// Whether any comma-separated item of a field named name lists value,
+// without case.
+[[nodiscard]] auto lists(const request& incoming, std::string_view name, std::string_view value)
+    noexcept -> bool
+{
+    for (const auto& field : incoming.headers()) {
+        if (!ascii_equal(field.name, name)) continue;
+        auto rest = field.value;
+        for (;;) {
+            const auto comma = rest.find(',');
+            auto item = rest.substr(0, comma);
+            while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.remove_prefix(1);
+            while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.remove_suffix(1);
+            if (ascii_equal(item, value)) return true;
+            if (comma == std::string_view::npos) break;
+            rest.remove_prefix(comma + 1);
+        }
+    }
+    return false;
+}
+
+// RFC 6455 section 4.2.2: base64(SHA-1(key + GUID)) for a key that is the
+// base64 encoding of 16 bytes. Empty for an invalid key.
+[[nodiscard]] auto websocket_accept(std::string_view key) -> std::string
+{
+    std::array<char, 29> encoded {};
+    constexpr std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (key.size() != 24 || !key.ends_with("==") ||
+        key.substr(0, 22).find_first_not_of(alphabet) != std::string_view::npos ||
+        alphabet.find(key[21]) % 16 != 0)
+        return {};
+    constexpr std::string_view guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    std::array<char, 24 + guid.size()> input {};
+    std::memcpy(input.data(), key.data(), key.size());
+    std::memcpy(input.data() + key.size(), guid.data(), guid.size());
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest {};
+    unsigned int size = 0;
+    if (EVP_Digest(input.data(), input.size(), digest.data(), &size, EVP_sha1(), nullptr) != 1 ||
+        size != 20)
+        return {};
+    const int written = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(encoded.data()),
+                                        digest.data(), 20);
+    if (written != 28) return {};
+    return std::string(encoded.data(), 28);
+}
+
+// An HTTP/1.1 Upgrade (RFC 6455) or HTTP/2 and HTTP/3 Extended CONNECT
+// (RFC 8441, RFC 9220) WebSocket request. Returns the Sec-WebSocket-Accept
+// value an HTTP/1.1 response needs, or an empty string elsewhere.
+[[nodiscard]] auto websocket_request(const request& incoming)
+    -> std::expected<std::string, std::error_code>
+{
+    if (incoming.protocol() != http::protocol::http1_1) {
+        if (incoming.method() != method_type::connect ||
+            incoming.connect_protocol() != "websocket" || incoming.content_length())
+            return std::unexpected(failure(std::errc::invalid_argument));
+        return std::string {};
+    }
+    std::string_view key;
+    unsigned keys = 0;
+    for (const auto& field : incoming.headers()) {
+        if (ascii_equal(field.name, "transfer-encoding"))
+            return std::unexpected(failure(std::errc::invalid_argument));
+        if (ascii_equal(field.name, "sec-websocket-key")) {
+            key = field.value;
+            ++keys;
+        }
+    }
+    if (incoming.method() != method_type::get || incoming.content_length().value_or(0) != 0 ||
+        !lists(incoming, "upgrade", "websocket") || !lists(incoming, "connection", "upgrade") ||
+        keys != 1)
+        return std::unexpected(failure(std::errc::invalid_argument));
+    auto accept = websocket_accept(key);
+    if (accept.empty()) return std::unexpected(failure(std::errc::invalid_argument));
+    return accept;
+}
+
 auto accept_websocket_task(event_loop& loop, exchange& owner, const request& incoming,
                            std::string_view selected)
     -> task<std::expected<websocket_stream, std::error_code>>
 {
     (void)loop;
-    if (incoming.protocol() == http::protocol::http1_1)
-        co_return std::unexpected(failure(std::errc::operation_not_supported));
-    if (owner.websocket_accepted || owner.body_read || incoming.method() != method_type::connect ||
-        incoming.connect_protocol() != "websocket" || incoming.content_length() ||
-        (!selected.empty() && !token(selected)))
+    if (owner.websocket_accepted || owner.body_read || (!selected.empty() && !token(selected)))
         co_return std::unexpected(failure(std::errc::invalid_argument));
+    const auto accept = websocket_request(incoming);
+    if (!accept) co_return std::unexpected(accept.error());
     unsigned versions = 0;
     bool offered = selected.empty();
     for (const auto& field : incoming.headers()) {
-        if (field.name == "sec-websocket-version") {
+        if (ascii_equal(field.name, "sec-websocket-version")) {
             if (++versions != 1 || field.value != "13")
                 co_return std::unexpected(failure(std::errc::invalid_argument));
         }
-        if (field.name != "sec-websocket-protocol") continue;
+        if (!ascii_equal(field.name, "sec-websocket-protocol")) continue;
         auto rest = field.value;
         for (;;) {
             const auto comma = rest.find(',');
@@ -66,9 +145,12 @@ auto accept_websocket_task(event_loop& loop, exchange& owner, const request& inc
     }
     if (versions != 1 || !offered)
         co_return std::unexpected(failure(std::errc::invalid_argument));
-    const std::array<header, 1> fields {{{"sec-websocket-protocol", selected}}};
+    std::array<header, 2> fields {};
+    std::size_t count = 0;
+    if (!accept->empty()) fields[count++] = {"sec-websocket-accept", *accept};
+    if (!selected.empty()) fields[count++] = {"sec-websocket-protocol", selected};
     auto accepted = flatten_result(co_await owner.accept_websocket(
-        selected.empty() ? std::span<const header> {} : std::span<const header>(fields)));
+        std::span<const header>(fields).first(count)));
     if (!accepted) co_return std::unexpected(accepted.error());
     co_return request_access::make_websocket(owner);
 }
