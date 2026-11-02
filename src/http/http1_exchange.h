@@ -3,6 +3,7 @@
 #include "exchange.h"
 #include "file_operations.h"
 #include "session.h"
+#include "../socket_operations.h"
 
 #include "eventloop/tcp_stream.h"
 #if !defined(_WIN32) || defined(EVENTLOOP_WINDOWS_TLS)
@@ -78,6 +79,9 @@ public:
     http1_exchange(event_loop& loop, Stream& peer, session& state, route_state& routing) noexcept
         : loop_(loop), peer_(peer), session_(state), routing_(routing)
     {
+        if (const auto address = eventloop::detail::socket_operations::peer_endpoint(
+                peer.descriptor()))
+            remote_ = *address;
     }
 
     // Runs the handler for the session's routed request. Returns whether the
@@ -93,6 +97,7 @@ public:
             .authority = head.host,
             .content_length = head.content_length_seen
                 ? std::optional<std::uint64_t>(head.content_length) : std::nullopt,
+            .peer = self.remote_ ? &*self.remote_ : nullptr,
             .method = head.method,
             .protocol = http::protocol::http1_1,
         };
@@ -589,6 +594,7 @@ private:
     route_state& routing_;
     request request_ = request_access::make_request();
     response response_ = request_access::make_response();
+    std::optional<ip_endpoint> remote_;
     std::array<std::byte, 4096> buffer_ {};
     std::size_t output_size_ {0};
     std::uint64_t body_length_ {0};

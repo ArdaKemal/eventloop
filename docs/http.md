@@ -61,6 +61,10 @@ TLS HTTP/2, and HTTPS HTTP/3. Build a router before passing it as
 
 Request method/path/query/authority/field/Content-Length views live until the
 handler completes. `header_value()` compares names case-insensitively.
+`peer()` is the client address: the TCP peer, read once per connection
+when it starts, or the QUIC connection's remote address when the handler
+starts (it follows migration). It is empty when unknown, as on Unix-domain
+sockets; a proxy in front of the server appears as the client.
 `async_read_body(buffer)` returns up to the span size, or zero at end. One
 read may be pending; another returns `operation_in_progress`. Peer reset/loss
 returns `connection_reset`. Declared bodies above `max_request_body` (default

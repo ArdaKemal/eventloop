@@ -145,6 +145,7 @@ auto request_access::bind(request& value, exchange& owner, const request_fields&
     value.authority_ = fields.authority;
     value.connect_protocol_ = fields.connect_protocol;
     value.content_length_ = fields.content_length;
+    value.peer_ = fields.peer;
     value.route_context_ = context;
     value.method_ = fields.method;
     value.protocol_ = fields.protocol;

@@ -49,6 +49,8 @@ struct request_fields {
     std::string_view authority;
     std::string_view connect_protocol {};
     std::optional<std::uint64_t> content_length;
+    // Connection-owned; outlives the request.
+    const ip_endpoint* peer {nullptr};
     method_type method {method_type::unknown};
     http::protocol protocol {http::protocol::http1_1};
 };

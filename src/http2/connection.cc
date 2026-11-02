@@ -6,6 +6,7 @@
 #include "../http/file_operations.h"
 #include "../http/file_response.h"
 #include "session.h"
+#include "../socket_operations.h"
 
 #include <algorithm>
 #include <array>
@@ -399,6 +400,9 @@ struct connection_state {
         : loop(loop), peer(peer), state(state), routes(routes), root(root), files(files),
           directory_listing(directory_listing), alt_svc(alt_svc), deadline(deadline)
     {
+        if (const auto address = eventloop::detail::socket_operations::peer_endpoint(
+                peer.descriptor()))
+            remote = *address;
     }
 
     [[nodiscard]] auto used_slots() noexcept -> std::span<std::unique_ptr<handler_slot>>
@@ -495,6 +499,8 @@ struct connection_state {
     bool directory_listing;
     std::string_view alt_svc;
     idle_deadline deadline;
+    // The client address, read once; requests point at it.
+    std::optional<ip_endpoint> remote;
     // Slots are allocated when concurrency first needs them, then kept. The
     // first busy_count entries of slot_order are in use, the rest are free.
     std::array<std::unique_ptr<handler_slot>, max_concurrent_streams> slots {};
@@ -829,6 +835,7 @@ auto dispatch_routed(connection_state& connection, routed_request routed) -> voi
         .authority = authority.empty() ? host : authority,
         .connect_protocol = connect_protocol,
         .content_length = exchange.routed.content_length,
+        .peer = connection.remote ? &*connection.remote : nullptr,
         .method = http::detail::method_from_name(method),
         .protocol = http::protocol::http2,
     };
