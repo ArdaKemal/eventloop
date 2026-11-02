@@ -52,8 +52,7 @@ ordinary requests).
   (exhaustion REFUSED_STREAM) or one HTTP/3 scratch slot (H3_REQUEST_REJECTED).
   Accepted DATA has no cumulative request-body limit; configured WebSocket
   message/output bounds remain. The adapter allocates no buffers; framing
-  vectors may allocate within bounds. Size HTTP/3's 2048-byte frame class
-  for simultaneous requests.
+  vectors may allocate within bounds.
 
 Portable across HTTP/1.1 (plain or TLS), TLS HTTP/2, and QUIC HTTP/3
 platforms; cleartext HTTP/2 is unsupported. Session/framing setup may

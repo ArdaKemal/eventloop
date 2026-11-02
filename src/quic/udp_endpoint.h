@@ -97,9 +97,9 @@ private:
     static auto socket_destroyed(void*) noexcept -> void;
     auto check_owner() const noexcept -> void;
     // True when the datagram belongs to another endpoint in the group; it is
-    // then forwarded or dropped.
-    [[nodiscard]] auto forward(std::span<const std::byte>, const packet_header&,
-                               ip_endpoint source) noexcept -> bool;
+    // then forwarded or dropped. Parses the header here, outside
+    // receive_loop's frame.
+    [[nodiscard]] auto forward(std::span<const std::byte>, ip_endpoint source) noexcept -> bool;
     event_loop& loop_;
     std::thread::id owner_ {std::this_thread::get_id()};
     udp_socket* socket_ {};

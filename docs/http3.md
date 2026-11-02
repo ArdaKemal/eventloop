@@ -42,8 +42,10 @@ exhaustion rejects that connection without stopping the listener; peer
 unidirectional-frame exhaustion closes it with H3_INTERNAL_ERROR.
 
 Static headers/I/O use scratch; listings and OpenSSL may allocate separately.
-Request frames use the 2048-byte class: size
-`event_loop_options::coroutine_frame_capacities` for concurrency, as examples do.
+A request holds two or three nested frames in the 1 KiB class (static and
+routed paths each have their own frame; at most 864 bytes with GCC), so
+request concurrency is bounded by the scratch pool, not the scarce 2 and
+4 KiB frame classes.
 Handshake datagrams stay bounded at 1200 bytes; path MTU discovery is absent, so lower
 application payloads for constrained paths. Before address validation the server builds
 a packet only when its remaining 3x anti-amplification credit covers a full datagram,

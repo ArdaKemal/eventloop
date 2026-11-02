@@ -237,9 +237,12 @@ struct client_connection::state {
     [[nodiscard]] static auto request(event_loop& loop, state& self, client_request request,
                                       response_sink sink, response_header_sink header_sink)
         -> task<std::expected<client_response, std::error_code>>;
+    // Borrows prepared, request, and the sinks from the awaiting caller's
+    // frame, which owns them, so this large frame holds no copies.
     [[nodiscard]] static auto exchange(event_loop& loop, state& self,
-                                       prepared_request prepared, client_request request,
-                                       response_sink sink, response_header_sink header_sink)
+                                       const prepared_request& prepared,
+                                       client_request& request, response_sink& sink,
+                                       response_header_sink& header_sink)
         -> task<std::expected<client_response, std::error_code>>;
     [[nodiscard]] static auto close(event_loop& loop, state& self)
         -> task<std::expected<void, std::error_code>>;
@@ -292,8 +295,7 @@ auto client_connection::state::request(event_loop& loop, state& self,
     if (!self.usable()) co_return std::unexpected(failure(std::errc::not_connected));
     auto prepared = prepare(request, self.hostname);
     if (!prepared) co_return std::unexpected(prepared.error());
-    co_return unwrap(co_await exchange(loop, self, std::move(*prepared), std::move(request),
-                                       std::move(sink), std::move(header_sink)));
+    co_return unwrap(co_await exchange(loop, self, *prepared, request, sink, header_sink));
 }
 
 auto client_connection::state::close(event_loop& loop, state& self)
@@ -321,8 +323,9 @@ auto client_connection::state::close_transport(event_loop& loop, state& self,
 }
 
 auto client_connection::state::exchange(event_loop& loop, state& self,
-                                        prepared_request prepared, client_request request,
-                                        response_sink sink, response_header_sink header_sink)
+                                        const prepared_request& prepared,
+                                        client_request& request, response_sink& sink,
+                                        response_header_sink& header_sink)
     -> task<std::expected<client_response, std::error_code>>
 {
     operation_guard guard(self.busy);
@@ -712,7 +715,7 @@ auto async_request(event_loop& loop, ip_endpoint endpoint,
     auto connected = unwrap(co_await client_connection::state::connect(loop, self));
     if (!connected) co_return std::unexpected(connected.error());
     auto response = unwrap(co_await client_connection::state::exchange(loop, self,
-        std::move(*prepared), std::move(request), std::move(sink), std::move(header_sink)));
+        *prepared, request, sink, header_sink));
     if (self.stream != nullptr) (void)co_await client_connection::state::close_transport(
         loop, self, false);
     co_return response;

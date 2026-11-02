@@ -289,13 +289,7 @@ auto udp_endpoint::receive_loop(event_loop& loop, udp_endpoint& endpoint) -> tas
                                 endpoint.router_, *header, received->source);
                         }
                     } else if (endpoint.inbox_) {
-                        // Parse as the router does: a peer that negotiated
-                        // greasing clears the QUIC bit (RFC 9287).
-                        const auto routed = parse_packet_header(datagram, 0,
-                            endpoint.router_.short_cid_length(),
-                            endpoint.router_.grease_quic_bit());
-                        if (routed)
-                            handled = endpoint.forward(datagram, *routed, received->source);
+                        handled = endpoint.forward(datagram, received->source);
                     }
                 }
             }
@@ -306,13 +300,19 @@ auto udp_endpoint::receive_loop(event_loop& loop, udp_endpoint& endpoint) -> tas
     co_return std::error_code(ECANCELED, std::generic_category());
 }
 
-auto udp_endpoint::forward(std::span<const std::byte> datagram, const packet_header& header,
-                           ip_endpoint source) noexcept -> bool
+auto udp_endpoint::forward(std::span<const std::byte> datagram, ip_endpoint source) noexcept
+    -> bool
 {
+    if (!inbox_) return false;
+    // Parse as the router does: a peer that negotiated greasing clears the
+    // QUIC bit (RFC 9287).
+    const auto parsed = parse_packet_header(datagram, 0, router_.short_cid_length(),
+                                            router_.grease_quic_bit());
+    if (!parsed) return false;
+    const auto& header = *parsed;
     // Initial and 0-RTT may carry a client-chosen ID; only IDs this group
     // issued (short header and Handshake) name an owner.
-    if (!inbox_ || (header.kind != packet_kind::short_header &&
-                    header.kind != packet_kind::handshake))
+    if (header.kind != packet_kind::short_header && header.kind != packet_kind::handshake)
         return false;
     const auto cid = header.destination_cid;
     if (cid.size() != router_.short_cid_length()) return false;

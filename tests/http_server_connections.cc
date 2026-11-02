@@ -212,6 +212,22 @@ auto trickle(event_loop& loop, std::uint16_t port, std::string_view name) -> tas
     check(false, std::string(name) + ": never closed");
 }
 
+// A complete head gets its redirect, and the server closes the connection.
+auto redirected(event_loop& loop, std::uint16_t port) -> task<void>
+{
+    auto* peer = (co_await connect(loop, port)).value();
+    const auto sent = co_await write_all(loop, *peer, "GET /a?b=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    check(sent && *sent, "send redirect request");
+    std::string response;
+    std::array<std::byte, 512> buffer {};
+    while (const auto size = transferred(co_await peer->async_read_some(buffer)))
+        response.append(reinterpret_cast<const char*>(buffer.data()), size);
+    check(response.starts_with("HTTP/1.1 308 ") &&
+              response.find("Location: https://localhost/a?b=1\r\n") != std::string::npos,
+          "redirect response");
+    std::cerr << "redirect within 1 KiB frames\n";
+}
+
 // A slow handler answers; keep-alive survives a pause shorter than the idle
 // timeout, then the idle connection closes.
 template<typename Stream>
@@ -525,8 +541,16 @@ auto main() -> int
     });
     plain(plain_keep_alive);
 
-    const auto redirect = [](auto client) {
-        event_loop loop;
+    // A redirect connection holds its frame until its head arrives, so like an
+    // HTTPS connection it must fit the 1 KiB class. With small_frames the loop
+    // has no larger class; its client must fit too.
+    const auto redirect = [](auto client, bool small_frames = false) {
+        event_loop_options loop_options;
+        if (small_frames) {
+            loop_options.coroutine_frame_capacities[4] = 0;
+            loop_options.coroutine_frame_capacities[5] = 0;
+        }
+        event_loop loop(loop_options);
         auto options = ::options();
         options.reuse_port = true;
         auto listener = std::make_unique<http::redirect_server>(
@@ -544,6 +568,7 @@ auto main() -> int
     redirect([](event_loop& loop, std::uint16_t port) {
         return trickle(loop, port, "redirect trickled head");
     });
+    redirect(redirected, true);
 
     const auto directory = std::filesystem::temp_directory_path() /
         ("eventloop-connections-" + std::to_string(::getpid()));

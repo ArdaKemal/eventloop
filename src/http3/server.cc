@@ -60,6 +60,8 @@ struct stream_storage {
     // Kept here, not in serve_request's frame, so that frame stays in its
     // size class; its views point into strings.
     h3::request_head head {};
+    // A static file response's validators, outside serve_static's frame.
+    detail::file_response selected {};
     scratch_array<h3::field, h3::qpack_max_fields> fields;
     scratch_array<http::header, h3::qpack_max_fields> request_headers;
     std::array<std::byte, header_limit> headers;
@@ -802,6 +804,172 @@ auto route_request(event_loop& loop, quic_connection& connection, std::uint64_t 
     return std::nullopt;
 }
 
+// A static request's answer, decided without awaiting. Its validators go to
+// s.selected; both stay out of serve_static's frame so it fits its class.
+struct static_answer {
+    unsigned status {200};
+    http::detail::static_file file;
+    std::uint64_t size {0};
+    std::uint64_t offset {0};
+    bool have_file {false};
+    bool have_listing {false};
+    std::vector<char> listing;
+    std::string_view mime {"text/plain"};
+};
+
+[[nodiscard]] auto decide_static(native_socket root, http::detail::open_file_cache* files,
+                                 stream_storage& s, std::span<const h3::field> request_fields,
+                                 const request_settings& settings, static_answer& answer)
+    -> std::optional<h3::h3_error>
+{
+    const auto method = s.head.method;
+    const auto path = s.head.path;
+    const bool https = h3::ascii_equal(s.head.scheme, "https");
+    std::size_t match_size = 0;
+    std::string_view if_modified_since, range;
+    bool duplicate_range = false;
+    for (const auto& field : request_fields) {
+        if (field.name == "if-none-match") {
+            const auto extra = field.value.size() + (match_size != 0 ? 1 : 0);
+            if (extra > s.headers.size() - match_size) return h3::h3_error::excessive_load;
+            auto* output = reinterpret_cast<char*>(s.headers.data());
+            if (match_size != 0) output[match_size++] = ',';
+            if (!field.value.empty())
+                std::memcpy(output + match_size, field.value.data(), field.value.size());
+            match_size += field.value.size();
+        }
+        else if (field.name == "if-modified-since") if_modified_since = field.value;
+        else if (field.name == "range") {
+            if (!range.empty()) duplicate_range = true;
+            else range = field.value;
+        }
+    }
+    const std::string_view if_none_match {
+        reinterpret_cast<const char*>(s.headers.data()), match_size};
+    auto& status = answer.status;
+    auto& file = answer.file;
+    auto& selected = s.selected;
+    auto& listing = answer.listing;
+    auto& mime = answer.mime;
+    // Plain CONNECT has no :scheme and is answered 405 below.
+    if (method != "CONNECT" && !https) status = 400;
+    else if (method == "OPTIONS") status = 204;
+    else if (method != "GET" && method != "HEAD") status = 405;
+    else {
+        auto opened = http::detail::open_static(root, files, path);
+        if (!opened) status = opened.error() == http::detail::resource_error::invalid_target ? 400
+            : opened.error() == http::detail::resource_error::target_too_long ? 414 : 404;
+        else {
+            file = std::move(opened->file);
+            const std::optional<http::detail::file_info> info = opened->info;
+            if (!info) status = 404;
+            else if (info->kind == http::detail::file_info::type::directory) {
+                auto index = http::detail::open_child(file.get(), "index.html", false);
+                auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
+                if (index_info && index_info->kind == http::detail::file_info::type::regular) {
+                    file = std::move(index);
+                    selected = detail::choose_file_response(*index_info,
+                        {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
+                    answer.size = selected.length; answer.offset = selected.offset; status = selected.status;
+                    answer.have_file = true; mime = http::mime_type_from_path("index.html");
+                } else if (!settings.directory_listing) {
+                    status = 403;
+                } else {
+                    auto rendered = http::detail::render_directory_listing(file.take_owned());
+                    if (!rendered) {
+                        status = 500;
+                        mime = "text/plain";
+                        listing.assign(directory_listing_error_body.begin(),
+                                       directory_listing_error_body.end());
+                    } else {
+                        listing = std::move(*rendered);
+                        mime = "text/html; charset=utf-8";
+                    }
+                    answer.size = listing.size();
+                    answer.have_listing = true;
+                }
+            } else if (info->kind == http::detail::file_info::type::regular) {
+                selected = detail::choose_file_response(*info,
+                    {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
+                answer.size = selected.length; answer.offset = selected.offset; status = selected.status;
+                answer.have_file = true; mime = http::mime_type_from_path(path);
+            } else status = 404;
+        }
+    }
+    return std::nullopt;
+}
+
+// Answers a request with a static file, listing, or status. Returns false
+// after failing the stream. A separate frame keeps serve_request's in its class.
+auto serve_static(event_loop& loop, quic_connection& connection, std::uint64_t id,
+                  native_socket root, http::detail::open_file_cache* files, stream_storage& s,
+                  std::span<const h3::field> request_fields, const request_settings& settings)
+    -> task<bool>
+{
+    static_answer answer;
+    if (const auto failed = decide_static(root, files, s, request_fields, settings, answer)) {
+        fail(connection, id, *failed);
+        co_return false;
+    }
+    const auto& [status, file, size, offset, have_file, have_listing, listing, mime] = answer;
+    const auto method = s.head.method;
+    const bool body_expected = have_listing || (have_file && (status == 200 || status == 206));
+    const bool finish = !body_expected || method == "HEAD";
+    // A failed write means the peer stopped or reset the stream, or the
+    // connection is ending; abandon only this request.
+    const auto cancelled = h3::h3_error::request_cancelled;
+    if (!(co_await send_headers(loop, connection, id, status, size, mime, finish,
+            std::span(s.io).first(response_header_area),
+            have_file ? &s.selected : nullptr)).value_or(false)) {
+        fail(connection, id, cancelled);
+        co_return false;
+    }
+    if (have_listing && method != "HEAD") {
+        std::array<std::byte, 16> frame_header {};
+        const auto header_size = h3::encode_frame_header(h3::data_frame, listing.size(), frame_header);
+        if (!header_size ||
+            !(co_await write_all(loop, connection, id,
+                    std::span(frame_header).first(*header_size), false)).value_or(false) ||
+            !(co_await write_all(loop, connection, id,
+                    std::span(reinterpret_cast<const std::byte*>(listing.data()),
+                              listing.size()), true)).value_or(false)) {
+            fail(connection, id, cancelled);
+            co_return false;
+        }
+    } else if (!finish) {
+        if (size == 0 && !(co_await write_all(loop, connection, id, {}, true)).value_or(false)) {
+            fail(connection, id, cancelled);
+            co_return false;
+        }
+        std::uint64_t sent = 0;
+        while (sent < size) {
+            // Request headers and conditional fields have already been
+            // consumed. Reuse their bounded scratch area for a contiguous DATA
+            // frame: larger reads and one stream write per chunk need no
+            // additional request memory.
+            constexpr std::size_t frame_header_limit = 16;
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                s.headers.size() - frame_header_limit, size - sent));
+            const auto header_size = h3::encode_frame_header(h3::data_frame, count,
+                std::span(s.headers).first(frame_header_limit));
+            if (!header_size ||
+                !http::detail::read_file_at(file.get(), offset + sent,
+                    std::span(s.headers).subspan(*header_size, count))) {
+                fail(connection, id, h3::h3_error::internal_error);
+                co_return false;
+            }
+            if (!(co_await write_all(loop, connection, id,
+                    std::span<const std::byte>(s.headers).first(*header_size + count),
+                    sent + count == size)).value_or(false)) {
+                fail(connection, id, cancelled);
+                co_return false;
+            }
+            sent += count;
+        }
+    }
+    co_return true;
+}
+
 auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t id,
                    native_socket root, http::detail::open_file_cache* files,
                    stream_storage* storage,
@@ -839,8 +1007,6 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         co_return;
     }
     frames.set_content_length(s.head.content_length, s.head.content_length_too_large);
-    const auto method = s.head.method;
-    const auto path = s.head.path;
     const bool https = h3::ascii_equal(s.head.scheme, "https");
     if (s.head.connect_protocol == "websocket" && !https) {
         fail(connection, id, h3::h3_error::message_error);
@@ -852,138 +1018,9 @@ auto serve_request(event_loop& loop, quic_connection& connection, std::uint64_t 
         (co_await route_request(loop, connection, id, s, frames, pending, s.head,
                                 request_fields, settings)).value_or(true))
         co_return;
-    std::size_t match_size = 0;
-    std::string_view if_modified_since, range;
-    bool duplicate_range = false;
-    for (const auto& field : request_fields) {
-        if (field.name == "if-none-match") {
-            const auto extra = field.value.size() + (match_size != 0 ? 1 : 0);
-            if (extra > s.headers.size() - match_size) {
-                fail(connection, id, h3::h3_error::excessive_load);
-                co_return;
-            }
-            auto* output = reinterpret_cast<char*>(s.headers.data());
-            if (match_size != 0) output[match_size++] = ',';
-            if (!field.value.empty())
-                std::memcpy(output + match_size, field.value.data(), field.value.size());
-            match_size += field.value.size();
-        }
-        else if (field.name == "if-modified-since") if_modified_since = field.value;
-        else if (field.name == "range") {
-            if (!range.empty()) duplicate_range = true;
-            else range = field.value;
-        }
-    }
-    const std::string_view if_none_match {
-        reinterpret_cast<const char*>(s.headers.data()), match_size};
-    unsigned status = 200;
-    http::detail::static_file file;
-    std::uint64_t size = 0;
-    std::uint64_t offset = 0;
-    detail::file_response selected;
-    bool have_file = false;
-    bool have_listing = false;
-    std::vector<char> listing;
-    std::string_view mime = "text/plain";
-    // Plain CONNECT has no :scheme and is answered 405 below.
-    if (method != "CONNECT" && !https) status = 400;
-    else if (method == "OPTIONS") status = 204;
-    else if (method != "GET" && method != "HEAD") status = 405;
-    else {
-        auto opened = http::detail::open_static(root, files, path);
-        if (!opened) status = opened.error() == http::detail::resource_error::invalid_target ? 400
-            : opened.error() == http::detail::resource_error::target_too_long ? 414 : 404;
-        else {
-            file = std::move(opened->file);
-            const std::optional<http::detail::file_info> info = opened->info;
-            if (!info) status = 404;
-            else if (info->kind == http::detail::file_info::type::directory) {
-                auto index = http::detail::open_child(file.get(), "index.html", false);
-                auto index_info = index ? http::detail::get_file_info(index.get()) : std::nullopt;
-                if (index_info && index_info->kind == http::detail::file_info::type::regular) {
-                    file = std::move(index);
-                    selected = detail::choose_file_response(*index_info,
-                        {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
-                    size = selected.length; offset = selected.offset; status = selected.status;
-                    have_file = true; mime = http::mime_type_from_path("index.html");
-                } else if (!settings.directory_listing) {
-                    status = 403;
-                } else {
-                    auto rendered = http::detail::render_directory_listing(file.take_owned());
-                    if (!rendered) {
-                        status = 500;
-                        mime = "text/plain";
-                        listing.assign(directory_listing_error_body.begin(),
-                                       directory_listing_error_body.end());
-                    } else {
-                        listing = std::move(*rendered);
-                        mime = "text/html; charset=utf-8";
-                    }
-                    size = listing.size();
-                    have_listing = true;
-                }
-            } else if (info->kind == http::detail::file_info::type::regular) {
-                selected = detail::choose_file_response(*info,
-                    {if_none_match, if_modified_since, duplicate_range ? std::string_view {} : range});
-                size = selected.length; offset = selected.offset; status = selected.status;
-                have_file = true; mime = http::mime_type_from_path(path);
-            } else status = 404;
-        }
-    }
-    const bool body_expected = have_listing || (have_file && (status == 200 || status == 206));
-    const bool finish = !body_expected || method == "HEAD";
-    // A failed write means the peer stopped or reset the stream, or the
-    // connection is ending; abandon only this request.
-    const auto cancelled = h3::h3_error::request_cancelled;
-    if (!(co_await send_headers(loop, connection, id, status, size, mime, finish,
-            std::span(s.io).first(response_header_area),
-            have_file ? &selected : nullptr)).value_or(false)) {
-        fail(connection, id, cancelled);
+    if (!(co_await serve_static(loop, connection, id, root, files, s, request_fields, settings))
+             .value_or(false))
         co_return;
-    }
-    if (have_listing && method != "HEAD") {
-        std::array<std::byte, 16> frame_header {};
-        const auto header_size = h3::encode_frame_header(h3::data_frame, listing.size(), frame_header);
-        if (!header_size ||
-            !(co_await write_all(loop, connection, id,
-                    std::span(frame_header).first(*header_size), false)).value_or(false) ||
-            !(co_await write_all(loop, connection, id,
-                    std::span(reinterpret_cast<const std::byte*>(listing.data()),
-                              listing.size()), true)).value_or(false)) {
-            fail(connection, id, cancelled);
-            co_return;
-        }
-    } else if (!finish) {
-        if (size == 0 && !(co_await write_all(loop, connection, id, {}, true)).value_or(false)) {
-            fail(connection, id, cancelled);
-            co_return;
-        }
-        std::uint64_t sent = 0;
-        while (sent < size) {
-            // Request headers and conditional fields have already been
-            // consumed. Reuse their bounded scratch area for a contiguous DATA
-            // frame: larger reads and one stream write per chunk need no
-            // additional request memory.
-            constexpr std::size_t frame_header_limit = 16;
-            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
-                s.headers.size() - frame_header_limit, size - sent));
-            const auto header_size = h3::encode_frame_header(h3::data_frame, count,
-                std::span(s.headers).first(frame_header_limit));
-            if (!header_size ||
-                !http::detail::read_file_at(file.get(), offset + sent,
-                    std::span(s.headers).subspan(*header_size, count))) {
-                fail(connection, id, h3::h3_error::internal_error);
-                co_return;
-            }
-            if (!(co_await write_all(loop, connection, id,
-                    std::span<const std::byte>(s.headers).first(*header_size + count),
-                    sent + count == size)).value_or(false)) {
-                fail(connection, id, cancelled);
-                co_return;
-            }
-            sent += count;
-        }
-    }
     (void)co_await finish_request(loop, connection, id, s, frames, pending);
 }
 
