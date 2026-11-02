@@ -1,5 +1,6 @@
 #pragma once
 
+#include "eventloop/ip_endpoint.h"
 #include "eventloop/task.h"
 #include "eventloop/http/websocket_stream.h"
 
@@ -54,6 +55,14 @@ public:
     // :authority, or Host on HTTP/1.1.
     [[nodiscard]] auto authority() const noexcept -> std::string_view { return authority_; }
     [[nodiscard]] auto protocol() const noexcept -> http::protocol { return protocol_; }
+    // The client's address: the TCP peer of the connection, read once when it
+    // is accepted, or the QUIC connection's current remote address. Empty
+    // when the address is unknown, such as on Unix-domain sockets. A proxy in
+    // front of the server appears here as the client.
+    [[nodiscard]] auto peer() const noexcept -> std::optional<ip_endpoint>
+    {
+        return peer_ ? std::optional<ip_endpoint> {*peer_} : std::nullopt;
+    }
     // Extended CONNECT :protocol, or empty on ordinary requests.
     [[nodiscard]] auto connect_protocol() const noexcept -> std::string_view
     { return connect_protocol_; }
@@ -96,6 +105,7 @@ private:
     std::string_view authority_;
     std::string_view connect_protocol_;
     std::optional<std::uint64_t> content_length_;
+    const ip_endpoint* peer_ {nullptr};
     void* route_context_ {nullptr};
     method_type method_ {method_type::unknown};
     http::protocol protocol_ {http::protocol::http1_1};

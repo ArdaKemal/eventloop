@@ -55,6 +55,8 @@ struct stream_storage {
     semaphore::permit permit;
     // The connection's peer state, which outlives every request task.
     const h3::peer_critical_streams* peer {nullptr};
+    // The request's client address, read when its handler starts.
+    ip_endpoint remote {};
     // Kept here, not in serve_request's frame, so that frame stays in its
     // size class; its views point into strings.
     h3::request_head head {};
@@ -711,6 +713,7 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
     }
     http3_exchange exchange(loop, connection, id, s, frames, pending, max_request_body,
                             head.method == "HEAD");
+    s.remote = connection.remote_endpoint();
     const detail::request_fields request {
         .headers = std::span<const header>(s.request_headers.items).first(count),
         .method_name = head.method,
@@ -718,6 +721,7 @@ auto serve_route(event_loop& loop, quic_connection& connection, std::uint64_t id
         .authority = head.authority,
         .connect_protocol = head.connect_protocol,
         .content_length = head.content_length,
+        .peer = &s.remote,
         .method = detail::method_from_name(head.method),
         .protocol = http::protocol::http3,
     };

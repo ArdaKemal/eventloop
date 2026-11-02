@@ -71,6 +71,10 @@ auto cookies(event_loop&, http::request& request, http::response& response) -> t
 
 auto info(event_loop&, http::request& request, http::response& response) -> task<void>
 {
+    const auto peer = request.peer();
+    check(peer && peer->port != 0 && (*peer == ip_endpoint::loopback_v4(peer->port) ||
+                                      *peer == ip_endpoint::loopback_v6(peer->port)),
+          "request peer is the loopback client");
     std::array<char, 256> body {};
     const auto custom = request.header_value("X-Test").value_or("-");
     const int size = std::snprintf(body.data(), body.size(), "%.*s|%.*s|%.*s|%.*s",
