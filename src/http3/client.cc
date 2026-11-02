@@ -3,6 +3,7 @@
 #include "errors.h"
 #include "frames.h"
 #include "http/client_fields.h"
+#include "queue_behind_wakeups.h"
 #include "qpack.h"
 #include "quic/varint.h"
 
@@ -616,7 +617,8 @@ auto client_connection::state::request(event_loop& loop, state& self, client_req
                 final_headers = true;
                 bodyless = request.method == "HEAD" || response.status == 204 ||
                            response.status == 304;
-                const auto declared = http::detail::content_length(response.headers);
+                const auto declared =
+                    http::detail::response_content_length(response.headers, response.status);
                 if (!declared) return declared.error();
                 if (!bodyless) response_length = *declared;
             }
@@ -680,6 +682,13 @@ auto client_connection::state::request(event_loop& loop, state& self, client_req
     if (!error && (!frames.complete() || !final_headers ||
                    (response_length && received != *response_length)))
         error = failure(std::errc::protocol_error);
+    // A connection error delivered with the response, such as an invalid
+    // QPACK instruction in the same datagram, fails the request: the
+    // critical-stream readers woken alongside this one run first.
+    if (!error) {
+        co_await eventloop::detail::queue_behind_wakeups {loop};
+        if (self.closed_by) error = self.closed_by;
+    }
     // An upload source failure or GOAWAY closes the connection; report its cause.
     if (error && self.closed_by) error = self.closed_by;
     if (self.upload) {

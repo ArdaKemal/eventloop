@@ -525,7 +525,8 @@ auto client_connection::state::exchange(event_loop& loop, state& self,
                 if (!initial_headers && response.status >= 200) {
                     bodyless = request.method == "HEAD" || response.status == 204 ||
                                response.status == 304;
-                    const auto length = http::detail::content_length(response.headers);
+                    const auto length = http::detail::response_content_length(
+                        response.headers, response.status);
                     if (!length) { error = length.error(); break; }
                     if (!bodyless) response_length = *length;
                 }
