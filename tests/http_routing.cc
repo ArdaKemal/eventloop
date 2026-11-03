@@ -61,7 +61,9 @@ auto hello(event_loop&, http::request&, http::response& response) -> task<void>
 auto upgrade(event_loop&, http::request& request, http::response& response) -> task<void>
 {
     const bool offered = request.header_value("sec-websocket-protocol").has_value();
-    auto accepted = co_await request.async_accept_websocket(offered ? "chat" : "");
+    // The test names the extensions to accept, as a proxy relays a backend's.
+    const auto extensions = request.header_value("x-accept-extension").value_or("");
+    auto accepted = co_await request.async_accept_websocket(offered ? "chat" : "", extensions);
     if (!accepted || !*accepted) {
         check(accepted && accepted->error() == std::errc::invalid_argument,
               "invalid upgrade is invalid_argument");
@@ -503,6 +505,15 @@ auto main() -> int
                 "\r\n",
             request("GET /ws HTTP/1.1\r\nSec-WebSocket-Version: 13\r\n"
                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"),
+            // An offered extension is accepted; one never offered is refused.
+            "GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits, x-other\r\n"
+                "X-Accept-Extension: permessage-deflate; server_no_context_takeover\r\n\r\nping",
+            "GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\n"
+                "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                "Sec-WebSocket-Extensions: x-other\r\n"
+                "X-Accept-Extension: permessage-deflate\r\n\r\n",
         });
 
     const std::string hello_head =
@@ -549,7 +560,7 @@ auto main() -> int
     check(responses[23].starts_with("HTTP/1.1 405 ") &&
           responses[23].find("Connection: close") != std::string::npos,
           "chunked body on a path without a handler for the method");
-    const auto upgrades = std::span(responses).last(3);
+    const auto upgrades = std::span(responses).last(5);
     check(upgrades[0] == "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n"
           "connection: upgrade\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
           "sec-websocket-protocol: chat\r\n\r\nping", "HTTP/1.1 WebSocket upgrade");
@@ -557,6 +568,12 @@ auto main() -> int
           "upgrade with an invalid key");
     check(upgrades[2].starts_with("HTTP/1.1 400 ") && upgrades[2].ends_with("refused"),
           "upgrade without Upgrade fields");
+    check(upgrades[3] == "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n"
+          "connection: upgrade\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+          "sec-websocket-extensions: permessage-deflate; server_no_context_takeover\r\n\r\nping",
+          "upgrade accepting an offered extension");
+    check(upgrades[4].starts_with("HTTP/1.1 400 ") && upgrades[4].ends_with("refused"),
+          "upgrade accepting an extension never offered");
     check(responses[24] == responses[8], "throwing handler answers 500");
     check(responses[25] == hello_head + "connection: close\r\n\r\nhello",
           "server survives a throwing handler");

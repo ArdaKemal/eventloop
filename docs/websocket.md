@@ -28,7 +28,11 @@ ordinary requests).
   Content-Length. Borrow subprotocol through acceptance. Invalid handshake
   returns `invalid_argument` without responding; the handler can reject
   (include Sec-WebSocket-Version: 13 for unsupported version). Handler owns
-  authentication/Origin policy; extensions are not negotiated.
+  authentication/Origin policy. eventloop implements no extensions; a
+  handler that does (or a proxy relaying frames to one that does) passes the
+  accepted `Sec-WebSocket-Extensions` value as the second argument, and
+  acceptance fails with `invalid_argument` if it names an extension the
+  client did not offer (RFC 6455 9.1).
 - HTTP/1.1 success sends 101 Switching Protocols with
   `Sec-WebSocket-Accept`; the stream then carries the connection's raw bytes,
   starting with any the client sent after the request head. A read of zero is
