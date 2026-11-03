@@ -114,12 +114,50 @@ auto rejected(event_loop& loop, std::errc code) -> task<std::expected<T, std::er
     return accept;
 }
 
+// Whether a Sec-WebSocket-Extensions response value accepts only extensions
+// the client offered (RFC 6455 section 9.1): each comma-separated element's
+// name, before any ';' parameters, must name an offered element.
+[[nodiscard]] auto extensions_offered(const request& incoming, std::string_view accepted) noexcept
+    -> bool
+{
+    // An element's name: the text before any ';' parameters, without spaces.
+    const auto name_of = [](std::string_view element) {
+        element = element.substr(0, element.find(';'));
+        while (!element.empty() && (element.front() == ' ' || element.front() == '\t'))
+            element.remove_prefix(1);
+        while (!element.empty() && (element.back() == ' ' || element.back() == '\t'))
+            element.remove_suffix(1);
+        return element;
+    };
+    const auto offered = [&](std::string_view name) {
+        for (const auto& field : incoming.headers()) {
+            if (!ascii_equal(field.name, "sec-websocket-extensions")) continue;
+            for (auto rest = field.value;;) {
+                const auto comma = rest.find(',');
+                if (ascii_equal(name_of(rest.substr(0, comma)), name)) return true;
+                if (comma == std::string_view::npos) break;
+                rest.remove_prefix(comma + 1);
+            }
+        }
+        return false;
+    };
+    if (!valid_response_field("sec-websocket-extensions", accepted)) return false;
+    for (;;) {
+        const auto comma = accepted.find(',');
+        const auto name = name_of(accepted.substr(0, comma));
+        if (!token(name) || !offered(name)) return false;
+        if (comma == std::string_view::npos) return true;
+        accepted.remove_prefix(comma + 1);
+    }
+}
+
 auto accept_websocket_task(event_loop& loop, exchange& owner, const request& incoming,
-                           std::string_view selected)
+                           std::string_view selected, std::string_view extensions)
     -> task<std::expected<websocket_stream, std::error_code>>
 {
     (void)loop;
-    if (owner.websocket_accepted || owner.body_read || (!selected.empty() && !token(selected)))
+    if (owner.websocket_accepted || owner.body_read || (!selected.empty() && !token(selected)) ||
+        (!extensions.empty() && !extensions_offered(incoming, extensions)))
         co_return std::unexpected(failure(std::errc::invalid_argument));
     const auto accept = websocket_request(incoming);
     if (!accept) co_return std::unexpected(accept.error());
@@ -145,10 +183,11 @@ auto accept_websocket_task(event_loop& loop, exchange& owner, const request& inc
     }
     if (versions != 1 || !offered)
         co_return std::unexpected(failure(std::errc::invalid_argument));
-    std::array<header, 2> fields {};
+    std::array<header, 3> fields {};
     std::size_t count = 0;
     if (!accept->empty()) fields[count++] = {"sec-websocket-accept", *accept};
     if (!selected.empty()) fields[count++] = {"sec-websocket-protocol", selected};
+    if (!extensions.empty()) fields[count++] = {"sec-websocket-extensions", extensions};
     auto accepted = flatten_result(co_await owner.accept_websocket(
         std::span<const header>(fields).first(count)));
     if (!accepted) co_return std::unexpected(accepted.error());
@@ -372,10 +411,11 @@ auto request::async_read_body(std::span<std::byte> buffer)
     return exchange_->read_body(buffer);
 }
 
-auto request::async_accept_websocket(std::string_view subprotocol)
+auto request::async_accept_websocket(std::string_view subprotocol, std::string_view extensions)
     -> task<std::expected<websocket_stream, std::error_code>>
 {
-    return detail::accept_websocket_task(exchange_->loop(), *exchange_, *this, subprotocol);
+    return detail::accept_websocket_task(exchange_->loop(), *exchange_, *this, subprotocol,
+                                         extensions);
 }
 
 auto response::async_start(unsigned status, std::span<const header> headers)

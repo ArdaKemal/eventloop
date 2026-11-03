@@ -88,11 +88,15 @@ public:
     // response: an RFC 6455 Upgrade on HTTP/1.1 (answered 101, and the
     // connection closes when the handler returns), or RFC 8441/9220 Extended
     // CONNECT on HTTP/2 and HTTP/3. A selected subprotocol must have been
-    // offered. No extensions are negotiated. The handler applies Origin/auth
-    // policy. Invalid handshakes return invalid_argument without a response.
-    // The returned stream cannot outlive this handler. Ordinary HTTP I/O is
-    // invalid after acceptance.
-    [[nodiscard]] auto async_accept_websocket(std::string_view subprotocol = {})
+    // offered. extensions, when not empty, is sent as Sec-WebSocket-Extensions
+    // and may accept only extensions the client offered; eventloop does not
+    // implement any, so the handler (for example a proxy relaying frames)
+    // processes them. The handler applies Origin/auth policy. Invalid
+    // handshakes return invalid_argument without a response. The returned
+    // stream cannot outlive this handler. Ordinary HTTP I/O is invalid after
+    // acceptance.
+    [[nodiscard]] auto async_accept_websocket(std::string_view subprotocol = {},
+                                              std::string_view extensions = {})
         -> task<std::expected<websocket_stream, std::error_code>>;
 
 private:
