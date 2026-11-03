@@ -21,6 +21,8 @@ option(EVENTLOOP_HTTP3_INTEROP_TESTS
     "Enable optional outbound HTTP/3 v1/v2 tests using aioquic 1.3.0" OFF)
 option(EVENTLOOP_WEBSOCKET_INTEROP_TESTS
     "Enable Python websockets interoperability test" OFF)
+option(EVENTLOOP_FUZZERS
+    "Build libFuzzer harnesses with ASan and UBSan (Clang only); see fuzz/README.md" OFF)
 
 # --- Library -----------------------------------------------------------------
 
@@ -94,6 +96,17 @@ else()
     endif()
 endif()
 add_library(eventloop::eventloop ALIAS eventloop)
+
+if(EVENTLOOP_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "EVENTLOOP_FUZZERS needs Clang for libFuzzer")
+    endif()
+    # Coverage feedback and sanitizers for the library itself, so harnesses
+    # explore its branches; everything linking it gets the sanitizers too.
+    target_compile_options(eventloop PRIVATE -fsanitize=fuzzer-no-link,address,undefined
+        -fno-sanitize-recover=undefined -g)
+    target_link_options(eventloop PUBLIC -fsanitize=address,undefined)
+endif()
 target_include_directories(eventloop
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -408,4 +421,15 @@ if(BUILD_TESTING)
                 TIMEOUT 60 LABELS "http3;interop")
         endforeach()
     endif()
+endif()
+
+if(EVENTLOOP_FUZZERS)
+    foreach(target http1_session http2_session hpack qpack http3_request quic chunked)
+        add_executable(fuzz_${target} fuzz/${target}.cc)
+        target_link_libraries(fuzz_${target} PRIVATE eventloop::eventloop)
+        target_include_directories(fuzz_${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_options(fuzz_${target} PRIVATE -fsanitize=fuzzer,address,undefined
+            -fno-sanitize-recover=undefined -g)
+        target_link_options(fuzz_${target} PRIVATE -fsanitize=fuzzer)
+    endforeach()
 endif()
