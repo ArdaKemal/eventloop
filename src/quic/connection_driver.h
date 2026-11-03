@@ -24,14 +24,19 @@ public:
     {
         if (local_cid.empty() || local_cid.size() > 20 || peer_cid.size() > 20)
             throw std::invalid_argument("QUIC driver CID");
+        // After a Retry the client keeps its connection and source ID (RFC
+        // 9000 section 7.3), so the replacement driver finds that ID already
+        // registered. Registering first leaves no route behind on failure.
+        const auto* initial=connection_.local_ids().find(0);
+        if (!(initial && std::ranges::equal(initial->id(), std::as_bytes(local_cid))) &&
+            !connection_.local_ids().set_initial(std::as_bytes(local_cid)))
+            throw std::invalid_argument("QUIC driver CID");
         std::copy(local_cid.begin(), local_cid.end(), local_.begin()); local_size_=local_cid.size();
         std::copy(peer_cid.begin(), peer_cid.end(), peer_.begin()); peer_size_=peer_cid.size();
         const auto route=endpoint_.router().add(std::as_bytes(local_cid),peer,
             {this,enqueue,authenticate_changed_peer,stateless_reset},validated);
         if (!route) throw std::runtime_error("QUIC driver route capacity");
         route_=*route;
-        if (!connection_.local_ids().set_initial(std::as_bytes(local_cid)))
-            throw std::invalid_argument("QUIC driver CID");
         // Start from a 1500-byte MTU and probe upward only when datagrams
         // cannot be fragmented; IPv6 headers are 20 bytes longer.
         mtu_search_=dont_fragment_=endpoint_.dont_fragment();
