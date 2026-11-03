@@ -477,8 +477,14 @@ private:
 
     auto initialize_client_driver(slot& entry, std::span<const std::uint8_t> dcid) noexcept -> bool
     {
-        entry.driver.emplace(loop_, endpoint_, *entry.connection,
-            as_u8(std::span<const std::byte>(entry.local_cid)), dcid, entry.peer, true);
+        // A driver that cannot be set up (connection IDs, route capacity)
+        // fails this connection, not the process.
+        try {
+            entry.driver.emplace(loop_, endpoint_, *entry.connection,
+                as_u8(std::span<const std::byte>(entry.local_cid)), dcid, entry.peer, true);
+        } catch (const std::exception&) {
+            return false;
+        }
         entry.route = endpoint_.router().lookup(entry.local_cid);
         entry.driver->set_retry_handler(&entry, accept_retry);
         entry.driver->set_initial_token(std::span(entry.retry_token).first(entry.retry_token_size));
