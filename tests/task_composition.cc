@@ -122,13 +122,26 @@ auto blocking_child(event_loop& loop, std::atomic<bool>& release,
     cancelled = !result && result.error() == blocking_error::cancelled;
     co_return 8;
 }
+// A loaded machine may not start the worker job before the other branch
+// wins; cancelling it then just dequeues it. Either way the race resumes only
+// once the job has retired: a started job holds it until released.
 auto worker_race_root(event_loop& loop, std::atomic<bool>& release,
-                      bool& cancelled, bool& passed) -> task<void>
+                      std::atomic<bool>& entered, bool& cancelled, bool& passed) -> task<void>
 {
-    auto result = co_await race(blocking_child(loop, release, cancelled),
+    auto result = co_await race(blocking_child(loop, release, cancelled, &entered),
                                 later(loop, 2, 1ms, passed));
     passed = result && result->index == 1 && cancelled &&
-             release.load(std::memory_order_acquire);
+             (release.load(std::memory_order_acquire) ||
+              !entered.load(std::memory_order_acquire));
+}
+
+// Retires whatever is still pending, such as release_after when the job was
+// dequeued before it started, so the loop is destroyed with no live frame.
+auto finish_worker_test(event_loop& loop, std::atomic<bool>& release) -> void
+{
+    release.store(true, std::memory_order_release);
+    loop.shutdown(event_loop::clock::duration::zero());
+    (void)loop.run();
 }
 auto worker_race_test() -> bool
 {
@@ -136,29 +149,30 @@ auto worker_race_test() -> bool
     options.worker_count = 1;
     event_loop loop(options);
     std::atomic<bool> release {false};
+    std::atomic<bool> entered {false};
     bool cancelled = false;
     bool passed = false;
     auto root = stop_when_done(
-        loop, worker_race_root(loop, release, cancelled, passed));
+        loop, worker_race_root(loop, release, entered, cancelled, passed));
     if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
-    if (loop.spawn(release_after(loop, release, 5ms)) !=
-        task_spawn_result::accepted) {
-        release.store(true, std::memory_order_release);
-        loop.shutdown(event_loop::clock::duration::zero());
-        (void)loop.run();
+    if (loop.spawn(release_after(loop, release, 5ms)) != task_spawn_result::accepted) {
+        finish_worker_test(loop, release);
         return false;
     }
     (void)loop.run();
-    return passed && loop.coroutine_statistics().active_roots == 0;
+    finish_worker_test(loop, release);
+    return passed && loop.coroutine_statistics().live == 0;
 }
 // Expiry cancels the worker operation and resumes only after it retires.
 auto worker_timeout_root(event_loop& loop, std::atomic<bool>& release,
-                         bool& cancelled, bool& passed) -> task<void>
+                         std::atomic<bool>& entered, bool& cancelled, bool& passed)
+    -> task<void>
 {
     auto result = co_await with_timeout(
-        loop, blocking_child(loop, release, cancelled), 1ms);
+        loop, blocking_child(loop, release, cancelled, &entered), 1ms);
     passed = result && result->state == timeout_result<int>::outcome::timed_out &&
-             cancelled && release.load(std::memory_order_acquire);
+             cancelled && (release.load(std::memory_order_acquire) ||
+                           !entered.load(std::memory_order_acquire));
 }
 auto worker_timeout_test() -> bool
 {
@@ -166,20 +180,19 @@ auto worker_timeout_test() -> bool
     options.worker_count = 1;
     event_loop loop(options);
     std::atomic<bool> release {false};
+    std::atomic<bool> entered {false};
     bool cancelled = false;
     bool passed = false;
     auto root = stop_when_done(
-        loop, worker_timeout_root(loop, release, cancelled, passed));
+        loop, worker_timeout_root(loop, release, entered, cancelled, passed));
     if (loop.spawn(std::move(root)) != task_spawn_result::accepted) return false;
-    if (loop.spawn(release_after(loop, release, 5ms)) !=
-        task_spawn_result::accepted) {
-        release.store(true, std::memory_order_release);
-        loop.shutdown(event_loop::clock::duration::zero());
-        (void)loop.run();
+    if (loop.spawn(release_after(loop, release, 5ms)) != task_spawn_result::accepted) {
+        finish_worker_test(loop, release);
         return false;
     }
     (void)loop.run();
-    return passed && loop.coroutine_statistics().active_roots == 0;
+    finish_worker_test(loop, release);
+    return passed && loop.coroutine_statistics().live == 0;
 }
 auto cancelled_timeout_root(event_loop& loop, std::atomic<bool>& release,
                             std::atomic<bool>& entered, bool& cancelled,

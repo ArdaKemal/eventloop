@@ -128,7 +128,13 @@ for index in {1..6}; do
     cmp "$work_dir/www/file.txt" "$work_dir/parallel-$index.out"
 done
 cmp "$work_dir/www/large.bin" "$work_dir/parallel-large.out"
-grep -Eq 'Multiplexed connection|Using Stream ID' "$work_dir/parallel.trace" || \
-    fail 'curl did not report multiplexed HTTP/2 streams'
+# curl's wording depends on its version and on whether transfers queued
+# before ALPN finished, so count streams opened and connections made: all
+# seven transfers must share one connection.
+streams=$(grep -Ec '\[HTTP/2\] \[[0-9]+\] OPENED stream|Using Stream ID' \
+    "$work_dir/parallel.trace" || true)
+connections=$(grep -c 'Connected to' "$work_dir/parallel.trace" || true)
+[[ $streams -ge 7 && $connections -eq 1 ]] || \
+    fail "curl did not multiplex HTTP/2 streams ($streams streams, $connections connections)"
 
 echo 'HTTP/2 server integration: ALPN, methods, paths, security, flow control, and parallel streams passed'
